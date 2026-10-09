@@ -9,6 +9,15 @@ The newest version is at the top.
 
 Glint stays at 0.x while it's in beta.
 
+## 0.9.1 (2026-10-10): fixes
+
+- **Updates**: Glint now finds the newest release by its version number, even when GitHub still
+  marks an older one as "latest".
+- **Right-click menus**: Windows' commands from other apps (WinRAR, Send to and the like) may
+  finish their work after the click, as they can in File Explorer, and Glint keeps what they need
+  a little longer.
+- Glint notes in its log which of Windows' menu commands ran, to help find problems.
+
 ## 0.9.0 (2026-10-09): Chrome and Gunmetal
 
 - **Two new skins: Chrome and Gunmetal.** Year 2000 chrome: shiny silver-blue (or dark

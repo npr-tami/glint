@@ -60,6 +60,7 @@ pub fn show(owner: HWND, at: POINT, menu: &Menu, default_item: u32, built: Optio
         // this returns (the window releases it).
         let picked = unsafe { TrackPopupMenuEx(HMENU(b.hmenu as *mut _), flags, at.x, at.y, owner, None) };
         SHOWING.with(|s| s.set(0));
+        log::line(&format!("shell menu {}: Windows' menu closed, picked {}", b.session, picked.0));
         return to_pick(picked.0, &[]);
     }
     let mut shared = Vec::new();
@@ -73,6 +74,9 @@ pub fn show(owner: HWND, at: POINT, menu: &Menu, default_item: u32, built: Optio
         SHOWING.with(|s| s.set(built.map_or(0, |b| b.session)));
         let picked = TrackPopupMenuEx(h, flags, at.x, at.y, owner, None);
         SHOWING.with(|s| s.set(0));
+        if let Some(b) = built {
+            log::line(&format!("shell menu {}: menu closed, picked {}", b.session, picked.0));
+        }
         if !shared.is_empty() {
             let n = GetMenuItemCount(Some(h)).max(0) as u32;
             for pos in (0..n).rev() {

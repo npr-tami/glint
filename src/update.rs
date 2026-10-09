@@ -458,10 +458,14 @@ pub fn valid_repo(repo: &str) -> bool {
     [owner, name].iter().all(|p| p.len() <= 100 && p.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) && !p.bytes().all(|b| b == b'.'))
 }
 
-/// Where GitHub tells about the newest release of `repo` (owner/name).
-fn latest_url(repo: &str) -> String {
-    format!("https://api.github.com/repos/{repo}/releases/latest")
+/// Where GitHub lists `repo`'s recent releases, newest first. Glint picks the highest version
+/// there itself (`read_releases`): the release GitHub marks "latest" can be an older one.
+fn releases_url(repo: &str) -> String {
+    format!("https://api.github.com/repos/{repo}/releases?per_page={RELEASES_LISTED}")
 }
+
+/// How many recent releases `releases_url` asks for.
+const RELEASES_LISTED: u32 = 20;
 
 /// Where `repo`'s CHANGELOG.md is, as it is at the release tagged `tag`.
 fn changelog_url(repo: &str, tag: &str) -> String {
@@ -643,10 +647,32 @@ fn shorten(text: &str, max: usize) -> String {
     format!("{}\n…", &text[..end])
 }
 
-/// What GitHub's answer about the newest release (`json`) means for Glint at version `ours`. A newer
-/// release's changelog is its own text for now (`whats_new` may find better).
+/// What GitHub's answer about one release (`json`) means for Glint at version `ours` (the tests
+/// read single releases with it).
+#[cfg(test)]
 fn read_latest(json: &[u8], ours: &Version) -> Found {
     let Ok(release) = serde_json::from_slice::<ReleaseJson>(json) else { return Found::Failed("GitHub's answer about the newest release couldn't be read".into()) };
+    read_release(release, ours)
+}
+
+/// What GitHub's list of recent releases (`json`) means for Glint at version `ours`: the release
+/// with the highest version number, drafts and pre-releases left out, judged as `read_latest` does.
+fn read_releases(json: &[u8], ours: &Version) -> Found {
+    let Ok(list) = serde_json::from_slice::<Vec<ReleaseJson>>(json) else { return Found::Failed("GitHub's list of releases couldn't be read".into()) };
+    let best = list
+        .into_iter()
+        .filter(|r| !r.draft && !r.prerelease && valid_tag(r.tag_name.trim()))
+        .filter_map(|r| Version::parse(r.tag_name.trim()).map(|v| (v, r)))
+        .max_by(|a, b| a.0.cmp(&b.0));
+    match best {
+        Some((_, release)) => read_release(release, ours),
+        None => Found::Unavailable("no release yet".into()),
+    }
+}
+
+/// What one release means for Glint at version `ours`. A newer release's changelog is its own
+/// text for now (`whats_new` may find better).
+fn read_release(release: ReleaseJson, ours: &Version) -> Found {
     if release.draft || release.prerelease {
         return Found::Unavailable("the newest release isn't out yet".into());
     }
@@ -730,7 +756,7 @@ fn describe(f: &Found) -> String {
 /// when it's newer, what's new in it.
 fn check(repo: &str) -> Found {
     let repo = if valid_repo(repo) { repo } else { settings::UPDATE_REPO };
-    let json = match fetch(&latest_url(repo), API_HEADERS) {
+    let json = match fetch(&releases_url(repo), API_HEADERS) {
         Ok(json) => json,
         // No release yet (or a repository GitHub doesn't show).
         Err(NetError::Status(404)) => return Found::Unavailable("no release yet".into()),
@@ -740,7 +766,7 @@ fn check(repo: &str) -> Found {
         Err(NetError::Failed(why)) => return Found::Failed(why),
     };
     let ours = ours();
-    let mut found = read_latest(&json, &ours);
+    let mut found = read_releases(&json, &ours);
     if let Found::Newer(r) = &mut found {
         let theirs = Version::parse(&r.version).unwrap_or_else(|| ours.clone());
         let md = fetch(&changelog_url(repo, &r.tag), "").ok().map(|b| String::from_utf8_lossy(&b).into_owned());
@@ -1273,6 +1299,25 @@ mod tests {
     }
 
     #[test]
+    fn the_highest_version_in_the_list_wins() {
+        let ours = v("0.8.0");
+        let exe = |tag: &str| asset("Glint.exe", 3_000_000, "uploaded").replace("v0.8.0", tag);
+        // GitHub lists newest first, but its "latest" can be an older release: the highest version
+        // counts, whatever the order.
+        let list = format!("[{},{}]", latest_json("v0.8.0", &exe("v0.8.0")), latest_json("v0.9.0", &exe("v0.9.0")));
+        assert!(matches!(read_releases(list.as_bytes(), &ours), Found::Newer(r) if r.version == "0.9.0" && r.url.ends_with("/v0.9.0/Glint.exe")));
+        // Drafts and pre-releases are left out.
+        let pre = latest_json("v1.0.0", &exe("v1.0.0")).replace("\"prerelease\": false", "\"prerelease\": true");
+        let draft = latest_json("v0.9.5", &exe("v0.9.5")).replace("\"draft\": false", "\"draft\": true");
+        let list = format!("[{pre},{draft},{}]", latest_json("v0.9.0", &exe("v0.9.0")));
+        assert!(matches!(read_releases(list.as_bytes(), &ours), Found::Newer(r) if r.version == "0.9.0"));
+        // Nothing newer, nothing at all, or something that isn't a list.
+        assert_eq!(read_releases(format!("[{}]", latest_json("v0.8.0", &exe("v0.8.0"))).as_bytes(), &ours), Found::UpToDate("0.8.0".into()));
+        assert_eq!(read_releases(b"[]", &ours), Found::Unavailable("no release yet".into()));
+        assert!(matches!(read_releases(b"{}", &ours), Found::Failed(_)));
+    }
+
+    #[test]
     fn the_newest_release_is_read() {
         let ours = v("0.7.0");
         let exe = asset("Glint.exe", 3_000_000, "uploaded");
@@ -1325,7 +1370,7 @@ mod tests {
         for bad in ["", "nightly", "v0.8.0/../x", "v0.8.0 x", "v1.0.0+a b", "v1.0.0+a/b", "v1.0.0?x", "release-1"] {
             assert!(!valid_tag(bad), "{bad:?}");
         }
-        assert_eq!(latest_url("npr-tami/glint"), "https://api.github.com/repos/npr-tami/glint/releases/latest");
+        assert_eq!(releases_url("npr-tami/glint"), "https://api.github.com/repos/npr-tami/glint/releases?per_page=20");
         assert_eq!(changelog_url("npr-tami/glint", "v0.8.0"), "https://raw.githubusercontent.com/npr-tami/glint/v0.8.0/CHANGELOG.md");
         assert_eq!(split_https("https://api.github.com/repos/a/b/releases/latest"), Some(("api.github.com", "/repos/a/b/releases/latest")));
         assert_eq!(split_https("https://github.com"), Some(("github.com", "/")));

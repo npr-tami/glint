@@ -2,7 +2,7 @@
 <!-- Tells Windows how to run Glint: sharp at every DPI (per-monitor v2), modern common controls (v6),
      long paths and UTF-8 as the code page. -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="Glint" version="0.9.0.0" processorArchitecture="amd64"/>
+  <assemblyIdentity type="win32" name="Glint" version="0.9.1.0" processorArchitecture="amd64"/>
   <description>Glint</description>
   <dependency>
     <dependentAssembly>

@@ -87,6 +87,12 @@ const THIS_PC: &str = "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
 /// CMIC_MASK_UNICODE (the windows crate doesn't name it): the wide fields of
 /// CMINVOKECOMMANDINFOEX are filled.
 const CMIC_MASK_UNICODE: u32 = 0x4000;
+/// CMIC_MASK_ASYNCOK: the command may finish its work after InvokeCommand returns (as Explorer
+/// lets it); archivers and "Send to" often do.
+const CMIC_MASK_ASYNCOK: u32 = 0x0010_0000;
+/// How long a menu whose command ran is kept alive afterwards, for commands that finish their work
+/// later (they may still use the files and objects the menu gave them).
+const LINGER: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// One item of Windows' menu, read on the shell thread so the UI thread can copy it into Glint's
 /// menu (popup.rs). The handles belong to the session and stay valid until it's released.
@@ -423,6 +429,9 @@ fn parse(path: &str) -> Option<Pidl> {
 
 thread_local! {
     static SESSIONS: RefCell<HashMap<u64, Session>> = RefCell::new(HashMap::new());
+    /// Menus whose command ran, kept until LINGER has passed (let go at the next job after that,
+    /// or when Glint closes).
+    static LINGERING: RefCell<Vec<(std::time::Instant, Session)>> = const { RefCell::new(Vec::new()) };
     /// A job is running (a job can pump messages and so meet WM_SHELL_JOB again: that one leaves
     /// the queue to the loop already running).
     static RUNNING: Cell<bool> = const { Cell::new(false) };
@@ -521,6 +530,15 @@ fn run_jobs() {
     loop {
         let Some(job) = lock(&JOBS).pop_front() else { break };
         BUSY_SINCE.store(clock(), Ordering::SeqCst);
+        // Menus whose command ran long enough ago are let go now (taken out first, then dropped,
+        // so no borrow is held while their makers' code runs).
+        let done: Vec<Session> = LINGERING.with(|l| {
+            let mut l = l.borrow_mut();
+            let (old, keep): (Vec<_>, Vec<_>) = l.drain(..).partition(|(at, _)| at.elapsed() >= LINGER);
+            *l = keep;
+            old.into_iter().map(|(_, s)| s).collect()
+        });
+        drop(done);
         match job {
             Job::Build { session, owner, req } => {
                 if let Some(wait) = test_delay() {
@@ -554,13 +572,15 @@ fn run_jobs() {
                     if (SHELL_FIRST..=SHELL_LAST).contains(&cmd) {
                         let offset = (cmd - SHELL_FIRST) as usize;
                         let keys = Keys { point: Some(point), shift, ctrl };
-                        if let Err(e) = invoke_command(&s, HWND(owner as *mut _), Verb::Offset(offset), keys) {
+                        let verb = verb(&s.menu, offset as u32);
+                        match invoke_command(&s, HWND(owner as *mut _), Verb::Offset(offset), keys) {
+                            Ok(()) => log::line(&format!("shell menu {session}: ran command {offset} (verb \"{verb}\")")),
                             // Cancelled by the person (a UAC prompt, say) is not worth a word.
-                            if e.code().0 as u32 != 0x800704C7 {
-                                log::line(&format!("shell menu: command {offset} failed: {e}"));
-                            }
+                            Err(e) if e.code().0 as u32 == 0x800704C7 => {}
+                            Err(e) => log::line(&format!("shell menu {session}: command {offset} (verb \"{verb}\") failed: {e}")),
                         }
                     }
+                    LINGERING.with(|l| l.borrow_mut().push((std::time::Instant::now(), s)));
                 }
             }
             Job::Release(session) => {
@@ -569,6 +589,7 @@ fn run_jobs() {
             }
             Job::Properties { owner, paths } => show_properties(HWND(owner as *mut _), &paths),
             Job::Quit => {
+                LINGERING.with(|l| l.borrow_mut().clear());
                 SESSIONS.with(|s| s.borrow_mut().clear());
                 // SAFETY: keeps what Windows' Copy put on the clipboard there after Glint ends; then
                 // ends this thread's message loop.
@@ -847,7 +868,7 @@ struct Keys {
 }
 
 fn invoke_command(s: &Session, owner: HWND, verb: Verb, keys: Keys) -> windows::core::Result<()> {
-    let mut mask = CMIC_MASK_UNICODE;
+    let mut mask = CMIC_MASK_UNICODE | CMIC_MASK_ASYNCOK;
     if keys.point.is_some() {
         mask |= CMIC_MASK_PTINVOKE;
     }
