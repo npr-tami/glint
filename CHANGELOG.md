@@ -9,6 +9,12 @@ The newest version is at the top.
 
 Glint stays at 0.x while it's in beta.
 
+## 0.9.2 (2026-10-10): right-click submenus
+
+- **Submenus from other apps open again on slower PCs** (WinRAR ›, Send to ›, Give access to ›…).
+  Glint now waits longer for Windows to fill a submenu, and one slow submenu no longer stops all
+  the others in the same menu from opening.
+
 ## 0.9.1 (2026-10-10): fixes
 
 - **Updates**: Glint now finds the newest release by its version number, even when GitHub still

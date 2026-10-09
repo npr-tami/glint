@@ -20,8 +20,9 @@
 //!   their own icons (WM_MEASUREITEM, WM_DRAWITEM). Those messages are handed over with [`forward`]:
 //!   a SendMessage to the shell thread, which passes them to the session's IContextMenu3/2. The UI
 //!   thread waits for that, but only while the menu itself is open, and never longer than
-//!   FORWARD_WAIT_MS.
-//! - The picked command runs on the shell thread too ([`invoke`]), and the session is then let go.
+//!   FORWARD_WAIT_MS (SUBMENU_WAIT_MS for a submenu about to open).
+//! - The picked command runs on the shell thread too ([`invoke`]); its session is let go a minute
+//!   later (LINGER), as some commands finish their work after the click.
 //!   Properties windows ([`properties`]) are opened from there as well, since the thread stays.
 //!
 //! If the thread can't be started, or a menu can't be built (Wine, a path the shell doesn't know,
@@ -76,6 +77,19 @@ const WM_SHELL_FORWARD: u32 = WM_APP + 2;
 /// Longest the UI thread waits for the shell thread to handle one menu message (a hung app's code
 /// would otherwise hang the menu). The item it was about just stays empty.
 const FORWARD_WAIT_MS: u32 = 1000;
+/// The same for a submenu about to open (WM_INITMENUPOPUP): filling one can take a few seconds on
+/// a slower PC ("Send to", "Give access to", an archiver's list), and a submenu that isn't filled
+/// in time doesn't open at all.
+const SUBMENU_WAIT_MS: u32 = 8000;
+
+/// The shell thread is handling a forwarded menu message right now (one the UI thread may have
+/// stopped waiting for).
+static IN_FORWARD: AtomicBool = AtomicBool::new(false);
+
+/// Whether the shell thread is still busy with a forwarded menu message.
+pub fn forward_in_progress() -> bool {
+    IN_FORWARD.load(Ordering::SeqCst)
+}
 
 /// At most this many items are handed to Windows for one menu (Explorer has a similar limit: a
 /// menu for 50,000 files would take very long to build and nobody reads it).
@@ -326,7 +340,8 @@ pub fn forward(session: u64, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Forwar
     let mut answer = 0usize;
     // SAFETY: the shell thread takes over `theirs` (Arc::from_raw) when the message arrives.
     let sent = unsafe {
-        SendMessageTimeoutW(HWND(h as *mut _), WM_SHELL_FORWARD, WPARAM(0), LPARAM(theirs as isize), SMTO_ABORTIFHUNG, FORWARD_WAIT_MS, Some(&mut answer))
+        let wait = if msg == WM_INITMENUPOPUP { SUBMENU_WAIT_MS } else { FORWARD_WAIT_MS };
+        SendMessageTimeoutW(HWND(h as *mut _), WM_SHELL_FORWARD, WPARAM(0), LPARAM(theirs as isize), SMTO_ABORTIFHUNG, wait, Some(&mut answer))
     };
     if sent.0 == 0 {
         // Timed out (the message may still be handled later; it then has its own copy) or never
@@ -514,7 +529,9 @@ unsafe extern "system" fn thread_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
             let shared = unsafe { Arc::from_raw(lparam.0 as *const Mutex<Forward>) };
             // Worked on as a copy, so the lock isn't held while an app's code runs.
             let mut f = lock(&shared).clone();
+            IN_FORWARD.store(true, Ordering::SeqCst);
             handle_forward(&mut f);
+            IN_FORWARD.store(false, Ordering::SeqCst);
             *lock(&shared) = f;
             LRESULT(0)
         }

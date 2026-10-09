@@ -110,15 +110,24 @@ fn to_pick(id: i32, ours: &[MenuItem]) -> Pick {
 /// the menu messages they need go to their maker. Some(result) when it handled one.
 pub fn forward(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
     let session = SHOWING.with(|s| s.get());
-    if session == 0 || HUNG.with(|h| h.get()) == session || !shellmenu::is_menu_message(msg, lparam) {
+    if session == 0 || !shellmenu::is_menu_message(msg, lparam) {
         return None;
+    }
+    if HUNG.with(|h| h.get()) == session {
+        // An earlier message wasn't answered in time. Asking again while the shell thread still
+        // works on it would only wait again; once it's done, the other items are asked again.
+        if shellmenu::forward_in_progress() {
+            return None;
+        }
+        HUNG.with(|h| h.set(0));
+        log::line(&format!("shell menu {session}: Windows' items answer again"));
     }
     match shellmenu::forward(session, msg, wparam, lparam) {
         Forwarded::Handled(r) => Some(r),
         Forwarded::NotHandled => None,
         Forwarded::TimedOut => {
             HUNG.with(|h| h.set(session));
-            log::line(&format!("shell menu {session}: Windows' items didn't answer in time; the menu carries on without asking them"));
+            log::line(&format!("shell menu {session}: Windows' items didn't answer in time (message {msg:#x}); the menu carries on without them until they do"));
             None
         }
     }
