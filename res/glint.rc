@@ -1,0 +1,33 @@
+// Resources baked into glint.exe: the app icon (the chrome star, logo/glint.ico), the manifest and
+// the version info Explorer shows. Plain numbers instead of #include <winver.h>, so it compiles
+// without any SDK headers - with MinGW's windres as well as Microsoft's rc.exe. File names are
+// relative to this file's folder (both run in it).
+
+1 ICON "logo/glint.ico"
+1 24 "glint.manifest"
+
+// 1 VERSIONINFO = VS_VERSION_INFO; FILEOS 0x40004 = VOS_NT_WINDOWS32; FILETYPE 1 = VFT_APP.
+1 VERSIONINFO
+FILEVERSION 0,8,0,0
+PRODUCTVERSION 0,8,0,0
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "FileDescription", "Glint"
+      VALUE "ProductName", "Glint"
+      VALUE "CompanyName", "tamara"
+      VALUE "FileVersion", "0.8.0"
+      VALUE "LegalCopyright", "Copyright (c) 2026 tamara. MIT License."
+      VALUE "ProductVersion", "0.8.0"
+      VALUE "OriginalFilename", "glint.exe"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

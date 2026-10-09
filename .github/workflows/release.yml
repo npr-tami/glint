@@ -1,0 +1,41 @@
+# Builds Glint.exe when a release is published and attaches it to that release.
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check that the tag matches Cargo.toml
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::The release tag is '$TAG', but Cargo.toml says version $VERSION. Tag the release 'v$VERSION', or change the version in Cargo.toml."
+            exit 1
+          fi
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Attach Glint.exe to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          cp target/release/glint.exe Glint.exe
+          gh release upload "$TAG" Glint.exe --clobber

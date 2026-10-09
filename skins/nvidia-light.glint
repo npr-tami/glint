@@ -1,0 +1,53 @@
+// NVIDIA (Light) - the NVIDIA style in light: white and soft grey layers, dark text, NVIDIA
+// green, straight square edges and a green line on top of the active tab.
+// (How skins are written: see the top of AMD Radeon.)
+
+name: NVIDIA (Light)
+description: White and grey layers, dark text, NVIDIA green, square edges
+dark: false
+
+// ---- colours
+accent: #76b900
+accent-text: #0f0f0f
+background: #e6e6e6
+title-bar: background
+toolbar: #f4f4f4
+panel: #ffffff
+sidebar: background
+status-bar: background
+input: panel
+button: #e2e2e2
+button-hover: #d4d4d4
+text: #1a1a1a
+text-bright: #000000
+muted: #666666
+disabled: #b3b3b3
+selection: accent 18%
+selection-edge: accent
+hover: #f0f0f0
+tool-hover: #e2e2e2
+tool-pressed: #d4d4d4
+path-hover: #ececec
+line: #dcdcdc
+scrollbar: #c4c4c4
+scrollbar-hover: #a6a6a6
+usage-bar: #d4d4d4
+logo: accent
+logo-letters: accent-text
+tab-line: accent
+toolbar-line: #dcdcdc
+caption-hover: button-hover
+caption-pressed: button-hover 70%
+close-hover: accent
+menus: light
+
+// ---- shapes and text
+shape: straight
+slant: 0
+path-slant: 0
+radius: 2
+row-height: 28
+tab-line-width: 3
+toolbar-line-width: 1
+font: NVIDIA Sans, Segoe UI Variable Text, Segoe UI
+font-size: 9pt

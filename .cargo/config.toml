@@ -1,0 +1,6 @@
+# Cross-building the Windows exe from Linux (or WSL) with MinGW:
+#   cargo build --release --target x86_64-pc-windows-gnu
+# On Windows itself nothing here is needed: plain `cargo build --release` uses the MSVC toolchain
+# that rustup installs by default.
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"

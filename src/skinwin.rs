@@ -1,0 +1,2417 @@
+//! The skin customiser (Settings > Appearance > CUSTOMISE…): a window of its own, drawn by Glint in
+//! the Settings window's style (kit.rs), for changing a skin in plain words and seeing it at once.
+//!
+//! - **Left:** every skin - the built-in ones, then the person's own - and the buttons NEW,
+//!   DUPLICATE, RENAME, DELETE (own skins only, after a question; the file goes to the Recycle Bin),
+//!   IMPORT…, EXPORT… and OPEN SKINS FOLDER. Clicking a skin uses it, like Settings' drop-down.
+//! - **Right:** the skin in use, in plain words: eight colours (each with a swatch that opens
+//!   Windows' colour picker, and a box for its #hex), the button shape, the slant, the row height,
+//!   the text size, the logo (empty: the chrome wordmark; a word: that word in a box), and whether
+//!   it's a dark skin. "Show as text" swaps the controls for the skin's text itself (a Windows
+//!   EDIT), with what Glint couldn't understand under it.
+//! - **Live, and saved by itself.** Every change goes into the skin's text (`skin::with_value`, so
+//!   the rest of the text stays as it was), the main window shows it at once (`AppState::apply_skin`),
+//!   and the file is written a moment later (SAVE_TIMER) by the skin file worker - never on this
+//!   thread. A built-in skin is never changed: the first change makes a copy, "My skin", and goes
+//!   there.
+//!
+//! How it fits in, as the Settings window (settingswin.rs): its state lives in the main window's
+//! state and its messages go through the main window's guard (`window::skin_message`), and what
+//! runs a message loop of its own (drop-down lists, the colour picker, the file dialogs, showing,
+//! closing) comes back to the main window as a [`Job`] that runs after the message.
+//!
+//! Keyboard: Tab / Shift+Tab go round the skin list, the buttons and the controls; Up / Down (and
+//! Home / End) in the list pick a skin; F2 renames and Del deletes one of your own; Space or Enter
+//! presses, flips or opens; Ctrl+Shift+L switches light / dark as in the main window; Esc (or
+//! Ctrl+W) closes.
+
+use std::cell::Cell;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::Instant;
+
+use windows::core::{w, HSTRING, PCWSTR};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    CreateFontW, CreateSolidBrush, DeleteObject, GetMonitorInfoW, InvalidateRect, MonitorFromWindow, RedrawWindow, ScreenToClient,
+    SetBkColor, SetTextColor, ValidateRect, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, DEFAULT_CHARSET, FF_MODERN,
+    FIXED_PITCH, FW_NORMAL, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, RDW_ALLCHILDREN,
+    RDW_INVALIDATE, RDW_UPDATENOW,
+};
+use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::Dialogs::{ChooseColorW, CC_ANYCOLOR, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW};
+use windows::Win32::UI::Controls::{SetWindowTheme, EM_LIMITTEXT, EM_SETREADONLY, EM_SETSEL, WM_MOUSELEAVE};
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_CONTROL, VK_DELETE,
+    VK_DOWN, VK_END, VK_ESCAPE, VK_F2, VK_F4, VK_HOME, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+};
+use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+use windows::Win32::UI::Shell::{
+    DefSubclassProc, FileOpenDialog, FileSaveDialog, IFileOpenDialog, IFileSaveDialog, SetWindowSubclass, FOS_FILEMUSTEXIST,
+    FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, SIGDN_FILESYSPATH,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetParent, GetWindow, GetWindowRect, GetWindowTextLengthW,
+    GetWindowTextW, IsIconic, KillTimer, LoadCursorW, LoadIconW, PostMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow,
+    SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN, GW_OWNER, HMENU,
+    HTCLIENT, IDC_ARROW, MINMAXINFO, SIZE_MINIMIZED, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SW_HIDE, SW_RESTORE, SW_SHOW, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_CHAR,
+    WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_SETFONT,
+    WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_HSCROLL, WS_SYSMENU,
+    WS_THICKFRAME, WS_VSCROLL,
+};
+
+use crate::app::AppState;
+use crate::ask::{Answer, AskBox};
+use crate::frame;
+use crate::kit::{self, size as ksize, Look, Scroller};
+use crate::log;
+use crate::render::{Align, FrameResult, Renderer, TextStyle};
+use crate::shell;
+use crate::skin::{self, Entry};
+use crate::textbox::{self, TextBox, TextEvent, TextEventKind, WM_APP_TEXT};
+use crate::theme::{size, Color, Shape, Theme};
+use crate::ui::{Command, Menu, MenuItem, Point, Rect};
+
+/// The window's title (Alt+Tab, the taskbar's thumbnails).
+pub const TITLE: &str = "Glint skins";
+/// The skin list's width, its rows and its two small headings.
+const LIST_W: f32 = 236.0;
+const ITEM_H: f32 = 34.0;
+const GROUP_H: f32 = 28.0;
+/// The buttons under the list.
+const BUTTONS_PAD: f32 = 14.0;
+const BUTTON_GAP: f32 = 8.0;
+/// The right side: the skin's name and notes at the top, then the controls (or its text).
+const HEADER_H: f32 = 96.0;
+const PAD_X: f32 = 28.0;
+const GUTTER: f32 = 10.0;
+const MAX_CARD_W: f32 = 720.0;
+const HEADING_H: f32 = 22.0;
+const ROW_H: f32 = 46.0;
+/// A row with a note under its title.
+const ROW_NOTE_H: f32 = 56.0;
+const ROW_PAD_X: f32 = 16.0;
+const SWATCH: f32 = 26.0;
+const HEX_W: f32 = 104.0;
+const DROPDOWN_W: f32 = 200.0;
+const LOGO_FIELD_W: f32 = 140.0;
+/// What the Logo box says while it's empty: no word means the chrome wordmark.
+const LOGO_HINT: &str = "GLINT";
+/// What Glint couldn't understand in the skin's text, under the text.
+const NOTES_H: f32 = 86.0;
+const NOTE_LINE: f32 = 17.0;
+/// The window's size, and the smallest it gets (DIPs).
+const DEFAULT_W: f32 = 780.0;
+const MIN_W: f32 = 780.0;
+const MIN_H: f32 = 540.0;
+const WHEEL_STEP: f32 = 96.0;
+/// Text box ids (textbox.rs: 600-699 belong to the customiser): the one-line box (a colour's
+/// #hex, the logo's word, renaming) and the skin's whole text.
+const EDIT_BOX: u16 = 600;
+const TEXT_BOX: u16 = 601;
+/// Results of background work for this window; Tab or Esc in the skin's text.
+const WM_APP_BG: u32 = WM_APP + 82;
+const WM_APP_TEXT_KEY: u32 = WM_APP + 83;
+/// Saving a moment after the last change; trying to draw again after a refused frame.
+const SAVE_TIMER: usize = 1;
+const RETRY_TIMER: usize = 2;
+const SAVE_DELAY_MS: u32 = 600;
+/// The skin's text is kept below this (EM_LIMITTEXT), like the files Glint reads.
+const MAX_TEXT: usize = 256 * 1024;
+
+/// The colours offered: the skin's name for each, its title and a note where the title alone
+/// doesn't say what it colours ("" for none).
+const COLOURS: [(&str, &str, &str); 8] = [
+    ("accent", "Accent", ""),
+    ("background", "Background", "Title bar, sidebar and status bar"),
+    ("toolbar", "Toolbar", ""),
+    ("panel", "Panels", "File list and details panel"),
+    ("text", "Text", ""),
+    ("muted", "Muted text", ""),
+    ("selection", "Selection", ""),
+    ("hover", "Hover", ""),
+];
+
+/// The choices of the drop-downs.
+const SHAPES: [(Shape, &str, &str); 3] = [(Shape::Slanted, "slanted", "Slanted"), (Shape::Straight, "straight", "Straight"), (Shape::Rounded, "rounded", "Rounded")];
+const SLANTS: [f32; 9] = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0];
+const ROW_HEIGHTS: [f32; 7] = [24.0, 26.0, 28.0, 30.0, 32.0, 34.0, 36.0];
+const FONT_SIZES: [f32; 8] = [8.0, 8.5, 9.0, 9.5, 10.0, 10.5, 11.0, 12.0];
+/// DIPs in a point (9 pt = 12 DIPs).
+const PT: f32 = 96.0 / 72.0;
+
+thread_local! {
+    /// The text boxes' colours (background COLORREF, text COLORREF, brush), for WM_CTLCOLOREDIT.
+    static EDIT_COLORS: Cell<(u32, u32, isize)> = const { Cell::new((0, 0, 0)) };
+}
+
+/// Windows' colour picker remembers 16 colours of the person's ("custom colours") while Glint runs.
+static CUSTOM_COLOURS: Mutex<[u32; 16]> = Mutex::new([0x00ff_ffff; 16]);
+
+/// A control on the right.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ctl {
+    /// One of COLOURS.
+    Colour(usize),
+    Shape,
+    Slant,
+    RowHeight,
+    FontSize,
+    LogoText,
+    Dark,
+}
+
+/// Which part of a control: the main one (a colour's swatch), or a colour's #hex box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Part {
+    Main,
+    Hex,
+}
+
+/// The buttons under the list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Btn {
+    New,
+    Duplicate,
+    Rename,
+    Delete,
+    Import,
+    Export,
+    Folder,
+}
+
+const BUTTONS: [(Btn, &str); 7] = [
+    (Btn::New, "NEW"),
+    (Btn::Duplicate, "DUPLICATE"),
+    (Btn::Rename, "RENAME"),
+    (Btn::Delete, "DELETE"),
+    (Btn::Import, "IMPORT\u{2026}"),
+    (Btn::Export, "EXPORT\u{2026}"),
+    (Btn::Folder, "OPEN SKINS FOLDER"),
+];
+
+/// What is under the mouse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hot {
+    Close,
+    /// A skin in the list (index into the laid-out items).
+    Item(usize),
+    Button(Btn),
+    /// "Show as text".
+    Advanced,
+    Ctl(Ctl, Part),
+    ListThumb,
+    PageThumb,
+}
+
+/// What has the keyboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Spot {
+    List,
+    Button(Btn),
+    Advanced,
+    Ctl(Ctl, Part),
+    /// The skin's text (the EDIT has the keyboard itself).
+    Text,
+}
+
+/// What the one-line text box is for while it's shown.
+#[derive(Clone, Debug, PartialEq)]
+enum Editing {
+    /// A colour's #hex (COLOURS index), with the value before (Esc puts it back).
+    Hex(usize, String),
+    /// The word in the logo, with the word before.
+    LogoText(String),
+    /// Renaming this skin (its id).
+    Rename(String),
+}
+
+/// Something the main window does for this window after the message (see the module comment).
+#[derive(Clone, Debug)]
+pub enum Job {
+    /// Show this window (just made), cloaked until its first frame.
+    Show,
+    /// Bring it to the front (CUSTOMISE… while it's open).
+    Activate,
+    /// A drop-down's list: a native menu at `menu.at` (this window's client DIPs).
+    Menu(Menu),
+    /// Windows' colour picker for COLOURS[at], starting at this COLORREF.
+    Colour { at: usize, initial: u32 },
+    /// Windows' "Open" dialog for a skin file.
+    Import,
+    /// Windows' "Save as" dialog, suggesting this file name.
+    Export(String),
+    /// Put the window here (after a DPI change).
+    Place(RECT),
+    Close,
+}
+
+/// What a job brought back.
+#[derive(Clone, Debug, PartialEq)]
+pub enum JobDone {
+    Nothing,
+    /// The menu item picked (0: none).
+    Picked(u32),
+    /// COLOURS[at] picked as this COLORREF.
+    Colour(usize, u32),
+    Import(PathBuf),
+    Export(PathBuf),
+}
+
+/// What the main window should do after this window handled something.
+#[derive(Clone, Debug)]
+pub enum Ask {
+    Command(Command),
+    Job(Job),
+    /// Paint the main window again (the skin it shows changed).
+    RedrawMain,
+}
+
+/// Results of background work.
+#[derive(Debug)]
+enum Bg {
+    /// A skin file read for IMPORT…: its path and its text (or why it couldn't be read).
+    Imported(PathBuf, Result<String, String>),
+    /// The skins folder exists now: open it in a tab.
+    Open(PathBuf),
+}
+
+/// Background results waiting for their window: (the window's number, the result).
+static RESULTS: Mutex<Vec<(u64, Bg)>> = Mutex::new(Vec::new());
+static NEXT_SERIAL: AtomicU64 = AtomicU64::new(1);
+
+/// Hands a background result to the window (by its handle and number) and wakes it.
+fn post(hwnd: isize, serial: u64, bg: Bg) {
+    RESULTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((serial, bg));
+    // SAFETY: posting to a window by handle; if it's gone the message is simply dropped.
+    unsafe {
+        let _ = PostMessageW(Some(HWND(hwnd as *mut _)), WM_APP_BG, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// A skin in the list, as laid out (list coordinates: y from the top of the scrolling list).
+#[derive(Clone, Debug)]
+struct Item {
+    id: String,
+    name: String,
+    rect: Rect,
+}
+
+/// A row of controls on the right, as laid out (page coordinates).
+#[derive(Clone, Debug)]
+struct Row {
+    ctl: Ctl,
+    rect: Rect,
+    title: &'static str,
+    note: &'static str,
+}
+
+/// The drawn parts of the page other than rows.
+#[derive(Clone, Debug)]
+enum Block {
+    Heading(Rect, &'static str),
+    Card(Rect),
+    Line(Rect),
+}
+
+pub struct SkinWindow {
+    hwnd: HWND,
+    serial: u64,
+    renderer: Renderer,
+    dpi: u32,
+    /// Client size in DIPs.
+    size: (f32, f32),
+    started: Instant,
+    active: bool,
+    tracking: bool,
+    hover: Option<Hot>,
+    pressed: Option<Hot>,
+    focus: Spot,
+    /// Show the keyboard's outline (after a key was used).
+    cues: bool,
+    /// Dragging a scrollbar's thumb: which, and where in the thumb it was grabbed.
+    drag: Option<(Hot, f32)>,
+    items: Vec<Item>,
+    list: Scroller,
+    rows: Vec<Row>,
+    blocks: Vec<Block>,
+    page: Scroller,
+    layout_dirty: bool,
+    /// The library and look last laid out for (a new skin, a renamed one, another skin in use).
+    seen: (u64, u64, String),
+    /// The one-line text box, and what it's editing.
+    edit_box: TextBox,
+    editing: Option<Editing>,
+    edit_at: Option<Rect>,
+    /// "Show as text": the skin's text in a multi-line EDIT instead of the controls.
+    advanced: bool,
+    text_box: HWND,
+    text_font: HFONT,
+    text_font_dpi: u32,
+    /// What the text box was last given (a change from elsewhere is shown when it's not being typed in).
+    text_shown: String,
+    text_at: Option<Rect>,
+    /// We are putting text in the text box (its EN_CHANGE isn't typing).
+    setting_text: bool,
+    /// Skins changed and waiting for SAVE_TIMER to save them.
+    save_due: Vec<String>,
+    /// A line under the skin's name: what just happened (a copy made, a problem).
+    status: Option<(String, bool)>,
+    /// The status is this window's own (not the file worker's "Saved…"), which it doesn't hide.
+    status_mine: bool,
+    /// The drop-down whose list is open.
+    menu_for: Option<Ctl>,
+    /// "Delete this skin?": the question (drawn by ask.rs) and the skin it's about.
+    ask: AskBox,
+    asking: Option<(u64, String)>,
+    next_question: u64,
+    /// Space or Enter on a drop-down: its list opens when that key's character arrives.
+    act_on_char: Option<Spot>,
+    /// Under Wine a hidden text box stays on screen until a later frame: paint until then.
+    repaint_until: f64,
+    /// The switches the person just flipped ("Show as text", "Dark skin"), gliding to their new
+    /// place (kit.rs).
+    flips: kit::Flips,
+}
+
+/// Registers the window class (once; registering again just fails harmlessly).
+fn register_class() {
+    // SAFETY: plain class registration with a static name and our own window procedure.
+    unsafe {
+        let Ok(instance) = GetModuleHandleW(None) else { return };
+        let class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(wndproc),
+            hInstance: instance.into(),
+            hIcon: LoadIconW(Some(instance.into()), PCWSTR(std::ptr::without_provenance(1))).unwrap_or_default(),
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            lpszClassName: w!("GlintSkinWindow"),
+            ..Default::default()
+        };
+        RegisterClassExW(&class);
+    }
+}
+
+/// Makes the customiser (hidden: show it with [`Job::Show`] once its state is kept), owned by
+/// `owner`, centred over it. None if Windows can't make it.
+pub fn create(owner: HWND, theme: &Theme) -> Option<SkinWindow> {
+    register_class();
+    let title: Vec<u16> = TITLE.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: window creation and plain queries on our own windows; all structs are valid.
+    unsafe {
+        let scale = GetDpiForWindow(owner).max(96) as f32 / 96.0;
+        // As tall as the main window, beside it (`beside`).
+        let (x, y, w, h) = beside(owner, (DEFAULT_W * scale) as i32);
+        let instance = GetModuleHandleW(None).ok()?;
+        let hwnd = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("GlintSkinWindow"),
+            PCWSTR(title.as_ptr()),
+            WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_CLIPCHILDREN,
+            x,
+            y,
+            w,
+            h,
+            Some(owner),
+            None,
+            Some(instance.into()),
+            None,
+        )
+        .ok()?;
+        let dpi = GetDpiForWindow(hwnd).max(96);
+        let renderer = match Renderer::new(hwnd, dpi) {
+            Ok(r) => r,
+            Err(e) => {
+                log::error(&format!("The skin customiser couldn't draw: {e}"));
+                let _ = DestroyWindow(hwnd);
+                return None;
+            }
+        };
+        frame::init(hwnd);
+        let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        let edit_box = TextBox::new(hwnd, EDIT_BOX);
+        // The skin's whole text: a multi-line EDIT with scroll bars, Tab and Esc told to the window.
+        let style = WS_CHILD | WS_VSCROLL | WS_HSCROLL | WINDOW_STYLE((ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN) as u32);
+        let text_box = CreateWindowExW(WINDOW_EX_STYLE(0), w!("EDIT"), w!(""), style, 0, 0, 0, 0, Some(hwnd), Some(HMENU(TEXT_BOX as usize as *mut _)), Some(instance.into()), None)
+            .unwrap_or_default();
+        if !text_box.is_invalid() {
+            SendMessageW(text_box, EM_LIMITTEXT, Some(WPARAM(MAX_TEXT)), Some(LPARAM(0)));
+            let _ = SetWindowSubclass(text_box, Some(text_proc), 3, 0);
+        }
+        let mut window = SkinWindow {
+            hwnd,
+            serial: NEXT_SERIAL.fetch_add(1, Ordering::Relaxed),
+            renderer,
+            dpi,
+            size: (0.0, 0.0),
+            started: Instant::now(),
+            active: true,
+            tracking: false,
+            hover: None,
+            pressed: None,
+            focus: Spot::List,
+            cues: false,
+            drag: None,
+            items: Vec::new(),
+            list: Scroller::default(),
+            rows: Vec::new(),
+            blocks: Vec::new(),
+            page: Scroller::default(),
+            layout_dirty: true,
+            seen: (0, 0, String::new()),
+            edit_box,
+            editing: None,
+            edit_at: None,
+            advanced: false,
+            text_box,
+            text_font: HFONT::default(),
+            text_font_dpi: 0,
+            text_shown: String::new(),
+            text_at: None,
+            setting_text: false,
+            save_due: Vec::new(),
+            status: None,
+            status_mine: false,
+            menu_for: None,
+            ask: AskBox::default(),
+            asking: None,
+            next_question: 1,
+            act_on_char: None,
+            repaint_until: 0.0,
+            flips: kit::Flips::default(),
+        };
+        window.apply_theme(theme);
+        let mut rc = RECT::default();
+        if GetClientRect(hwnd, &mut rc).is_ok() {
+            window.size = ((rc.right - rc.left) as f32 / window.scale(), (rc.bottom - rc.top) as f32 / window.scale());
+        }
+        Some(window)
+    }
+}
+
+/// Runs a job for the window `hwnd` (no state is touched: the main window calls this outside its
+/// guard, since menus, the colour picker and the file dialogs run their own message loop).
+pub fn run_job(hwnd: HWND, scale: f32, job: Job, show_menu: fn(HWND, &Menu, f32) -> u32) -> JobDone {
+    // SAFETY: window operations on our own window, with no borrow of any state held.
+    unsafe {
+        match job {
+            Job::Show => {
+                frame::cloak(hwnd, true);
+                let _ = ShowWindow(hwnd, SW_SHOW);
+                let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+                frame::cloak(hwnd, false);
+                let _ = SetForegroundWindow(hwnd);
+            }
+            Job::Activate => {
+                if IsIconic(hwnd).as_bool() {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                }
+                let _ = SetForegroundWindow(hwnd);
+            }
+            Job::Menu(menu) => return JobDone::Picked(show_menu(hwnd, &menu, scale)),
+            Job::Colour { at, initial } => return pick_colour(hwnd, initial).map_or(JobDone::Nothing, |c| JobDone::Colour(at, c)),
+            Job::Import => return open_file(hwnd).map_or(JobDone::Nothing, JobDone::Import),
+            Job::Export(name) => return save_file(hwnd, &name).map_or(JobDone::Nothing, JobDone::Export),
+            Job::Place(r) => {
+                let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            Job::Close => {
+                // The main window gets the focus back (not whatever Windows would pick).
+                if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
+                    let _ = SetForegroundWindow(owner);
+                }
+                let _ = DestroyWindow(hwnd);
+            }
+        }
+    }
+    JobDone::Nothing
+}
+
+/// Windows' colour picker, owned by `owner`, starting at `initial` (a COLORREF). None if cancelled.
+fn pick_colour(owner: HWND, initial: u32) -> Option<u32> {
+    let mut custom = *CUSTOM_COLOURS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut refs: [COLORREF; 16] = custom.map(COLORREF);
+    let mut cc = CHOOSECOLORW {
+        lStructSize: std::mem::size_of::<CHOOSECOLORW>() as u32,
+        hwndOwner: owner,
+        rgbResult: COLORREF(initial),
+        lpCustColors: refs.as_mut_ptr(),
+        Flags: CC_RGBINIT | CC_FULLOPEN | CC_ANYCOLOR,
+        ..Default::default()
+    };
+    // SAFETY: the struct and the 16 custom colours it points to live across the (modal) call.
+    let ok = unsafe { ChooseColorW(&mut cc) }.as_bool();
+    for (c, r) in custom.iter_mut().zip(refs) {
+        *c = r.0;
+    }
+    *CUSTOM_COLOURS.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = custom;
+    ok.then_some(cc.rgbResult.0)
+}
+
+/// The file types the file dialogs offer.
+fn filters() -> [COMDLG_FILTERSPEC; 3] {
+    [
+        COMDLG_FILTERSPEC { pszName: w!("Skins (*.glint)"), pszSpec: w!("*.glint") },
+        COMDLG_FILTERSPEC { pszName: w!("Text files (*.txt)"), pszSpec: w!("*.txt") },
+        COMDLG_FILTERSPEC { pszName: w!("All files"), pszSpec: w!("*.*") },
+    ]
+}
+
+/// Windows' "Open" dialog for a skin file. None if cancelled.
+fn open_file(owner: HWND) -> Option<PathBuf> {
+    // SAFETY: COM is set up on this (the UI) thread (main.rs); the interfaces are released when
+    // dropped and the returned string is freed with CoTaskMemFree.
+    unsafe {
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let options = dialog.GetOptions().ok()?;
+        let _ = dialog.SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+        let _ = dialog.SetTitle(w!("Import a skin"));
+        let _ = dialog.SetFileTypes(&filters());
+        dialog.Show(Some(owner)).ok()?;
+        let name = dialog.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let text = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as *const _));
+        text.filter(|t| !t.is_empty()).map(PathBuf::from)
+    }
+}
+
+/// Windows' "Save as" dialog, suggesting `file_name`. None if cancelled.
+fn save_file(owner: HWND, file_name: &str) -> Option<PathBuf> {
+    // SAFETY: as in `open_file`.
+    unsafe {
+        let dialog: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let options = dialog.GetOptions().ok()?;
+        let _ = dialog.SetOptions(options | FOS_FORCEFILESYSTEM | FOS_OVERWRITEPROMPT);
+        let _ = dialog.SetTitle(w!("Export the skin"));
+        let _ = dialog.SetFileTypes(&filters());
+        let _ = dialog.SetDefaultExtension(w!("glint"));
+        let _ = dialog.SetFileName(&HSTRING::from(file_name));
+        dialog.Show(Some(owner)).ok()?;
+        let name = dialog.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let text = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as *const _));
+        text.filter(|t| !t.is_empty()).map(PathBuf::from)
+    }
+}
+
+/// The skin's text box's extra subclass: Tab and Esc go to the window (Tab moves on, Esc leaves
+/// the text), and Ctrl+A selects everything.
+unsafe extern "system" fn text_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _id: usize, _data: usize) -> LRESULT {
+    if msg == WM_KEYDOWN && (wparam.0 == VK_TAB.0 as usize || wparam.0 == VK_ESCAPE.0 as usize) {
+        // SAFETY: a key-state query and a post to our own parent window.
+        unsafe {
+            let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+            if let Ok(parent) = GetParent(hwnd) {
+                let _ = PostMessageW(Some(parent), WM_APP_TEXT_KEY, WPARAM(wparam.0), LPARAM(shift as isize));
+            }
+        }
+        return LRESULT(0);
+    }
+    // SAFETY: a key-state query and a message to this same control.
+    if msg == WM_KEYDOWN && wparam.0 == 'A' as usize && unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 {
+        unsafe { SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1))) };
+        return LRESULT(0);
+    }
+    if msg == WM_CHAR && matches!(wparam.0, 0x09 | 0x1b | 0x01) {
+        return LRESULT(0); // no tab typed, no beep
+    }
+    // SAFETY: everything else goes on to the EDIT's own handling.
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
+/// The window procedure. Messages that need no state are answered here; the rest go to the state,
+/// which the main window keeps, through its guard (window::skin_message).
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        // SAFETY: lparam is the NCCALCSIZE_PARAMS Windows passed with this message.
+        WM_NCCALCSIZE if wparam.0 != 0 => return unsafe { frame::nc_calc_size(hwnd, wparam, lparam) },
+        WM_ERASEBKGND => return LRESULT(1),
+        WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC => return edit_colors(HDC(wparam.0 as *mut _)),
+        WM_GETMINMAXINFO => {
+            // SAFETY: lparam points to the MINMAXINFO Windows passed.
+            unsafe {
+                let info = &mut *(lparam.0 as *mut MINMAXINFO);
+                let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+                info.ptMinTrackSize = POINT { x: (MIN_W * scale) as i32, y: (MIN_H * scale) as i32 };
+            }
+            return LRESULT(0);
+        }
+        WM_NCHITTEST => return hit_test(hwnd, wparam, lparam),
+        _ => {}
+    }
+    // SAFETY: plain query; the owner is the main window (set when this window was made).
+    let owner = unsafe { GetWindow(hwnd, GW_OWNER) }.unwrap_or_default();
+    if let Some(r) = crate::window::skin_message(owner, hwnd, msg, wparam, lparam) {
+        return r;
+    }
+    if msg == WM_PAINT {
+        // The state is busy (a message inside another): paint on the next turn of the loop instead.
+        // SAFETY: plain invalidate of our own window.
+        unsafe {
+            let _ = ValidateRect(Some(hwnd), None);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+        return LRESULT(0);
+    }
+    if msg == WM_CLOSE {
+        return LRESULT(0); // closing goes through the state (see settingswin.rs)
+    }
+    // SAFETY: default handling.
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// Where the customiser goes, `w` pixels wide: docked beside `owner` (on its right if there's room,
+/// else on its left, else at the screen's right edge), as tall as it and level with it, so the
+/// skin shows in the main window as it changes.
+fn beside(owner: HWND, w: i32) -> (i32, i32, i32, i32) {
+    let mut main = RECT::default();
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    // SAFETY: plain queries with valid out-structs.
+    let work = unsafe {
+        let _ = GetWindowRect(owner, &mut main);
+        if GetMonitorInfoW(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() { info.rcWork } else { main }
+    };
+    let w = w.min((work.right - work.left).max(200));
+    let h = (main.bottom - main.top).min(work.bottom - work.top).max(300);
+    let x = if main.right + w <= work.right {
+        main.right
+    } else if main.left - w >= work.left {
+        main.left - w
+    } else {
+        (work.right - w).max(work.left)
+    };
+    let y = main.top.clamp(work.top, (work.bottom - h).max(work.top));
+    (x, y, w, h)
+}
+
+/// WM_NCHITTEST: the edges resize, the rest is ours. The title bar doesn't move the window: it
+/// stays docked to the main window (`follow_owner`).
+fn hit_test(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if let Some(edge) = frame::resize_edge(hwnd, wparam, lparam) {
+        return LRESULT(edge as isize);
+    }
+    let mut pt = POINT { x: (lparam.0 & 0xffff) as i16 as i32, y: ((lparam.0 >> 16) & 0xffff) as i16 as i32 };
+    let mut rc = RECT::default();
+    // SAFETY: plain queries on our own window with valid out-structs.
+    let scale = unsafe {
+        let _ = ScreenToClient(hwnd, &mut pt);
+        let _ = GetClientRect(hwnd, &mut rc);
+        GetDpiForWindow(hwnd).max(96) as f32 / 96.0
+    };
+    let (x, y, w) = (pt.x as f32 / scale, pt.y as f32 / scale, rc.right as f32 / scale);
+    let _ = (x, y, w);
+    LRESULT(HTCLIENT as isize)
+}
+
+/// WM_CTLCOLOREDIT / WM_CTLCOLORSTATIC (a read-only text box): the text boxes in the skin's colours.
+fn edit_colors(hdc: HDC) -> LRESULT {
+    let (bg, fg, brush) = EDIT_COLORS.with(|c| c.get());
+    // SAFETY: `hdc` is the control's DC for this paint; the brush lives until the theme changes.
+    unsafe {
+        SetTextColor(hdc, COLORREF(fg));
+        SetBkColor(hdc, COLORREF(bg));
+    }
+    if brush == 0 {
+        return LRESULT(COLOR_WINDOW.0 as isize + 1);
+    }
+    LRESULT(brush)
+}
+
+fn lo_word(v: usize) -> u32 {
+    (v & 0xffff) as u32
+}
+
+fn hi_word(v: usize) -> u32 {
+    ((v >> 16) & 0xffff) as u32
+}
+
+/// The colour a skin's colour name stands for in a look.
+fn colour_of(theme: &Theme, key: &str) -> Color {
+    match key {
+        "accent" => theme.accent,
+        "background" => theme.window,
+        "toolbar" => theme.toolbar,
+        "panel" => theme.panel,
+        "text" => theme.text,
+        "muted" => theme.muted,
+        "selection" => theme.accent_tint,
+        _ => theme.hover,
+    }
+}
+
+/// A number as a skin writes it: "8", "8.5".
+fn number(x: f32) -> String {
+    if (x - x.round()).abs() < 0.01 {
+        format!("{}", x.round() as i32)
+    } else {
+        format!("{:.1}", x)
+    }
+}
+
+/// Text for the multi-line EDIT: Windows' line ends.
+fn crlf(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
+impl SkinWindow {
+    /// Docked beside the main window again (it moved or changed size, or the customiser did).
+    pub fn follow_owner(&self) {
+        // SAFETY: plain queries and a move of our own window.
+        unsafe {
+            let Ok(owner) = GetWindow(self.hwnd, GW_OWNER) else { return };
+            if IsIconic(owner).as_bool() {
+                return;
+            }
+            let mut r = RECT::default();
+            let _ = GetWindowRect(self.hwnd, &mut r);
+            let (x, y, w, h) = beside(owner, r.right - r.left);
+            let _ = SetWindowPos(self.hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+
+    pub fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+
+    /// DIPs to pixels.
+    pub fn scale(&self) -> f32 {
+        self.dpi as f32 / 96.0
+    }
+
+    fn now(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
+    }
+
+    fn invalidate(&self) {
+        // SAFETY: plain invalidate of our own window.
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+    }
+
+    /// The skin changed (or the window was just made): its colours and font here too.
+    pub fn apply_theme(&mut self, theme: &Theme) {
+        self.renderer.set_font(&theme.font, 1.0);
+        self.layout_dirty = true;
+        self.edit_at = None;
+        let (bg, fg) = (theme.input.to_colorref(), theme.text.to_colorref());
+        // SAFETY: a new brush replaces the old one, which is deleted (no control paints in between:
+        // this is the UI thread). The text box's scroll bars follow light or dark.
+        unsafe {
+            let brush = CreateSolidBrush(COLORREF(bg));
+            let old = EDIT_COLORS.with(|c| c.replace((bg, fg, brush.0 as isize))).2;
+            if old != 0 {
+                let _ = DeleteObject(HGDIOBJ(old as *mut _));
+            }
+            if !self.text_box.is_invalid() {
+                let _ = SetWindowTheme(self.text_box, if theme.dark { w!("DarkMode_Explorer") } else { w!("Explorer") }, PCWSTR::null());
+            }
+            frame::apply_theme(self.hwnd, theme);
+            let _ = RedrawWindow(Some(self.hwnd), None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
+        }
+    }
+
+    /// Opened again (CUSTOMISE… while it's open).
+    pub fn reopen(&mut self) -> Vec<Ask> {
+        self.invalidate();
+        vec![Ask::Job(Job::Activate)]
+    }
+
+    /// The main window heard news about skins (a file changed, one was saved): show it - a problem
+    /// always, "Saved…" unless it would hide what this window just said (a copy was made).
+    pub fn skins_news(&mut self, app: &mut AppState) {
+        match app.skins.take_said() {
+            Some(Err(e)) => self.say(e, true),
+            Some(Ok(s)) if !self.status_mine || self.status.is_none() => self.status = Some((s, false)),
+            _ => {}
+        }
+        self.invalidate();
+    }
+
+    /// A line under the skin's name about what this window just did (`problem`: in the accent).
+    fn say(&mut self, text: impl Into<String>, problem: bool) {
+        self.status = Some((text.into(), problem));
+        self.status_mine = true;
+    }
+
+    /// Everything not saved yet goes to the file worker now (the window is closing).
+    pub fn save_now(&mut self, app: &mut AppState) {
+        for id in std::mem::take(&mut self.save_due) {
+            app.skins.save(&id);
+        }
+        // SAFETY: stops our own timer (fine if it isn't running).
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), SAVE_TIMER);
+        }
+    }
+
+    // ------------------------------------------------------------ layout
+
+    /// The list of skins (its visible part, on screen).
+    fn list_rect(&self) -> Rect {
+        let buttons = 4.0 * ksize::BUTTON_H + 3.0 * BUTTON_GAP + 2.0 * BUTTONS_PAD;
+        Rect::new(0.0, size::TITLE_H, LIST_W, (self.size.1 - size::TITLE_H - buttons).max(0.0))
+    }
+
+    fn button_rect(&self, b: Btn) -> Rect {
+        let list = self.list_rect();
+        let full = LIST_W - 2.0 * BUTTONS_PAD;
+        let half = (full - BUTTON_GAP) / 2.0;
+        let (row, col, wide) = match b {
+            Btn::New => (0, 0, false),
+            Btn::Duplicate => (0, 1, false),
+            Btn::Rename => (1, 0, false),
+            Btn::Delete => (1, 1, false),
+            Btn::Import => (2, 0, false),
+            Btn::Export => (2, 1, false),
+            Btn::Folder => (3, 0, true),
+        };
+        let y = list.bottom() + BUTTONS_PAD + row as f32 * (ksize::BUTTON_H + BUTTON_GAP);
+        let x = BUTTONS_PAD + col as f32 * (half + BUTTON_GAP);
+        Rect::new(x, y, if wide { full } else { half }, ksize::BUTTON_H)
+    }
+
+    fn close_rect(&self) -> Rect {
+        Rect::new(self.size.0 - ksize::CLOSE_W, 0.0, ksize::CLOSE_W, size::TITLE_H)
+    }
+
+    /// The right side's top: the skin's name, notes and "Show as text".
+    fn header_rect(&self) -> Rect {
+        Rect::new(LIST_W, size::TITLE_H, (self.size.0 - LIST_W).max(0.0), HEADER_H)
+    }
+
+    fn advanced_rect(&self) -> Rect {
+        let h = self.header_rect();
+        Rect::new(h.right() - PAD_X - ksize::TOGGLE_W, h.y + 22.0, ksize::TOGGLE_W, ksize::TOGGLE_H)
+    }
+
+    /// The scrolling controls (or the skin's text) under the header.
+    fn page_rect(&self) -> Rect {
+        let top = size::TITLE_H + HEADER_H;
+        Rect::new(LIST_W, top, (self.size.0 - LIST_W).max(0.0), (self.size.1 - top).max(0.0))
+    }
+
+    fn list_track(&self) -> Rect {
+        let l = self.list_rect();
+        Rect::new(l.right() - size::SCROLLBAR_W - size::SCROLLBAR_MARGIN, l.y + size::SCROLLBAR_MARGIN, size::SCROLLBAR_W, (l.h - 2.0 * size::SCROLLBAR_MARGIN).max(0.0))
+    }
+
+    fn page_track(&self) -> Rect {
+        let p = self.page_rect();
+        Rect::new(p.right() - size::SCROLLBAR_W - size::SCROLLBAR_MARGIN, p.y + size::SCROLLBAR_MARGIN, size::SCROLLBAR_W, (p.h - 2.0 * size::SCROLLBAR_MARGIN).max(0.0))
+    }
+
+    /// The skin's text box (on screen), while "Show as text" is on.
+    fn text_rect(&self) -> Rect {
+        let p = self.page_rect();
+        Rect::new(p.x + PAD_X, p.y + 4.0, (p.w - 2.0 * PAD_X).max(80.0), (p.h - NOTES_H - 16.0).max(60.0))
+    }
+
+    /// A list item on screen.
+    fn item_on_screen(&self, r: Rect) -> Rect {
+        Rect::new(r.x, r.y + self.list_rect().y - self.list.offset, r.w, r.h)
+    }
+
+    /// A control on screen.
+    fn on_page(&self, r: Rect) -> Rect {
+        Rect::new(r.x, r.y + self.page_rect().y - self.page.offset, r.w, r.h)
+    }
+
+    /// Where a control's parts are, in page coordinates.
+    fn part_rect(&self, row: &Row, part: Part) -> Option<Rect> {
+        let right = row.rect.right() - ROW_PAD_X;
+        let mid = |h: f32| row.rect.y + ((row.rect.h - h) / 2.0).round();
+        match (row.ctl, part) {
+            (Ctl::Colour(_), Part::Hex) => Some(Rect::new(right - HEX_W, mid(ksize::FIELD_H), HEX_W, ksize::FIELD_H)),
+            (Ctl::Colour(_), Part::Main) => Some(Rect::new(right - HEX_W - 10.0 - SWATCH, mid(SWATCH), SWATCH, SWATCH)),
+            (Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize, Part::Main) => Some(Rect::new(right - DROPDOWN_W, mid(ksize::FIELD_H), DROPDOWN_W, ksize::FIELD_H)),
+            (Ctl::LogoText, Part::Main) => Some(Rect::new(right - LOGO_FIELD_W, mid(ksize::FIELD_H), LOGO_FIELD_W, ksize::FIELD_H)),
+            (Ctl::Dark, Part::Main) => Some(Rect::new(right - ksize::TOGGLE_W, mid(ksize::TOGGLE_H), ksize::TOGGLE_W, ksize::TOGGLE_H)),
+            _ => None,
+        }
+    }
+
+    /// Lays out the list and the controls.
+    fn layout(&mut self, app: &AppState) {
+        self.layout_dirty = false;
+        // The list: the built-in skins, then the person's own.
+        let mut items = Vec::new();
+        let mut y = 6.0 + GROUP_H;
+        let entries = app.skins.entries();
+        for e in entries.iter().filter(|e| e.built_in()) {
+            items.push(Item { id: e.id.clone(), name: e.name.clone(), rect: Rect::new(0.0, y, LIST_W, ITEM_H) });
+            y += ITEM_H;
+        }
+        y += 10.0 + GROUP_H;
+        let own_top = y;
+        for e in entries.iter().filter(|e| !e.built_in()) {
+            items.push(Item { id: e.id.clone(), name: e.name.clone(), rect: Rect::new(0.0, y, LIST_W, ITEM_H) });
+            y += ITEM_H;
+        }
+        if y == own_top {
+            y += ITEM_H; // room for "None yet"
+        }
+        self.items = items;
+        self.list.set_extent(y + 10.0, self.list_rect().h);
+
+        // The controls: two cards.
+        let page = self.page_rect();
+        let card_w = (page.w - 2.0 * PAD_X - GUTTER).clamp(300.0, MAX_CARD_W);
+        let x0 = page.x + PAD_X;
+        let mut blocks = Vec::new();
+        let mut rows = Vec::new();
+        let mut y = 10.0;
+        let card = |title: &'static str, ctls: &[(Ctl, &'static str, &'static str)], y: &mut f32, blocks: &mut Vec<Block>, rows: &mut Vec<Row>| {
+            blocks.push(Block::Heading(Rect::new(x0 + 1.0, *y, card_w, HEADING_H), title));
+            *y += HEADING_H + 6.0;
+            let top = *y;
+            // The card goes under its rows' lines (drawn first).
+            let at = blocks.len();
+            for (i, (ctl, t, n)) in ctls.iter().enumerate() {
+                if i > 0 {
+                    blocks.push(Block::Line(Rect::new(x0 + 1.0, *y, card_w - 2.0, 1.0)));
+                }
+                let h = if n.is_empty() { ROW_H } else { ROW_NOTE_H };
+                rows.push(Row { ctl: *ctl, rect: Rect::new(x0, *y, card_w, h), title: t, note: n });
+                *y += h;
+            }
+            blocks.insert(at, Block::Card(Rect::new(x0, top, card_w, *y - top)));
+            *y += 18.0;
+        };
+        let colours: Vec<(Ctl, &'static str, &'static str)> = COLOURS.iter().enumerate().map(|(i, (_, t, n))| (Ctl::Colour(i), *t, *n)).collect();
+        card("Colours", &colours, &mut y, &mut blocks, &mut rows);
+        let shapes = [
+            (Ctl::Shape, "Button shape", ""),
+            (Ctl::Slant, "Slant", ""),
+            (Ctl::RowHeight, "Row height", ""),
+            (Ctl::FontSize, "Text size", ""),
+            (Ctl::LogoText, "Logo text", ""),
+            (Ctl::Dark, "Dark skin", ""),
+        ];
+        card("Shapes and text", &shapes, &mut y, &mut blocks, &mut rows);
+        self.rows = rows;
+        self.blocks = blocks;
+        self.page.set_extent(y + 18.0, page.h);
+        // The keyboard can't stay on a control that's gone.
+        if let Spot::Ctl(c, _) = self.focus {
+            if self.advanced || !self.rows.iter().any(|r| r.ctl == c) {
+                self.focus = Spot::List;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ painting
+
+    fn paint(&mut self, app: &mut AppState) {
+        let seen = (app.skins.generation, app.theme_generation, app.settings.skin.clone());
+        if seen != self.seen {
+            self.seen = seen;
+            self.layout_dirty = true;
+            self.sync_text(app);
+        }
+        if self.layout_dirty {
+            self.layout(app);
+        }
+        let now = self.now();
+        let mut more = self.list.tick(now) | self.page.tick(now) | self.flips.tick(now) || now < self.repaint_until;
+        if !self.renderer.begin() {
+            // SAFETY: a timer on our own window.
+            unsafe {
+                SetTimer(Some(self.hwnd), RETRY_TIMER, 500, None);
+            }
+            return;
+        }
+        let theme = app.theme.clone();
+        self.renderer.clear(theme.window);
+        self.paint_caption(&theme);
+        self.paint_list(&theme, app);
+        self.paint_header(&theme, app);
+        if self.advanced {
+            self.paint_notes(&theme, app);
+        } else {
+            self.paint_page(&theme, app);
+        }
+        if let Some((id, skin_id)) = &self.asking {
+            let name = app.skins.find(skin_id).map_or_else(|| skin_id.clone(), |e| e.name.clone());
+            let area = Rect::new(0.0, size::TITLE_H, self.size.0, (self.size.1 - size::TITLE_H).max(0.0));
+            self.ask.paint_question(
+                &mut self.renderer,
+                &theme,
+                *id,
+                &format!("Delete the skin \u{201c}{name}\u{201d}?"),
+                "Its file goes to the Recycle Bin.",
+                "DELETE",
+                area,
+            );
+        }
+        if self.renderer.end() == FrameResult::DeviceLost {
+            more = true;
+        }
+        self.place_boxes();
+        if more {
+            self.invalidate();
+        }
+    }
+
+    fn paint_caption(&mut self, theme: &Theme) {
+        let close = self.close_rect();
+        let r = &mut self.renderer;
+        let bar = Rect::new(0.0, 0.0, self.size.0, size::TITLE_H);
+        r.fill_rect(bar, theme.titlebar);
+        let x = kit::logo(r, theme, bar);
+        let color = if self.active { theme.text } else { theme.muted };
+        r.text("Skins", Rect::new(x + 10.0, 0.0, (self.size.0 - x - 10.0 - ksize::CLOSE_W).max(0.0), size::TITLE_H), &TextStyle::new(color).size(13.0).semibold());
+        let hot = self.hover == Some(Hot::Close);
+        kit::close_button(r, theme, close, hot, hot && self.pressed == Some(Hot::Close), self.active);
+    }
+
+    fn paint_list(&mut self, theme: &Theme, app: &AppState) {
+        let list = self.list_rect();
+        let dy = list.y - self.list.offset;
+        self.renderer.push_clip(list);
+        let heading = TextStyle::new(theme.muted).size(ksize::NOTE_FONT).semibold();
+        self.renderer.text("BUILT IN", Rect::new(18.0, 6.0 + dy, LIST_W - 26.0, GROUP_H), &heading);
+        let own_heading_y = self.items.iter().filter(|i| !i.id.starts_with(skin::FILE_PREFIX)).map(|i| i.rect.bottom()).fold(6.0 + GROUP_H, f32::max) + 10.0;
+        self.renderer.text("YOUR SKINS", Rect::new(18.0, own_heading_y + dy, LIST_W - 26.0, GROUP_H), &heading);
+        if !self.items.iter().any(|i| i.id.starts_with(skin::FILE_PREFIX)) {
+            let style = TextStyle::new(theme.muted.with_alpha(0.8)).size(ksize::NOTE_FONT);
+            let y = own_heading_y + GROUP_H + dy;
+            self.renderer.text("None yet", Rect::new(18.0, y, LIST_W - 26.0, NOTE_LINE), &style);
+        }
+        for (i, item) in self.items.iter().enumerate() {
+            let rect = Rect::new(item.rect.x, item.rect.y + dy, item.rect.w, item.rect.h);
+            if rect.bottom() < list.y || rect.y > list.bottom() {
+                continue;
+            }
+            let selected = item.id.eq_ignore_ascii_case(&app.settings.skin);
+            let look = Look { hover: self.hover == Some(Hot::Item(i)), focused: self.cues && self.focus == Spot::List && selected, ..Look::enabled() };
+            let unsaved = app.skins.unsaved(&item.id) || self.save_due.contains(&item.id);
+            let name = if unsaved { format!("{} \u{2022}", item.name) } else { item.name.clone() };
+            if self.editing == Some(Editing::Rename(item.id.clone())) {
+                continue; // the name box sits there
+            }
+            kit::nav_item(&mut self.renderer, theme, rect, &name, selected, look);
+        }
+        self.renderer.pop_clip();
+        let hover = matches!(self.hover, Some(Hot::ListThumb)) || matches!(self.drag, Some((Hot::ListThumb, _)));
+        let track = self.list_track();
+        kit::scrollbar(&mut self.renderer, theme, track, &self.list, hover);
+        // The buttons.
+        let own = app.skins.find(&app.settings.skin).is_some_and(|e| !e.built_in());
+        let exists = app.skins.find(&app.settings.skin).is_some();
+        for (b, label) in BUTTONS {
+            let enabled = match b {
+                Btn::Rename | Btn::Delete => own,
+                Btn::Duplicate | Btn::Export => exists,
+                _ => true,
+            };
+            let me = Hot::Button(b);
+            let look = Look { hover: self.hover == Some(me), pressed: self.pressed == Some(me) && self.hover == Some(me), focused: self.cues && self.focus == Spot::Button(b), enabled };
+            let rect = self.button_rect(b);
+            kit::button(&mut self.renderer, theme, rect, label, look);
+        }
+    }
+
+    fn paint_header(&mut self, theme: &Theme, app: &AppState) {
+        let right = Rect::new(LIST_W, size::TITLE_H, (self.size.0 - LIST_W).max(0.0), (self.size.1 - size::TITLE_H).max(0.0));
+        self.renderer.fill_rect(right, theme.toolbar);
+        let h = self.header_rect();
+        let x = h.x + PAD_X;
+        let w = (self.advanced_rect().x - 120.0 - x).max(60.0);
+        let entry = app.skins.find(&app.settings.skin);
+        let name = entry.map_or_else(|| app.settings.skin.clone(), |e| e.name.clone());
+        let t = self.advanced_rect();
+        let me = Hot::Advanced;
+        let look = Look { hover: self.hover == Some(me), pressed: self.pressed == Some(me), focused: self.cues && self.focus == Spot::Advanced, enabled: true };
+        let now = self.now();
+        let advanced = self.flips.at("text", self.advanced, now);
+        let r = &mut self.renderer;
+        r.text(&name, Rect::new(x, h.y + 14.0, w, 30.0), &TextStyle::new(theme.text_strong).size(ksize::PAGE_TITLE_FONT).semibold());
+        let note = match entry {
+            Some(e) if e.built_in() => "Built in. Changes go into your own copy.",
+            Some(_) => "",
+            None => "Its file is missing, so AMD Radeon is shown.",
+        };
+        let mut line_y = h.y + 46.0;
+        if !note.is_empty() {
+            r.text(note, Rect::new(x, line_y, w + 110.0, NOTE_LINE), &TextStyle::new(theme.muted).size(ksize::NOTE_FONT));
+            line_y += NOTE_LINE + 2.0;
+        }
+        if let Some((said, problem)) = &self.status {
+            let color = if *problem { theme.accent } else { theme.text };
+            r.text(said, Rect::new(x, line_y, w + 110.0, NOTE_LINE), &TextStyle::new(color).size(ksize::NOTE_FONT).semibold());
+        }
+        // "Show as text", and its switch.
+        let label = Rect::new(t.x - 110.0, t.y - 2.0, 102.0, t.h + 4.0);
+        r.text("Show as text", label, &TextStyle::new(theme.text).size(ksize::NOTE_FONT + 1.0).align(Align::Right));
+        kit::toggle(r, theme, t, advanced, look);
+        r.fill_rect(Rect::new(h.x + PAD_X, h.bottom() - 1.0, (h.w - 2.0 * PAD_X).max(0.0), 1.0), theme.line);
+    }
+
+    /// Under the skin's text: what Glint couldn't understand in it.
+    fn paint_notes(&mut self, theme: &Theme, app: &AppState) {
+        let t = self.text_rect();
+        let y0 = t.bottom() + 10.0;
+        let style = TextStyle::new(theme.muted).size(ksize::NOTE_FONT);
+        let entry = app.skins.find(&app.settings.skin);
+        let mut lines: Vec<(String, Color)> = Vec::new();
+        if entry.is_some_and(Entry::built_in) {
+            lines.push(("Built-in skins can't be edited here. DUPLICATE makes a copy you can edit.".into(), theme.text));
+        }
+        let notes = app.skins.notes(&app.settings.skin);
+        if notes.is_empty() {
+            lines.push(("Every line is understood.".into(), theme.muted));
+        } else {
+            for n in notes.iter().take(4) {
+                let at = if n.line > 0 { format!("Line {}: ", n.line) } else { String::new() };
+                lines.push((format!("{at}{}", n.text), theme.accent));
+            }
+            if notes.len() > 4 {
+                lines.push((format!("\u{2026}and {} more.", notes.len() - 4), theme.muted));
+            }
+        }
+        for (i, (line, color)) in lines.iter().enumerate().take(5) {
+            self.renderer.text(line, Rect::new(t.x, y0 + i as f32 * NOTE_LINE, t.w, NOTE_LINE), &style.color(*color));
+        }
+    }
+
+    fn look_of(&self, ctl: Ctl, part: Part, enabled: bool) -> Look {
+        let me = Hot::Ctl(ctl, part);
+        Look { hover: self.hover == Some(me), pressed: self.pressed == Some(me) && self.hover == Some(me), focused: self.cues && self.focus == Spot::Ctl(ctl, part), enabled }
+    }
+
+    fn paint_page(&mut self, theme: &Theme, app: &AppState) {
+        let page = self.page_rect();
+        let dy = page.y - self.page.offset;
+        let shift = |r: Rect| Rect::new(r.x, r.y + dy, r.w, r.h);
+        let enabled = app.skins.find(&app.settings.skin).is_some();
+        let now = self.now();
+        let dark = self.flips.at("dark", app.theme.dark, now);
+        self.renderer.push_clip(page);
+        for block in &self.blocks {
+            let r = &mut self.renderer;
+            match block {
+                Block::Heading(rect, text) => kit::heading(r, theme, shift(*rect), text),
+                Block::Card(rect) => kit::card(r, theme, shift(*rect)),
+                Block::Line(rect) => kit::separator(r, theme, rect.x, rect.y + dy, rect.w),
+            }
+        }
+        for i in 0..self.rows.len() {
+            let row = self.rows[i].clone();
+            let rect = shift(row.rect);
+            if rect.bottom() < page.y || rect.y > page.bottom() {
+                continue;
+            }
+            let text_w = (rect.w - 2.0 * ROW_PAD_X - HEX_W - SWATCH - 40.0).max(80.0);
+            let title_color = if enabled { theme.text } else { theme.muted };
+            if row.note.is_empty() {
+                self.renderer.text(row.title, Rect::new(rect.x + ROW_PAD_X, rect.y + ((rect.h - 19.0) / 2.0).round(), text_w, 19.0), &TextStyle::new(title_color));
+            } else {
+                self.renderer.text(row.title, Rect::new(rect.x + ROW_PAD_X, rect.y + 9.0, text_w, 19.0), &TextStyle::new(title_color));
+                self.renderer.text(row.note, Rect::new(rect.x + ROW_PAD_X, rect.y + 28.0, text_w, 16.0), &TextStyle::new(theme.muted).size(ksize::NOTE_FONT));
+            }
+            let main = self.part_rect(&row, Part::Main).map(shift);
+            let hex = self.part_rect(&row, Part::Hex).map(shift);
+            let main_look = self.look_of(row.ctl, Part::Main, enabled);
+            let hex_look = self.look_of(row.ctl, Part::Hex, enabled);
+            let label = self.choice_label(row.ctl, &app.theme);
+            let r = &mut self.renderer;
+            match row.ctl {
+                Ctl::Colour(i) => {
+                    let c = colour_of(&app.theme, COLOURS[i].0);
+                    if let Some(s) = main {
+                        swatch(r, theme, s, c, main_look);
+                    }
+                    if let Some(hx) = hex {
+                        let editing = matches!(self.editing, Some(Editing::Hex(j, _)) if j == i);
+                        kit::field(r, theme, hx, (!editing).then_some(skin::hex_of(c).as_str()), editing, hex_look);
+                    }
+                }
+                Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize => {
+                    if let Some(m) = main {
+                        kit::dropdown(r, theme, m, &label, main_look);
+                    }
+                }
+                Ctl::LogoText => {
+                    if let Some(m) = main {
+                        let editing = matches!(self.editing, Some(Editing::LogoText(_)));
+                        let word = app.theme.logo_text.as_str();
+                        kit::field(r, theme, m, (!editing && !word.is_empty()).then_some(word), editing, main_look);
+                        if !editing && word.is_empty() {
+                            // No word: the chrome wordmark, said in the hint's grey (as the box says
+                            // it while typing).
+                            let grey = if main_look.enabled { theme.muted } else { theme.muted.with_alpha(theme.muted.a * 0.38) };
+                            r.text(LOGO_HINT, Rect::new(m.x + 8.0, m.y, (m.w - 16.0).max(0.0), m.h), &TextStyle::new(grey));
+                        }
+                    }
+                }
+                Ctl::Dark => {
+                    if let Some(m) = main {
+                        kit::toggle(r, theme, m, dark, main_look);
+                    }
+                }
+            }
+        }
+        self.renderer.pop_clip();
+        let hover = matches!(self.hover, Some(Hot::PageThumb)) || matches!(self.drag, Some((Hot::PageThumb, _)));
+        let track = self.page_track();
+        kit::scrollbar(&mut self.renderer, theme, track, &self.page, hover);
+    }
+
+    /// The label of a drop-down's current choice.
+    fn choice_label(&self, ctl: Ctl, t: &Theme) -> String {
+        match ctl {
+            Ctl::Shape => SHAPES.iter().find(|(s, _, _)| *s == t.shape).map_or("", |(_, _, l)| l).to_string(),
+            Ctl::Slant => slant_label(t.slant),
+            Ctl::RowHeight => row_label(t.row_h),
+            Ctl::FontSize => size_label(t.font_size / PT),
+            _ => String::new(),
+        }
+    }
+
+    /// Puts the one-line box over what it edits (when that's in view; otherwise editing ends), and
+    /// the skin's text box over its place (or hides it).
+    fn place_boxes(&mut self) {
+        let want = match &self.editing {
+            Some(Editing::Hex(i, _)) => self.rows.iter().find(|r| r.ctl == Ctl::Colour(*i)).and_then(|r| self.part_rect(r, Part::Hex)).map(|r| self.on_page(r)),
+            Some(Editing::LogoText(_)) => self.rows.iter().find(|r| r.ctl == Ctl::LogoText).and_then(|r| self.part_rect(r, Part::Main)).map(|r| self.on_page(r)),
+            Some(Editing::Rename(id)) => self.items.iter().find(|i| i.id == *id).map(|i| self.item_on_screen(i.rect).inset(6.0, 3.0)),
+            None => None,
+        };
+        let area = if matches!(self.editing, Some(Editing::Rename(_))) { self.list_rect() } else { self.page_rect() };
+        let want = want.filter(|r| r.y >= area.y && r.bottom() <= area.bottom() && self.asking.is_none());
+        if want != self.edit_at {
+            match want {
+                Some(rect) => {
+                    self.edit_box.place(rect.inset(1.0, 1.0), 7.0, self.scale());
+                    if self.edit_at.is_none() {
+                        self.edit_box.show();
+                    }
+                }
+                None => {
+                    self.edit_box.hide();
+                    if frame::is_wine() {
+                        self.repaint_until = self.now() + 0.3;
+                        self.invalidate();
+                    }
+                }
+            }
+            self.edit_at = want;
+        }
+        // The skin's text.
+        let text_want = (self.advanced && self.asking.is_none()).then(|| self.text_rect());
+        if text_want != self.text_at && !self.text_box.is_invalid() {
+            let s = self.scale();
+            // SAFETY: moves, shows or hides our own child window.
+            unsafe {
+                match text_want {
+                    Some(r) => {
+                        if self.text_font_dpi != self.dpi {
+                            self.make_text_font();
+                        }
+                        let _ = SetWindowPos(self.text_box, None, (r.x * s).round() as i32, (r.y * s).round() as i32, (r.w * s).round() as i32, (r.h * s).round() as i32, SWP_NOZORDER | SWP_NOACTIVATE);
+                        let _ = ShowWindow(self.text_box, SW_SHOW);
+                    }
+                    None => {
+                        let _ = ShowWindow(self.text_box, SW_HIDE);
+                        if frame::is_wine() {
+                            self.repaint_until = self.now() + 0.3;
+                            self.invalidate();
+                        }
+                    }
+                }
+            }
+            self.text_at = text_want;
+        }
+    }
+
+    /// The skin's text in a fixed-width font (Consolas), at this window's DPI.
+    fn make_text_font(&mut self) {
+        let height = -((10.0 * PT * self.scale()).round() as i32);
+        // SAFETY: creates a GDI font (deleted in Drop or when replaced) and hands it to our own EDIT.
+        unsafe {
+            let font = CreateFontW(
+                height,
+                0,
+                0,
+                0,
+                FW_NORMAL.0 as i32,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY,
+                (FIXED_PITCH.0 as u32) | (FF_MODERN.0 as u32),
+                w!("Consolas"),
+            );
+            SendMessageW(self.text_box, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+            if !self.text_font.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(self.text_font.0));
+            }
+            self.text_font = font;
+        }
+        self.text_font_dpi = self.dpi;
+    }
+
+    /// Shows the skin's text in the text box, unless someone is typing there (then their text is
+    /// the truth); a built-in skin's text can't be changed.
+    fn sync_text(&mut self, app: &AppState) {
+        if self.text_box.is_invalid() {
+            return;
+        }
+        // SAFETY: plain query.
+        if unsafe { GetFocus() } == self.text_box {
+            return;
+        }
+        let entry = app.skins.find(&app.settings.skin);
+        let text = entry.map(|e| crlf(&e.text)).unwrap_or_default();
+        let read_only = entry.is_none_or(Entry::built_in);
+        if text != self.text_shown {
+            let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            self.setting_text = true;
+            // SAFETY: the string lives across the call; our own child window.
+            unsafe {
+                let _ = SetWindowTextW(self.text_box, PCWSTR(wide.as_ptr()));
+            }
+            self.setting_text = false;
+            self.text_shown = text;
+        }
+        // SAFETY: plain message to our own child.
+        unsafe {
+            SendMessageW(self.text_box, EM_SETREADONLY, Some(WPARAM(read_only as usize)), Some(LPARAM(0)));
+        }
+    }
+
+    fn text_box_text(&self) -> String {
+        // SAFETY: the buffer is sized from the reported length and written by the call.
+        unsafe {
+            let len = GetWindowTextLengthW(self.text_box).max(0) as usize;
+            let mut buf = vec![0u16; len + 1];
+            let n = GetWindowTextW(self.text_box, &mut buf).max(0) as usize;
+            String::from_utf16_lossy(&buf[..n])
+        }
+    }
+
+    // ------------------------------------------------------------ the mouse
+
+    fn target_at(&self, p: Point) -> Option<Hot> {
+        if p.y < size::TITLE_H {
+            return self.close_rect().contains(p).then_some(Hot::Close);
+        }
+        if p.x < LIST_W {
+            if let Some(thumb) = self.list.thumb(self.list_track()) {
+                if thumb.inset(-4.0, 0.0).contains(p) {
+                    return Some(Hot::ListThumb);
+                }
+            }
+            if self.list_rect().contains(p) {
+                return self.items.iter().position(|i| self.item_on_screen(i.rect).contains(p)).map(Hot::Item);
+            }
+            return BUTTONS.iter().find(|(b, _)| kit::button_contains(self.button_rect(*b), p)).map(|(b, _)| Hot::Button(*b));
+        }
+        if kit::toggle_contains(self.advanced_rect(), p) {
+            return Some(Hot::Advanced);
+        }
+        if self.advanced || !self.page_rect().contains(p) {
+            return None;
+        }
+        if let Some(thumb) = self.page.thumb(self.page_track()) {
+            if thumb.inset(-4.0, 0.0).contains(p) {
+                return Some(Hot::PageThumb);
+            }
+        }
+        for row in &self.rows {
+            for part in [Part::Main, Part::Hex] {
+                let Some(r) = self.part_rect(row, part).map(|r| self.on_page(r)) else { continue };
+                let hit = if row.ctl == Ctl::Dark { kit::toggle_contains(r, p) } else { r.contains(p) };
+                if hit {
+                    return Some(Hot::Ctl(row.ctl, part));
+                }
+            }
+        }
+        None
+    }
+
+    fn client_point(&self, lparam: LPARAM) -> Point {
+        let s = self.scale();
+        Point::new((lparam.0 & 0xffff) as i16 as f32 / s, ((lparam.0 >> 16) & 0xffff) as i16 as f32 / s)
+    }
+
+    fn mouse_move(&mut self, p: Point) {
+        if !self.tracking {
+            let mut tme = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: self.hwnd, dwHoverTime: 0 };
+            // SAFETY: a valid struct for our own window.
+            self.tracking = unsafe { TrackMouseEvent(&mut tme) }.is_ok();
+        }
+        if self.asking.is_some() {
+            if self.ask.mouse_move(p) == Answer::Redraw {
+                self.invalidate();
+            }
+            return;
+        }
+        if let Some((which, grab)) = self.drag {
+            let (track, scroller) = if which == Hot::ListThumb { (self.list_track(), &mut self.list) } else { (self.page_track(), &mut self.page) };
+            if let Some(thumb) = scroller.thumb(track) {
+                let to = scroller.offset_for_thumb(track, thumb.h, p.y - grab);
+                scroller.jump_to(to);
+                self.invalidate();
+            }
+            return;
+        }
+        let hover = self.target_at(p);
+        if hover != self.hover {
+            self.hover = hover;
+            self.invalidate();
+        }
+    }
+
+    fn mouse_down(&mut self, p: Point, app: &mut AppState) -> Vec<Ask> {
+        self.cues = false;
+        self.act_on_char = None;
+        if self.asking.is_some() {
+            let a = self.ask.mouse_down(p);
+            return self.answer(a, app);
+        }
+        let target = self.target_at(p);
+        // A click anywhere ends typing in the one-line box (what was typed is kept).
+        if self.editing.is_some() && !matches!(target, Some(Hot::Ctl(_, Part::Hex))) {
+            self.end_editing(app, true);
+        }
+        // SAFETY: focus and capture on our own window.
+        unsafe {
+            if GetFocus() != self.hwnd {
+                let _ = SetFocus(Some(self.hwnd));
+            }
+            SetCapture(self.hwnd);
+        }
+        self.pressed = target;
+        let mut asks = Vec::new();
+        match target {
+            Some(Hot::Item(i)) => {
+                // Picking happens on the way down, like the tabs: it feels instant.
+                if let Some(id) = self.items.get(i).map(|it| it.id.clone()) {
+                    asks.extend(self.pick(app, &id));
+                }
+                self.focus = Spot::List;
+            }
+            Some(Hot::ListThumb) => {
+                if let Some(thumb) = self.list.thumb(self.list_track()) {
+                    self.drag = Some((Hot::ListThumb, p.y - thumb.y));
+                }
+            }
+            Some(Hot::PageThumb) => {
+                if let Some(thumb) = self.page.thumb(self.page_track()) {
+                    self.drag = Some((Hot::PageThumb, p.y - thumb.y));
+                }
+            }
+            Some(Hot::Button(b)) => self.focus = Spot::Button(b),
+            Some(Hot::Advanced) => self.focus = Spot::Advanced,
+            Some(Hot::Ctl(c, part)) => self.focus = Spot::Ctl(c, part),
+            _ => {}
+        }
+        self.invalidate();
+        asks
+    }
+
+    fn mouse_up(&mut self, p: Point, app: &mut AppState) -> Vec<Ask> {
+        if self.asking.is_some() {
+            let a = self.ask.mouse_up(p);
+            return self.answer(a, app);
+        }
+        let was = self.pressed.take();
+        self.drag = None;
+        // SAFETY: releasing our own capture.
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        self.invalidate();
+        if was.is_none() || was != self.target_at(p) {
+            return Vec::new();
+        }
+        match was {
+            Some(Hot::Close) => vec![Ask::Job(Job::Close)],
+            Some(Hot::Button(b)) => self.press(b, app),
+            Some(Hot::Advanced) => {
+                self.set_advanced(!self.advanced, app);
+                Vec::new()
+            }
+            Some(Hot::Ctl(c, part)) => self.activate(c, part, app),
+            _ => Vec::new(),
+        }
+    }
+
+    fn wheel(&mut self, p: Point, notches: f32) {
+        let now = self.now();
+        let moved = if p.x < LIST_W { self.list.scroll_by(-notches * WHEEL_STEP, now) } else { !self.advanced && self.page.scroll_by(-notches * WHEEL_STEP, now) };
+        if moved {
+            self.invalidate();
+        }
+    }
+
+    // ------------------------------------------------------------ the keyboard
+
+    /// The places that can have the keyboard, in Tab order.
+    fn spots(&self, app: &AppState) -> Vec<Spot> {
+        let own = app.skins.find(&app.settings.skin).is_some_and(|e| !e.built_in());
+        let mut spots = vec![Spot::List];
+        for (b, _) in BUTTONS {
+            if own || !matches!(b, Btn::Rename | Btn::Delete) {
+                spots.push(Spot::Button(b));
+            }
+        }
+        spots.push(Spot::Advanced);
+        if self.advanced {
+            spots.push(Spot::Text);
+        } else if app.skins.find(&app.settings.skin).is_some() {
+            for row in &self.rows {
+                spots.push(Spot::Ctl(row.ctl, Part::Main));
+                if matches!(row.ctl, Ctl::Colour(_)) {
+                    spots.push(Spot::Ctl(row.ctl, Part::Hex));
+                }
+            }
+        }
+        spots
+    }
+
+    fn move_focus(&mut self, step: i32, app: &AppState) {
+        let spots = self.spots(app);
+        let at = spots.iter().position(|s| *s == self.focus).unwrap_or(0) as i32;
+        let next = spots[(at + step).rem_euclid(spots.len() as i32) as usize];
+        self.set_focus(next);
+    }
+
+    fn set_focus(&mut self, spot: Spot) {
+        self.focus = spot;
+        self.cues = true;
+        match spot {
+            Spot::Text => {
+                // SAFETY: focuses our own child window.
+                unsafe {
+                    let _ = SetFocus(Some(self.text_box));
+                }
+            }
+            Spot::Ctl(c, part) => {
+                if let Some(r) = self.rows.iter().find(|r| r.ctl == c).and_then(|r| self.part_rect(r, part)) {
+                    let row = Rect::new(r.x, r.y - 14.0, r.w, r.h + 28.0);
+                    self.page.reveal(row.y, row.bottom(), 8.0, self.now());
+                }
+            }
+            _ => {}
+        }
+        self.invalidate();
+    }
+
+    /// A key, when the window (not a text box) has the keyboard. Returns whether it was used.
+    fn key(&mut self, vk: u16, app: &mut AppState, asks: &mut Vec<Ask>) -> bool {
+        // SAFETY: plain key-state queries.
+        let (ctrl, shift, alt) = unsafe { (GetKeyState(VK_CONTROL.0 as i32) < 0, GetKeyState(VK_SHIFT.0 as i32) < 0, GetKeyState(VK_MENU.0 as i32) < 0) };
+        let is = |k: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| vk == k.0;
+        self.act_on_char = None;
+        if self.asking.is_some() {
+            let a = self.ask.key(vk);
+            asks.extend(self.answer(a, app));
+            return true;
+        }
+        if alt && !is(VK_DOWN) {
+            return false;
+        }
+        let now = self.now();
+        match () {
+            _ if is(VK_ESCAPE) || (ctrl && vk == 'W' as u16) => asks.push(Ask::Job(Job::Close)),
+            // Light or dark, as in the main window: switches to the skin's twin (if it has one).
+            _ if ctrl && shift && vk == 'L' as u16 => asks.push(Ask::Command(Command::ToggleTheme)),
+            _ if is(VK_TAB) => self.move_focus(if shift { -1 } else { 1 }, app),
+            _ if self.focus == Spot::List && (is(VK_UP) || is(VK_DOWN) || is(VK_HOME) || is(VK_END)) => {
+                let at = self.items.iter().position(|i| i.id.eq_ignore_ascii_case(&app.settings.skin));
+                let last = self.items.len().saturating_sub(1);
+                let next = match at {
+                    _ if is(VK_HOME) => 0,
+                    _ if is(VK_END) => last,
+                    Some(a) if is(VK_UP) => a.saturating_sub(1),
+                    Some(a) => (a + 1).min(last),
+                    None => 0,
+                };
+                if let Some(item) = self.items.get(next) {
+                    let (id, rect) = (item.id.clone(), item.rect);
+                    asks.extend(self.pick(app, &id));
+                    self.list.reveal(rect.y, rect.bottom(), 4.0, now);
+                }
+                self.cues = true;
+                self.invalidate();
+            }
+            _ if self.focus == Spot::List && is(VK_F2) => asks.extend(self.press(Btn::Rename, app)),
+            _ if self.focus == Spot::List && is(VK_DELETE) => asks.extend(self.press(Btn::Delete, app)),
+            _ if is(VK_UP) || is(VK_DOWN) => self.move_focus(if is(VK_UP) { -1 } else { 1 }, app),
+            _ if is(VK_SPACE) || is(VK_RETURN) || is(VK_F4) || (alt && is(VK_DOWN)) => {
+                self.cues = true;
+                let dropdown = matches!(self.focus, Spot::Ctl(Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize, _));
+                if dropdown && (is(VK_SPACE) || is(VK_RETURN)) {
+                    // Opened when the key's character has come (it would close the menu again).
+                    self.act_on_char = Some(self.focus);
+                } else if dropdown || !(is(VK_F4) || alt) {
+                    asks.extend(self.activate_spot(self.focus, app));
+                }
+                self.invalidate();
+            }
+            _ if is(VK_NEXT) || is(VK_PRIOR) => {
+                let step = (self.page_rect().h - 40.0).max(40.0);
+                if self.page.scroll_by(if is(VK_NEXT) { step } else { -step }, now) {
+                    self.invalidate();
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn activate_spot(&mut self, spot: Spot, app: &mut AppState) -> Vec<Ask> {
+        match spot {
+            Spot::Button(b) => self.press(b, app),
+            Spot::Advanced => {
+                self.set_advanced(!self.advanced, app);
+                Vec::new()
+            }
+            Spot::Ctl(c, part) => self.activate(c, part, app),
+            Spot::List | Spot::Text => Vec::new(),
+        }
+    }
+
+    // ------------------------------------------------------------ changing things
+
+    /// Uses skin `id` (as Settings' drop-down does).
+    fn pick(&mut self, app: &mut AppState, id: &str) -> Vec<Ask> {
+        if app.settings.skin.eq_ignore_ascii_case(id) {
+            return Vec::new();
+        }
+        self.end_editing(app, true);
+        app.pick_skin(id);
+        self.status = None;
+        self.status_mine = false;
+        self.layout_dirty = true;
+        self.page.jump_to(0.0);
+        self.invalidate();
+        vec![Ask::RedrawMain]
+    }
+
+    /// The skin to change: the one in use - or, when that's built in, a copy of it made now ("My
+    /// skin"), which is used from now on. None when there is nothing to change (its file is gone).
+    fn editable(&mut self, app: &mut AppState) -> Option<String> {
+        let id = app.settings.skin.clone();
+        let e = app.skins.find(&id)?;
+        if !e.built_in() {
+            return Some(e.id.clone());
+        }
+        let (from_name, from_text) = (e.name.clone(), e.text.clone());
+        let name = app.skins.free_name("My skin");
+        let text = skin::copy_text(&from_text, &name, &from_name);
+        let new = app.skins.add(&name, &text);
+        app.pick_skin(&new);
+        self.say(format!("Made {name}, your copy of {from_name}"), false);
+        self.layout_dirty = true;
+        Some(new)
+    }
+
+    /// Changes the skin in use: these settings get these values in its text, the look follows at
+    /// once and the file is saved a moment later.
+    fn change(&mut self, app: &mut AppState, changes: &[(&str, String)]) -> Vec<Ask> {
+        // The next "Saved…" may show again (unless this change makes a copy, which says so).
+        self.status_mine = false;
+        let Some(id) = self.editable(app) else { return Vec::new() };
+        let Some(text) = app.skins.find(&id).map(|e| e.text.clone()) else { return Vec::new() };
+        let mut new = text;
+        for (key, value) in changes {
+            new = skin::with_value(&new, key, value);
+        }
+        app.skins.set_text(&id, &new);
+        app.apply_skin();
+        self.save_soon(&id);
+        self.invalidate();
+        vec![Ask::RedrawMain]
+    }
+
+    /// Saves `id` a moment after the last change (SAVE_TIMER), so typing a colour is one write.
+    fn save_soon(&mut self, id: &str) {
+        if !self.save_due.iter().any(|d| d == id) {
+            self.save_due.push(id.to_string());
+        }
+        // SAFETY: a (re)started timer on our own window.
+        unsafe {
+            SetTimer(Some(self.hwnd), SAVE_TIMER, SAVE_DELAY_MS, None);
+        }
+    }
+
+    /// A control was clicked, or Space / Enter was pressed on it.
+    fn activate(&mut self, ctl: Ctl, part: Part, app: &mut AppState) -> Vec<Ask> {
+        if app.skins.find(&app.settings.skin).is_none() {
+            return Vec::new();
+        }
+        let anchor = self.rows.iter().find(|r| r.ctl == ctl).and_then(|r| self.part_rect(r, part)).map(|r| self.on_page(r));
+        let menu = |items: Vec<MenuItem>| {
+            let at = anchor.map_or(Point::new(LIST_W + PAD_X, size::TITLE_H + HEADER_H), |a| Point::new(a.x, a.bottom() + 2.0));
+            vec![Ask::Job(Job::Menu(Menu { tag: 1, at, items, right_aligned: false }))]
+        };
+        let t = app.theme.clone();
+        match (ctl, part) {
+            (Ctl::Colour(i), Part::Main) => vec![Ask::Job(Job::Colour { at: i, initial: colour_of(&t, COLOURS[i].0).to_colorref() })],
+            (Ctl::Colour(i), Part::Hex) => {
+                let before = skin::hex_of(colour_of(&t, COLOURS[i].0));
+                self.start_editing(Editing::Hex(i, before.clone()), &before);
+                Vec::new()
+            }
+            (Ctl::LogoText, _) => {
+                self.start_editing(Editing::LogoText(t.logo_text.clone()), &t.logo_text);
+                Vec::new()
+            }
+            (Ctl::Dark, _) => {
+                let now = self.now();
+                self.flips.start("dark", !t.dark, now, kit::SWITCH_TIME);
+                let asks = self.change(app, &[("dark", (!t.dark).to_string())]);
+                // "Light or dark" follows (as when a skin is picked).
+                let id = app.settings.skin.clone();
+                app.pick_skin(&id);
+                asks
+            }
+            (Ctl::Shape, _) => {
+                self.menu_for = Some(ctl);
+                menu(SHAPES.iter().enumerate().map(|(n, (s, _, l))| MenuItem::new(n as u32 + 1, l).checked(*s == t.shape)).collect())
+            }
+            (Ctl::Slant, _) => {
+                self.menu_for = Some(ctl);
+                menu(SLANTS.iter().enumerate().map(|(n, v)| MenuItem::new(n as u32 + 1, &slant_label(*v)).checked((*v - t.slant).abs() < 0.01)).collect())
+            }
+            (Ctl::RowHeight, _) => {
+                self.menu_for = Some(ctl);
+                menu(ROW_HEIGHTS.iter().enumerate().map(|(n, v)| MenuItem::new(n as u32 + 1, &row_label(*v)).checked((*v - t.row_h).abs() < 0.01)).collect())
+            }
+            (Ctl::FontSize, _) => {
+                self.menu_for = Some(ctl);
+                menu(FONT_SIZES.iter().enumerate().map(|(n, v)| MenuItem::new(n as u32 + 1, &size_label(*v)).checked((*v - t.font_size / PT).abs() < 0.01)).collect())
+            }
+        }
+    }
+
+    /// A drop-down's choice: what it means in the skin's text.
+    fn picked(&mut self, ctl: Ctl, n: usize, app: &mut AppState) -> Vec<Ask> {
+        let t = app.theme.clone();
+        let changes: Vec<(&str, String)> = match ctl {
+            Ctl::Shape => {
+                let Some((shape, word, _)) = SHAPES.get(n) else { return Vec::new() };
+                let mut c = vec![("shape", word.to_string())];
+                // A slant or a corner that would show nothing gets AMD Radeon's.
+                if *shape == Shape::Slanted && t.slant < 1.0 {
+                    c.push(("slant", "8".into()));
+                    c.push(("path-slant", "6".into()));
+                }
+                if *shape == Shape::Rounded && t.radius < 4.0 {
+                    c.push(("radius", "6".into()));
+                }
+                c
+            }
+            Ctl::Slant => {
+                let Some(v) = SLANTS.get(n) else { return Vec::new() };
+                let mut c = vec![("slant", number(*v)), ("path-slant", number((v * 0.75 * 2.0).round() / 2.0))];
+                if *v > 0.0 && t.shape != Shape::Slanted {
+                    c.push(("shape", "slanted".into()));
+                }
+                c
+            }
+            Ctl::RowHeight => match ROW_HEIGHTS.get(n) {
+                Some(v) => vec![("row-height", number(*v))],
+                None => return Vec::new(),
+            },
+            Ctl::FontSize => match FONT_SIZES.get(n) {
+                Some(v) => vec![("font-size", format!("{}pt", number(*v)))],
+                None => return Vec::new(),
+            },
+            _ => return Vec::new(),
+        };
+        self.change(app, &changes)
+    }
+
+    /// Shows the one-line box with `text` in it, for `what`.
+    fn start_editing(&mut self, what: Editing, text: &str) {
+        // Only the logo's word has a hint: empty means the chrome wordmark.
+        self.edit_box.set_hint(if matches!(what, Editing::LogoText(_)) { LOGO_HINT } else { "" });
+        self.editing = Some(what);
+        self.edit_at = None; // placed on the next frame
+        self.edit_box.set_text(text);
+        self.edit_box.select_all();
+        self.edit_box.focus();
+        self.invalidate();
+    }
+
+    /// The one-line box is done: `keep` what was typed (Enter, a click elsewhere) or put the value
+    /// before back (Esc).
+    fn end_editing(&mut self, app: &mut AppState, keep: bool) -> Vec<Ask> {
+        let Some(what) = self.editing.take() else { return Vec::new() };
+        let typed = self.edit_box.text();
+        if self.edit_box.has_focus() {
+            self.edit_box.give_focus_back();
+        }
+        self.edit_box.hide();
+        self.edit_at = None;
+        self.invalidate();
+        match what {
+            Editing::Hex(i, before) => {
+                let value = if keep && skin::parse_hex(typed.trim()).is_some() { typed.trim().to_lowercase() } else { before };
+                let now = skin::hex_of(colour_of(&app.theme, COLOURS[i].0));
+                if skin::parse_hex(&value) != skin::parse_hex(&now) {
+                    return self.change(app, &[(COLOURS[i].0, value)]);
+                }
+                Vec::new()
+            }
+            Editing::LogoText(before) => {
+                // Empty means the standard word (GLINT); any other word goes in the box.
+                let value = if keep { skin::logo_word(&typed) } else { before };
+                if value != app.theme.logo_text {
+                    return self.change(app, &[("logo-text", value)]);
+                }
+                Vec::new()
+            }
+            Editing::Rename(id) => {
+                let name = typed.trim().to_string();
+                if !keep || name.is_empty() || app.skins.find(&id).is_none_or(|e| e.name == name) {
+                    return Vec::new();
+                }
+                let free = app.skins.free_name(&name);
+                if !free.eq_ignore_ascii_case(&name) && !skin::id_for(&name).eq_ignore_ascii_case(&id) {
+                    self.say(format!("There's a skin called \u{201c}{name}\u{201d} already"), true);
+                    return Vec::new();
+                }
+                if let Some(new_id) = app.skins.rename(&id, &name) {
+                    self.save_due.retain(|d| *d != id);
+                    if app.settings.skin == id {
+                        app.settings.skin = new_id;
+                    }
+                    app.apply_skin();
+                    self.say(format!("Renamed to {name}"), false);
+                }
+                self.layout_dirty = true;
+                vec![Ask::RedrawMain]
+            }
+        }
+    }
+
+    /// "Show as text" on or off (the person flipped its switch).
+    fn set_advanced(&mut self, on: bool, app: &mut AppState) {
+        self.end_editing(app, true);
+        let now = self.now();
+        self.flips.start("text", on, now, kit::SWITCH_TIME);
+        self.advanced = on;
+        self.text_shown.clear();
+        self.sync_text(app);
+        self.layout_dirty = true;
+        self.invalidate();
+    }
+
+    /// One of the buttons under the list.
+    fn press(&mut self, b: Btn, app: &mut AppState) -> Vec<Ask> {
+        self.end_editing(app, true);
+        let current = app.skins.find(&app.settings.skin).cloned();
+        match b {
+            Btn::New => {
+                // A new skin starts as AMD Radeon, light or dark as Glint is now.
+                let base = if app.dark { skin::DEFAULT } else { skin::DEFAULT_LIGHT };
+                let Some(from) = app.skins.find(base).cloned() else { return Vec::new() };
+                let name = app.skins.free_name("My skin");
+                let id = app.skins.add(&name, &skin::copy_text(&from.text, &name, &from.name));
+                self.say(format!("Made {name} from {}", from.name), false);
+                self.after_new(app, &id)
+            }
+            Btn::Duplicate => {
+                let Some(from) = current else { return Vec::new() };
+                let name = app.skins.free_name(&format!("{} copy", from.name));
+                let id = app.skins.add(&name, &skin::copy_text(&from.text, &name, &from.name));
+                self.say(format!("Made {name}, a copy of {}", from.name), false);
+                self.after_new(app, &id)
+            }
+            Btn::Rename => {
+                let Some(e) = current.filter(|e| !e.built_in()) else { return Vec::new() };
+                if let Some(item) = self.items.iter().find(|i| i.id == e.id) {
+                    let rect = item.rect;
+                    self.list.reveal(rect.y, rect.bottom(), 4.0, self.now());
+                }
+                self.start_editing(Editing::Rename(e.id.clone()), &e.name);
+                Vec::new()
+            }
+            Btn::Delete => {
+                let Some(e) = current.filter(|e| !e.built_in()) else { return Vec::new() };
+                self.end_editing(app, true);
+                self.asking = Some((self.next_question, e.id));
+                self.next_question += 1;
+                self.invalidate();
+                Vec::new()
+            }
+            Btn::Import => vec![Ask::Job(Job::Import)],
+            Btn::Export => match current {
+                Some(e) => vec![Ask::Job(Job::Export(format!("{}.{}", skin::file_stem(&e.name), skin::EXTENSION)))],
+                None => Vec::new(),
+            },
+            Btn::Folder => {
+                // Made first if it isn't there yet, away from this thread (it may be on a slow drive).
+                let (hwnd, serial, dir) = (self.hwnd.0 as isize, self.serial, skin::folder());
+                shell::background("skins: open folder", move || {
+                    let _ = std::fs::create_dir_all(&dir);
+                    post(hwnd, serial, Bg::Open(dir));
+                });
+                Vec::new()
+            }
+        }
+    }
+
+    /// A skin was just made: use it, and show it in the list.
+    fn after_new(&mut self, app: &mut AppState, id: &str) -> Vec<Ask> {
+        app.pick_skin(id);
+        self.layout(app);
+        if let Some(item) = self.items.iter().find(|i| i.id == id) {
+            let rect = item.rect;
+            self.list.reveal(rect.y, rect.bottom(), 4.0, self.now());
+        }
+        self.focus = Spot::List;
+        self.invalidate();
+        vec![Ask::RedrawMain]
+    }
+
+    /// The question about deleting was answered (or not yet).
+    fn answer(&mut self, a: Answer, app: &mut AppState) -> Vec<Ask> {
+        match a {
+            Answer::Nothing => Vec::new(),
+            Answer::Redraw => {
+                self.invalidate();
+                Vec::new()
+            }
+            Answer::No => {
+                self.asking = None;
+                self.invalidate();
+                Vec::new()
+            }
+            Answer::Yes => {
+                let Some((_, id)) = self.asking.take() else { return Vec::new() };
+                let name = app.skins.find(&id).map(|e| e.name.clone()).unwrap_or_default();
+                let dark = app.dark;
+                self.save_due.retain(|d| *d != id);
+                app.skins.delete(&id);
+                // Glint goes back to AMD Radeon (light or dark as it was).
+                if app.settings.skin == id {
+                    app.pick_skin(if dark { skin::DEFAULT } else { skin::DEFAULT_LIGHT });
+                }
+                self.say(format!("Moved {name} to the Recycle Bin"), false);
+                self.layout_dirty = true;
+                self.focus = Spot::List;
+                self.invalidate();
+                vec![Ask::RedrawMain]
+            }
+        }
+    }
+
+    /// Takes in what background work found.
+    fn take_results(&mut self, app: &mut AppState) -> Vec<Ask> {
+        let mine = self.serial;
+        let results: Vec<Bg> = std::mem::take(&mut *RESULTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+            .into_iter()
+            .filter(|(serial, _)| *serial == mine)
+            .map(|(_, b)| b)
+            .collect();
+        let mut asks = Vec::new();
+        for bg in results {
+            match bg {
+                Bg::Imported(path, Ok(text)) => {
+                    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Imported skin".into());
+                    let wanted = skin::parse(&text, &stem).name;
+                    let name = app.skins.free_name(&wanted);
+                    let text = if name == wanted && skin::value_in(&text, "name").is_some() { text } else { skin::with_value(&text, "name", &name) };
+                    let notes = skin::parse(&text, &name).notes.len();
+                    let id = app.skins.add(&name, &text);
+                    match notes {
+                        0 => self.say(format!("Imported {name}"), false),
+                        n => self.say(format!("Imported {name}. Skipped {n} line(s): see Show as text"), true),
+                    }
+                    asks.extend(self.after_new(app, &id));
+                }
+                Bg::Imported(_, Err(why)) => self.say(why, true),
+                Bg::Open(dir) => {
+                    // The folder exists now: watch it (a skin copied in shows at once).
+                    app.skins.watch_folder();
+                    asks.push(Ask::Command(Command::NewTabAt(dir.display().to_string())));
+                    asks.push(Ask::Job(Job::Close));
+                }
+            }
+        }
+        self.invalidate();
+        asks
+    }
+
+    /// The one-line box or the skin's text changed, or a key was pressed in them.
+    fn text_event(&mut self, ev: TextEvent, app: &mut AppState) -> Vec<Ask> {
+        if ev.id != EDIT_BOX {
+            return Vec::new();
+        }
+        match ev.kind {
+            TextEventKind::Changed => {
+                // Colours and the logo show as they're typed (a colour once it's whole).
+                let typed = self.edit_box.text();
+                match self.editing.clone() {
+                    Some(Editing::Hex(i, _)) => {
+                        if let Some(c) = skin::parse_hex(typed.trim()) {
+                            if Some(c) != skin::parse_hex(&skin::hex_of(colour_of(&app.theme, COLOURS[i].0))) {
+                                return self.change(app, &[(COLOURS[i].0, typed.trim().to_lowercase())]);
+                            }
+                        }
+                        Vec::new()
+                    }
+                    Some(Editing::LogoText(_)) => {
+                        let word = skin::logo_word(&typed);
+                        if word != app.theme.logo_text {
+                            return self.change(app, &[("logo-text", word)]);
+                        }
+                        Vec::new()
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            TextEventKind::Enter => {
+                self.cues = true;
+                self.end_editing(app, true)
+            }
+            TextEventKind::Escape => {
+                self.cues = true;
+                self.end_editing(app, false)
+            }
+            TextEventKind::LostFocus => self.end_editing(app, true),
+            TextEventKind::Down => Vec::new(),
+        }
+    }
+
+    /// The skin's text was typed in: the skin in use is that text from now on (built-in ones can't
+    /// be typed in: their box is read-only).
+    fn text_typed(&mut self, app: &mut AppState) -> Vec<Ask> {
+        let id = app.settings.skin.clone();
+        if app.skins.find(&id).is_none_or(Entry::built_in) {
+            return Vec::new();
+        }
+        let typed = self.text_box_text();
+        self.text_shown = typed.clone();
+        app.skins.set_text(&id, &typed);
+        app.apply_skin();
+        self.save_soon(&id);
+        self.invalidate();
+        vec![Ask::RedrawMain]
+    }
+
+    /// What a job brought back (a drop-down's pick, a colour, a file).
+    pub fn job_done(&mut self, done: JobDone, app: &mut AppState) -> Vec<Ask> {
+        match done {
+            JobDone::Nothing => Vec::new(),
+            JobDone::Picked(id) => {
+                let Some(ctl) = self.menu_for.take() else { return Vec::new() };
+                match id.checked_sub(1) {
+                    Some(n) => self.picked(ctl, n as usize, app),
+                    None => Vec::new(),
+                }
+            }
+            JobDone::Colour(i, colorref) => {
+                // Windows' picker has no see-through: the colour keeps the strength it had.
+                let old = colour_of(&app.theme, COLOURS[i].0);
+                let new = Color::from_colorref(colorref).with_alpha(old.a);
+                if new == old {
+                    return Vec::new();
+                }
+                self.change(app, &[(COLOURS[i].0, skin::hex_of(new))])
+            }
+            JobDone::Import(path) => {
+                let (hwnd, serial) = (self.hwnd.0 as isize, self.serial);
+                shell::background("skins: import", move || {
+                    let read = match std::fs::metadata(&path) {
+                        Ok(m) if m.len() > MAX_TEXT as u64 => Err(format!("{} is too big to be a skin", path.display())),
+                        _ => std::fs::read(&path).map(|b| skin::decode(&b)).map_err(|e| format!("Couldn't read {}: {e}", path.display())),
+                    };
+                    post(hwnd, serial, Bg::Imported(path, read));
+                });
+                Vec::new()
+            }
+            JobDone::Export(path) => {
+                let id = app.settings.skin.clone();
+                self.say(format!("Exporting to {}\u{2026}", path.display()), false);
+                app.skins.export(&id, path);
+                self.invalidate();
+                Vec::new()
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ messages
+
+    /// Handles one message of this window, with the app's state. None: Windows' default.
+    pub fn handle(&mut self, msg: u32, wparam: WPARAM, lparam: LPARAM, app: &mut AppState) -> (Option<LRESULT>, Vec<Ask>) {
+        let mut asks = Vec::new();
+        let result = match msg {
+            WM_PAINT => {
+                // SAFETY: marks our own window as painted.
+                unsafe {
+                    let _ = ValidateRect(Some(self.hwnd), None);
+                }
+                self.paint(app);
+                Some(LRESULT(0))
+            }
+            WM_SIZE if wparam.0 == SIZE_MINIMIZED as usize => Some(LRESULT(0)),
+            // Resized from an edge: docked again (its new width stays).
+            WM_EXITSIZEMOVE => {
+                self.follow_owner();
+                Some(LRESULT(0))
+            }
+            WM_SIZE => {
+                let (w, h) = (lo_word(lparam.0 as usize), hi_word(lparam.0 as usize));
+                self.renderer.resize(w, h);
+                if w > 0 && h > 0 {
+                    let s = self.scale();
+                    self.size = (w as f32 / s, h as f32 / s);
+                    self.layout_dirty = true;
+                    self.edit_at = None;
+                    self.text_at = None;
+                }
+                self.invalidate();
+                Some(LRESULT(0))
+            }
+            WM_DPICHANGED => {
+                self.dpi = lo_word(wparam.0).max(96);
+                self.renderer.set_dpi(self.dpi);
+                let mut rc = RECT::default();
+                // SAFETY: our own window and a valid out-struct.
+                if unsafe { GetClientRect(self.hwnd, &mut rc) }.is_ok() && rc.right > rc.left {
+                    let s = self.scale();
+                    self.size = ((rc.right - rc.left) as f32 / s, (rc.bottom - rc.top) as f32 / s);
+                }
+                self.layout_dirty = true;
+                self.edit_at = None;
+                self.text_at = None;
+                self.invalidate();
+                // SAFETY: lparam points to the suggested window rectangle.
+                let suggested = unsafe { *(lparam.0 as *const RECT) };
+                asks.push(Ask::Job(Job::Place(suggested)));
+                Some(LRESULT(0))
+            }
+            WM_MOUSEMOVE => {
+                let p = self.client_point(lparam);
+                self.mouse_move(p);
+                Some(LRESULT(0))
+            }
+            WM_MOUSELEAVE => {
+                self.tracking = false;
+                if self.drag.is_none() && self.hover.take().is_some() {
+                    self.invalidate();
+                }
+                Some(LRESULT(0))
+            }
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+                let p = self.client_point(lparam);
+                asks.extend(self.mouse_down(p, app));
+                Some(LRESULT(0))
+            }
+            WM_LBUTTONUP => {
+                let p = self.client_point(lparam);
+                asks.extend(self.mouse_up(p, app));
+                Some(LRESULT(0))
+            }
+            WM_CAPTURECHANGED => {
+                self.pressed = None;
+                self.drag = None;
+                self.invalidate();
+                Some(LRESULT(0))
+            }
+            WM_MOUSEWHEEL => {
+                // The wheel's point is on the screen.
+                let mut pt = POINT { x: (lparam.0 & 0xffff) as i16 as i32, y: ((lparam.0 >> 16) & 0xffff) as i16 as i32 };
+                // SAFETY: converts in place for our own window.
+                unsafe {
+                    let _ = ScreenToClient(self.hwnd, &mut pt);
+                }
+                let s = self.scale();
+                self.wheel(Point::new(pt.x as f32 / s, pt.y as f32 / s), hi_word(wparam.0) as u16 as i16 as f32 / 120.0);
+                Some(LRESULT(0))
+            }
+            WM_KEYDOWN | WM_SYSKEYDOWN => self.key(wparam.0 as u16, app, &mut asks).then_some(LRESULT(0)),
+            WM_CHAR => {
+                if let Some(spot) = self.act_on_char.take() {
+                    asks.extend(self.activate_spot(spot, app));
+                }
+                Some(LRESULT(0))
+            }
+            WM_SYSCHAR if wparam.0 != ' ' as usize => Some(LRESULT(0)),
+            WM_ACTIVATE => {
+                self.active = lo_word(wparam.0) != WA_INACTIVE;
+                self.invalidate();
+                None
+            }
+            WM_CLOSE => {
+                asks.push(Ask::Job(Job::Close));
+                Some(LRESULT(0))
+            }
+            WM_TIMER if wparam.0 == SAVE_TIMER => {
+                self.save_now(app);
+                self.invalidate();
+                Some(LRESULT(0))
+            }
+            WM_TIMER if wparam.0 == RETRY_TIMER => {
+                // SAFETY: stops our own one-off timer.
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), RETRY_TIMER);
+                }
+                self.invalidate();
+                Some(LRESULT(0))
+            }
+            WM_APP_TEXT => {
+                let ev = TextEvent { id: wparam.0 as u16, kind: TextEventKind::from_number(lparam.0) };
+                asks.extend(self.text_event(ev, app));
+                Some(LRESULT(0))
+            }
+            WM_APP_TEXT_KEY => {
+                // Tab or Esc in the skin's text: the keyboard goes back to the window.
+                // SAFETY: focuses our own window.
+                unsafe {
+                    let _ = SetFocus(Some(self.hwnd));
+                }
+                if wparam.0 == VK_TAB.0 as usize {
+                    self.focus = Spot::Text;
+                    self.move_focus(if lparam.0 != 0 { -1 } else { 1 }, app);
+                } else {
+                    self.focus = Spot::Advanced;
+                    self.cues = true;
+                }
+                self.invalidate();
+                Some(LRESULT(0))
+            }
+            WM_COMMAND => {
+                let (id, code) = (lo_word(wparam.0) as u16, hi_word(wparam.0));
+                // EN_CHANGE (0x0300): typed (not set by us).
+                if code == 0x0300 && id == EDIT_BOX && !textbox::setting_text() {
+                    asks.extend(self.text_event(TextEvent { id, kind: TextEventKind::Changed }, app));
+                }
+                if code == 0x0300 && id == TEXT_BOX && !self.setting_text {
+                    asks.extend(self.text_typed(app));
+                }
+                // EN_SETFOCUS (0x0100) on the skin's text: the keyboard is there.
+                if code == 0x0100 && id == TEXT_BOX {
+                    self.focus = Spot::Text;
+                    self.invalidate();
+                }
+                Some(LRESULT(0))
+            }
+            WM_APP_BG => {
+                asks.extend(self.take_results(app));
+                Some(LRESULT(0))
+            }
+            _ => None,
+        };
+        (result, asks)
+    }
+}
+
+impl Drop for SkinWindow {
+    fn drop(&mut self) {
+        let brush = EDIT_COLORS.with(|c| c.replace((0, 0, 0))).2;
+        // SAFETY: the brush and the font are ours, and the text boxes that used them are gone with
+        // the window.
+        unsafe {
+            if brush != 0 {
+                let _ = DeleteObject(HGDIOBJ(brush as *mut _));
+            }
+            if !self.text_font.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(self.text_font.0));
+            }
+        }
+    }
+}
+
+/// A colour's swatch: the colour over a checked pattern (so a see-through one shows as such), in a
+/// thin frame.
+fn swatch(r: &mut Renderer, theme: &Theme, rect: Rect, c: Color, look: Look) {
+    if c.a < 0.999 {
+        let cell = rect.w / 4.0;
+        for row in 0..4 {
+            for col in 0..4 {
+                let light = (row + col) % 2 == 0;
+                let tone = if light { Color::hex(0xffffff) } else { Color::hex(0xc8c8c8) };
+                r.fill_rect(Rect::new(rect.x + col as f32 * cell, rect.y + row as f32 * cell, cell, cell), tone);
+            }
+        }
+    }
+    r.fill_rect(rect, c);
+    r.stroke_rect(rect, 1.0, if look.hover { theme.text } else { theme.line });
+    if look.focused {
+        kit::focus_ring(r, theme, rect, 0.0);
+    }
+}
+
+fn slant_label(v: f32) -> String {
+    match v {
+        x if x < 0.5 => "0 (straight)".into(),
+        x if (x - 8.0).abs() < 0.01 => "8 (AMD Radeon)".into(),
+        x => number(x),
+    }
+}
+
+fn row_label(v: f32) -> String {
+    if (v - size::ROW_H).abs() < 0.01 {
+        format!("{} (standard)", number(v))
+    } else {
+        number(v)
+    }
+}
+
+fn size_label(pt: f32) -> String {
+    if (pt - 9.0).abs() < 0.01 {
+        "9 pt (standard)".into()
+    } else {
+        format!("{} pt", number(pt))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn labels_and_numbers() {
+        assert_eq!(number(8.0), "8");
+        assert_eq!(number(10.5), "10.5");
+        assert_eq!(slant_label(0.0), "0 (straight)");
+        assert_eq!(slant_label(8.0), "8 (AMD Radeon)");
+        assert_eq!(row_label(28.0), "28 (standard)");
+        assert_eq!(size_label(9.0), "9 pt (standard)");
+        assert_eq!(size_label(10.5), "10.5 pt");
+        assert_eq!(crlf("a\nb\r\nc"), "a\r\nb\r\nc");
+    }
+
+    #[test]
+    fn every_offered_colour_is_a_skin_colour() {
+        for (key, _, _) in COLOURS {
+            assert!(skin::COLOURS.iter().any(|(k, _)| *k == key), "{key}");
+        }
+        // And reads back from the look it makes.
+        let t = skin::parse("accent: #010203\nbackground: #040506\ntoolbar: #070809\npanel: #0a0b0c\ntext: #0d0e0f\nmuted: #101112\nselection: #13141580\nhover: #161718\n", "x").theme;
+        let hexes: Vec<String> = COLOURS.iter().map(|(k, _, _)| skin::hex_of(colour_of(&t, k))).collect();
+        assert_eq!(hexes, ["#010203", "#040506", "#070809", "#0a0b0c", "#0d0e0f", "#101112", "#13141580", "#161718"]);
+    }
+
+    #[test]
+    fn the_choices_write_what_the_skin_reads() {
+        for (shape, word, _) in SHAPES {
+            assert_eq!(skin::parse(&format!("shape: {word}"), "x").theme.shape, shape);
+        }
+        for v in FONT_SIZES {
+            let t = skin::parse(&format!("font-size: {}pt", number(v)), "x");
+            assert!(t.notes.is_empty(), "{v}: {:?}", t.notes);
+            assert!((t.theme.font_size / PT - v).abs() < 0.01);
+        }
+        for v in ROW_HEIGHTS {
+            assert_eq!(skin::parse(&format!("row-height: {}", number(v)), "x").theme.row_h, v);
+        }
+    }
+}

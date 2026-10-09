@@ -1,0 +1,53 @@
+// NVIDIA - in the style of the NVIDIA app: near-black layers, white text, NVIDIA green,
+// straight square edges and a green line on top of the active tab.
+// (How skins are written: see the top of AMD Radeon.)
+
+name: NVIDIA
+description: Near-black layers, white text, NVIDIA green, square edges
+dark: true
+
+// ---- colours
+accent: #76b900
+accent-text: #0f0f0f
+background: #0f0f0f
+title-bar: background
+toolbar: #1a1a1a
+panel: #222222
+sidebar: background
+status-bar: background
+input: background
+button: #2b2b2b
+button-hover: #363636
+text: #ffffff
+text-bright: #ffffff
+muted: #a3a3a3
+disabled: #505050
+selection: accent 20%
+selection-edge: accent
+hover: #2a2a2a
+tool-hover: #2b2b2b
+tool-pressed: #363636
+path-hover: #222222
+line: #333333
+scrollbar: #3d3d3d
+scrollbar-hover: #575757
+usage-bar: line
+logo: accent
+logo-letters: accent-text
+tab-line: accent
+toolbar-line: #2b2b2b
+caption-hover: tool-hover
+caption-pressed: button-hover
+close-hover: accent
+menus: dark
+
+// ---- shapes and text
+shape: straight
+slant: 0
+path-slant: 0
+radius: 2
+row-height: 28
+tab-line-width: 3
+toolbar-line-width: 1
+font: NVIDIA Sans, Segoe UI Variable Text, Segoe UI
+font-size: 9pt

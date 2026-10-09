@@ -1,0 +1,56 @@
+// AMD Radeon - Glint's own look: layers of charcoal, one red accent, slanted buttons.
+//
+// One setting per line: "name: value". Lines starting with // are notes.
+// Colours: #rrggbb, #rrggbbaa (see-through), another colour's name ("tab-line: accent"),
+// or one at a strength ("accent 16%"). Anything left out comes from AMD Radeon
+// (or AMD Radeon (Light) for a light skin).
+
+name: AMD Radeon
+description: Glint's own look: layered charcoal, one red accent, slanted buttons
+dark: true
+
+// ---- colours
+accent: #e3262d
+accent-text: #ffffff
+background: #0e0e10
+title-bar: background
+toolbar: #151517
+panel: #1b1b1e
+sidebar: background
+status-bar: background
+input: background
+button: #232327
+button-hover: #2c2c31
+text: #e8e8ea
+text-bright: #ffffff
+muted: #8d8d96
+disabled: #4a4a50
+selection: accent 16%
+selection-edge: accent
+hover: #202024
+tool-hover: #232327
+tool-pressed: #2c2c31
+path-hover: #1b1b1e
+line: #2a2a2f
+scrollbar: #3a3a40
+scrollbar-hover: #4d4d55
+usage-bar: line
+logo: accent
+logo-letters: accent-text
+tab-line: accent
+toolbar-line: accent
+caption-hover: tool-hover
+caption-pressed: button-hover
+close-hover: accent
+menus: dark
+
+// ---- shapes and text
+shape: slanted
+slant: 8
+path-slant: 6
+radius: 6
+row-height: 28
+tab-line-width: 3
+toolbar-line-width: 2
+font: Segoe UI Variable Text, Segoe UI
+font-size: 9pt
