@@ -16,21 +16,32 @@
 //! - Colours are `#rrggbb`, `#rgb` or `#rrggbbaa` (aa: how solid, 00 = clear, ff = solid), `none`,
 //!   or another colour's name (`tab-line: accent`), optionally at a strength (`accent 16%`). The
 //!   names are in [`COLOURS`].
+//! - Any colour can also be a gradient: colours separated by commas, each with where it sits
+//!   (`title-bar: #fdfdfd, #c3cddb 45%, #8d9db8 55%, #dfe6f0`). Colours without a % are spread
+//!   evenly between their neighbours, as in CSS (a line copied from a CSS `linear-gradient(...)`
+//!   works too; its direction is left out). A see-through colour in a gradient gives its strength
+//!   first: `accent 50% 30%` is the accent at half strength, 30 % along. A gradient runs across the
+//!   short side of what it fills: top to bottom on bars and buttons, left to right on a scrollbar's
+//!   thumb (theme.rs `Paint`). Up to 8 colours.
 //! - The rest is in [`OTHERS`]: the name, light or dark, the shapes (straight / slanted / rounded,
-//!   how far things lean, how round corners are), the row height, the font and its size, and a
-//!   word for the logo (without one, the title bars show the chrome wordmark: logo.rs).
+//!   how far things lean, how round corners are), the row height, the font and its size, a word for
+//!   the logo (without one, the title bars show the chrome wordmark: logo.rs), and the styles of
+//!   the buttons, caption buttons, tabs, sidebar and scrollbars.
 //! - Whatever a skin leaves out comes from AMD Radeon (a dark skin) or AMD Radeon (Light) (a light
-//!   one), so a skin can be three lines. A line Glint doesn't understand is skipped with a note (the
-//!   customiser shows them); nothing in a skin can stop Glint from starting.
+//!   one), so a skin can be three lines. Colours that came later than those two skins follow an
+//!   older colour when left out ([`DERIVED`]), so a skin made before them looks as it always did.
+//!   A line Glint doesn't understand is skipped with a note (the customiser shows them); nothing in
+//!   a skin can stop Glint from starting.
 //!
-//! **Where skins are.** The built-in ones (AMD Radeon, NVIDIA and their "(Light)" versions) are
-//! compiled into glint.exe from `skins/*.glint`, in the same format. A person's own skins are
-//! `*.glint` files in the `skins` folder of the config folder (settings.rs), made by the customiser
-//! (skinwin.rs) or by hand. Ids in settings.json: `amd-radeon`, `amd-radeon-light`, `nvidia`,
-//! `nvidia-light`, and `file:<file name without .glint>`.
+//! **Where skins are.** The built-in ones (AMD Radeon, NVIDIA and their "(Light)" versions, Chrome
+//! and Gunmetal) are compiled into glint.exe from `skins/*.glint`, in the same format. A person's
+//! own skins are `*.glint` files in the `skins` folder of the config folder (settings.rs), made by
+//! the customiser (skinwin.rs) or by hand. Ids in settings.json: `amd-radeon`, `amd-radeon-light`,
+//! `nvidia`, `nvidia-light`, `chrome`, `gunmetal`, and `file:<file name without .glint>`.
 //!
 //! **Light and dark.** A skin's light version is the skin with the same name and " (Light)" after
-//! it (and `dark: false`); the light/dark choice picks between the two (`Library::twin`).
+//! it (and `dark: false`); the light/dark choice picks between the two (`Library::twin`). Two skins
+//! whose names don't match name each other with `twin` (Chrome and Gunmetal).
 //!
 //! **Fast.** A skin is read into a `Theme` (plain colours and sizes) once, when it's picked or its
 //! text changes; drawing never looks at the text.
@@ -64,7 +75,7 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 use crate::log;
 use crate::settings;
 use crate::shell;
-use crate::theme::{size, Color, Shape, Theme};
+use crate::theme::{size, ButtonStyle, CaptionStyle, Color, Paint, Shape, SidebarStyle, Stop, TabStyle, Theme, MAX_STOPS};
 
 /// The skin Glint starts with, and its light version.
 pub const DEFAULT: &str = "amd-radeon";
@@ -82,12 +93,14 @@ pub const EVENT_CHANGED: usize = 0;
 pub const EVENT_LISTED: usize = 1;
 pub const EVENT_WRITTEN: usize = 2;
 
-/// The built-in skins, in the order they're listed: id and text.
-const BUILT_IN: [(&str, &str); 4] = [
+/// The built-in skins, in the order they're listed (each light or dark pair together): id and text.
+const BUILT_IN: [(&str, &str); 6] = [
     (DEFAULT, include_str!("../skins/amd-radeon.glint")),
     (DEFAULT_LIGHT, include_str!("../skins/amd-radeon-light.glint")),
     ("nvidia", include_str!("../skins/nvidia.glint")),
     ("nvidia-light", include_str!("../skins/nvidia-light.glint")),
+    ("chrome", include_str!("../skins/chrome.glint")),
+    ("gunmetal", include_str!("../skins/gunmetal.glint")),
 ];
 
 /// A person's own skins: at most this many files are read, each at most this big.
@@ -132,6 +145,61 @@ pub const COLOURS: &[(&str, &str)] = &[
     ("caption-hover", "+, minimise and maximise under the mouse"),
     ("caption-pressed", "Those while clicked"),
     ("close-hover", "Close button under the mouse"),
+    ("tab", "Tabs other than the current one"),
+    ("tab-active", "The current tab"),
+    ("tab-text", "Names of the other tabs"),
+    ("tab-active-text", "Name of the current tab"),
+    ("tab-border", "Edge of each tab (tabs: pills)"),
+    ("highlight", "Thin shine along the top of bars and tabs"),
+    ("sidebar-panel", "Sidebar panels (sidebar-style: panels)"),
+    ("panel-header", "Header bars of the sidebar panels"),
+    ("panel-header-text", "Sidebar headings"),
+    ("sidebar-selection", "The place you're in, in the sidebar"),
+    ("sidebar-selection-text", "Its name"),
+    ("list-header", "Column titles' bar"),
+    ("list-header-text", "Column titles"),
+    ("column-line", "Lines between the column titles"),
+    ("status-text", "Status bar text"),
+    ("status-line", "Line along the top of the status bar"),
+    ("selection-text", "Text on selected rows"),
+    ("input-border", "Edge of the path and filter boxes"),
+    ("button-text", "Words and signs on buttons"),
+    ("marble", "Minimise and maximise (caption-buttons: marbles)"),
+    ("marble-close", "Close (caption-buttons: marbles)"),
+    ("usage-fill", "Used part of a drive's usage bar"),
+    ("scrollbar-track", "Behind the scroll bars"),
+    ("scrollbar-border", "Edge of the scroll bars"),
+    ("scrollbar-grip-lines", "Lines on the scroll bars (scrollbar-grip)"),
+];
+
+/// Colours that came later than AMD Radeon and NVIDIA: each follows an older colour when a skin
+/// leaves it out, so every skin made before them looks exactly as it did.
+pub const DERIVED: &[(&str, &str)] = &[
+    ("tab", "none"),
+    ("tab-active", "toolbar"),
+    ("tab-text", "muted"),
+    ("tab-active-text", "text"),
+    ("tab-border", "none"),
+    ("highlight", "none"),
+    ("sidebar-panel", "panel"),
+    ("panel-header", "toolbar"),
+    ("panel-header-text", "muted"),
+    ("sidebar-selection", "selection"),
+    ("sidebar-selection-text", "selection-text"),
+    ("list-header", "panel"),
+    ("list-header-text", "muted"),
+    ("column-line", "none"),
+    ("status-text", "muted"),
+    ("status-line", "none"),
+    ("selection-text", "text-bright"),
+    ("input-border", "none"),
+    ("button-text", "text"),
+    ("marble", "muted"),
+    ("marble-close", "close-hover"),
+    ("usage-fill", "accent"),
+    ("scrollbar-track", "none"),
+    ("scrollbar-border", "none"),
+    ("scrollbar-grip-lines", "muted"),
 ];
 
 /// Everything else a skin can set, with what it does.
@@ -140,6 +208,7 @@ pub const OTHERS: &[(&str, &str)] = &[
     ("description", "One line about it"),
     ("author", "Who made it"),
     ("dark", "true or false"),
+    ("twin", "Its light or dark other half, by id or name (when the names don't pair up)"),
     ("menus", "Right-click menus: dark or light"),
     ("shape", "slanted, straight or rounded"),
     ("slant", "How far buttons lean, 0 to 20"),
@@ -151,10 +220,16 @@ pub const OTHERS: &[(&str, &str)] = &[
     ("font", "Fonts to try, best first"),
     ("font-size", "8pt to 14pt (or pixels: 12px)"),
     ("logo-text", "The word in the logo's box, at most 12 letters"),
+    ("buttons", "flat, or liquid (glossy glass marbles and capsules)"),
+    ("caption-buttons", "symbols, or marbles (minimise, maximise, close)"),
+    ("tabs", "attached (the current one joins the toolbar), or pills"),
+    ("sidebar-style", "plain, or panels (each group in a rounded panel)"),
+    ("scrollbar-grip", "Lines across the scroll bars: true or false"),
+    ("scrollbar-width", "How thick the scroll bars are, 4 to 14"),
 ];
 
 /// Other names people may write for a setting (CSS habits, the code's names).
-const ALIASES: [(&str, &str); 10] = [
+const ALIASES: &[(&str, &str)] = &[
     ("window", "background"),
     ("titlebar", "title-bar"),
     ("statusbar", "status-bar"),
@@ -165,6 +240,14 @@ const ALIASES: [(&str, &str); 10] = [
     ("chip-hover", "button-hover"),
     ("font-family", "font"),
     ("mode", "dark"),
+    ("field", "input"),
+    ("field-border", "input-border"),
+    ("scrollbar-thumb", "scrollbar"),
+    ("scrollbar-thumb-hover", "scrollbar-hover"),
+    ("selected-text", "selection-text"),
+    ("caption", "caption-buttons"),
+    ("button-style", "buttons"),
+    ("tab-style", "tabs"),
 ];
 
 // ---------------------------------------------------------------- reading a skin
@@ -182,6 +265,9 @@ pub struct Parsed {
     pub theme: Theme,
     pub name: String,
     pub description: String,
+    /// The skin's light or dark other half as its `twin` line names it (an id or a name; "" for
+    /// none: then names pair up, see `Library::twin`).
+    pub twin: String,
     pub notes: Vec<Note>,
 }
 
@@ -333,14 +419,108 @@ struct Resolver<'a> {
     /// The base skin's lines, then the skin's own (later ones win).
     base: HashMap<String, String>,
     own: HashMap<String, (String, usize)>,
-    done: HashMap<String, Color>,
+    done: HashMap<String, Paint>,
     busy: HashSet<String>,
     notes: &'a mut Vec<Note>,
 }
 
+/// Why a colour couldn't be read, and - for a gradient with a bad colour or position - what is
+/// used instead (and how to say so). Without that, the standard colour is used.
+struct Bad {
+    why: String,
+    instead: Option<Box<(Paint, String)>>,
+}
+
+impl From<String> for Bad {
+    fn from(why: String) -> Bad {
+        Bad { why, instead: None }
+    }
+}
+
+/// `v` cut at the commas that aren't inside brackets: "rgb(1, 2, 3), #fff" is two parts.
+fn split_commas(v: &str) -> Vec<&str> {
+    let (mut parts, mut depth, mut start) = (Vec::new(), 0i32, 0);
+    for (i, ch) in v.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth <= 0 => {
+                parts.push(&v[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&v[start..]);
+    parts
+}
+
+/// A gradient's colours without a CSS `linear-gradient( ... )` round them and its direction ("to
+/// bottom", "180deg"): Glint runs a gradient across the short side of what it fills.
+fn without_css_wrapper(v: &str) -> &str {
+    let t = v.trim();
+    let lower = t.to_ascii_lowercase();
+    let Some(inner) = lower.strip_prefix("linear-gradient(").and_then(|_| t.get("linear-gradient(".len()..)).and_then(|s| s.strip_suffix(')')) else { return t };
+    let first = split_commas(inner)[0].trim().to_ascii_lowercase();
+    let direction = first.starts_with("to ") || ["deg", "turn", "rad", "grad"].iter().any(|u| first.ends_with(u) && first[..first.len() - u.len()].trim().parse::<f32>().is_ok());
+    match (direction, inner.find(',')) {
+        (true, Some(at)) if split_commas(inner).len() > 1 => inner[at + 1..].trim(),
+        _ => inner.trim(),
+    }
+}
+
+/// Fills in the positions a gradient's colours left out, as CSS does: the first at the start, the
+/// last at the end, the ones between spread evenly between their neighbours. A position before an
+/// earlier one moves up to it.
+fn fill_positions(at: &mut [Option<f32>]) -> Vec<f32> {
+    let n = at.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if at[0].is_none() {
+        at[0] = Some(0.0);
+    }
+    if at[n - 1].is_none() {
+        at[n - 1] = Some(1.0);
+    }
+    let mut out: Vec<f32> = Vec::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        match at[i] {
+            Some(p) => {
+                out.push(p.max(out.last().copied().unwrap_or(0.0)));
+                i += 1;
+            }
+            None => {
+                // A run of missing ones, between the one before (known) and the next known one.
+                let from = out.last().copied().unwrap_or(0.0);
+                let end = (i..n).find(|&j| at[j].is_some()).unwrap_or(n - 1);
+                let to = at[end].unwrap_or(1.0).max(from);
+                let steps = (end - i + 1) as f32;
+                for k in i..end {
+                    out.push(from + (to - from) * (k - i + 1) as f32 / steps);
+                }
+                i = end;
+            }
+        }
+    }
+    out
+}
+
 impl Resolver<'_> {
-    /// A colour expression: "#hex", "none", "rgb(..)", a colour's name, each maybe with "NN%".
-    fn expression(&mut self, v: &str) -> Result<Color, String> {
+    /// A colour expression: "#hex", "none", "rgb(..)", a colour's name, each maybe with "NN%"; or
+    /// a gradient of those, separated by commas.
+    fn expression(&mut self, v: &str) -> Result<Paint, Bad> {
+        let inner = without_css_wrapper(v);
+        let parts = split_commas(inner);
+        if parts.len() == 1 {
+            return self.single(parts[0]).map_err(Bad::from);
+        }
+        self.gradient(&parts)
+    }
+
+    /// One colour, maybe at a strength ("accent 16%"). A name can stand for a gradient.
+    fn single(&mut self, v: &str) -> Result<Paint, String> {
         let v = v.trim();
         let (term, strength) = match v.rsplit_once(char::is_whitespace) {
             Some((t, pct)) if pct.ends_with('%') => {
@@ -350,25 +530,73 @@ impl Resolver<'_> {
             _ => (v, None),
         };
         let lower = term.to_lowercase();
-        let color = if lower == "none" || lower == "transparent" {
-            Color::rgba(0, 0, 0, 0.0)
+        let paint = if lower == "none" || lower == "transparent" {
+            Paint::CLEAR
         } else if let Some(c) = parse_hex(term).or_else(|| parse_rgb(term)) {
-            c
+            Paint::Flat(c)
         } else {
             let name = normalize_key(term);
             if !COLOURS.iter().any(|(k, _)| *k == name) {
-                return Err(format!("\u{201c}{term}\u{201d} isn't a colour: write it like #e3262d, or another colour's name"));
+                return Err(if term.is_empty() {
+                    "A colour is missing (two commas in a row?)".to_string()
+                } else {
+                    format!("\u{201c}{term}\u{201d} isn't a colour: write it like #e3262d, or another colour's name")
+                });
             }
             self.colour(&name).ok_or_else(|| format!("\u{201c}{name}\u{201d} refers back to itself"))?
         };
         Ok(match strength {
-            Some(s) => color.with_alpha(color.a * s),
-            None => color,
+            Some(s) => paint.with_strength(s),
+            None => paint,
         })
     }
 
-    /// The colour called `key` (None while it's being worked out: a circle).
-    fn colour(&mut self, key: &str) -> Option<Color> {
+    /// A gradient: each part a colour with an optional position ("#c3cddb 45%"). A part that
+    /// can't be read makes the whole a flat colour (its first good one), with a note.
+    fn gradient(&mut self, parts: &[&str]) -> Result<Paint, Bad> {
+        let mut colours: Vec<Color> = Vec::new();
+        let mut at: Vec<Option<f32>> = Vec::new();
+        let mut problem: Option<String> = None;
+        for part in parts {
+            let part = part.trim();
+            // A last word with % is the position (a strength, if any, comes before it).
+            let (colour_text, position) = match part.rsplit_once(char::is_whitespace) {
+                Some((c, pct)) if pct.ends_with('%') => match pct.trim_end_matches('%').trim().parse::<f32>().ok().filter(|p| p.is_finite()) {
+                    Some(p) => (c.trim(), Some((p / 100.0).clamp(0.0, 1.0))),
+                    None => {
+                        problem.get_or_insert(format!("\u{201c}{pct}\u{201d} isn't a position like 45%"));
+                        continue;
+                    }
+                },
+                _ => (part, None),
+            };
+            match self.single(colour_text) {
+                // A name that is a gradient itself gives its one colour here.
+                Ok(p) => {
+                    colours.push(p.base());
+                    at.push(position);
+                }
+                Err(why) => {
+                    problem.get_or_insert(why);
+                }
+            }
+        }
+        let first_good = colours.first().copied();
+        if let Some(why) = problem {
+            let instead = first_good.map(|c| Box::new((Paint::Flat(c), format!("Using {}, its first colour, without the gradient.", hex_of(c)))));
+            return Err(Bad { why, instead });
+        }
+        if colours.len() > MAX_STOPS {
+            colours.truncate(MAX_STOPS);
+            at.truncate(MAX_STOPS);
+            let kept = Paint::from_stops(&stops_of(&colours, &mut at));
+            return Err(Bad { why: format!("A gradient has at most {MAX_STOPS} colours"), instead: Some(Box::new((kept, "The rest are left out.".into()))) });
+        }
+        Ok(Paint::from_stops(&stops_of(&colours, &mut at)))
+    }
+
+    /// The paint called `key` (None while it's being worked out: a circle).
+    fn colour(&mut self, key: &str) -> Option<Paint> {
         if let Some(c) = self.done.get(key) {
             return Some(*c);
         }
@@ -379,7 +607,12 @@ impl Resolver<'_> {
         if let Some((v, line)) = self.own.get(key).cloned() {
             match self.expression(&v) {
                 Ok(c) => result = Some(c),
-                Err(why) => self.notes.push(Note { line, text: format!("{why}. Using the standard {key} instead.") }),
+                Err(Bad { why, instead: Some(instead) }) => {
+                    let (paint, said) = *instead;
+                    self.notes.push(Note { line, text: format!("{why}. {said}") });
+                    result = Some(paint);
+                }
+                Err(Bad { why, instead: None }) => self.notes.push(Note { line, text: format!("{why}. Using the standard {key} instead.") }),
             }
         }
         if result.is_none() {
@@ -387,12 +620,23 @@ impl Resolver<'_> {
                 result = self.expression(&v).ok();
             }
         }
+        if result.is_none() {
+            if let Some((_, v)) = DERIVED.iter().find(|(k, _)| *k == key) {
+                result = self.expression(v).ok();
+            }
+        }
         self.busy.remove(key);
-        // (Never reached with the built-in base skins, which name every colour; the tests check.)
-        let c = result.unwrap_or(Color::hex(0x808080));
+        // (Never reached with the built-in base skins and DERIVED, which name every colour; the
+        // tests check.)
+        let c = result.unwrap_or(Paint::Flat(Color::hex(0x808080)));
         self.done.insert(key.to_string(), c);
         Some(c)
     }
+}
+
+/// Stops from colours and their positions as written (the missing ones filled in).
+fn stops_of(colours: &[Color], at: &mut [Option<f32>]) -> Vec<Stop> {
+    fill_positions(at).into_iter().zip(colours).map(|(at, color)| Stop { at, color: *color }).collect()
 }
 
 /// Reads a skin. Never fails: what can't be understood is noted and taken from the base skin.
@@ -420,42 +664,60 @@ pub fn parse(text: &str, fallback_name: &str) -> Parsed {
     let base: HashMap<String, String> = read_lines(base_text, &mut Vec::new()).into_iter().map(|l| (l.key, l.value)).collect();
 
     let mut r = Resolver { base: base.clone(), own: own.clone(), done: HashMap::new(), busy: HashSet::new(), notes: &mut notes };
-    let mut c = |key: &str| r.colour(key).unwrap_or(Color::hex(0x808080));
-    let window = c("background");
+    let mut p = |key: &str| r.colour(key).unwrap_or(Paint::Flat(Color::hex(0x808080)));
+    // Each surface's paint, and the one colour that stands for it.
+    let window_paint = p("background");
+    let titlebar_paint = p("title-bar");
+    let toolbar_paint = p("toolbar");
+    let panel_paint = p("panel");
+    let sidebar_paint = p("sidebar");
+    let statusbar_paint = p("status-bar");
+    let input_paint = p("input");
+    let chip_paint = p("button");
+    let chip_hover_paint = p("button-hover");
+    let accent_paint = p("accent");
+    let accent_tint_paint = p("selection");
+    let hover_paint = p("hover");
+    let scroll_thumb_paint = p("scrollbar");
+    let scroll_thumb_hover_paint = p("scrollbar-hover");
+    let bar_track_paint = p("usage-bar");
+    let logo_paint = p("logo");
+    let text = p("text").base();
+    let selection_text = p("selection-text").base();
     let mut theme = Theme {
         dark,
-        window,
-        titlebar: c("title-bar"),
-        toolbar: c("toolbar"),
-        panel: c("panel"),
-        sidebar: c("sidebar"),
-        statusbar: c("status-bar"),
-        input: c("input"),
-        chip: c("button"),
-        chip_hover: c("button-hover"),
-        text: c("text"),
-        text_strong: c("text-bright"),
-        muted: c("muted"),
-        disabled: c("disabled"),
-        accent: c("accent"),
-        accent_tint: c("selection"),
-        select_edge: c("selection-edge"),
-        on_accent: c("accent-text"),
-        hover: c("hover"),
-        button_hover: c("tool-hover"),
-        button_pressed: c("tool-pressed"),
-        crumb_hover: c("path-hover"),
-        line: c("line"),
-        scroll_thumb: c("scrollbar"),
-        scroll_thumb_hover: c("scrollbar-hover"),
-        bar_track: c("usage-bar"),
-        logo: c("logo"),
-        logo_ink: c("logo-letters"),
-        tab_line: c("tab-line"),
-        toolbar_line: c("toolbar-line"),
-        caption_hover: c("caption-hover"),
-        caption_pressed: c("caption-pressed"),
-        close_hover: c("close-hover"),
+        window: window_paint.base(),
+        titlebar: titlebar_paint.base(),
+        toolbar: toolbar_paint.base(),
+        panel: panel_paint.base(),
+        sidebar: sidebar_paint.base(),
+        statusbar: statusbar_paint.base(),
+        input: input_paint.base(),
+        chip: chip_paint.base(),
+        chip_hover: chip_hover_paint.base(),
+        text,
+        text_strong: p("text-bright").base(),
+        muted: p("muted").base(),
+        disabled: p("disabled").base(),
+        accent: accent_paint.base(),
+        accent_tint: accent_tint_paint.base(),
+        select_edge: p("selection-edge").base(),
+        on_accent: p("accent-text").base(),
+        hover: hover_paint.base(),
+        button_hover: p("tool-hover").base(),
+        button_pressed: p("tool-pressed").base(),
+        crumb_hover: p("path-hover").base(),
+        line: p("line").base(),
+        scroll_thumb: scroll_thumb_paint.base(),
+        scroll_thumb_hover: scroll_thumb_hover_paint.base(),
+        bar_track: bar_track_paint.base(),
+        logo: logo_paint.base(),
+        logo_ink: p("logo-letters").base(),
+        tab_line: p("tab-line").base(),
+        toolbar_line: p("toolbar-line").base(),
+        caption_hover: p("caption-hover").base(),
+        caption_pressed: p("caption-pressed").base(),
+        close_hover: p("close-hover").base(),
         menus_dark: dark,
         shape: Shape::Slanted,
         slant: 8.0,
@@ -468,6 +730,56 @@ pub fn parse(text: &str, fallback_name: &str) -> Parsed {
         font_size: size::FONT,
         logo_text: DEFAULT_LOGO_TEXT.into(),
         logo_style: crate::settings::LogoStyle::Box,
+        window_paint,
+        titlebar_paint,
+        toolbar_paint,
+        panel_paint,
+        sidebar_paint,
+        statusbar_paint,
+        input_paint,
+        chip_paint,
+        chip_hover_paint,
+        accent_paint,
+        accent_tint_paint,
+        hover_paint,
+        scroll_thumb_paint,
+        scroll_thumb_hover_paint,
+        bar_track_paint,
+        logo_paint,
+        tab: p("tab"),
+        tab_active: p("tab-active"),
+        tab_text: p("tab-text").base(),
+        tab_active_text: p("tab-active-text").base(),
+        tab_border: p("tab-border").base(),
+        highlight: p("highlight").base(),
+        sidebar_panel: p("sidebar-panel"),
+        panel_header: p("panel-header"),
+        panel_header_text: p("panel-header-text").base(),
+        sidebar_selection: p("sidebar-selection"),
+        sidebar_selection_text: p("sidebar-selection-text").base(),
+        list_header: p("list-header"),
+        list_header_text: p("list-header-text").base(),
+        column_line: p("column-line").base(),
+        status_text: p("status-text").base(),
+        status_line: p("status-line").base(),
+        selection_text,
+        // A selected row's other columns stay in the normal text colour unless the skin says
+        // otherwise (as before `selection-text` existed).
+        selection_details: if own.contains_key("selection-text") { selection_text } else { text },
+        input_border: p("input-border").base(),
+        button_text: p("button-text").base(),
+        marble: p("marble"),
+        marble_close: p("marble-close"),
+        usage_fill: p("usage-fill"),
+        scrollbar_track: p("scrollbar-track"),
+        scrollbar_border: p("scrollbar-border").base(),
+        scrollbar_grip_lines: p("scrollbar-grip-lines").base(),
+        buttons: ButtonStyle::Flat,
+        caption_buttons: CaptionStyle::Symbols,
+        tabs: TabStyle::Attached,
+        sidebar_style: SidebarStyle::Plain,
+        scrollbar_grip: false,
+        scrollbar_w: size::SCROLLBAR_W,
     };
 
     // The rest: as the skin says, else as the base says.
@@ -541,12 +853,52 @@ pub fn parse(text: &str, fallback_name: &str) -> Parsed {
     }
     theme.logo_text = logo_word(&logo);
 
+    // The styles: one of a few words each (as the skin says, else as the base says, else the
+    // first word, which is how Glint looked before the style existed).
+    let mut style = |key: &str, words: &[(&str, bool)], choices: &str| -> bool {
+        let read = |v: &str| {
+            let v = normalize_key(v);
+            words.iter().find(|(w, _)| *w == v).map(|(_, second)| *second)
+        };
+        let (mine, theirs) = value(key);
+        if let Some((v, line)) = mine {
+            match read(&v) {
+                Some(second) => return second,
+                None => notes.push(Note { line, text: format!("{key} is {choices} (not \u{201c}{v}\u{201d}).") }),
+            }
+        }
+        theirs.as_deref().and_then(read).unwrap_or(false)
+    };
+    if style("buttons", &[("flat", false), ("plain", false), ("liquid", true), ("glass", true)], "flat or liquid") {
+        theme.buttons = ButtonStyle::Liquid;
+    }
+    if style("caption-buttons", &[("symbols", false), ("signs", false), ("marbles", true), ("marble", true)], "symbols or marbles") {
+        theme.caption_buttons = CaptionStyle::Marbles;
+    }
+    if style("tabs", &[("attached", false), ("pills", true), ("pill", true)], "attached or pills") {
+        theme.tabs = TabStyle::Pills;
+    }
+    if style("sidebar-style", &[("plain", false), ("panels", true), ("panel", true)], "plain or panels") {
+        theme.sidebar_style = SidebarStyle::Panels;
+    }
+    theme.scrollbar_grip = match own.get("scrollbar-grip") {
+        Some((v, line)) => yes_no(v).unwrap_or_else(|| {
+            notes.push(Note { line: *line, text: format!("scrollbar-grip is true or false (not \u{201c}{v}\u{201d}).") });
+            false
+        }),
+        None => base.get("scrollbar-grip").and_then(|v| yes_no(v)).unwrap_or(false),
+    };
+    if let Some(x) = number("scrollbar-width", 4.0, 14.0, None, &mut notes) {
+        theme.scrollbar_w = x;
+    }
+
     let text_of = |key: &str, max: usize| own.get(key).map(|(v, _)| v.trim().chars().take(max).collect::<String>().trim().to_string()).filter(|v| !v.is_empty());
     let name = text_of("name", MAX_NAME).unwrap_or_else(|| fallback_name.chars().take(MAX_NAME).collect());
     let description = text_of("description", MAX_DESCRIPTION).unwrap_or_default();
+    let twin = text_of("twin", MAX_NAME).unwrap_or_default();
     notes.sort_by_key(|n| n.line);
     notes.dedup();
-    Parsed { theme, name, description, notes }
+    Parsed { theme, name, description, twin, notes }
 }
 
 /// The word a skin's `logo-text` puts in the logo's box: at most MAX_LOGO_TEXT letters. GLINT for
@@ -581,9 +933,19 @@ fn parse_shape(v: &str) -> Option<Shape> {
     }
 }
 
-/// Dark unless the background the skin gives is light (only when it doesn't say).
+/// Dark unless the background the skin gives is light (only when it doesn't say). A gradient
+/// counts by its first colour.
 fn guess_dark(own: &HashMap<String, (String, usize)>) -> bool {
-    own.get("background").and_then(|(v, _)| parse_hex(v).or_else(|| parse_rgb(v))).is_none_or(|c| c.lightness() < 0.5)
+    let first = |v: &str| {
+        let part = split_commas(without_css_wrapper(v))[0].trim().to_string();
+        // Without its position ("#f4f7fb 0%").
+        let colour = match part.rsplit_once(char::is_whitespace) {
+            Some((c, pct)) if pct.ends_with('%') => c.trim().to_string(),
+            _ => part,
+        };
+        parse_hex(&colour).or_else(|| parse_rgb(&colour))
+    };
+    own.get("background").and_then(|(v, _)| first(v)).is_none_or(|c| c.lightness() < 0.5)
 }
 
 /// A list of fonts tidied: "\"A\", 'B',C" is "A, B, C" (at most MAX_FONTS, each name at most
@@ -609,6 +971,39 @@ pub fn built_in_theme(id: &str) -> Theme {
     static THEMES: OnceLock<Vec<(&'static str, Theme)>> = OnceLock::new();
     let all = THEMES.get_or_init(|| BUILT_IN.iter().map(|(id, text)| (*id, parse(text, id).theme)).collect());
     all.iter().find(|(i, _)| *i == id).or_else(|| all.first()).map(|(_, t)| t.clone()).unwrap_or_else(|| parse("", DEFAULT).theme)
+}
+
+/// Every colour in [`COLOURS`], in that order, as the skin with `text` makes it (as `parse` does:
+/// names followed, what it leaves out from its base skin or from [`DERIVED`]). With each, what it
+/// is written as when that is another colour's name ("accent", "accent 16%"), else None. For the
+/// customiser, which shows every colour, including those that follow another one.
+pub fn colours_of(text: &str) -> Vec<(Paint, Option<String>)> {
+    let mut notes = Vec::new();
+    let mut own: HashMap<String, (String, usize)> = HashMap::new();
+    for l in read_lines(text, &mut notes) {
+        if known_key(&l.key) {
+            own.insert(l.key, (l.value, l.number));
+        }
+    }
+    let dark = own.get("dark").and_then(|(v, _)| yes_no(v)).unwrap_or_else(|| guess_dark(&own));
+    let base_text = BUILT_IN.iter().find(|(id, _)| *id == if dark { DEFAULT } else { DEFAULT_LIGHT }).map_or("", |(_, t)| t);
+    let base: HashMap<String, String> = read_lines(base_text, &mut Vec::new()).into_iter().map(|l| (l.key, l.value)).collect();
+    let written: Vec<Option<String>> = COLOURS
+        .iter()
+        .map(|(key, _)| {
+            let v = own.get(*key).map(|(v, _)| v.clone()).or_else(|| base.get(*key).cloned()).or_else(|| DERIVED.iter().find(|(k, _)| k == key).map(|(_, v)| v.to_string()))?;
+            let v = v.trim();
+            // One name, maybe at a strength: "accent", "accent 16%".
+            let name = match v.rsplit_once(char::is_whitespace) {
+                Some((name, pct)) if pct.ends_with('%') && !v.contains(',') => name.trim(),
+                _ => v,
+            };
+            let name = normalize_key(name);
+            (name != *key && COLOURS.iter().any(|(k, _)| *k == name)).then(|| v.to_lowercase())
+        })
+        .collect();
+    let mut r = Resolver { base, own, done: HashMap::new(), busy: HashSet::new(), notes: &mut notes };
+    COLOURS.iter().zip(written).map(|((key, _), w)| (r.colour(key).unwrap_or(Paint::Flat(Color::hex(0x808080))), w)).collect()
 }
 
 // ---------------------------------------------------------------- changing a skin's text
@@ -650,8 +1045,10 @@ pub fn with_value(text: &str, key: &str, value: &str) -> String {
 pub fn copy_text(from: &str, name: &str, came_from: &str) -> String {
     let body: Vec<&str> = from.trim_start_matches('\u{feff}').lines().skip_while(|l| l.trim().is_empty() || l.trim_start().starts_with("//")).collect();
     let header = format!(
-        "// {name} - made from {came_from}.\r\n// One setting per line: \"name: value\". Colours are #rrggbb (#rrggbbaa: see-through).\r\n\r\n"
+        "// {name} - made from {came_from}.\r\n// One setting per line: \"name: value\". Colours are #rrggbb (#rrggbbaa: see-through),\r\n// or a gradient: #fdfdfd, #c3cddb 45%, #8d9db8 (top to bottom; left to right on tall things).\r\n\r\n"
     );
+    // A copy is a skin of its own: the original's other half isn't the copy's.
+    let body: Vec<&str> = body.into_iter().filter(|l| without_note(l).and_then(split_line).is_none_or(|(k, _)| normalize_key(k) != "twin")).collect();
     let text = format!("{header}{}\r\n", body.join("\r\n"));
     let text = with_value(&text, "name", name);
     // (The line about the skin it came from would say the wrong thing now.)
@@ -667,6 +1064,8 @@ pub struct Entry {
     pub name: String,
     pub description: String,
     pub dark: bool,
+    /// Its light or dark other half as its `twin` line names it ("" for none).
+    pub twin: String,
     pub text: String,
     /// The file (a person's own skin); None for a built-in one.
     pub file: Option<PathBuf>,
@@ -675,7 +1074,7 @@ pub struct Entry {
 impl Entry {
     fn new(id: String, text: String, file: Option<PathBuf>, fallback_name: &str) -> Entry {
         let p = parse(&text, fallback_name);
-        Entry { id, name: p.name, description: p.description, dark: p.theme.dark, text, file }
+        Entry { id, name: p.name, description: p.description, dark: p.theme.dark, twin: p.twin, text, file }
     }
 
     pub fn built_in(&self) -> bool {
@@ -814,12 +1213,20 @@ impl Library {
         }
     }
 
-    /// The id of `id`'s light (`dark` false) or dark version: the skin of the same kind (built in,
-    /// or the person's) called the same with or without " (Light)". `id` itself when there's none.
+    /// The id of `id`'s light (`dark` false) or dark version: the skin its `twin` line names (by id
+    /// or by name), or one whose `twin` line names it; else the skin of the same kind (built in, or
+    /// the person's) called the same with or without " (Light)". `id` itself when there's none.
     pub fn twin(&self, id: &str, dark: bool) -> String {
         let Some(e) = self.find(id) else { return id.to_string() };
         if e.dark == dark {
             return e.id.clone();
+        }
+        let named = |o: &Entry, by: &str| !by.is_empty() && (o.id.eq_ignore_ascii_case(by) || o.name.trim().eq_ignore_ascii_case(by));
+        if let Some(o) = self.entries.iter().find(|o| o.dark == dark && named(o, &e.twin)) {
+            return o.id.clone();
+        }
+        if let Some(o) = self.entries.iter().find(|o| o.dark == dark && named(e, &o.twin)) {
+            return o.id.clone();
         }
         let base = base_name(&e.name);
         let want = if dark { base.to_string() } else { format!("{base} (Light)") };
@@ -890,6 +1297,7 @@ impl Library {
         e.name = p.name;
         e.description = p.description;
         e.dark = p.theme.dark;
+        e.twin = p.twin;
         self.dirty.insert(id.to_string());
         self.generation += 1;
     }
@@ -1672,7 +2080,7 @@ mod tests {
         assert_eq!(lib.twin("nvidia", false), "nvidia-light", "a built-in pairs with a built-in");
         // Built-ins first, then the person's by name.
         let names: Vec<String> = lib.names().into_iter().map(|(_, n)| n).collect();
-        assert_eq!(names, ["AMD Radeon", "AMD Radeon (Light)", "NVIDIA", "NVIDIA (Light)", "Alone", "Moss", "Moss (Light)", "NVIDIA (Light)"]);
+        assert_eq!(names, ["AMD Radeon", "AMD Radeon (Light)", "NVIDIA", "NVIDIA (Light)", "Chrome", "Gunmetal", "Alone", "Moss", "Moss (Light)", "NVIDIA (Light)"]);
         assert_eq!(lib.free_name("Moss"), "Moss 2");
         assert_eq!(lib.free_name("New"), "New");
     }
@@ -1728,6 +2136,7 @@ mod tests {
         let pieces = [
             "accent", "background", "slant", "row-height", "font-size", "radius", "font", "name", "logo-text", ":", "=", " ", "%", "#", "//", "\n",
             "NaN", "inf", "-inf", "1e39", "-0", "999999999999", "rgb(", ")", ",", "accent 50%", "accent NaN%", "\u{feff}", "\u{1f600}", "\"", "'", "{", "}",
+            "title-bar", "#fff", "45%", "linear-gradient(", "to bottom", "buttons", "liquid", "twin", "scrollbar-width", "tabs", "pills",
         ];
         for _ in 0..400 {
             let mut text = String::new();
@@ -1739,6 +2148,10 @@ mod tests {
             let t = parse(&text, "fuzz").theme;
             assert!((0.0..=20.0).contains(&t.slant) && (0.0..=16.0).contains(&t.radius) && (20.0..=48.0).contains(&t.row_h), "{text:?}");
             assert!(t.font_size.is_finite() && t.accent.a.is_finite() && t.hover.a.is_finite() && t.accent_tint.a.is_finite(), "{text:?}");
+            assert!(t.titlebar.r.is_finite() && (4.0..=14.0).contains(&t.scrollbar_w), "{text:?}");
+            if let Some(g) = t.titlebar_paint.gradient() {
+                assert!(g.stops().windows(2).all(|s| s[0].at <= s[1].at) && g.stops().len() <= MAX_STOPS, "{text:?}");
+            }
             let _ = with_value(&text, "accent", "#123456");
         }
         // Huge values are cut down to size.
@@ -1748,6 +2161,198 @@ mod tests {
         assert!(p.theme.font.split(", ").count() <= MAX_FONTS);
         assert!(p.theme.accent_tint.a.is_finite(), "a strength that isn't a number is the standard one");
         assert!(p.notes.iter().any(|n| n.line == 4));
+    }
+
+    /// Every colour, shape and size of a theme that existed before paints and styles, as text.
+    fn old_fields(t: &Theme) -> String {
+        let h = hex_of;
+        format!(
+            "{} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {:?} {} {} {} {} {} {} {} {} {}",
+            t.dark, h(t.window), h(t.titlebar), h(t.toolbar), h(t.panel), h(t.sidebar), h(t.statusbar), h(t.input), h(t.chip), h(t.chip_hover),
+            h(t.text), h(t.text_strong), h(t.muted), h(t.disabled), h(t.accent), h(t.accent_tint), h(t.select_edge), h(t.on_accent), h(t.hover),
+            h(t.button_hover), h(t.button_pressed), h(t.crumb_hover), h(t.line), h(t.scroll_thumb), h(t.scroll_thumb_hover), h(t.bar_track),
+            h(t.logo), h(t.logo_ink), h(t.tab_line), h(t.toolbar_line), h(t.caption_hover), h(t.caption_pressed), h(t.close_hover),
+            t.shape, t.menus_dark, t.slant, t.path_slant, t.radius, t.row_h, t.tab_line_w, t.toolbar_line_w, t.font, t.font_size
+        )
+    }
+
+    #[test]
+    fn the_older_skins_look_exactly_as_they_did() {
+        // As the four skins read before gradients, the new colours and the styles existed.
+        let before = [
+            ("amd-radeon", "true #0e0e10 #0e0e10 #151517 #1b1b1e #0e0e10 #0e0e10 #0e0e10 #232327 #2c2c31 #e8e8ea #ffffff #8d8d96 #4a4a50 #e3262d #e3262d29 #e3262d #ffffff #202024 #232327 #2c2c31 #1b1b1e #2a2a2f #3a3a40 #4d4d55 #2a2a2f #e3262d #ffffff #e3262d #e3262d #232327 #2c2c31 #e3262d Slanted true 8 6 6 28 3 2 Segoe UI Variable Text, Segoe UI 12"),
+            ("amd-radeon-light", "false #e9e9ec #e9e9ec #f5f5f7 #ffffff #e9e9ec #e9e9ec #ffffff #e6e6ea #dcdce1 #1d1d1f #1d1d1f #6b6b73 #b8b8be #e3262d #e3262d1f #e3262d #ffffff #f3f3f5 #e6e6ea #dcdce1 #ededf0 #e0e0e4 #c6c6cc #a9a9b0 #dcdce1 #e3262d #ffffff #e3262d #e3262d #dcdce1 #dcdce1b3 #e3262d Slanted false 8 6 6 28 3 2 Segoe UI Variable Text, Segoe UI 12"),
+            ("nvidia", "true #0f0f0f #0f0f0f #1a1a1a #222222 #0f0f0f #0f0f0f #0f0f0f #2b2b2b #363636 #ffffff #ffffff #a3a3a3 #505050 #76b900 #76b90033 #76b900 #0f0f0f #2a2a2a #2b2b2b #363636 #222222 #333333 #3d3d3d #575757 #333333 #76b900 #0f0f0f #76b900 #2b2b2b #2b2b2b #363636 #76b900 Straight true 0 0 2 28 3 1 NVIDIA Sans, Segoe UI Variable Text, Segoe UI 12"),
+            ("nvidia-light", "false #e6e6e6 #e6e6e6 #f4f4f4 #ffffff #e6e6e6 #e6e6e6 #ffffff #e2e2e2 #d4d4d4 #1a1a1a #000000 #666666 #b3b3b3 #76b900 #76b9002e #76b900 #0f0f0f #f0f0f0 #e2e2e2 #d4d4d4 #ececec #dcdcdc #c4c4c4 #a6a6a6 #d4d4d4 #76b900 #0f0f0f #76b900 #dcdcdc #d4d4d4 #d4d4d4b3 #76b900 Straight false 0 0 2 28 3 1 NVIDIA Sans, Segoe UI Variable Text, Segoe UI 12"),
+        ];
+        for (id, want) in before {
+            let t = built_in_theme(id);
+            assert_eq!(old_fields(&t), want, "{id}");
+            // Every surface is its old colour, flat.
+            for (paint, colour) in [
+                (t.window_paint, t.window),
+                (t.titlebar_paint, t.titlebar),
+                (t.toolbar_paint, t.toolbar),
+                (t.panel_paint, t.panel),
+                (t.sidebar_paint, t.sidebar),
+                (t.statusbar_paint, t.statusbar),
+                (t.input_paint, t.input),
+                (t.chip_paint, t.chip),
+                (t.chip_hover_paint, t.chip_hover),
+                (t.accent_paint, t.accent),
+                (t.accent_tint_paint, t.accent_tint),
+                (t.hover_paint, t.hover),
+                (t.scroll_thumb_paint, t.scroll_thumb),
+                (t.scroll_thumb_hover_paint, t.scroll_thumb_hover),
+                (t.bar_track_paint, t.bar_track),
+                (t.logo_paint, t.logo),
+            ] {
+                assert_eq!(paint, Paint::Flat(colour), "{id}");
+            }
+            // The newer colours follow the ones the parts were drawn with before them.
+            assert_eq!((t.tab, t.tab_active), (Paint::CLEAR, t.toolbar_paint), "{id}");
+            assert_eq!((t.tab_text, t.tab_active_text, t.tab_border.a, t.highlight.a), (t.muted, t.text, 0.0, 0.0), "{id}");
+            assert_eq!((t.sidebar_panel, t.panel_header, t.panel_header_text), (t.panel_paint, t.toolbar_paint, t.muted), "{id}");
+            assert_eq!((t.sidebar_selection, t.sidebar_selection_text), (t.accent_tint_paint, t.text_strong), "{id}");
+            assert_eq!((t.list_header, t.list_header_text, t.column_line.a, t.status_text), (t.panel_paint, t.muted, 0.0, t.muted), "{id}");
+            assert_eq!(t.status_line.a, 0.0, "{id}");
+            assert_eq!((t.selection_text, t.selection_details, t.input_border.a, t.button_text), (t.text_strong, t.text, 0.0, t.text), "{id}");
+            assert_eq!((t.marble, t.marble_close, t.usage_fill), (Paint::Flat(t.muted), Paint::Flat(t.close_hover), t.accent_paint), "{id}");
+            assert!(t.scrollbar_track.is_clear() && t.scrollbar_border.a == 0.0 && t.scrollbar_grip_lines == t.muted, "{id}");
+            // And the styles are the ones Glint always had.
+            assert_eq!((t.buttons, t.caption_buttons, t.tabs, t.sidebar_style), (ButtonStyle::Flat, CaptionStyle::Symbols, TabStyle::Attached, SidebarStyle::Plain), "{id}");
+            assert_eq!((t.scrollbar_grip, t.scrollbar_w, t.scrollbar_margin()), (false, size::SCROLLBAR_W, size::SCROLLBAR_MARGIN), "{id}");
+        }
+        assert_eq!(Theme::dark(), built_in_theme(DEFAULT));
+        assert_eq!(Theme::light(), built_in_theme(DEFAULT_LIGHT));
+        // A skin of the person's that names none of the newer things looks like its base skin did.
+        let mine = parse("name: Mine\naccent: #3a7d44\ntoolbar: #202020\n", "x").theme;
+        assert_eq!((mine.tab_active, mine.usage_fill, mine.logo_paint), (Paint::Flat(Color::hex(0x202020)), Paint::Flat(Color::hex(0x3a7d44)), Paint::Flat(Color::hex(0x3a7d44))));
+    }
+
+    /// The stops of a paint, as (position in %, colour) - rounded so they compare plainly.
+    fn stops(p: Paint) -> Vec<(u32, String)> {
+        match p {
+            Paint::Flat(c) => vec![(0, hex_of(c))],
+            Paint::Gradient(g) => g.stops().iter().map(|s| ((s.at * 100.0).round() as u32, hex_of(s.color))).collect(),
+        }
+    }
+
+    #[test]
+    fn colours_can_be_gradients() {
+        let text = "title-bar: #fdfdfd, #c3cddb 45%, #8d9db8 55%, #dfe6f0\n\
+                    toolbar: #000, #888, #fff\n\
+                    panel: #000, #111 20%, #222, #333, #444 80%, #555\n\
+                    sidebar: linear-gradient(180deg, #ffffff 0%, #000000 100%);\n\
+                    status-bar: rgb(1, 2, 3), #ffffff\n\
+                    input: accent 50% 30%, #ffffff\n\
+                    hover: #000000 60%, #ffffff 20%\n\
+                    accent: #102030\n\
+                    button: title-bar\n\
+                    selection: toolbar 50%\n\
+                    tab-active: #ffffff, title-bar\n";
+        let p = parse(text, "x");
+        assert!(p.notes.is_empty(), "{:?}", p.notes);
+        let t = p.theme;
+        assert_eq!(stops(t.titlebar_paint), [(0, "#fdfdfd".into()), (45, "#c3cddb".into()), (55, "#8d9db8".into()), (100, "#dfe6f0".into())]);
+        // Without a %: spread evenly between their neighbours.
+        assert_eq!(stops(t.toolbar_paint).iter().map(|s| s.0).collect::<Vec<_>>(), [0, 50, 100]);
+        assert_eq!(stops(t.panel_paint).iter().map(|s| s.0).collect::<Vec<_>>(), [0, 20, 40, 60, 80, 100]);
+        // CSS's own way of writing it, its direction left out.
+        assert_eq!(stops(t.sidebar_paint), [(0, "#ffffff".into()), (100, "#000000".into())]);
+        assert_eq!(stops(t.statusbar_paint)[0], (0, "#010203".into()));
+        // A strength, then the position.
+        assert_eq!(stops(t.input_paint)[0], (30, "#10203080".into()));
+        // A position before an earlier one moves up to it.
+        assert_eq!(stops(t.hover_paint).iter().map(|s| s.0).collect::<Vec<_>>(), [60, 60]);
+        // A name stands for the whole gradient (at a strength too); inside a gradient, for its one colour.
+        assert_eq!(t.chip_paint, t.titlebar_paint);
+        assert_eq!(t.accent_tint_paint, t.toolbar_paint.with_strength(0.5));
+        assert_eq!(stops(t.tab_active)[1], (100, hex_of(t.titlebar_paint.base())));
+        // The colour that stands for a gradient: its average along its length.
+        assert_eq!(t.titlebar, t.titlebar_paint.base());
+        assert_eq!(hex_of(t.toolbar), "#848484", "a quarter black, half #888, a quarter white");
+        assert_eq!(hex_of(Paint::even(&[Color::hex(0), Color::hex(0xffffff)]).base()), "#808080");
+        assert_eq!(Paint::from(Color::hex(0x123456)).base(), Color::hex(0x123456));
+        // A gradient on the background is light or dark by its first colour.
+        assert!(!parse("background: #f4f7fb, #cfd8e6", "x").theme.dark);
+        assert!(parse("background: #101010 0%, #f0f0f0", "x").theme.dark);
+    }
+
+    #[test]
+    fn bad_gradient_colours_are_noted_and_fall_back_to_a_flat_colour() {
+        let text = "title-bar: #fdfdfd, wobble, #000000\n\
+                    toolbar: #ffffff, #000000 5x%\n\
+                    panel: wobble, nope\n\
+                    hover: #ffffff,,#000000\n\
+                    sidebar: #000, #111, #222, #333, #444, #555, #666, #777, #888, #999\n";
+        let p = parse(text, "x");
+        let lines: Vec<usize> = p.notes.iter().map(|n| n.line).collect();
+        assert_eq!(lines, [1, 2, 3, 4, 5], "{:?}", p.notes);
+        let t = p.theme;
+        assert_eq!(t.titlebar_paint, Paint::Flat(Color::hex(0xfdfdfd)), "its first good colour, flat");
+        assert!(p.notes[0].text.contains("wobble") && p.notes[0].text.contains("#fdfdfd"), "{}", p.notes[0].text);
+        assert_eq!(t.toolbar_paint, Paint::Flat(Color::hex(0xffffff)));
+        assert!(p.notes[1].text.contains("5x%"), "{}", p.notes[1].text);
+        assert_eq!(t.panel_paint, built_in_theme(DEFAULT).panel_paint, "no good colour at all: the standard one");
+        assert_eq!(t.hover_paint, Paint::Flat(Color::hex(0xffffff)));
+        assert_eq!(stops(t.sidebar_paint).len(), MAX_STOPS, "at most 8 colours, the rest left out");
+        // Styles that aren't one of their words are noted too.
+        let p = parse("buttons: wobbly\ntabs: pill\nsidebar-style: PANELS\ncaption-buttons: 3\nscrollbar-grip: maybe\nscrollbar-width: 40\n", "x");
+        let lines: Vec<usize> = p.notes.iter().map(|n| n.line).collect();
+        assert_eq!(lines, [1, 4, 5, 6], "{:?}", p.notes);
+        assert_eq!((p.theme.buttons, p.theme.tabs, p.theme.sidebar_style, p.theme.caption_buttons), (ButtonStyle::Flat, TabStyle::Pills, SidebarStyle::Panels, CaptionStyle::Symbols));
+        assert_eq!((p.theme.scrollbar_grip, p.theme.scrollbar_w), (false, 14.0));
+    }
+
+    #[test]
+    fn chrome_and_gunmetal_are_liquid_chrome_and_a_pair() {
+        for (id, dark) in [("chrome", false), ("gunmetal", true)] {
+            let text = BUILT_IN.iter().find(|(i, _)| *i == id).unwrap().1;
+            let p = parse(text, id);
+            assert!(p.notes.is_empty(), "{id}: {:?}", p.notes);
+            let t = p.theme;
+            assert_eq!(t.dark, dark, "{id}");
+            assert_eq!((t.buttons, t.caption_buttons, t.tabs, t.sidebar_style), (ButtonStyle::Liquid, CaptionStyle::Marbles, TabStyle::Pills, SidebarStyle::Panels), "{id}");
+            assert!(t.scrollbar_grip && t.scrollbar_w > size::SCROLLBAR_W && !t.scrollbar_track.is_clear(), "{id}");
+            assert_eq!((t.shape, t.radius, t.font.as_str(), t.font_size), (Shape::Rounded, 10.0, "Verdana, Tahoma, Segoe UI", 8.0 * PT), "{id}");
+            for paint in [t.titlebar_paint, t.toolbar_paint, t.sidebar_paint, t.chip_paint, t.marble, t.marble_close, t.scroll_thumb_paint, t.scrollbar_track, t.list_header, t.panel_header] {
+                assert!(paint.gradient().is_some(), "{id}: {paint:?}");
+            }
+            assert_eq!(t.select_edge.a, 0.0, "{id}: no edge on selected rows");
+        }
+        let chrome = built_in_theme("chrome");
+        assert_eq!(stops(chrome.titlebar_paint), [(0, "#fdfdfd".into()), (45, "#c3cddb".into()), (55, "#8d9db8".into()), (100, "#dfe6f0".into())]);
+        assert_eq!((chrome.accent, chrome.text, chrome.button_text), (Color::hex(0x5a82c8), Color::hex(0x112233), Color::hex(0xffffff)));
+        let lib = Library::new();
+        let chrome = lib.find("chrome").unwrap();
+        assert_eq!((chrome.name.as_str(), chrome.description.as_str()), ("Chrome", "Year 2000 chrome: shiny silver-blue, liquid buttons"));
+        let gunmetal = lib.find("gunmetal").unwrap();
+        assert_eq!((gunmetal.name.as_str(), gunmetal.description.as_str()), ("Gunmetal", "Year 2000 chrome in dark gunmetal, liquid buttons"));
+    }
+
+    #[test]
+    fn twins_named_in_the_skin_pair_up() {
+        let mut lib = Library::new();
+        assert_eq!(lib.twin("chrome", true), "gunmetal");
+        assert_eq!(lib.twin("gunmetal", false), "chrome");
+        assert_eq!(lib.twin("chrome", false), "chrome");
+        assert_eq!(lib.twin(DEFAULT, false), DEFAULT_LIGHT, "names still pair up");
+        // The person's own: by id or by name, and one named by the other half works both ways.
+        lib.add_for_tests("file:Dusk", "name: Dusk\ndark: true\ntwin: Morning glow\n");
+        lib.add_for_tests("file:Morning glow", "name: Morning glow\ndark: false\n");
+        lib.add_for_tests("file:Night", "name: Night\ndark: true\ntwin: chrome\n");
+        lib.add_for_tests("file:Wrong", "name: Wrong\ndark: true\ntwin: gunmetal\n");
+        assert_eq!(lib.twin("file:Dusk", false), "file:Morning glow");
+        assert_eq!(lib.twin("file:Morning glow", true), "file:Dusk");
+        assert_eq!(lib.twin("file:Night", false), "chrome");
+        assert_eq!(lib.twin("file:Wrong", false), "file:Wrong", "a twin that's dark too isn't the light version");
+        // A copy is a skin of its own: it doesn't take the original's other half.
+        let copy = copy_text(BUILT_IN[4].1, "My chrome", "Chrome");
+        let p = parse(&copy, "x");
+        assert!(p.notes.is_empty(), "{:?}", p.notes);
+        assert_eq!((p.twin.as_str(), p.name.as_str()), ("", "My chrome"));
+        assert_eq!(p.theme, built_in_theme("chrome"));
     }
 
     #[test]
@@ -1792,5 +2397,29 @@ mod tests {
         assert!(!lib.free_for(at, "Huge") && !lib.free_for(at, "taken"));
         assert_eq!(lib.rename(&lib.entries()[at].id.clone(), "Huge"), None, "refused before anything is queued");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_colour_is_listed_as_the_skin_makes_it() {
+        let at = |key: &str| COLOURS.iter().position(|(k, _)| *k == key).unwrap();
+        // The same colours as the look the skin makes.
+        let chrome = BUILT_IN.iter().find(|(id, _)| *id == "chrome").unwrap().1;
+        let all = colours_of(chrome);
+        let theme = built_in_theme("chrome");
+        assert_eq!(all.len(), COLOURS.len());
+        assert_eq!(all[at("title-bar")], (theme.titlebar_paint, None));
+        assert_eq!(all[at("marble-close")].0, theme.marble_close);
+        assert_eq!(all[at("accent")].0, theme.accent_paint);
+        // A colour that names another follows it, and says so; one left out follows its base
+        // skin's line or the colour it came after.
+        assert_eq!(all[at("tab-line")], (theme.accent_paint, Some("accent".to_string())));
+        let mine = colours_of("dark: true\naccent: #102030\nselection: Accent 20%\n");
+        assert_eq!(mine[at("selection")].1.as_deref(), Some("accent 20%"));
+        assert_eq!(mine[at("selection")].0, Paint::Flat(Color::hex(0x102030).with_alpha(0.2)));
+        assert_eq!(mine[at("title-bar")].1.as_deref(), Some("background"));
+        assert_eq!(mine[at("tab-active")].1.as_deref(), Some("toolbar"));
+        assert_eq!(mine[at("accent")].1, None);
+        // Gradients and plain colours don't follow anything.
+        assert_eq!(mine[at("panel")].1, None);
     }
 }

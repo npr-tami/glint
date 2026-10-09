@@ -1,0 +1,88 @@
+// Gunmetal - year 2000 chrome in dark gunmetal: dark brushed bars, glossy liquid buttons, glass
+// marbles for minimise, maximise and close, rounded tabs and sidebar panels. Its light other half
+// is Chrome.
+// (How skins are written: see the top of AMD Radeon; gradients: see Chrome.)
+
+name: Gunmetal
+description: Year 2000 chrome in dark gunmetal, liquid buttons
+dark: true
+twin: chrome
+
+// ---- colours
+accent: #84a6e0
+accent-text: #ffffff
+background: #2a303a, #1c2028
+title-bar: #6a7588, #3c4556 45%, #2a3140 55%, #4a5466
+toolbar: #2a303a, #1c2028
+panel: #181c23
+sidebar: #262d38, #1c222c
+status-bar: #2a303a, #1c2028
+input: #12151b, #181c23
+input-border: #3c4556
+button: #dde6f5, #7088b0 45%, #2d3f63         // the liquid glass: light point, body, rim
+button-hover: #eef3fb, #8299c0 45%, #3a4e76
+button-text: #ffffff
+text: #e6e8ee
+text-bright: #dde6f5
+muted: #9aa0ad
+disabled: #4f5866
+selection: #4a6fb0, #2f4f8a
+selection-text: #ffffff
+selection-edge: none
+sidebar-selection: #4a6fb0, #2f4f8a
+sidebar-selection-text: #ffffff
+hover: #222731
+tool-hover: #333a46
+tool-pressed: #3c4556
+path-hover: #222833
+line: #343b48
+scrollbar: #6a7588, #3c4556 45%, #2a3140 55%, #4a5466
+scrollbar-hover: #7a869a, #4a5466 45%, #343c4c 55%, #5a6578
+scrollbar-track: #101318, #161a20 40%, #1a1e25
+scrollbar-border: #7a869a
+scrollbar-grip-lines: #b8c4d8
+usage-bar: #101318, #1a1e25
+usage-fill: #4a6fb0, #2f4f8a
+logo: #4a6fb0, #2f4f8a
+logo-letters: #ffffff
+tab: #333a46, #262c36
+tab-active: #4a5466, #333a46
+tab-text: #aab0bc
+tab-active-text: #ffffff
+tab-border: #4f5a6e
+tab-line: accent
+highlight: #ffffff38
+toolbar-line: #343b48
+sidebar-panel: #232a35
+panel-header: #4a5466, #2a3140
+panel-header-text: #dde6f5
+list-header: #222833, #181c23
+list-header-text: #9aa0ad
+column-line: #2a303a
+status-text: #9aa0ad
+status-line: #343b48
+marble: #ffffff, #8095bd 45%, #2d3f63
+marble-close: #ffffff, #d6889a 45%, #7a2233
+caption-hover: #ffffff1f
+caption-pressed: #ffffff14
+close-hover: #7a2233
+menus: dark
+
+// ---- shapes and text
+shape: rounded
+slant: 0
+path-slant: 0
+radius: 10
+row-height: 26
+tab-line-width: 0
+toolbar-line-width: 1
+font: Verdana, Tahoma, Segoe UI
+font-size: 8pt
+
+// ---- styles
+buttons: liquid
+caption-buttons: marbles
+tabs: pills
+sidebar-style: panels
+scrollbar-grip: true
+scrollbar-width: 11

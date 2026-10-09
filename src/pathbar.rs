@@ -2,9 +2,11 @@
 //! This PC › Local Disk (C:) › Users › Downloads.
 //!
 //! Earlier steps are muted text that gets a box when the mouse is over it; the folder you're in sits
-//! in a slanted box (a parallelogram, like the GLINT logo's cut) in lighter text. When the steps don't
-//! fit, the earliest ones make way for "…", which lists them in a popup. The empty part on the right
-//! is for typing: a click there (or Ctrl+L / F4) swaps the steps for a text box (see toolbar.rs).
+//! in a slanted box (a parallelogram, like the GLINT logo's cut) in lighter text. (With `buttons:
+//! liquid` the steps are in the normal text colour and the folder you're in is bold, without a box.)
+//! When the steps don't fit, the earliest ones make way for "…", which lists them in a popup. The
+//! empty part on the right is for typing: a click there (or Ctrl+L / F4) swaps the steps for a text
+//! box (see toolbar.rs).
 //!
 //! The path is only split as text - the disk is never asked - so this is instant. Measuring the
 //! names is done only when the steps or the width change, not on every frame.
@@ -14,7 +16,7 @@
 
 use crate::app::AppState;
 use crate::render::{Renderer, TextStyle};
-use crate::theme::{size, Color, Theme};
+use crate::theme::{size, ButtonStyle, Color, Paint, Stop, Theme};
 use crate::ui::{Point, Rect};
 
 /// Room around a step's name. (How far the folder-you're-in box leans comes from the skin:
@@ -46,8 +48,9 @@ pub struct Crumb {
 }
 
 /// What a layout of the steps was made for: the steps (name, path), where the bar sits, how far the
-/// folder-you're-in box leans and the font (the last two are the skin's).
-type LaidOut = (Vec<(String, String)>, Rect, f32, u32);
+/// folder-you're-in box leans, the font and whether the folder you're in is bold (the last three
+/// are the skin's).
+type LaidOut = (Vec<(String, String)>, Rect, f32, u32, bool);
 
 /// What is under a point of the path bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,8 +113,9 @@ impl PathBar {
         let steps = app.path_steps(&app.tab().path);
         let lean = app.theme.path_lean();
         let font = r.font_generation();
-        if let Some((s, at, l, f)) = &self.laid_out {
-            if *s == steps && *at == self.rect && *l == lean && *f == font {
+        let bold = app.theme.buttons == ButtonStyle::Liquid;
+        if let Some((s, at, l, f, b)) = &self.laid_out {
+            if *s == steps && *at == self.rect && *l == lean && *f == font && *b == bold {
                 return;
             }
         }
@@ -128,7 +132,10 @@ impl PathBar {
         let mut widths: Vec<f32> = steps
             .iter()
             .enumerate()
-            .map(|(i, (name, _))| r.measure(name, &style).min(MAX_NAME).ceil() + 2.0 * PAD + if i == last { 2.0 * lean } else { 0.0 })
+            .map(|(i, (name, _))| {
+                let style = if i == last && bold { style.bold() } else { style };
+                r.measure(name, &style).min(MAX_NAME).ceil() + 2.0 * PAD + if i == last { 2.0 * lean } else { 0.0 }
+            })
             .collect();
         let total = |from: usize, widths: &[f32]| -> f32 {
             let mut t = if from > 0 { MORE_W + SEP_W } else { 0.0 };
@@ -157,13 +164,13 @@ impl PathBar {
             x += widths[i] + if i < last { SEP_W } else { 0.0 };
         }
         self.end = x;
-        self.laid_out = Some((steps, self.rect, lean, font));
+        self.laid_out = Some((steps, self.rect, lean, font, bold));
     }
 
     /// Draws the box and (unless `editing`, when a text box sits on top) the steps.
     /// `mouse` is where the mouse is, if it is over the bar.
     pub fn paint(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState, editing: bool, mouse: Option<Point>) {
-        r.fill_rect(self.rect, theme.input);
+        fill_field(r, theme, self.rect);
         if editing {
             return;
         }
@@ -172,16 +179,28 @@ impl PathBar {
             Some(PathHit::Step(i)) => Some(i),
             _ => None,
         };
-        let style = TextStyle::new(theme.muted);
+        // With liquid buttons the folder you're in is bold text rather than a button of glass, and
+        // the steps before it are in the normal text colour.
+        let liquid = theme.buttons == ButtonStyle::Liquid;
+        let step_color = if liquid { theme.text } else { theme.muted };
+        let style = TextStyle::new(step_color);
         let lean = theme.path_lean();
         r.push_clip(self.rect);
         for (i, c) in self.crumbs.iter().enumerate() {
             let dropping = !c.more && self.drop_path.as_deref() == Some(c.path.as_str());
             let hot = hover == Some(i) || dropping;
-            let mut color = theme.muted;
+            let mut color = step_color;
             let mut inset = PAD;
-            if c.current {
-                fill_box(r, theme, c.rect, lean, if hot { theme.chip_hover } else { theme.chip });
+            let mut style = style;
+            if c.current && liquid {
+                if hot {
+                    fill_box(r, theme, c.rect, lean, theme.crumb_hover);
+                }
+                color = theme.text_strong;
+                style = style.bold();
+                inset = PAD + lean;
+            } else if c.current {
+                fill_box_paint(r, theme, c.rect, lean, if hot { &theme.chip_hover_paint } else { &theme.chip_paint });
                 color = theme.text_strong;
                 inset = PAD + lean;
             } else if hot {
@@ -242,6 +261,45 @@ pub fn fill_box(r: &mut Renderer, theme: &Theme, rect: Rect, lean: f32, color: C
     } else {
         r.fill_rect(rect, color);
     }
+}
+
+/// Fills a box in the skin's shape, as `fill_box`, with a paint (a gradient runs across the box's
+/// short side).
+pub fn fill_box_paint(r: &mut Renderer, theme: &Theme, rect: Rect, lean: f32, paint: &Paint) {
+    if lean > 0.0 {
+        let (top, bottom) = (r.snap(rect.y), r.snap(rect.bottom()));
+        r.fill_polygon_paint(&slanted_points(Rect::new(rect.x, top, rect.w, bottom - top), lean), paint);
+    } else {
+        r.fill_paint(rect, theme.corner(rect.h), paint);
+    }
+}
+
+/// A text field of the main window (the path, the filter box): the skin's `input` paint, round
+/// corners in a rounded skin, and its `input-border` edge if it has one.
+pub fn fill_field(r: &mut Renderer, theme: &Theme, rect: Rect) {
+    let radius = theme.corner(rect.h);
+    r.fill_paint(rect, radius, &field_paint(&theme.input_paint));
+    if theme.input_border.a > 0.0 {
+        // A faint shade along the inside of the top edge: the field sits below the surface.
+        r.fill_rect(Rect::new(rect.x + radius * 0.7, rect.y + 1.0, (rect.w - 1.4 * radius).max(0.0), 1.0), Color::rgba(0, 0, 0, 0.07));
+        r.stroke_round_rect(rect.inset(0.5, 0.5), (radius - 0.5).max(0.0), 1.0, theme.input_border);
+    }
+}
+
+/// A field's paint: a gradient keeps its first and last colours at the top and bottom but holds
+/// the field's one colour (`Paint::base`, which Windows' text box in it is painted with) across the
+/// middle, where the text box sits, so the box doesn't show as a patch.
+fn field_paint(paint: &Paint) -> Paint {
+    if paint.gradient().is_none() {
+        return *paint;
+    }
+    let mid = paint.base();
+    Paint::from_stops(&[
+        Stop { at: 0.0, color: paint.first() },
+        Stop { at: 0.2, color: mid },
+        Stop { at: 0.8, color: mid },
+        Stop { at: 1.0, color: paint.last() },
+    ])
 }
 
 /// The outline of such a box, `width` DIPs thick (focus rings, frames).

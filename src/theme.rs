@@ -52,6 +52,274 @@ impl Color {
     pub fn lightness(self) -> f32 {
         0.2126 * self.r + 0.7152 * self.g + 0.0722 * self.b
     }
+
+    /// `t` of the way from this colour to `other` (0: this one, 1: the other), opacity too.
+    pub fn mix(self, other: Color, t: f32) -> Color {
+        let t = if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.0 };
+        let m = |a: f32, b: f32| a + (b - a) * t;
+        Color { r: m(self.r, other.r), g: m(self.g, other.g), b: m(self.b, other.b), a: m(self.a, other.a) }
+    }
+
+    /// Lighter: `t` of the way to white, keeping its opacity.
+    pub fn lighter(self, t: f32) -> Color {
+        self.mix(Color { a: self.a, ..Color::hex(0xffffff) }, t)
+    }
+
+    /// Darker: `t` of the way to black, keeping its opacity.
+    pub fn darker(self, t: f32) -> Color {
+        self.mix(Color { a: self.a, ..Color::hex(0) }, t)
+    }
+
+    /// The grey of the same lightness (a disabled button's marble).
+    #[allow(dead_code)]
+    pub fn grey(self) -> Color {
+        let l = self.lightness();
+        Color { r: l, g: l, b: l, a: self.a }
+    }
+}
+
+/// The most colours a gradient has.
+pub const MAX_STOPS: usize = 8;
+
+/// One colour of a gradient and where it sits along it: 0 at the start, 1 at the end.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Stop {
+    pub at: f32,
+    pub color: Color,
+}
+
+/// A gradient of 2 to `MAX_STOPS` colours, their positions in order from 0 to 1. Kept in a fixed
+/// array, so a paint is a plain value: copying one or keeping it in a `Theme` never allocates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Gradient {
+    stops: [Stop; MAX_STOPS],
+    len: u8,
+}
+
+impl Gradient {
+    /// From `stops` (at most `MAX_STOPS` are kept): positions are kept between 0 and 1 and never
+    /// go back (one before the stop ahead of it moves up to it, as in CSS). None for fewer than two.
+    pub fn new(stops: &[Stop]) -> Option<Gradient> {
+        if stops.len() < 2 {
+            return None;
+        }
+        let mut g = Gradient { stops: [Stop { at: 0.0, color: Color::rgba(0, 0, 0, 0.0) }; MAX_STOPS], len: 0 };
+        let mut last = 0.0f32;
+        for s in stops.iter().take(MAX_STOPS) {
+            let at = if s.at.is_finite() { s.at.clamp(0.0, 1.0) } else { last };
+            last = at.max(last);
+            g.stops[g.len as usize] = Stop { at: last, color: s.color };
+            g.len += 1;
+        }
+        Some(g)
+    }
+
+    /// The stops, first to last.
+    pub fn stops(&self) -> &[Stop] {
+        &self.stops[..self.len as usize]
+    }
+
+    /// The colour at `t` (0 to 1) along the gradient; before the first stop the first colour,
+    /// after the last the last one.
+    pub fn color_at(&self, t: f32) -> Color {
+        let stops = self.stops();
+        let (first, last) = (stops[0], stops[stops.len() - 1]);
+        if t <= first.at {
+            return first.color;
+        }
+        for pair in stops.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            if t <= b.at {
+                let span = b.at - a.at;
+                return if span <= 0.0 { b.color } else { a.color.mix(b.color, (t - a.at) / span) };
+            }
+        }
+        last.color
+    }
+
+    /// The same gradient with every colour changed by `f`.
+    fn map(mut self, f: impl Fn(Color) -> Color) -> Gradient {
+        for s in &mut self.stops[..self.len as usize] {
+            s.color = f(s.color);
+        }
+        self
+    }
+}
+
+/// What a surface is filled with: one colour, or a gradient (skin.rs: any colour a skin sets can
+/// be written as a gradient). Draw one with `Renderer::fill_paint`.
+///
+/// A gradient runs across the short side of the shape it fills: top to bottom on a wide shape (a
+/// bar, a button, a row), left to right on a tall one (a vertical scrollbar's thumb). So one paint
+/// looks right on a title bar and on a scrollbar alike.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Paint {
+    Flat(Color),
+    Gradient(Gradient),
+}
+
+impl Default for Paint {
+    fn default() -> Paint {
+        Paint::CLEAR
+    }
+}
+
+impl From<Color> for Paint {
+    fn from(c: Color) -> Paint {
+        Paint::Flat(c)
+    }
+}
+
+// (Not every part draws with all of these yet.)
+#[allow(dead_code)]
+impl Paint {
+    /// Nothing: a fill with it draws nothing.
+    pub const CLEAR: Paint = Paint::Flat(Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 });
+
+    /// A gradient of `colors` spread evenly from start to end (one colour: that colour, flat).
+    pub fn even(colors: &[Color]) -> Paint {
+        let n = colors.len().min(MAX_STOPS);
+        let mut stops = [Stop { at: 0.0, color: Color::rgba(0, 0, 0, 0.0) }; MAX_STOPS];
+        for (i, c) in colors.iter().take(n).enumerate() {
+            stops[i] = Stop { at: if n > 1 { i as f32 / (n - 1) as f32 } else { 0.0 }, color: *c };
+        }
+        Paint::from_stops(&stops[..n])
+    }
+
+    /// A gradient of `stops`; fewer than two stops make a flat paint of the one colour (or nothing).
+    pub fn from_stops(stops: &[Stop]) -> Paint {
+        match Gradient::new(stops) {
+            Some(g) => Paint::Gradient(g),
+            None => stops.first().map_or(Paint::CLEAR, |s| Paint::Flat(s.color)),
+        }
+    }
+
+    /// One colour that stands for the paint, for code that needs a single colour (a Windows text
+    /// box's background, telling whether text on it should be light or dark): the colour itself,
+    /// or a gradient's average along its length.
+    pub fn base(&self) -> Color {
+        let g = match self {
+            Paint::Flat(c) => return *c,
+            Paint::Gradient(g) => g,
+        };
+        let stops = g.stops();
+        let (first, last) = (stops[0], stops[stops.len() - 1]);
+        // The ends hold their colours out to 0 and 1; each span between stops counts by its length.
+        let mut sum = [0.0f32; 4];
+        let mut add = |c: Color, w: f32| {
+            sum[0] += c.r * w;
+            sum[1] += c.g * w;
+            sum[2] += c.b * w;
+            sum[3] += c.a * w;
+        };
+        add(first.color, first.at);
+        add(last.color, 1.0 - last.at);
+        for pair in stops.windows(2) {
+            let w = pair[1].at - pair[0].at;
+            add(pair[0].color.mix(pair[1].color, 0.5), w);
+        }
+        Color { r: sum[0], g: sum[1], b: sum[2], a: sum[3] }
+    }
+
+    /// The gradient, if it is one.
+    pub fn gradient(&self) -> Option<&Gradient> {
+        match self {
+            Paint::Flat(_) => None,
+            Paint::Gradient(g) => Some(g),
+        }
+    }
+
+    /// The colour at the start (top or left) and at the end (bottom or right).
+    pub fn first(&self) -> Color {
+        match self {
+            Paint::Flat(c) => *c,
+            Paint::Gradient(g) => g.stops()[0].color,
+        }
+    }
+    pub fn last(&self) -> Color {
+        match self {
+            Paint::Flat(c) => *c,
+            Paint::Gradient(g) => g.stops()[g.stops().len() - 1].color,
+        }
+    }
+
+    /// The colour at `t` (0 to 1) along it.
+    pub fn color_at(&self, t: f32) -> Color {
+        match self {
+            Paint::Flat(c) => *c,
+            Paint::Gradient(g) => g.color_at(t),
+        }
+    }
+
+    /// Whether filling with it shows nothing (every colour fully see-through).
+    pub fn is_clear(&self) -> bool {
+        match self {
+            Paint::Flat(c) => c.a <= 0.0,
+            Paint::Gradient(g) => g.stops().iter().all(|s| s.color.a <= 0.0),
+        }
+    }
+
+    /// The same paint with every colour changed by `f`.
+    pub fn map(self, f: impl Fn(Color) -> Color) -> Paint {
+        match self {
+            Paint::Flat(c) => Paint::Flat(f(c)),
+            Paint::Gradient(g) => Paint::Gradient(g.map(f)),
+        }
+    }
+
+    /// At a strength: every colour's opacity times `s` (a skin's "accent 16%").
+    pub fn with_strength(self, s: f32) -> Paint {
+        self.map(|c| c.with_alpha(c.a * s))
+    }
+
+    /// Lighter or darker by `t` (0 to 1) - a button under the mouse, or pressed.
+    pub fn lighter(self, t: f32) -> Paint {
+        self.map(|c| c.lighter(t))
+    }
+    pub fn darker(self, t: f32) -> Paint {
+        self.map(|c| c.darker(t))
+    }
+}
+
+/// How the toolbar's buttons look: the skin's `buttons`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ButtonStyle {
+    /// Signs on the toolbar, boxes in the skin's shape for SORT, VIEW and SETTINGS.
+    #[default]
+    Flat,
+    /// Glossy glass: round marbles with white signs for back, forward, up and refresh, shiny
+    /// capsules with white words for SORT, VIEW and SETTINGS (the `button` paint).
+    Liquid,
+}
+
+/// How minimise, maximise and close look: the skin's `caption-buttons`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CaptionStyle {
+    /// Windows' signs (_, a square, ×) on a plain button.
+    #[default]
+    Symbols,
+    /// Three small glass marbles without signs; close in its own colour (`marble-close`).
+    Marbles,
+}
+
+/// How the tabs sit in the title bar: the skin's `tabs`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TabStyle {
+    /// The current tab runs into the toolbar below it; the others are just their names.
+    #[default]
+    Attached,
+    /// Every tab a rounded box of its own with an edge, inside the title bar.
+    Pills,
+}
+
+/// How the sidebar is laid out: the skin's `sidebar-style`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SidebarStyle {
+    /// Headings and places straight on the sidebar.
+    #[default]
+    Plain,
+    /// Each group (Quick access, Pinned, This PC) in a rounded panel with a header bar.
+    Panels,
 }
 
 /// How the skin cuts buttons and boxes (SORT, SETTINGS, the folder you're in, a logo word's box, the
@@ -153,6 +421,90 @@ pub struct Theme {
     /// What the title bars show at the left (the "Logo" setting; not part of a skin).
     pub logo_style: crate::settings::LogoStyle,
     pub logo_text: String,
+
+    // ---- Paints. What the surfaces above are filled with: a flat colour in most skins, a gradient
+    // in some. The colour fields above keep the paint's one colour (`Paint::base`) for code that
+    // needs a single colour; drawing a surface should use its paint.
+    /// `window` (the skin's `background`).
+    pub window_paint: Paint,
+    pub titlebar_paint: Paint,
+    pub toolbar_paint: Paint,
+    pub panel_paint: Paint,
+    pub sidebar_paint: Paint,
+    pub statusbar_paint: Paint,
+    /// `input`: the path and filter boxes (Glint's own windows' text boxes too).
+    pub input_paint: Paint,
+    /// `chip` and `chip_hover`: the skin's `button` and `button-hover` (with `buttons: liquid`,
+    /// the glass of the toolbar's marbles and capsules).
+    pub chip_paint: Paint,
+    pub chip_hover_paint: Paint,
+    pub accent_paint: Paint,
+    /// `accent_tint`: selected rows.
+    pub accent_tint_paint: Paint,
+    pub hover_paint: Paint,
+    pub scroll_thumb_paint: Paint,
+    pub scroll_thumb_hover_paint: Paint,
+    /// `bar_track`: behind a drive's usage bar.
+    pub bar_track_paint: Paint,
+    pub logo_paint: Paint,
+
+    // ---- More surfaces. Each one follows an older colour unless the skin sets it, so a skin that
+    // doesn't know about them looks as it always did.
+    /// Tabs other than the current one (clear: just their names), and the current one (the
+    /// toolbar's paint). Their names, and a thin edge round each tab (`tabs: pills`).
+    pub tab: Paint,
+    pub tab_active: Paint,
+    pub tab_text: Color,
+    pub tab_active_text: Color,
+    pub tab_border: Color,
+    /// A thin light line along the top of the title bar, the tabs and the sidebar's panel headers
+    /// (clear: none) - the shine on a polished edge.
+    pub highlight: Color,
+    /// The sidebar's panels and their header bars (`sidebar-style: panels`); the header's text is
+    /// also the colour of the plain sidebar's headings.
+    pub sidebar_panel: Paint,
+    pub panel_header: Paint,
+    pub panel_header_text: Color,
+    /// The place you're in, in the sidebar, and its name.
+    pub sidebar_selection: Paint,
+    pub sidebar_selection_text: Color,
+    /// The file list's band of column titles, their text, and the lines between the titles (clear:
+    /// none).
+    pub list_header: Paint,
+    pub list_header_text: Color,
+    pub column_line: Color,
+    /// The status bar's text, and a line along its top (clear: none).
+    pub status_text: Color,
+    pub status_line: Color,
+    /// Names on selected rows (`text_strong` unless the skin sets `selection-text`), and the
+    /// other columns of a selected row (`text` unless the skin sets `selection-text`).
+    pub selection_text: Color,
+    pub selection_details: Color,
+    /// The edge of the path and filter boxes (clear: none).
+    pub input_border: Color,
+    /// Words and signs on buttons (SORT, VIEW, SETTINGS; with `buttons: liquid`, the toolbar's
+    /// signs too).
+    pub button_text: Color,
+    /// The caption marbles (`caption-buttons: marbles`): minimise and maximise, and close.
+    pub marble: Paint,
+    pub marble_close: Paint,
+    /// The used part of a drive's usage bar.
+    pub usage_fill: Paint,
+    /// Behind a scrollbar's thumb (clear: nothing), the thumb's edge (clear: none), and the colour
+    /// of its grip lines (`scrollbar_grip`).
+    pub scrollbar_track: Paint,
+    pub scrollbar_border: Color,
+    pub scrollbar_grip_lines: Color,
+
+    // ---- Styles.
+    pub buttons: ButtonStyle,
+    pub caption_buttons: CaptionStyle,
+    pub tabs: TabStyle,
+    pub sidebar_style: SidebarStyle,
+    /// Three short lines across the middle of a scrollbar's thumb.
+    pub scrollbar_grip: bool,
+    /// How thick the scrollbars' thumbs are, in DIPs (6 = `size::SCROLLBAR_W`).
+    pub scrollbar_w: f32,
 }
 
 impl Theme {
@@ -160,6 +512,28 @@ impl Theme {
     #[cfg(test)]
     pub fn dark() -> Theme {
         crate::skin::built_in_theme(crate::skin::DEFAULT)
+    }
+
+    /// AMD Radeon (Light): the same in soft greys.
+    #[cfg(test)]
+    pub fn light() -> Theme {
+        crate::skin::built_in_theme(crate::skin::DEFAULT_LIGHT)
+    }
+
+    /// The space between a scrollbar's thumb and the sides of its lane: `size::SCROLLBAR_MARGIN`,
+    /// or less where the skin paints a track, so the thumb nearly fills it.
+    pub fn scrollbar_margin(&self) -> f32 {
+        if self.scrollbar_track.is_clear() {
+            size::SCROLLBAR_MARGIN
+        } else {
+            1.5
+        }
+    }
+
+    /// How wide a scrollbar's lane is: the thumb and the space on both sides of it.
+    #[allow(dead_code)]
+    pub fn scrollbar_lane(&self) -> f32 {
+        self.scrollbar_w + 2.0 * self.scrollbar_margin()
     }
 
     /// How far a box leans whose lean in AMD Radeon is `standard` (SORT and SETTINGS 8, a switch

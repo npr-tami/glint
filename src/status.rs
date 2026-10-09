@@ -9,7 +9,7 @@ use windows::Win32::System::Threading::GetCurrentProcess;
 
 use crate::app::AppState;
 use crate::folder::{format_count, format_size};
-use crate::pathbar::{fill_box, outline_box};
+use crate::pathbar::{fill_box_paint, outline_box};
 use crate::render::{Align, Renderer, TextStyle};
 use crate::theme::{size, Theme};
 use crate::ui::{Component, Ctx, Rect};
@@ -188,7 +188,7 @@ pub fn paint_note(r: &mut Renderer, theme: &Theme, app: &AppState, area: Rect) {
     let b = Rect::new(area.x + (area.w - w) / 2.0, area.bottom() - size::STATUS_H - 10.0, w, size::STATUS_H);
     // In the skin's shape: leaning a little in a slanted skin, round-cornered in a rounded one.
     let lean = theme.lean(6.0);
-    fill_box(r, theme, b, lean, theme.toolbar);
+    fill_box_paint(r, theme, b, lean, &theme.toolbar_paint);
     outline_box(r, theme, b, lean, 1.0, theme.line);
     r.text(note, b.inset(PAD, 0.0), &style.align(Align::Center));
 }
@@ -203,8 +203,9 @@ impl Component for StatusBar {
     }
 
     fn paint(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState, _ctx: &Ctx) {
-        r.fill_rect(self.rect, theme.statusbar);
-        let style = TextStyle::new(theme.muted);
+        r.fill_paint(self.rect, 0.0, &theme.statusbar_paint);
+        r.fill_rect(Rect::new(self.rect.x, self.rect.y, self.rect.w, 1.0), theme.status_line);
+        let style = TextStyle::new(theme.status_text);
         let right = Self::right_text(app);
         let right_w = r.measure(&right, &style).min(self.rect.w * 0.6);
         let inner = self.rect.inset(PAD, 0.0);

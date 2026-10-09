@@ -12,10 +12,11 @@
 //!   the first match is selected and Enter opens it, Down goes to the list); Esc or its × clears
 //!   it. The switch at its right end (Ctrl+Shift+F) makes it search the subfolders too (search.rs).
 //! - SORT, VIEW and SETTINGS are word buttons in the skin's shape - slanted in AMD Radeon (both
-//!   sides lean the same way). SORT opens a popup menu;
-//!   VIEW a menu of the six views (Ctrl+Shift+1 to 6; list.rs, views.rs) and the sidebar and status
-//!   bar switches; SETTINGS opens the Settings window (settingswin.rs), and right-clicking it opens
-//!   a small menu of the quickest choices.
+//!   sides lean the same way). With `buttons: liquid` they are glossy capsules with white words,
+//!   and the sidebar switch, back, forward, up and refresh are glass marbles with white signs.
+//!   SORT opens a popup menu; VIEW a menu of the six views (Ctrl+Shift+1 to 6; list.rs, views.rs)
+//!   and the sidebar and status bar switches; SETTINGS opens the Settings window (settingswin.rs),
+//!   and right-clicking it opens a small menu of the quickest choices.
 //! - The sidebar switch (Ctrl+B) sits at the left end: a little
 //!   window with its left pane filled while the sidebar shows.
 //!
@@ -28,11 +29,11 @@ use windows::Win32::UI::Shell::{SHAutoComplete, SHACF_AUTOAPPEND_FORCE_OFF, SHAC
 use crate::app::{AppState, SortKey};
 use crate::settings::ViewMode;
 use crate::frame;
-use crate::pathbar::{box_contains, fill_box, PathBar, PathHit};
+use crate::pathbar::{box_contains, fill_box, fill_box_paint, fill_field, PathBar, PathHit};
 use crate::render::{Align, Renderer, TextStyle};
 use crate::shell;
 use crate::textbox::{TextBox, TextEvent, TextEventKind};
-use crate::theme::{size, Color, Theme};
+use crate::theme::{size, ButtonStyle, Color, Theme};
 use crate::ui::{Command, Component, Ctx, CursorKind, DropTarget, Effect, Menu, MenuItem, MouseButton, MouseEvent, Point, Rect};
 
 /// Text box ids (100-199 belong to the toolbar).
@@ -313,8 +314,12 @@ impl Toolbar {
     // ------------------------------------------------------------ drawing
 
     fn paint_glyph(r: &mut Renderer, part: Part, b: Rect, color: Color) {
+        Self::paint_glyph_w(r, part, b, color, 1.3);
+    }
+
+    /// A back, forward, up or refresh sign in `b`, its lines `w` DIPs thick.
+    fn paint_glyph_w(r: &mut Renderer, part: Part, b: Rect, color: Color, w: f32) {
         let c = Point::new(b.x + b.w / 2.0, b.y + b.h / 2.0);
-        let w = 1.3;
         match part {
             Part::Back | Part::Forward => {
                 let s = if part == Part::Back { 1.0 } else { -1.0 };
@@ -344,12 +349,57 @@ impl Toolbar {
 
     /// The sidebar switch: a little window, its left pane filled while the sidebar shows.
     fn paint_sidebar_switch(r: &mut Renderer, b: Rect, shown: bool, color: Color) {
+        Self::paint_sidebar_switch_w(r, b, shown, color, 1.2);
+    }
+
+    /// The sidebar switch with its lines `lw` DIPs thick.
+    fn paint_sidebar_switch_w(r: &mut Renderer, b: Rect, shown: bool, color: Color, lw: f32) {
         let w = Rect::new(b.x + (b.w - 16.0) / 2.0, b.y + (b.h - 12.0) / 2.0, 16.0, 12.0);
         if shown {
-            r.fill_rect(Rect::new(w.x + 1.0, w.y + 1.0, 5.0, w.h - 2.0), color.with_alpha(0.45));
+            r.fill_rect(Rect::new(w.x + 1.0, w.y + 1.0, 5.0, w.h - 2.0), color.with_alpha(color.a * 0.45));
         }
-        r.stroke_round_rect(w, 1.5, 1.2, color);
-        r.line(Point::new(w.x + 6.0, w.y + 0.6), Point::new(w.x + 6.0, w.bottom() - 0.6), 1.2, color);
+        r.stroke_round_rect(w, 1.5, lw, color);
+        r.line(Point::new(w.x + 6.0, w.y + 0.6), Point::new(w.x + 6.0, w.bottom() - 0.6), lw, color);
+    }
+
+    /// One of the sidebar switch, back, forward, up and refresh as a glass marble (`buttons:
+    /// liquid`) with its sign in white on it, a darker shadow under the sign. A button that can't
+    /// be used is a faded grey marble; one under the mouse is lighter, one pressed darker.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_liquid_button(r: &mut Renderer, theme: &Theme, part: Part, b: Rect, enabled: bool, hot: bool, pressed: bool, sidebar_shown: bool) {
+        let c = Point::new(b.x + b.w / 2.0, b.y + b.h / 2.0);
+        let radius = (b.w.min(b.h) / 2.0 - 2.0).max(4.0);
+        let glass = if !enabled {
+            theme.chip_paint.map(|c| c.grey().lighter(0.15).with_alpha(c.a * 0.55))
+        } else if pressed {
+            theme.chip_paint.darker(0.15)
+        } else if hot {
+            theme.chip_hover_paint
+        } else {
+            theme.chip_paint
+        };
+        r.marble(c, radius, &glass);
+        let ink = if enabled { theme.button_text } else { theme.button_text.with_alpha(theme.button_text.a * 0.8) };
+        let shadow = text_shadow(theme);
+        let shadow = shadow.with_alpha(shadow.a * if enabled { 1.0 } else { 0.25 });
+        let below = Rect::new(b.x, b.y + 1.0, b.w, b.h);
+        if part == Part::Sidebar {
+            Self::paint_sidebar_switch_w(r, below, sidebar_shown, shadow, 1.9);
+            Self::paint_sidebar_switch_w(r, b, sidebar_shown, ink, 1.7);
+        } else {
+            Self::paint_glyph_w(r, part, below, shadow, 2.0);
+            Self::paint_glyph_w(r, part, b, ink, 1.8);
+        }
+    }
+
+    /// SORT, VIEW or SETTINGS as a glossy capsule (`buttons: liquid`): the skin's `button` glass
+    /// (`button-hover` under the mouse), its word in bold `button-text` with a dark shadow under it.
+    fn paint_capsule(r: &mut Renderer, theme: &Theme, b: Rect, label: &str, hot: bool) {
+        let capsule = b.inset(0.0, 2.0);
+        r.liquid_capsule(capsule, if hot { &theme.chip_hover_paint } else { &theme.chip_paint });
+        let style = TextStyle::new(theme.button_text).bold().size(size::FONT - 1.0).align(Align::Center);
+        r.text(label, Rect::new(capsule.x, capsule.y + 1.0, capsule.w, capsule.h), &style.color(text_shadow(theme)));
+        r.text(label, capsule, &style);
     }
 
     /// A magnifying glass: a ring and a handle going down to the right.
@@ -472,6 +522,11 @@ impl Toolbar {
     }
 }
 
+/// The shadow under white words and signs on liquid buttons: the glass's darkest colour, darker.
+fn text_shadow(theme: &Theme) -> Color {
+    theme.chip_paint.last().darker(0.5).with_alpha(0.8)
+}
+
 impl Component for Toolbar {
     fn layout(&mut self, rect: Rect, ctx: &Ctx, app: &AppState) {
         self.rect = rect;
@@ -489,14 +544,20 @@ impl Component for Toolbar {
     }
 
     fn paint(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState, _ctx: &Ctx) {
-        r.fill_rect(self.rect, theme.toolbar);
+        r.fill_paint(self.rect, 0.0, &theme.toolbar_paint);
         r.fill_rect(Rect::new(self.rect.x, self.rect.bottom() - self.line_w, self.rect.w, self.line_w), theme.toolbar_line);
 
+        let liquid = theme.buttons == ButtonStyle::Liquid;
         for part in [Part::Sidebar, Part::Back, Part::Forward, Part::Up, Part::Refresh] {
             let b = self.rect_of(part);
             let enabled = self.enabled(part, app);
             let hot = enabled && self.hover == Some(part);
-            if hot && self.pressed == Some(part) {
+            let pressed = hot && self.pressed == Some(part);
+            if liquid {
+                Self::paint_liquid_button(r, theme, part, b, enabled, hot, pressed, app.settings.show_sidebar);
+                continue;
+            }
+            if pressed {
                 r.fill_rect(b, theme.button_pressed);
             } else if hot {
                 r.fill_rect(b, theme.button_hover);
@@ -520,7 +581,7 @@ impl Component for Toolbar {
 
         // Filter: magnifier, the text box (a child window drawn by Windows), and × while filtering.
         let f = self.rect_of(Part::Filter);
-        r.fill_rect(f, theme.input);
+        fill_field(r, theme, f);
         let filtering = !app.tab().filter.is_empty();
         let mag = Point::new(f.x + FILTER_ICON_W / 2.0 + 1.0, f.y + f.h / 2.0);
         Self::paint_magnifier(r, mag, if filtering { theme.accent } else { theme.muted });
@@ -528,7 +589,7 @@ impl Component for Toolbar {
             let x = self.rect_of(Part::FilterClear);
             let hot = self.hover == Some(Part::FilterClear);
             if hot {
-                r.fill_rect(x.center(20.0, 20.0), theme.button_hover);
+                fill_box(r, theme, x.center(20.0, 20.0), 0.0, theme.button_hover);
             }
             Self::paint_cross(r, Point::new(x.x + x.w / 2.0, x.y + x.h / 2.0), 3.5, 1.2, if hot { theme.text } else { theme.muted });
         }
@@ -536,7 +597,7 @@ impl Component for Toolbar {
         let sub = self.rect_of(Part::Subfolders);
         let hot = self.hover == Some(Part::Subfolders);
         if hot {
-            r.fill_rect(sub.center(20.0, 20.0), theme.button_hover);
+            fill_box(r, theme, sub.center(20.0, 20.0), 0.0, theme.button_hover);
         }
         let color = if app.tab().path.is_empty() {
             theme.disabled
@@ -549,12 +610,17 @@ impl Component for Toolbar {
         };
         Self::paint_subfolders(r, Point::new(sub.x + sub.w / 2.0, sub.y + sub.h / 2.0), color);
 
-        // SORT, VIEW and SETTINGS: word buttons in the skin's shape.
+        // SORT, VIEW and SETTINGS: word buttons in the skin's shape, or glossy capsules.
         for (part, label) in [(Part::Sort, "SORT"), (Part::View, "VIEW"), (Part::Settings, "SETTINGS")] {
             let b = self.rect_of(part);
+            let hot = self.hover == Some(part);
             // (Their menus open as the button goes down, so there is no "pressed" look to show.)
-            fill_box(r, theme, b, self.lean, if self.hover == Some(part) { theme.chip_hover } else { theme.chip });
-            r.text(label, b, &TextStyle::new(theme.text).semibold().align(Align::Center));
+            if liquid {
+                Self::paint_capsule(r, theme, b, label, hot);
+            } else {
+                fill_box_paint(r, theme, b, self.lean, if hot { &theme.chip_hover_paint } else { &theme.chip_paint });
+                r.text(label, b, &TextStyle::new(theme.button_text).semibold().align(Align::Center));
+            }
         }
     }
 

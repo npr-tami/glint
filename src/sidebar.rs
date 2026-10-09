@@ -7,6 +7,9 @@
 //! opens it in a new tab, right-click gives a menu; clicking the "This PC" heading shows all
 //! drives; smooth wheel scrolling and a thin scrollbar when it doesn't fit.
 //!
+//! A skin with `sidebar-style: panels` puts each of the three groups in a rounded panel of its own,
+//! its heading in a header bar along the panel's top, the place you're in a rounded bar.
+//!
 //! Quick access places can be taken out (right-click > Remove from Quick access) and brought back
 //! (right-click > Show in Quick access ›). Pinned folders (Ctrl+D, "Pin to sidebar", or dropped on
 //! "Pinned") can be renamed - only the name shown here, in a name box over the row - moved up or
@@ -35,10 +38,11 @@ use crate::app::{can_pin, AppState};
 use crate::folder::Drive;
 use crate::icons::{self, IconId, Icons, LoadedIcon};
 use crate::recycle;
+use crate::list::{paint_scrollbar, ThumbState};
 use crate::render::{Renderer, TextStyle};
 use crate::shell::{self, ComGuard, KnownFolder};
 use crate::textbox::{TextBox, TextEvent, TextEventKind};
-use crate::theme::{size, Color, Theme};
+use crate::theme::{size, Color, SidebarStyle, Theme};
 use crate::ui::{Anim, Command, Component, Ctx, DropTarget, Effect, Menu, MenuItem, MouseButton, MouseEvent, Point, Rect};
 
 /// A heading's height: the same as the file list's column titles, so "Quick access" and "Name"
@@ -59,6 +63,15 @@ const BAR_H: f32 = 3.0;
 const BAR_BOTTOM: f32 = 4.0;
 /// How much of a drive row the name gets (the rest holds the bar).
 const DRIVE_TEXT_H: f32 = size::ROW_H - 8.0;
+/// `sidebar-style: panels`: the space around and between the panels, their header bars' height,
+/// the room inside a panel around its rows, where icons start in a row, and how much taller a
+/// drive's row is (for a thicker usage bar with an edge).
+const PANEL_MARGIN: f32 = 8.0;
+const PANEL_HEADER_H: f32 = 26.0;
+const PANEL_PAD: f32 = 4.0;
+const PANEL_ROW_PAD: f32 = 8.0;
+const PANEL_DRIVE_EXTRA: f32 = 6.0;
+const PANEL_BAR_H: f32 = 7.0;
 /// How long a wheel scroll glides, in seconds (the same as the file list).
 const SCROLL_TIME: f64 = 0.12;
 /// How far into the glide the first frame starts, so a wheel notch answers at once.
@@ -166,6 +179,11 @@ pub struct Sidebar {
     /// Where something dragged would be dropped (window/drag.rs): that place, the Recycle Bin or
     /// "Pinned" is outlined in red.
     drop_at: Option<DropTarget>,
+    /// The skin's `sidebar-style: panels`, and its scrollbar's thickness and the space beside it
+    /// (taken in `rebuild`).
+    panels: bool,
+    bar_w: f32,
+    bar_margin: f32,
 }
 
 impl Default for Sidebar {
@@ -207,6 +225,9 @@ impl Sidebar {
             name_box: None,
             name_box_at: None,
             drop_at: None,
+            panels: false,
+            bar_w: size::SCROLLBAR_W,
+            bar_margin: size::SCROLLBAR_MARGIN,
         }
     }
 
@@ -220,38 +241,100 @@ impl Sidebar {
 
     /// Lays the lines out again (the drives, pins or hidden places may have changed since last time).
     fn rebuild(&mut self, app: &AppState) {
+        self.panels = app.theme.sidebar_style == SidebarStyle::Panels;
+        self.bar_w = app.theme.scrollbar_w;
+        self.bar_margin = app.theme.scrollbar_margin();
+        // Above the first heading, after a heading, between the groups, and after the last line.
+        let (top, heading_h, first, between, end) = if self.panels {
+            (PANEL_MARGIN, PANEL_HEADER_H, PANEL_PAD, PANEL_PAD + PANEL_MARGIN, PANEL_PAD + PANEL_MARGIN)
+        } else {
+            (0.0, HEADING_H, 0.0, GROUP_GAP, BOTTOM_PAD)
+        };
+        let drive_h = if self.panels { size::ROW_H + PANEL_DRIVE_EXTRA } else { size::ROW_H };
         self.items.clear();
         let mut y = 0.0;
         let mut push = |items: &mut Vec<Placed>, item: Item, gap: f32, h: f32| {
             items.push(Placed { item, top: y + gap, h });
             y += gap + h;
         };
-        push(&mut self.items, Item::QuickHeading, 0.0, HEADING_H);
+        push(&mut self.items, Item::QuickHeading, top, heading_h);
         let before = self.items.len();
+        let mut gap = first;
         for (i, k) in self.known.iter().enumerate() {
             if !app.is_place_hidden(&k.name.to_lowercase()) {
-                push(&mut self.items, Item::Known(i), 0.0, size::ROW_H);
+                push(&mut self.items, Item::Known(i), gap, size::ROW_H);
+                gap = 0.0;
             }
         }
         if !app.is_place_hidden(BIN_ID) {
-            push(&mut self.items, Item::Bin, 0.0, size::ROW_H);
+            push(&mut self.items, Item::Bin, gap, size::ROW_H);
         }
         if self.items.len() == before {
-            push(&mut self.items, Item::QuickHint, 0.0, size::ROW_H);
+            push(&mut self.items, Item::QuickHint, first, size::ROW_H);
         }
-        push(&mut self.items, Item::PinnedHeading, GROUP_GAP, HEADING_H);
+        push(&mut self.items, Item::PinnedHeading, between, heading_h);
         for i in 0..app.settings.pinned.len() {
-            push(&mut self.items, Item::Pin(i), 0.0, size::ROW_H);
+            push(&mut self.items, Item::Pin(i), if i == 0 { first } else { 0.0 }, size::ROW_H);
         }
         if app.settings.pinned.is_empty() {
-            push(&mut self.items, Item::PinHint, 0.0, size::ROW_H);
+            push(&mut self.items, Item::PinHint, first, size::ROW_H);
         }
-        push(&mut self.items, Item::PcHeading, GROUP_GAP, HEADING_H);
+        push(&mut self.items, Item::PcHeading, between, heading_h);
         for i in 0..app.drives.len() {
-            push(&mut self.items, Item::Drive(i), 0.0, size::ROW_H);
+            push(&mut self.items, Item::Drive(i), if i == 0 { first } else { 0.0 }, drive_h);
         }
-        self.content_h = y + BOTTOM_PAD;
+        self.content_h = y + end;
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+    }
+
+    /// With panels: each group's panel, from the top of its heading to below its last line
+    /// (measured as `Placed::top` is), for the (at most three) groups.
+    fn panel_spans(&self) -> [Option<(f32, f32)>; 3] {
+        let mut spans = [None; 3];
+        let mut n = 0;
+        for placed in &self.items {
+            let bottom = placed.top + placed.h;
+            if Self::is_heading(placed.item) {
+                if n < spans.len() {
+                    spans[n] = Some((placed.top, bottom + PANEL_PAD));
+                }
+                n += 1;
+            } else if let Some(Some(span)) = spans.get_mut(n.wrapping_sub(1)) {
+                span.1 = bottom + PANEL_PAD;
+            }
+        }
+        spans
+    }
+
+    /// Whether a line is one of the three headings.
+    fn is_heading(item: Item) -> bool {
+        matches!(item, Item::QuickHeading | Item::PinnedHeading | Item::PcHeading)
+    }
+
+    /// Where the panels sit across: their left edge and width (clear of the scrollbar).
+    fn panel_across(&self) -> (f32, f32) {
+        let lane = if self.track().is_some() { self.bar_w + 2.0 * self.bar_margin } else { 0.0 };
+        (self.rect.x + PANEL_MARGIN, (self.rect.w - 2.0 * PANEL_MARGIN - lane).max(0.0))
+    }
+
+    /// A line's rectangle, `y` DIPs from the window's top: the sidebar's whole width, or with
+    /// panels, inside its panel (a heading as wide as the panel, a row a little in from its sides).
+    fn line_rect(&self, item: Item, y: f32, h: f32) -> Rect {
+        if !self.panels {
+            return Rect::new(self.rect.x, y, self.rect.w, h);
+        }
+        let (x, w) = self.panel_across();
+        let inset = if Self::is_heading(item) { 0.0 } else { PANEL_PAD };
+        Rect::new(x + inset, y, (w - 2.0 * inset).max(0.0), h)
+    }
+
+    /// Where icons (and hints) start in a row, from its left edge.
+    fn pad_left(&self) -> f32 {
+        if self.panels {
+            PANEL_ROW_PAD
+        } else {
+            PAD_LEFT
+        }
     }
 
     /// Where a line takes you: a folder or drive root, "" for This PC, the Recycle Bin's path, None
@@ -284,12 +367,18 @@ impl Sidebar {
     fn track(&self) -> Option<Rect> {
         (self.max_scroll() > 0.0).then(|| {
             Rect::new(
-                self.rect.right() - size::SCROLLBAR_W - size::SCROLLBAR_MARGIN,
-                self.rect.y + size::SCROLLBAR_MARGIN,
-                size::SCROLLBAR_W,
-                (self.rect.h - 2.0 * size::SCROLLBAR_MARGIN).max(0.0),
+                self.rect.right() - self.bar_w - self.bar_margin,
+                self.rect.y + self.bar_margin,
+                self.bar_w,
+                (self.rect.h - 2.0 * self.bar_margin).max(0.0),
             )
         })
+    }
+
+    /// The scrollbar's whole lane (where a skin paints a track behind the thumb).
+    fn lane(&self) -> Rect {
+        let w = self.bar_w + 2.0 * self.bar_margin;
+        Rect::new(self.rect.right() - w, self.rect.y, w, self.rect.h)
     }
 
     /// Whether a point is on the scrollbar (a little wider than drawn, so it's easy to hit).
@@ -359,28 +448,46 @@ impl Sidebar {
     /// The row of a line on screen (None when there's no such line).
     fn row_of(&self, item: Item) -> Option<Rect> {
         let placed = self.items.iter().find(|p| p.item == item)?;
-        Some(Rect::new(self.rect.x, self.rect.y + placed.top - self.scroll, self.rect.w, placed.h))
+        Some(self.line_rect(item, self.rect.y + placed.top - self.scroll, placed.h))
     }
 
     /// Where a line's name starts, and how wide it may be.
     fn name_span(&self, row: Rect) -> (f32, f32) {
-        let text_x = row.x + PAD_LEFT + size::ICON + ICON_GAP;
-        let right = row.right() - PAD_RIGHT - if self.track().is_some() { size::SCROLLBAR_W } else { 0.0 };
+        let text_x = row.x + self.pad_left() + size::ICON + ICON_GAP;
+        // (A panel's rows already keep clear of the scrollbar.)
+        let right = if self.panels {
+            row.right() - PANEL_ROW_PAD
+        } else {
+            row.right() - PAD_RIGHT - if self.track().is_some() { self.bar_w } else { 0.0 }
+        };
         (text_x, (right - text_x).max(0.0))
     }
 
     fn paint_place(&self, r: &mut Renderer, theme: &Theme, app: &AppState, item: Item, row: Rect, state: RowState) {
+        // In a panel, rows have round ends (in a rounded skin).
+        let radius = if self.panels { theme.corner(row.h) } else { 0.0 };
         match state {
             RowState::Selected => {
-                r.fill_rect(row, theme.accent_tint);
-                r.fill_rect(Rect::new(row.x, row.y, size::SELECT_EDGE, row.h), theme.select_edge);
+                r.fill_paint(row, radius, &theme.sidebar_selection);
+                if radius <= 0.0 {
+                    r.fill_rect(Rect::new(row.x, row.y, size::SELECT_EDGE, row.h), theme.select_edge);
+                }
             }
-            RowState::Hover => r.fill_rect(row, theme.hover),
+            RowState::Hover => r.fill_paint(row, radius, &theme.hover_paint),
             RowState::Normal => {}
         }
-        let icon = Rect::new(row.x + PAD_LEFT, row.y + (row.h - size::ICON) / 2.0, size::ICON, size::ICON);
+        let (top_h, bar_h, bar_bottom) = match item {
+            Item::Drive(_) if self.panels => (row.h - PANEL_BAR_H - 8.0, PANEL_BAR_H, 6.0),
+            _ => (DRIVE_TEXT_H, BAR_H, BAR_BOTTOM),
+        };
+        // A drive's icon sits beside its name, above the bar.
+        let icon_mid = if matches!(item, Item::Drive(_)) && self.panels { top_h / 2.0 + 1.0 } else { row.h / 2.0 };
+        let icon = Rect::new(row.x + self.pad_left(), row.y + icon_mid - size::ICON / 2.0, size::ICON, size::ICON);
         let (text_x, text_w) = self.name_span(row);
-        let color = if state == RowState::Selected { theme.text_strong } else { theme.text };
+        let selected = state == RowState::Selected;
+        let color = if selected { theme.sidebar_selection_text } else { theme.text };
+        // With panels, the place you're in is in bold.
+        let style = if selected && self.panels { TextStyle::new(color).bold() } else { TextStyle::new(color) };
         let path = self.path_of(item, app).unwrap_or("");
         match item {
             Item::Known(i) => {
@@ -389,14 +496,14 @@ impl Sidebar {
                     None => r.icon(&app.icons, app.icons.folder(), icon),
                 }
                 let name = self.known.get(i).map_or("", |k| k.name);
-                r.text(name, Rect::new(text_x, row.y, text_w, row.h), &TextStyle::new(color));
+                r.text(name, Rect::new(text_x, row.y, text_w, row.h), &style);
             }
             Item::Bin => {
                 match self.icons.get(path) {
                     Some(id) => r.icon(&app.icons, id, icon),
                     None => draw_bin_glyph(r, icon, theme.muted),
                 }
-                r.text(recycle::NAME, Rect::new(text_x, row.y, text_w, row.h), &TextStyle::new(color));
+                r.text(recycle::NAME, Rect::new(text_x, row.y, text_w, row.h), &style);
             }
             Item::Pin(_) => {
                 // A pinned drive gets its drive's icon (once the drive list brought it), a folder
@@ -407,7 +514,7 @@ impl Sidebar {
                     None => r.icon(&app.icons, app.icons.folder(), icon),
                 }
                 if self.renaming.as_ref().is_none_or(|rn| !same_path(&rn.path, path)) {
-                    r.text(&app.pin_name(path), Rect::new(text_x, row.y, text_w, row.h), &TextStyle::new(color));
+                    r.text(&app.pin_name(path), Rect::new(text_x, row.y, text_w, row.h), &style);
                 }
             }
             Item::Drive(i) => {
@@ -420,19 +527,40 @@ impl Sidebar {
                 }
                 match usage(drive) {
                     Some(used) => {
-                        r.text(&drive.name, Rect::new(text_x, row.y, text_w, DRIVE_TEXT_H), &TextStyle::new(color));
-                        let bar = Rect::new(text_x, row.bottom() - BAR_BOTTOM - BAR_H, text_w, BAR_H);
-                        r.fill_rect(bar, theme.bar_track);
+                        r.text(&drive.name, Rect::new(text_x, row.y, text_w, top_h), &style);
+                        let bar = Rect::new(text_x, row.bottom() - bar_bottom - bar_h, text_w, bar_h);
+                        // Round ends in a rounded skin, and the edge of the path box if it has one.
+                        let radius = theme.corner(bar_h);
+                        r.fill_paint(bar, radius, &theme.bar_track_paint);
                         if used > 0.0 {
                             // At least a sliver, so a nearly empty drive still shows some red.
-                            let w = (bar.w * used).clamp(1.0, bar.w);
-                            r.fill_rect(Rect::new(bar.x, bar.y, w, bar.h), theme.accent);
+                            let w = (bar.w * used).clamp(1.0_f32.max(2.0 * radius), bar.w);
+                            r.fill_paint(Rect::new(bar.x, bar.y, w, bar.h), radius, &theme.usage_fill);
+                        }
+                        if radius > 0.0 {
+                            r.stroke_round_rect(bar.inset(0.5, 0.5), (radius - 0.5).max(0.0), 1.0, theme.input_border);
                         }
                     }
-                    None => r.text(&drive.name, Rect::new(text_x, row.y, text_w, row.h), &TextStyle::new(color)),
+                    None => r.text(&drive.name, Rect::new(text_x, row.y, text_w, row.h), &style),
                 }
             }
             Item::QuickHeading | Item::QuickHint | Item::PinnedHeading | Item::PinHint | Item::PcHeading => {}
+        }
+    }
+
+    /// With panels: the three panels (in the skin's `sidebar-panel` paint, round-cornered in a
+    /// rounded skin, a soft shadow under each) behind their lines.
+    fn paint_panels(&self, r: &mut Renderer, theme: &Theme) {
+        let (x, w) = self.panel_across();
+        let shadow = Color::rgba(0, 0, 0, if theme.dark { 0.35 } else { 0.16 });
+        for (top, bottom) in self.panel_spans().into_iter().flatten() {
+            let panel = Rect::new(x, self.rect.y + top - self.scroll, w, bottom - top);
+            if panel.bottom() <= self.rect.y || panel.y >= self.rect.bottom() {
+                continue;
+            }
+            let radius = theme.corner(panel.h);
+            r.fill_round_rect(Rect::new(panel.x, panel.y + 1.0, panel.w, panel.h), radius, shadow);
+            r.fill_paint(panel, radius, &theme.sidebar_panel);
         }
     }
 
@@ -647,8 +775,12 @@ impl Component for Sidebar {
             self.place_name_box(app);
         }
 
-        r.fill_rect(self.rect, theme.sidebar);
+        // (A gradient runs down the whole sidebar, as on the bars.)
+        r.fill_paint_down(self.rect, 0.0, &theme.sidebar_paint, self.rect.y, self.rect.bottom());
         r.push_clip(self.rect);
+        if self.panels {
+            self.paint_panels(r, theme);
+        }
         let hover = if self.drag.is_some() { None } else { self.mouse.and_then(|p| self.item_at(p)) };
         let current = self.current_place(app);
         let heading_w = self.rect.w - PAD_LEFT - PAD_RIGHT;
@@ -657,36 +789,48 @@ impl Component for Sidebar {
             if y + placed.h <= self.rect.y || y >= self.rect.bottom() {
                 continue;
             }
-            let row = Rect::new(self.rect.x, y, self.rect.w, placed.h);
+            let row = self.line_rect(placed.item, y, placed.h);
             let hovered = hover == Some(index);
+            if self.panels && Self::is_heading(placed.item) {
+                let title = match placed.item {
+                    Item::QuickHeading => "Quick access",
+                    Item::PinnedHeading => "Pinned",
+                    _ => "This PC",
+                };
+                // "This PC" lights up under the mouse (it shows all drives); a heading something
+                // dragged would go into is outlined.
+                let lit = hovered && placed.item == Item::PcHeading;
+                paint_panel_header(r, theme, row, title, lit, self.is_drop_target(placed.item, app));
+                continue;
+            }
             match placed.item {
                 Item::QuickHeading | Item::PinnedHeading => {
                     // Folders dragged onto "Pinned" are pinned: it lights up and is outlined.
                     let dropping = self.is_drop_target(placed.item, app);
                     if dropping {
-                        r.fill_rect(row, theme.hover);
+                        r.fill_paint(row, 0.0, &theme.hover_paint);
                         r.stroke_rect(row, 1.0, theme.accent);
                     }
                     let title = if placed.item == Item::QuickHeading { "Quick access" } else { "Pinned" };
-                    r.text(title, Rect::new(row.x + PAD_LEFT, y, heading_w, row.h), &TextStyle::new(if dropping { theme.text } else { theme.muted }));
+                    r.text(title, Rect::new(row.x + PAD_LEFT, y, heading_w, row.h), &TextStyle::new(if dropping { theme.text } else { theme.panel_header_text }));
                 }
                 Item::QuickHint | Item::PinHint => {
                     if self.is_drop_target(placed.item, app) {
-                        r.fill_rect(row, theme.hover);
+                        r.fill_paint(row, 0.0, &theme.hover_paint);
                         r.stroke_rect(row, 1.0, theme.accent);
                     }
                     // Where the icons start (a hint has none), so it fits the narrow sidebar.
                     let hint = if placed.item == Item::PinHint { "Ctrl+D or drop folders here" } else { "Right-click to show items again" };
                     let (x, w) = self.name_span(row);
-                    let left = row.x + PAD_LEFT;
+                    let left = row.x + self.pad_left();
                     r.text(hint, Rect::new(left, y, w + x - left, row.h), &TextStyle::new(theme.muted));
                 }
                 Item::PcHeading => {
                     // A title you can click (it shows all drives): it lights up like a place.
                     if hovered {
-                        r.fill_rect(row, theme.hover);
+                        r.fill_paint(row, 0.0, &theme.hover_paint);
                     }
-                    let color = if hovered { theme.text } else { theme.muted };
+                    let color = if hovered { theme.text } else { theme.panel_header_text };
                     r.text("This PC", Rect::new(row.x + PAD_LEFT, y, heading_w, row.h), &TextStyle::new(color));
                 }
                 item => {
@@ -700,7 +844,10 @@ impl Component for Sidebar {
                         RowState::Normal
                     };
                     self.paint_place(r, theme, app, item, row, state);
-                    if dropping {
+                    if dropping && self.panels {
+                        let radius = theme.corner(row.h);
+                        r.stroke_round_rect(row.inset(0.5, 0.5), (radius - 0.5).max(0.0), 1.0, theme.accent);
+                    } else if dropping {
                         r.stroke_rect(row, 1.0, theme.accent);
                     }
                 }
@@ -714,14 +861,14 @@ impl Component for Sidebar {
         r.pop_clip();
 
         if let Some(thumb) = self.thumb() {
-            let color = if self.drag.is_some() {
-                theme.accent
+            let state = if self.drag.is_some() {
+                ThumbState::Dragged
             } else if self.over_track {
-                theme.scroll_thumb_hover
+                ThumbState::Hover
             } else {
-                theme.scroll_thumb
+                ThumbState::Rest
             };
-            r.fill_round_rect(thumb, size::SCROLLBAR_W / 2.0, color);
+            paint_scrollbar(r, theme, self.lane(), thumb, state);
         }
     }
 
@@ -914,6 +1061,27 @@ impl Component for Sidebar {
         }
         self.anim.running()
     }
+}
+
+/// A panel's header bar (`sidebar-style: panels`) in `row`: the skin's `panel-header` paint with the
+/// panel's round corners at the top (lighter when `lit`), a shine along its top, and the title in
+/// bold with a slight shadow. Outlined in the accent while something dragged would go into it.
+fn paint_panel_header(r: &mut Renderer, theme: &Theme, row: Rect, title: &str, lit: bool, dropping: bool) {
+    let radius = theme.corner(row.h);
+    let paint = if lit { theme.panel_header.lighter(if theme.dark { 0.1 } else { 0.3 }) } else { theme.panel_header };
+    // The bar reaches on below its bottom, out of sight, so only its top corners are round.
+    r.push_clip(row);
+    r.fill_paint_down(Rect::new(row.x, row.y, row.w, row.h + radius), radius, &paint, row.y, row.bottom());
+    r.pop_clip();
+    r.fill_rect(Rect::new(row.x + radius * 0.7, row.y + 1.0, (row.w - 1.4 * radius).max(0.0), 1.0), theme.highlight);
+    if dropping {
+        r.stroke_round_rect(row.inset(0.5, 0.5), (radius - 0.5).max(0.0), 1.0, theme.accent);
+    }
+    let text = Rect::new(row.x + 10.0, row.y, (row.w - 20.0).max(0.0), row.h);
+    let shade = if theme.dark { Color::rgba(0, 0, 0, 0.55) } else { Color::rgba(255, 255, 255, 0.45) };
+    let style = TextStyle::new(shade).bold();
+    r.text(title, Rect::new(text.x, text.y + 1.0, text.w, text.h), &style);
+    r.text(title, text, &style.color(theme.panel_header_text));
 }
 
 /// How full a drive is (0.0 - 1.0), for its bar. Only for local disks and removable drives that

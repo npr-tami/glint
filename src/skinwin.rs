@@ -3,12 +3,19 @@
 //!
 //! - **Left:** every skin - the built-in ones, then the person's own - and the buttons NEW,
 //!   DUPLICATE, RENAME, DELETE (own skins only, after a question; the file goes to the Recycle Bin),
-//!   IMPORT…, EXPORT… and OPEN SKINS FOLDER. Clicking a skin uses it, like Settings' drop-down.
-//! - **Right:** the skin in use, in plain words: eight colours (each with a swatch that opens
-//!   Windows' colour picker, and a box for its #hex), the button shape, the slant, the row height,
-//!   the text size, the logo (empty: the chrome wordmark; a word: that word in a box), and whether
-//!   it's a dark skin. "Show as text" swaps the controls for the skin's text itself (a Windows
-//!   EDIT), with what Glint couldn't understand under it.
+//!   IMPORT…, EXPORT… and OPEN SKINS FOLDER (in a new tab; this window stays open). Clicking a
+//!   skin uses it, like Settings' drop-down.
+//! - **Right:** the skin in use, in plain words: the button shape, the slant, the row height, the
+//!   text size, how thick the tab's and the toolbar's lines are, the logo (empty: the chrome
+//!   wordmark; a word: that word in a box), whether it's a dark skin; its style (glass buttons,
+//!   marbles for the window buttons, tabs as pills, the sidebar in panels, grip lines on the
+//!   scrollbars); and every colour it has, the window's from the top down. Each colour has a
+//!   swatch that opens Windows' colour picker and a box for its #hex - or for a gradient,
+//!   "#fdfdfd, #c3cddb 45%, #dfe6f0", whose first colour the picker changes. A colour that follows
+//!   another ("tab-line: accent") shows that colour, says which it follows, and keeps following it
+//!   until it's changed here. The Logo choice is the same as Settings' (not part of the skin).
+//!   "Show as text" swaps the controls for the skin's text itself (a Windows EDIT), with what
+//!   Glint couldn't understand under it.
 //! - **Live, and saved by itself.** Every change goes into the skin's text (`skin::with_value`, so
 //!   the rest of the text stays as it was), the main window shows it at once (`AppState::apply_skin`),
 //!   and the file is written a moment later (SAVE_TIMER) by the skin file worker - never on this
@@ -74,7 +81,8 @@ use crate::render::{Align, FrameResult, Renderer, TextStyle};
 use crate::shell;
 use crate::skin::{self, Entry};
 use crate::textbox::{self, TextBox, TextEvent, TextEventKind, WM_APP_TEXT};
-use crate::theme::{size, Color, Shape, Theme};
+use crate::settings::LogoStyle;
+use crate::theme::{size, ButtonStyle, CaptionStyle, Color, Paint, Shape, SidebarStyle, Stop, TabStyle, Theme};
 use crate::ui::{Command, Menu, MenuItem, Point, Rect};
 
 /// The window's title (Alt+Tab, the taskbar's thumbnails).
@@ -97,7 +105,8 @@ const ROW_H: f32 = 46.0;
 const ROW_NOTE_H: f32 = 56.0;
 const ROW_PAD_X: f32 = 16.0;
 const SWATCH: f32 = 26.0;
-const HEX_W: f32 = 104.0;
+/// A colour's box: wide enough for a short gradient.
+const HEX_W: f32 = 196.0;
 const DROPDOWN_W: f32 = 200.0;
 const LOGO_FIELD_W: f32 = 140.0;
 /// What the Logo box says while it's empty: no word means the chrome wordmark.
@@ -124,17 +133,66 @@ const SAVE_DELAY_MS: u32 = 600;
 /// The skin's text is kept below this (EM_LIMITTEXT), like the files Glint reads.
 const MAX_TEXT: usize = 256 * 1024;
 
-/// The colours offered: the skin's name for each, its title and a note where the title alone
-/// doesn't say what it colours ("" for none).
-const COLOURS: [(&str, &str, &str); 8] = [
-    ("accent", "Accent", ""),
-    ("background", "Background", "Title bar, sidebar and status bar"),
-    ("toolbar", "Toolbar", ""),
-    ("panel", "Panels", "File list and details panel"),
-    ("text", "Text", ""),
-    ("muted", "Muted text", ""),
-    ("selection", "Selection", ""),
-    ("hover", "Hover", ""),
+/// Every colour a skin has (skin::COLOURS), by the skin's name for it, with its title here: the
+/// window from the top down, then text, selections and hovers, lines, and the rest.
+const COLOURS: [(&str, &str); 57] = [
+    ("accent", "Accent"),
+    ("background", "Background"),
+    ("title-bar", "Title bar"),
+    ("highlight", "Shine on bars"),
+    ("logo", "Logo box"),
+    ("logo-letters", "Logo letters"),
+    ("tab", "Tabs"),
+    ("tab-text", "Tab names"),
+    ("tab-active", "Current tab"),
+    ("tab-active-text", "Current tab name"),
+    ("tab-border", "Tab edges"),
+    ("tab-line", "Line on current tab"),
+    ("caption-hover", "Window buttons hover"),
+    ("caption-pressed", "Window buttons pressed"),
+    ("close-hover", "Close hover"),
+    ("marble", "Window marbles"),
+    ("marble-close", "Close marble"),
+    ("toolbar", "Toolbar"),
+    ("toolbar-line", "Line under toolbar"),
+    ("tool-hover", "Toolbar icons hover"),
+    ("tool-pressed", "Toolbar icons pressed"),
+    ("button", "Buttons"),
+    ("button-hover", "Buttons hover"),
+    ("button-text", "Button text"),
+    ("input", "Text boxes"),
+    ("input-border", "Text box edges"),
+    ("path-hover", "Path hover"),
+    ("sidebar", "Sidebar"),
+    ("sidebar-panel", "Sidebar panels"),
+    ("panel-header", "Panel headers"),
+    ("panel-header-text", "Panel header text"),
+    ("sidebar-selection", "Sidebar selection"),
+    ("sidebar-selection-text", "Sidebar selection text"),
+    ("panel", "Panels"),
+    ("list-header", "Column titles"),
+    ("list-header-text", "Column title text"),
+    ("column-line", "Lines between columns"),
+    ("scrollbar", "Scroll bars"),
+    ("scrollbar-hover", "Scroll bars hover"),
+    ("scrollbar-track", "Scroll bar track"),
+    ("scrollbar-border", "Scroll bar edges"),
+    ("scrollbar-grip-lines", "Grip lines"),
+    ("usage-bar", "Usage bar"),
+    ("usage-fill", "Usage bar fill"),
+    ("status-bar", "Status bar"),
+    ("status-text", "Status bar text"),
+    ("status-line", "Line above status bar"),
+    ("text", "Text"),
+    ("text-bright", "Bright text"),
+    ("muted", "Muted text"),
+    ("selection", "Selected rows"),
+    ("selection-edge", "Selected row edge"),
+    ("selection-text", "Selected row text"),
+    ("hover", "Hover"),
+    ("line", "Lines"),
+    ("accent-text", "Text on accent"),
+    ("disabled", "Disabled"),
 ];
 
 /// The choices of the drop-downs.
@@ -142,8 +200,17 @@ const SHAPES: [(Shape, &str, &str); 3] = [(Shape::Slanted, "slanted", "Slanted")
 const SLANTS: [f32; 9] = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0];
 const ROW_HEIGHTS: [f32; 7] = [24.0, 26.0, 28.0, 30.0, 32.0, 34.0, 36.0];
 const FONT_SIZES: [f32; 8] = [8.0, 8.5, 9.0, 9.5, 10.0, 10.5, 11.0, 12.0];
+const LINE_WIDTHS: [f32; 7] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+const BUTTON_STYLES: [(ButtonStyle, &str, &str); 2] = [(ButtonStyle::Flat, "flat", "Flat"), (ButtonStyle::Liquid, "liquid", "Liquid")];
+const CAPTION_STYLES: [(CaptionStyle, &str, &str); 2] = [(CaptionStyle::Symbols, "symbols", "Symbols"), (CaptionStyle::Marbles, "marbles", "Marbles")];
+const TAB_STYLES: [(TabStyle, &str, &str); 2] = [(TabStyle::Attached, "attached", "Attached"), (TabStyle::Pills, "pills", "Pills")];
+const SIDEBAR_STYLES: [(SidebarStyle, &str, &str); 2] = [(SidebarStyle::Plain, "plain", "Plain"), (SidebarStyle::Panels, "panels", "Panels")];
+/// The Logo setting (as Settings > Appearance offers it).
+const LOGOS: [(LogoStyle, &str); 3] = [(LogoStyle::Box, "Box"), (LogoStyle::Chrome, "Chrome"), (LogoStyle::None, "None")];
 /// DIPs in a point (9 pt = 12 DIPs).
 const PT: f32 = 96.0 / 72.0;
+/// A colour row's note when the colour follows another: the row shows which ("follows Accent").
+const FOLLOWS: &str = "(follows)";
 
 thread_local! {
     /// The text boxes' colours (background COLORREF, text COLORREF, brush), for WM_CTLCOLOREDIT.
@@ -162,8 +229,19 @@ enum Ctl {
     Slant,
     RowHeight,
     FontSize,
+    /// How thick the line on the current tab and the one under the toolbar are.
+    TabLine,
+    ToolbarLine,
     LogoText,
     Dark,
+    /// The style: buttons, window buttons, tabs, sidebar, scrollbar grip.
+    Buttons,
+    Caption,
+    Tabs,
+    Sidebar,
+    Grip,
+    /// The Logo setting (not part of the skin).
+    Logo,
 }
 
 /// Which part of a control: the main one (a colour's swatch), or a colour's #hex box.
@@ -223,12 +301,36 @@ enum Spot {
 /// What the one-line text box is for while it's shown.
 #[derive(Clone, Debug, PartialEq)]
 enum Editing {
-    /// A colour's #hex (COLOURS index), with the value before (Esc puts it back).
-    Hex(usize, String),
+    /// A colour's #hex or gradient (COLOURS index), with how it was before (Esc puts it back).
+    Hex(usize, Before),
     /// The word in the logo, with the word before.
     LogoText(String),
     /// Renaming this skin (its id).
     Rename(String),
+}
+
+/// A colour as it was when its box was clicked.
+#[derive(Clone, Debug, PartialEq)]
+struct Before {
+    /// What the box showed.
+    shown: String,
+    /// The skin's own line for it (None: it had none).
+    own: Option<String>,
+    /// What goes back into the skin if the change is undone: its own line, or else the colour it
+    /// followed, or else what the box showed.
+    put_back: String,
+}
+
+/// One of COLOURS as the skin in use has it, ready to show.
+#[derive(Clone, Debug, Default)]
+struct Shown {
+    paint: Paint,
+    /// The paint as a skin writes it (`paint_text`).
+    text: String,
+    /// Another colour's name, when it follows that one ("accent", "accent 16%").
+    follows: Option<String>,
+    /// That, in words for the row ("follows Accent").
+    hint: String,
 }
 
 /// Something the main window does for this window after the message (see the module comment).
@@ -348,6 +450,8 @@ pub struct SkinWindow {
     edit_box: TextBox,
     editing: Option<Editing>,
     edit_at: Option<Rect>,
+    /// The one-line box was just given its text and isn't in its place yet.
+    edit_fresh: bool,
     /// "Show as text": the skin's text in a multi-line EDIT instead of the controls.
     advanced: bool,
     text_box: HWND,
@@ -377,6 +481,12 @@ pub struct SkinWindow {
     /// The switches the person just flipped ("Show as text", "Dark skin"), gliding to their new
     /// place (kit.rs).
     flips: kit::Flips,
+    /// How thick the scrollbars are in the skin.
+    bar: kit::Bar,
+    /// The skin's colours as shown (COLOURS's order), and the library, look and skin they were
+    /// worked out for.
+    colours: Vec<Shown>,
+    colours_for: (u64, u64, String),
 }
 
 /// Registers the window class (once; registering again just fails harmlessly).
@@ -467,6 +577,7 @@ pub fn create(owner: HWND, theme: &Theme) -> Option<SkinWindow> {
             edit_box,
             editing: None,
             edit_at: None,
+            edit_fresh: false,
             advanced: false,
             text_box,
             text_font: HFONT::default(),
@@ -484,6 +595,9 @@ pub fn create(owner: HWND, theme: &Theme) -> Option<SkinWindow> {
             act_on_char: None,
             repaint_until: 0.0,
             flips: kit::Flips::default(),
+            bar: kit::Bar::default(),
+            colours: Vec::new(),
+            colours_for: (0, 0, String::new()),
         };
         window.apply_theme(theme);
         let mut rc = RECT::default();
@@ -730,18 +844,84 @@ fn hi_word(v: usize) -> u32 {
     ((v >> 16) & 0xffff) as u32
 }
 
-/// The colour a skin's colour name stands for in a look.
-fn colour_of(theme: &Theme, key: &str) -> Color {
-    match key {
-        "accent" => theme.accent,
-        "background" => theme.window,
-        "toolbar" => theme.toolbar,
-        "panel" => theme.panel,
-        "text" => theme.text,
-        "muted" => theme.muted,
-        "selection" => theme.accent_tint,
-        _ => theme.hover,
+/// The skin's colours as the customiser shows them, in COLOURS's order (skin text `text`).
+fn shown_colours(text: &str) -> Vec<Shown> {
+    let all = skin::colours_of(text);
+    COLOURS
+        .iter()
+        .map(|(key, _)| {
+            let Some((paint, follows)) = skin::COLOURS.iter().position(|(k, _)| k == key).and_then(|at| all.get(at).cloned()) else { return Shown::default() };
+            let hint = follows.as_deref().map(follows_hint).unwrap_or_default();
+            Shown { paint, text: paint_text(&paint), follows, hint }
+        })
+        .collect()
+}
+
+/// "follows Accent" for a colour written as "accent", "follows Accent at 16%" for "accent 16%".
+fn follows_hint(written: &str) -> String {
+    let (name, strength) = match written.rsplit_once(char::is_whitespace) {
+        Some((n, pct)) if pct.ends_with('%') => (n.trim(), Some(pct)),
+        _ => (written.trim(), None),
+    };
+    let key = skin::normalize_key(name);
+    let title = COLOURS.iter().find(|(k, _)| *k == key).map_or(name, |(_, t)| t);
+    match strength {
+        Some(pct) => format!("follows {title} at {pct}"),
+        None => format!("follows {title}"),
     }
+}
+
+/// A paint as a skin writes it: "#e3262d", "none", or a gradient's colours with where each sits
+/// ("#fdfdfd, #c3cddb 45%, #dfe6f0"; the first is at the start and the last at the end, so they
+/// go without).
+fn paint_text(p: &Paint) -> String {
+    let Some(g) = p.gradient() else {
+        return if p.is_clear() { "none".into() } else { skin::hex_of(p.base()) };
+    };
+    let stops = g.stops();
+    let mut text = String::new();
+    for (i, s) in stops.iter().enumerate() {
+        if i > 0 {
+            text.push_str(", ");
+        }
+        text.push_str(&skin::hex_of(s.color));
+        let ends = (i == 0 && s.at <= 0.0) || (i == stops.len() - 1 && s.at >= 1.0);
+        if !ends {
+            text.push_str(&format!(" {}%", number(s.at * 100.0)));
+        }
+    }
+    text
+}
+
+/// What was typed in colour `key`'s box, tidied ("#E3262D " is "#e3262d"), if a skin may write it
+/// there and Glint understands all of it: a colour, "none", another colour's name ("accent 16%")
+/// or a gradient. None otherwise (half typed, say).
+fn typed_value(key: &str, typed: &str) -> Option<String> {
+    let typed = typed.trim().trim_end_matches(';').trim().to_lowercase();
+    if typed.is_empty() || typed.contains(['\n', '\r']) || typed.contains("//") {
+        return None;
+    }
+    let line = format!("{key}: {typed}");
+    let parsed = skin::parse(&line, "x");
+    (parsed.notes.is_empty() && skin::value_in(&line, key).as_deref() == Some(typed.as_str())).then_some(typed)
+}
+
+/// The paint a typed value makes in colour `key`'s place (names followed in the standard skins).
+#[cfg(test)]
+fn typed_paint(key: &str, typed: &str) -> Option<Paint> {
+    let value = typed_value(key, typed)?;
+    let at = skin::COLOURS.iter().position(|(k, _)| *k == key)?;
+    skin::colours_of(&format!("{key}: {value}")).get(at).map(|(p, _)| *p)
+}
+
+/// A gradient with its first colour changed to `c` (Windows' colour picker on a gradient's swatch).
+fn with_first(p: &Paint, c: Color) -> Paint {
+    let Some(g) = p.gradient() else { return c.into() };
+    let mut stops = [Stop { at: 0.0, color: c }; crate::theme::MAX_STOPS];
+    for (i, s) in g.stops().iter().enumerate() {
+        stops[i] = if i == 0 { Stop { at: s.at, color: c } } else { *s };
+    }
+    Paint::from_stops(&stops[..g.stops().len()])
 }
 
 /// A number as a skin writes it: "8", "8.5".
@@ -798,6 +978,7 @@ impl SkinWindow {
     pub fn apply_theme(&mut self, theme: &Theme) {
         self.renderer.set_font(&theme.font, 1.0);
         self.layout_dirty = true;
+        self.bar = kit::Bar::of(theme);
         self.edit_at = None;
         let (bg, fg) = (theme.input.to_colorref(), theme.text.to_colorref());
         // SAFETY: a new brush replaces the old one, which is deleted (no control paints in between:
@@ -831,6 +1012,43 @@ impl SkinWindow {
             _ => {}
         }
         self.invalidate();
+    }
+
+    /// The skin's colours (`colours`), worked out again when the skin in use or its text changed.
+    fn refresh_colours(&mut self, app: &AppState) {
+        let now = (app.skins.generation, app.theme_generation, app.settings.skin.clone());
+        if now == self.colours_for && self.colours.len() == COLOURS.len() {
+            return;
+        }
+        // A skin whose file is gone shows as AMD Radeon, light or dark.
+        let text = app.skins.find(&app.settings.skin).map_or_else(|| format!("dark: {}", app.dark), |e| e.text.clone());
+        self.colours = shown_colours(&text);
+        self.colours_for = now;
+    }
+
+    /// COLOURS[i] as the skin in use has it.
+    fn colour(&mut self, app: &AppState, i: usize) -> Shown {
+        self.refresh_colours(app);
+        self.colours.get(i).cloned().unwrap_or_default()
+    }
+
+    /// The skin's own line for COLOURS[i] (None: it has none).
+    fn own_value(app: &AppState, i: usize) -> Option<String> {
+        app.skins.find(&app.settings.skin).and_then(|e| skin::value_in(&e.text, COLOURS[i].0)).map(|v| v.trim().to_lowercase())
+    }
+
+    /// Colour `i`'s box says `typed` now (None: nothing usable, so as it was before): the skin gets
+    /// it - or, typed back to what the box showed at first, gets back how it was (a colour that
+    /// followed another follows it again).
+    fn set_colour(&mut self, app: &mut AppState, i: usize, typed: Option<String>, before: &Before) -> Vec<Ask> {
+        let key = COLOURS[i].0;
+        let own = Self::own_value(app, i);
+        match typed.filter(|t| *t != before.shown) {
+            Some(value) if own.as_deref() != Some(value.as_str()) => self.change(app, &[(key, value)]),
+            Some(_) => Vec::new(),
+            None if own != before.own => self.change(app, &[(key, before.put_back.clone())]),
+            None => Vec::new(),
+        }
     }
 
     /// A line under the skin's name about what this window just did (`problem`: in the accent).
@@ -897,13 +1115,11 @@ impl SkinWindow {
     }
 
     fn list_track(&self) -> Rect {
-        let l = self.list_rect();
-        Rect::new(l.right() - size::SCROLLBAR_W - size::SCROLLBAR_MARGIN, l.y + size::SCROLLBAR_MARGIN, size::SCROLLBAR_W, (l.h - 2.0 * size::SCROLLBAR_MARGIN).max(0.0))
+        self.bar.track(self.list_rect())
     }
 
     fn page_track(&self) -> Rect {
-        let p = self.page_rect();
-        Rect::new(p.right() - size::SCROLLBAR_W - size::SCROLLBAR_MARGIN, p.y + size::SCROLLBAR_MARGIN, size::SCROLLBAR_W, (p.h - 2.0 * size::SCROLLBAR_MARGIN).max(0.0))
+        self.bar.track(self.page_rect())
     }
 
     /// The skin's text box (on screen), while "Show as text" is on.
@@ -929,9 +1145,11 @@ impl SkinWindow {
         match (row.ctl, part) {
             (Ctl::Colour(_), Part::Hex) => Some(Rect::new(right - HEX_W, mid(ksize::FIELD_H), HEX_W, ksize::FIELD_H)),
             (Ctl::Colour(_), Part::Main) => Some(Rect::new(right - HEX_W - 10.0 - SWATCH, mid(SWATCH), SWATCH, SWATCH)),
-            (Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize, Part::Main) => Some(Rect::new(right - DROPDOWN_W, mid(ksize::FIELD_H), DROPDOWN_W, ksize::FIELD_H)),
+            (Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Logo, Part::Main) => {
+                Some(Rect::new(right - DROPDOWN_W, mid(ksize::FIELD_H), DROPDOWN_W, ksize::FIELD_H))
+            }
             (Ctl::LogoText, Part::Main) => Some(Rect::new(right - LOGO_FIELD_W, mid(ksize::FIELD_H), LOGO_FIELD_W, ksize::FIELD_H)),
-            (Ctl::Dark, Part::Main) => Some(Rect::new(right - ksize::TOGGLE_W, mid(ksize::TOGGLE_H), ksize::TOGGLE_W, ksize::TOGGLE_H)),
+            (Ctl::Dark | Ctl::Grip, Part::Main) => Some(Rect::new(right - ksize::TOGGLE_W, mid(ksize::TOGGLE_H), ksize::TOGGLE_W, ksize::TOGGLE_H)),
             _ => None,
         }
     }
@@ -939,6 +1157,7 @@ impl SkinWindow {
     /// Lays out the list and the controls.
     fn layout(&mut self, app: &AppState) {
         self.layout_dirty = false;
+        self.refresh_colours(app);
         // The list: the built-in skins, then the person's own.
         let mut items = Vec::new();
         let mut y = 6.0 + GROUP_H;
@@ -983,17 +1202,30 @@ impl SkinWindow {
             blocks.insert(at, Block::Card(Rect::new(x0, top, card_w, *y - top)));
             *y += 18.0;
         };
-        let colours: Vec<(Ctl, &'static str, &'static str)> = COLOURS.iter().enumerate().map(|(i, (_, t, n))| (Ctl::Colour(i), *t, *n)).collect();
-        card("Colours", &colours, &mut y, &mut blocks, &mut rows);
+        // A colour that follows another says which under its title (FOLLOWS stands for that).
+        let colours: Vec<(Ctl, &'static str, &'static str)> =
+            COLOURS.iter().zip(&self.colours).enumerate().map(|(i, ((_, t), c))| (Ctl::Colour(i), *t, if c.hint.is_empty() { "" } else { FOLLOWS })).collect();
         let shapes = [
             (Ctl::Shape, "Button shape", ""),
             (Ctl::Slant, "Slant", ""),
             (Ctl::RowHeight, "Row height", ""),
             (Ctl::FontSize, "Text size", ""),
+            (Ctl::TabLine, "Tab line width", ""),
+            (Ctl::ToolbarLine, "Toolbar line width", ""),
+            (Ctl::Logo, "Logo", "For every skin"),
             (Ctl::LogoText, "Logo text", ""),
             (Ctl::Dark, "Dark skin", ""),
         ];
         card("Shapes and text", &shapes, &mut y, &mut blocks, &mut rows);
+        let style = [
+            (Ctl::Buttons, "Buttons", ""),
+            (Ctl::Caption, "Window buttons", ""),
+            (Ctl::Tabs, "Tabs", ""),
+            (Ctl::Sidebar, "Sidebar", ""),
+            (Ctl::Grip, "Scrollbar grip", ""),
+        ];
+        card("Style", &style, &mut y, &mut blocks, &mut rows);
+        card("Colours", &colours, &mut y, &mut blocks, &mut rows);
         self.rows = rows;
         self.blocks = blocks;
         self.page.set_extent(y + 18.0, page.h);
@@ -1028,6 +1260,9 @@ impl SkinWindow {
         }
         let theme = app.theme.clone();
         self.renderer.clear(theme.window);
+        // The list of skins on the sidebar's colour (a gradient running down the whole window).
+        let below = Rect::new(0.0, size::TITLE_H, self.size.0, (self.size.1 - size::TITLE_H).max(0.0));
+        self.renderer.fill_paint(below, 0.0, &theme.sidebar_paint);
         self.paint_caption(&theme);
         self.paint_list(&theme, app);
         self.paint_header(&theme, app);
@@ -1062,7 +1297,7 @@ impl SkinWindow {
         let close = self.close_rect();
         let r = &mut self.renderer;
         let bar = Rect::new(0.0, 0.0, self.size.0, size::TITLE_H);
-        r.fill_rect(bar, theme.titlebar);
+        kit::title_bar(r, theme, bar);
         let x = kit::logo(r, theme, bar);
         let color = if self.active { theme.text } else { theme.muted };
         r.text("Skins", Rect::new(x + 10.0, 0.0, (self.size.0 - x - 10.0 - ksize::CLOSE_W).max(0.0), size::TITLE_H), &TextStyle::new(color).size(13.0).semibold());
@@ -1093,7 +1328,11 @@ impl SkinWindow {
             let unsaved = app.skins.unsaved(&item.id) || self.save_due.contains(&item.id);
             let name = if unsaved { format!("{} \u{2022}", item.name) } else { item.name.clone() };
             if self.editing == Some(Editing::Rename(item.id.clone())) {
-                continue; // the name box sits there
+                // The name box sits there (in a glass skin, in a rounded text box's frame).
+                if kit::glass(theme) {
+                    kit::field(&mut self.renderer, theme, rect.inset(6.0, 3.0), None, true, Look::enabled());
+                }
+                continue;
             }
             kit::nav_item(&mut self.renderer, theme, rect, &name, selected, look);
         }
@@ -1119,7 +1358,7 @@ impl SkinWindow {
 
     fn paint_header(&mut self, theme: &Theme, app: &AppState) {
         let right = Rect::new(LIST_W, size::TITLE_H, (self.size.0 - LIST_W).max(0.0), (self.size.1 - size::TITLE_H).max(0.0));
-        self.renderer.fill_rect(right, theme.toolbar);
+        self.renderer.fill_paint(right, 0.0, &theme.toolbar_paint);
         let h = self.header_rect();
         let x = h.x + PAD_X;
         let w = (self.advanced_rect().x - 120.0 - x).max(60.0);
@@ -1192,6 +1431,8 @@ impl SkinWindow {
         let enabled = app.skins.find(&app.settings.skin).is_some();
         let now = self.now();
         let dark = self.flips.at("dark", app.theme.dark, now);
+        let grip = self.flips.at("grip", app.theme.scrollbar_grip, now);
+        self.refresh_colours(app);
         self.renderer.push_clip(page);
         for block in &self.blocks {
             let r = &mut self.renderer;
@@ -1213,26 +1454,31 @@ impl SkinWindow {
                 self.renderer.text(row.title, Rect::new(rect.x + ROW_PAD_X, rect.y + ((rect.h - 19.0) / 2.0).round(), text_w, 19.0), &TextStyle::new(title_color));
             } else {
                 self.renderer.text(row.title, Rect::new(rect.x + ROW_PAD_X, rect.y + 9.0, text_w, 19.0), &TextStyle::new(title_color));
-                self.renderer.text(row.note, Rect::new(rect.x + ROW_PAD_X, rect.y + 28.0, text_w, 16.0), &TextStyle::new(theme.muted).size(ksize::NOTE_FONT));
+                let note = match row.ctl {
+                    Ctl::Colour(c) if row.note == FOLLOWS => self.colours.get(c).map_or("", |s| s.hint.as_str()),
+                    _ => row.note,
+                };
+                self.renderer.text(note, Rect::new(rect.x + ROW_PAD_X, rect.y + 28.0, text_w, 16.0), &TextStyle::new(theme.muted).size(ksize::NOTE_FONT));
             }
             let main = self.part_rect(&row, Part::Main).map(shift);
             let hex = self.part_rect(&row, Part::Hex).map(shift);
-            let main_look = self.look_of(row.ctl, Part::Main, enabled);
+            // The Logo setting isn't the skin's: it can always be changed.
+            let main_look = self.look_of(row.ctl, Part::Main, enabled || row.ctl == Ctl::Logo);
             let hex_look = self.look_of(row.ctl, Part::Hex, enabled);
             let label = self.choice_label(row.ctl, &app.theme);
             let r = &mut self.renderer;
             match row.ctl {
                 Ctl::Colour(i) => {
-                    let c = colour_of(&app.theme, COLOURS[i].0);
+                    let Some(c) = self.colours.get(i) else { continue };
                     if let Some(s) = main {
-                        swatch(r, theme, s, c, main_look);
+                        swatch(r, theme, s, &c.paint, main_look);
                     }
                     if let Some(hx) = hex {
                         let editing = matches!(self.editing, Some(Editing::Hex(j, _)) if j == i);
-                        kit::field(r, theme, hx, (!editing).then_some(skin::hex_of(c).as_str()), editing, hex_look);
+                        kit::field(r, theme, hx, (!editing).then_some(c.text.as_str()), editing, hex_look);
                     }
                 }
-                Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize => {
+                Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Logo => {
                     if let Some(m) = main {
                         kit::dropdown(r, theme, m, &label, main_look);
                     }
@@ -1255,6 +1501,11 @@ impl SkinWindow {
                         kit::toggle(r, theme, m, dark, main_look);
                     }
                 }
+                Ctl::Grip => {
+                    if let Some(m) = main {
+                        kit::toggle(r, theme, m, grip, main_look);
+                    }
+                }
             }
         }
         self.renderer.pop_clip();
@@ -1270,6 +1521,13 @@ impl SkinWindow {
             Ctl::Slant => slant_label(t.slant),
             Ctl::RowHeight => row_label(t.row_h),
             Ctl::FontSize => size_label(t.font_size / PT),
+            Ctl::TabLine => width_label(t.tab_line_w),
+            Ctl::ToolbarLine => width_label(t.toolbar_line_w),
+            Ctl::Buttons => label_of(&BUTTON_STYLES, t.buttons),
+            Ctl::Caption => label_of(&CAPTION_STYLES, t.caption_buttons),
+            Ctl::Tabs => label_of(&TAB_STYLES, t.tabs),
+            Ctl::Sidebar => label_of(&SIDEBAR_STYLES, t.sidebar_style),
+            Ctl::Logo => LOGOS.iter().find(|(l, _)| *l == t.logo_style).map_or("", |(_, l)| l).to_string(),
             _ => String::new(),
         }
     }
@@ -1291,6 +1549,13 @@ impl SkinWindow {
                     self.edit_box.place(rect.inset(1.0, 1.0), 7.0, self.scale());
                     if self.edit_at.is_none() {
                         self.edit_box.show();
+                    }
+                    if std::mem::take(&mut self.edit_fresh) {
+                        // Its text went in before it had its size, which can leave only the last
+                        // letters in view: from the start again, all of it selected.
+                        let n = self.edit_box.text().encode_utf16().count();
+                        self.edit_box.select_range(n, 0);
+                        self.edit_box.select_all();
                     }
                 }
                 None => {
@@ -1430,7 +1695,7 @@ impl SkinWindow {
         for row in &self.rows {
             for part in [Part::Main, Part::Hex] {
                 let Some(r) = self.part_rect(row, part).map(|r| self.on_page(r)) else { continue };
-                let hit = if row.ctl == Ctl::Dark { kit::toggle_contains(r, p) } else { r.contains(p) };
+                let hit = if matches!(row.ctl, Ctl::Dark | Ctl::Grip) { kit::toggle_contains(r, p) } else { r.contains(p) };
                 if hit {
                     return Some(Hot::Ctl(row.ctl, part));
                 }
@@ -1749,7 +2014,8 @@ impl SkinWindow {
 
     /// A control was clicked, or Space / Enter was pressed on it.
     fn activate(&mut self, ctl: Ctl, part: Part, app: &mut AppState) -> Vec<Ask> {
-        if app.skins.find(&app.settings.skin).is_none() {
+        // (The Logo setting isn't the skin's: it works whatever the skin.)
+        if app.skins.find(&app.settings.skin).is_none() && ctl != Ctl::Logo {
             return Vec::new();
         }
         let anchor = self.rows.iter().find(|r| r.ctl == ctl).and_then(|r| self.part_rect(r, part)).map(|r| self.on_page(r));
@@ -1758,11 +2024,15 @@ impl SkinWindow {
             vec![Ask::Job(Job::Menu(Menu { tag: 1, at, items, right_aligned: false }))]
         };
         let t = app.theme.clone();
+        let styles = |labels: &[(&str, bool)]| labels.iter().enumerate().map(|(n, (l, on))| MenuItem::new(n as u32 + 1, l).checked(*on)).collect::<Vec<_>>();
         match (ctl, part) {
-            (Ctl::Colour(i), Part::Main) => vec![Ask::Job(Job::Colour { at: i, initial: colour_of(&t, COLOURS[i].0).to_colorref() })],
+            // A gradient's swatch: the picker changes its first colour.
+            (Ctl::Colour(i), Part::Main) => vec![Ask::Job(Job::Colour { at: i, initial: self.colour(app, i).paint.first().to_colorref() })],
             (Ctl::Colour(i), Part::Hex) => {
-                let before = skin::hex_of(colour_of(&t, COLOURS[i].0));
-                self.start_editing(Editing::Hex(i, before.clone()), &before);
+                let now = self.colour(app, i);
+                let own = Self::own_value(app, i);
+                let put_back = own.clone().or_else(|| now.follows.clone()).unwrap_or_else(|| now.text.clone());
+                self.start_editing(Editing::Hex(i, Before { shown: now.text.clone(), own, put_back }), &now.text);
                 Vec::new()
             }
             (Ctl::LogoText, _) => {
@@ -1790,9 +2060,39 @@ impl SkinWindow {
                 self.menu_for = Some(ctl);
                 menu(ROW_HEIGHTS.iter().enumerate().map(|(n, v)| MenuItem::new(n as u32 + 1, &row_label(*v)).checked((*v - t.row_h).abs() < 0.01)).collect())
             }
+            (Ctl::TabLine | Ctl::ToolbarLine, _) => {
+                self.menu_for = Some(ctl);
+                let now = if ctl == Ctl::TabLine { t.tab_line_w } else { t.toolbar_line_w };
+                menu(LINE_WIDTHS.iter().enumerate().map(|(n, v)| MenuItem::new(n as u32 + 1, &width_label(*v)).checked((*v - now).abs() < 0.01)).collect())
+            }
             (Ctl::FontSize, _) => {
                 self.menu_for = Some(ctl);
                 menu(FONT_SIZES.iter().enumerate().map(|(n, v)| MenuItem::new(n as u32 + 1, &size_label(*v)).checked((*v - t.font_size / PT).abs() < 0.01)).collect())
+            }
+            (Ctl::Buttons, _) => {
+                self.menu_for = Some(ctl);
+                menu(styles(&BUTTON_STYLES.map(|(s, _, l)| (l, s == t.buttons))))
+            }
+            (Ctl::Caption, _) => {
+                self.menu_for = Some(ctl);
+                menu(styles(&CAPTION_STYLES.map(|(s, _, l)| (l, s == t.caption_buttons))))
+            }
+            (Ctl::Tabs, _) => {
+                self.menu_for = Some(ctl);
+                menu(styles(&TAB_STYLES.map(|(s, _, l)| (l, s == t.tabs))))
+            }
+            (Ctl::Sidebar, _) => {
+                self.menu_for = Some(ctl);
+                menu(styles(&SIDEBAR_STYLES.map(|(s, _, l)| (l, s == t.sidebar_style))))
+            }
+            (Ctl::Logo, _) => {
+                self.menu_for = Some(ctl);
+                menu(styles(&LOGOS.map(|(s, l)| (l, s == app.settings.logo))))
+            }
+            (Ctl::Grip, _) => {
+                let now = self.now();
+                self.flips.start("grip", !t.scrollbar_grip, now, kit::SWITCH_TIME);
+                self.change(app, &[("scrollbar-grip", (!t.scrollbar_grip).to_string())])
             }
         }
     }
@@ -1830,8 +2130,30 @@ impl SkinWindow {
                 Some(v) => vec![("font-size", format!("{}pt", number(*v)))],
                 None => return Vec::new(),
             },
+            Ctl::TabLine | Ctl::ToolbarLine => match LINE_WIDTHS.get(n) {
+                Some(v) => vec![(if ctl == Ctl::TabLine { "tab-line-width" } else { "toolbar-line-width" }, number(*v))],
+                None => return Vec::new(),
+            },
+            Ctl::Buttons => word_at(&BUTTON_STYLES, n, "buttons"),
+            Ctl::Caption => word_at(&CAPTION_STYLES, n, "caption-buttons"),
+            Ctl::Tabs => word_at(&TAB_STYLES, n, "tabs"),
+            Ctl::Sidebar => word_at(&SIDEBAR_STYLES, n, "sidebar-style"),
+            Ctl::Logo => {
+                // The setting, as Settings changes it: every title bar follows.
+                let Some((logo, _)) = LOGOS.get(n) else { return Vec::new() };
+                if app.settings.logo == *logo {
+                    return Vec::new();
+                }
+                app.settings.logo = *logo;
+                app.apply_skin();
+                self.invalidate();
+                return vec![Ask::RedrawMain];
+            }
             _ => return Vec::new(),
         };
+        if changes.is_empty() {
+            return Vec::new();
+        }
         self.change(app, &changes)
     }
 
@@ -1841,6 +2163,7 @@ impl SkinWindow {
         self.edit_box.set_hint(if matches!(what, Editing::LogoText(_)) { LOGO_HINT } else { "" });
         self.editing = Some(what);
         self.edit_at = None; // placed on the next frame
+        self.edit_fresh = true;
         self.edit_box.set_text(text);
         self.edit_box.select_all();
         self.edit_box.focus();
@@ -1860,12 +2183,8 @@ impl SkinWindow {
         self.invalidate();
         match what {
             Editing::Hex(i, before) => {
-                let value = if keep && skin::parse_hex(typed.trim()).is_some() { typed.trim().to_lowercase() } else { before };
-                let now = skin::hex_of(colour_of(&app.theme, COLOURS[i].0));
-                if skin::parse_hex(&value) != skin::parse_hex(&now) {
-                    return self.change(app, &[(COLOURS[i].0, value)]);
-                }
-                Vec::new()
+                let typed = if keep { typed_value(COLOURS[i].0, &typed) } else { None };
+                self.set_colour(app, i, typed, &before)
             }
             Editing::LogoText(before) => {
                 // Empty means the standard word (GLINT); any other word goes in the box.
@@ -2039,8 +2358,8 @@ impl SkinWindow {
                 Bg::Open(dir) => {
                     // The folder exists now: watch it (a skin copied in shows at once).
                     app.skins.watch_folder();
+                    // In a new tab; the customiser stays open beside it.
                     asks.push(Ask::Command(Command::NewTabAt(dir.display().to_string())));
-                    asks.push(Ask::Job(Job::Close));
                 }
             }
         }
@@ -2058,14 +2377,10 @@ impl SkinWindow {
                 // Colours and the logo show as they're typed (a colour once it's whole).
                 let typed = self.edit_box.text();
                 match self.editing.clone() {
-                    Some(Editing::Hex(i, _)) => {
-                        if let Some(c) = skin::parse_hex(typed.trim()) {
-                            if Some(c) != skin::parse_hex(&skin::hex_of(colour_of(&app.theme, COLOURS[i].0))) {
-                                return self.change(app, &[(COLOURS[i].0, typed.trim().to_lowercase())]);
-                            }
-                        }
-                        Vec::new()
-                    }
+                    Some(Editing::Hex(i, before)) => match typed_value(COLOURS[i].0, &typed) {
+                        Some(value) => self.set_colour(app, i, Some(value), &before),
+                        None => Vec::new(),
+                    },
                     Some(Editing::LogoText(_)) => {
                         let word = skin::logo_word(&typed);
                         if word != app.theme.logo_text {
@@ -2117,13 +2432,15 @@ impl SkinWindow {
                 }
             }
             JobDone::Colour(i, colorref) => {
-                // Windows' picker has no see-through: the colour keeps the strength it had.
-                let old = colour_of(&app.theme, COLOURS[i].0);
-                let new = Color::from_colorref(colorref).with_alpha(old.a);
+                // Windows' picker has no see-through: the colour keeps the strength it had (a clear
+                // one becomes solid). On a gradient it changes the first colour.
+                let old = self.colour(app, i).paint;
+                let alpha = if old.first().a > 0.0 { old.first().a } else { 1.0 };
+                let new = with_first(&old, Color::from_colorref(colorref).with_alpha(alpha));
                 if new == old {
                     return Vec::new();
                 }
-                self.change(app, &[(COLOURS[i].0, skin::hex_of(new))])
+                self.change(app, &[(COLOURS[i].0, paint_text(&new))])
             }
             JobDone::Import(path) => {
                 let (hwnd, serial) = (self.hwnd.0 as isize, self.serial);
@@ -2329,10 +2646,21 @@ impl Drop for SkinWindow {
     }
 }
 
-/// A colour's swatch: the colour over a checked pattern (so a see-through one shows as such), in a
-/// thin frame.
-fn swatch(r: &mut Renderer, theme: &Theme, rect: Rect, c: Color, look: Look) {
-    if c.a < 0.999 {
+/// The label of a style's choice in a look.
+fn label_of<T: PartialEq + Copy>(choices: &[(T, &str, &str)], now: T) -> String {
+    choices.iter().find(|(s, _, _)| *s == now).map_or("", |(_, _, l)| l).to_string()
+}
+
+/// The change choice `n` of a style's drop-down makes: `key` gets its word.
+fn word_at<T>(choices: &[(T, &'static str, &str)], n: usize, key: &'static str) -> Vec<(&'static str, String)> {
+    choices.get(n).map(|(_, word, _)| vec![(key, word.to_string())]).unwrap_or_default()
+}
+
+/// A colour's swatch: the colour or gradient over a checked pattern (so a see-through one shows
+/// as such), in a thin frame.
+fn swatch(r: &mut Renderer, theme: &Theme, rect: Rect, p: &Paint, look: Look) {
+    let see_through = p.gradient().map_or(p.base().a < 0.999, |g| g.stops().iter().any(|s| s.color.a < 0.999));
+    if see_through {
         let cell = rect.w / 4.0;
         for row in 0..4 {
             for col in 0..4 {
@@ -2342,7 +2670,7 @@ fn swatch(r: &mut Renderer, theme: &Theme, rect: Rect, c: Color, look: Look) {
             }
         }
     }
-    r.fill_rect(rect, c);
+    r.fill_paint(rect, 0.0, p);
     r.stroke_rect(rect, 1.0, if look.hover { theme.text } else { theme.line });
     if look.focused {
         kit::focus_ring(r, theme, rect, 0.0);
@@ -2360,6 +2688,14 @@ fn slant_label(v: f32) -> String {
 fn row_label(v: f32) -> String {
     if (v - size::ROW_H).abs() < 0.01 {
         format!("{} (standard)", number(v))
+    } else {
+        number(v)
+    }
+}
+
+fn width_label(v: f32) -> String {
+    if v < 0.5 {
+        "0 (none)".into()
     } else {
         number(v)
     }
@@ -2386,18 +2722,80 @@ mod tests {
         assert_eq!(row_label(28.0), "28 (standard)");
         assert_eq!(size_label(9.0), "9 pt (standard)");
         assert_eq!(size_label(10.5), "10.5 pt");
+        assert_eq!((width_label(0.0), width_label(2.0)), ("0 (none)".to_string(), "2".to_string()));
         assert_eq!(crlf("a\nb\r\nc"), "a\r\nb\r\nc");
     }
 
     #[test]
-    fn every_offered_colour_is_a_skin_colour() {
-        for (key, _, _) in COLOURS {
-            assert!(skin::COLOURS.iter().any(|(k, _)| *k == key), "{key}");
+    fn every_skin_colour_is_offered_once() {
+        for (key, _) in skin::COLOURS {
+            assert_eq!(COLOURS.iter().filter(|(k, _)| k == key).count(), 1, "{key}");
         }
-        // And reads back from the look it makes.
-        let t = skin::parse("accent: #010203\nbackground: #040506\ntoolbar: #070809\npanel: #0a0b0c\ntext: #0d0e0f\nmuted: #101112\nselection: #13141580\nhover: #161718\n", "x").theme;
-        let hexes: Vec<String> = COLOURS.iter().map(|(k, _, _)| skin::hex_of(colour_of(&t, k))).collect();
-        assert_eq!(hexes, ["#010203", "#040506", "#070809", "#0a0b0c", "#0d0e0f", "#101112", "#13141580", "#161718"]);
+        assert_eq!(COLOURS.len(), skin::COLOURS.len());
+        // Each shows what the skin says, read back from its own line.
+        let text: String = COLOURS.iter().enumerate().map(|(i, (k, _))| format!("{k}: #{:02x}0203\n", i + 1)).collect();
+        for (i, c) in shown_colours(&text).iter().enumerate() {
+            assert_eq!(c.text, format!("#{:02x}0203", i + 1), "{}", COLOURS[i].0);
+            assert!(c.follows.is_none() && c.hint.is_empty());
+        }
+        let at = |key: &str| COLOURS.iter().position(|(k, _)| *k == key).unwrap();
+        let shown = shown_colours("dark: true\naccent: #102030\nselection: accent 20%\ntab: none\n");
+        assert_eq!(shown[at("selection")].text, "#10203033");
+        assert_eq!(shown[at("selection")].follows.as_deref(), Some("accent 20%"));
+        assert_eq!(shown[at("selection")].hint, "follows Accent at 20%");
+        assert_eq!(shown[at("title-bar")].hint, "follows Background");
+        assert_eq!(shown[at("tab")].text, "none");
+    }
+
+    #[test]
+    fn gradients_are_shown_and_typed_as_text() {
+        let lib = skin::Library::new();
+        let chrome_text = &lib.find("chrome").unwrap().text;
+        let chrome = skin::built_in_theme("chrome");
+        let shown = shown_colours(chrome_text);
+        let at = |key: &str| COLOURS.iter().position(|(k, _)| *k == key).unwrap();
+        assert_eq!(shown[at("title-bar")].text, "#fdfdfd, #c3cddb 45%, #8d9db8 55%, #dfe6f0");
+        assert_eq!(shown[at("input")].text, "#e9eef6, #ffffff");
+        assert_eq!(shown[at("title-bar")].paint, chrome.titlebar_paint);
+        // A colour that follows another shows that one's colour, and says so.
+        assert_eq!(shown[at("tab-line")].paint, chrome.accent_paint);
+        assert_eq!(shown[at("tab-line")].hint, "follows Accent");
+        // What the box shows, typed back, is the same gradient; a flat colour is a colour.
+        let typed = typed_paint("title-bar", "#fdfdfd, #c3cddb 45%, #8d9db8 55%, #dfe6f0").unwrap();
+        assert_eq!(typed, chrome.titlebar_paint);
+        assert_eq!(typed_paint("toolbar", " #123456 "), Some(Color::hex(0x123456).into()));
+        assert_eq!(typed_value("toolbar", " #ABCDEF; "), Some("#abcdef".to_string()));
+        assert_eq!(typed_value("tab-line", "Accent 50%"), Some("accent 50%".to_string()));
+        assert_eq!(typed_value("tab", "none"), Some("none".to_string()));
+        // Half typed, or not colours: nothing yet.
+        for bad in ["#fdfdfd, #c3", "#fdfdfd,", "red, blue", "#fdfdfd, #c3cddb 4x%", "", "#12", "acc", "tab-line", "#fff // x"] {
+            assert_eq!(typed_value("tab-line", bad), None, "{bad:?}");
+        }
+        // Windows' colour picker on a gradient changes its first colour only.
+        let picked = with_first(&chrome.titlebar_paint, Color::hex(0xff0000));
+        assert_eq!(paint_text(&picked), "#ff0000, #c3cddb 45%, #8d9db8 55%, #dfe6f0");
+        assert_eq!(with_first(&Color::hex(0x010203).into(), Color::hex(0xff0000)), Color::hex(0xff0000).into());
+    }
+
+    #[test]
+    fn the_style_choices_write_what_the_skin_reads() {
+        for (style, word, _) in BUTTON_STYLES {
+            assert_eq!(skin::parse(&format!("buttons: {word}"), "x").theme.buttons, style);
+        }
+        for (style, word, _) in CAPTION_STYLES {
+            assert_eq!(skin::parse(&format!("caption-buttons: {word}"), "x").theme.caption_buttons, style);
+        }
+        for (style, word, _) in TAB_STYLES {
+            assert_eq!(skin::parse(&format!("tabs: {word}"), "x").theme.tabs, style);
+        }
+        for (style, word, _) in SIDEBAR_STYLES {
+            assert_eq!(skin::parse(&format!("sidebar-style: {word}"), "x").theme.sidebar_style, style);
+        }
+        assert_eq!(word_at(&TAB_STYLES, 1, "tabs"), [("tabs", "pills".to_string())]);
+        assert!(word_at(&TAB_STYLES, 7, "tabs").is_empty());
+        let chrome = skin::built_in_theme("chrome");
+        assert_eq!(label_of(&BUTTON_STYLES, chrome.buttons), "Liquid");
+        assert_eq!(label_of(&SIDEBAR_STYLES, skin::built_in_theme(skin::DEFAULT).sidebar_style), "Plain");
     }
 
     #[test]

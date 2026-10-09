@@ -23,7 +23,7 @@ use std::sync::Arc;
 use crate::app::AppState;
 use crate::details::{self, One, Sel};
 use crate::folder;
-use crate::pathbar::{chevron_right, fill_box};
+use crate::pathbar::{chevron_right, fill_box, fill_box_paint};
 use crate::peek::{self, Answer, FactsCache, Peeker};
 use crate::render::{Align, Renderer, TextStyle};
 use crate::theme::{Color, Theme};
@@ -273,7 +273,7 @@ impl PreviewPane {
         }
         self.scale = ctx.scale;
         self.take_answers();
-        r.fill_rect(rect, theme.panel);
+        r.fill_paint(rect, 0.0, &theme.panel_paint);
         r.push_clip(rect);
         let one = details::focused(app);
         if let Some(o) = &one {
@@ -429,18 +429,20 @@ impl PreviewPane {
             let track = Rect::new(view.right() - 6.0 - 3.0, view.y + 4.0, 6.0, view.h - 8.0);
             let h = (track.h * fits as f32 / total as f32).max(24.0).min(track.h);
             let top = track.y + (track.h - h) * (self.scroll / max_scroll.max(1.0));
-            r.fill_round_rect(Rect::new(track.x, top, track.w, h), 3.0, theme.scroll_thumb);
+            r.fill_paint(Rect::new(track.x, top, track.w, h), 3.0, &theme.scroll_thumb_paint);
         }
         r.pop_clip();
     }
 
     fn paint_bar(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState, one: Option<&One>) {
         let bar = self.bar();
+        // The bar takes the look of the file list's column titles.
+        r.fill_paint(Rect::new(self.rect.x, self.rect.y, self.rect.w, TOP_H), 0.0, &theme.list_header);
         r.fill_rect(Rect::new(self.rect.x, self.rect.y + TOP_H, self.rect.w, 1.0), theme.line);
         let picture = self.shown.and_then(|s| s.picture);
         let button_bg = |r: &mut Renderer, rect: Rect, hit: Hit, on: bool, enabled: bool| {
             if on {
-                fill_box(r, theme, rect, 0.0, theme.accent_tint);
+                fill_box_paint(r, theme, rect, 0.0, &theme.accent_tint_paint);
                 r.fill_rect(Rect::new(rect.x, rect.bottom() - 2.0, rect.w, 2.0), theme.accent);
             } else if enabled && self.hover == hit {
                 fill_box(r, theme, rect, 0.0, if self.pressed == hit { theme.button_pressed } else { theme.button_hover });

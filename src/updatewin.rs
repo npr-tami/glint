@@ -53,8 +53,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::frame;
 use crate::kit::{self, size as ksize, Look, Scroller};
 use crate::log;
-use crate::pathbar::fill_box;
-use crate::render::{Align, FrameResult, Renderer, TextStyle};
+use crate::render::{FrameResult, Renderer, TextStyle};
 use crate::theme::{size, Color, Theme};
 use crate::ui::{Point, Rect};
 use crate::update::{self, Release, ANSWERED, ANSWER_LATER, ANSWER_OFF, ANSWER_SKIP, ANSWER_UPDATE, WM_APP_UPDATE};
@@ -651,7 +650,8 @@ impl Prompt {
 
     fn track(&mut self) -> Rect {
         let b = self.changelog_rect();
-        Rect::new(b.right() - BOX_SCROLLBAR + 1.0, b.y + 4.0, size::SCROLLBAR_W, (b.h - 8.0).max(0.0))
+        let w = self.theme.scrollbar_w;
+        Rect::new(b.right() - 3.0 - w, b.y + 4.0, w, (b.h - 8.0).max(0.0))
     }
 
     /// Lays the changelog out for the box's width (again only when that changed).
@@ -703,6 +703,9 @@ impl Prompt {
         }
         let theme = self.theme.clone();
         self.renderer.clear(theme.toolbar);
+        if theme.toolbar_paint.gradient().is_some() {
+            self.renderer.fill_paint(Rect::new(0.0, 0.0, self.size.0, self.size.1), 0.0, &theme.toolbar_paint);
+        }
         self.paint_caption(&theme);
         self.paint_body(&theme);
         let lost = self.renderer.end() == FrameResult::DeviceLost;
@@ -715,14 +718,15 @@ impl Prompt {
         let close = self.close_rect();
         let bar = Rect::new(0.0, 0.0, self.size.0, size::TITLE_H);
         let r = &mut self.renderer;
-        r.fill_rect(bar, theme.window);
+        kit::title_bar(r, theme, bar);
         let x = kit::logo(r, theme, bar);
         let color = if self.active { theme.text } else { theme.muted };
         r.text("Update", Rect::new(x + 10.0, 0.0, (self.size.0 - x - 10.0 - ksize::CLOSE_W).max(0.0), size::TITLE_H), &TextStyle::new(color).size(13.0).semibold());
         let hot = self.hover == Some(Hot::Close);
         kit::close_button(r, theme, close, hot, hot && self.pressed == Some(Hot::Close), self.active);
-        // The line under the title bar, like the toolbar's (as the skin draws it, or none).
-        if theme.toolbar_line_w > 0.0 {
+        // The line under the title bar, like the toolbar's (as the skin draws it, or none; a skin
+        // with a shine on its bars has its edge there already).
+        if theme.toolbar_line_w > 0.0 && theme.highlight.a <= 0.0 {
             r.fill_rect(Rect::new(0.0, size::TITLE_H, self.size.0, theme.toolbar_line_w), theme.toolbar_line);
         }
     }
@@ -792,7 +796,7 @@ impl Prompt {
         r.text(SKIP, Rect::new(boxr.right() + 10.0, check.y, (check.w - ksize::CHECK - 12.0).max(0.0), check.h), &TextStyle::new(words_color));
 
         quiet_button(r, theme, off, OFF, off_look);
-        primary_button(r, theme, update, UPDATE, update_look);
+        kit::primary_button(r, theme, update, UPDATE, update_look);
         kit::button(r, theme, later, LATER, later_look);
     }
 
@@ -1086,23 +1090,6 @@ impl Prompt {
             _ => None,
         };
         (result, acts)
-    }
-}
-
-/// The main button (UPDATE): in the accent, like the question box's yes, in the skin's shape.
-fn primary_button(r: &mut Renderer, theme: &Theme, rect: Rect, label: &str, look: Look) {
-    let fill = match (look.enabled, look.pressed, look.hover) {
-        (false, _, _) => theme.accent.with_alpha(0.38),
-        (true, true, _) => theme.accent.with_alpha(0.75),
-        (true, false, true) => theme.accent.with_alpha(0.88),
-        _ => theme.accent,
-    };
-    let lean = theme.lean(ksize::BUTTON_LEAN);
-    fill_box(r, theme, rect, lean, fill);
-    let text = if look.enabled { theme.on_accent } else { theme.on_accent.with_alpha(0.7) };
-    r.text(label, rect, &TextStyle::new(text).semibold().align(Align::Center));
-    if look.focused {
-        kit::focus_ring(r, theme, rect, lean);
     }
 }
 

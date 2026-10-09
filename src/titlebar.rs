@@ -10,8 +10,12 @@
 //! - tabs, their × and "+" are ordinary client points.
 //!
 //! Tabs: the active one has the toolbar's colour (so it flows into the toolbar) with the skin's line
-//! on top (3 DIPs of red in AMD Radeon); the others are muted text that lights up under the mouse. The × shows on the active tab
-//! and the one under the mouse (never when there is only one tab: the last tab can't be closed).
+//! on top (3 DIPs of red in AMD Radeon); the others are muted text that lights up under the mouse.
+//! A skin with `tabs: pills` makes every tab a rounded box of its own with an edge, sitting inside
+//! the title bar, and `caption-buttons: marbles` draws minimise, maximise and close as three glass
+//! marbles (their buttons stay as wide as ever, so they are as easy to hit). The × shows on the
+//! active tab and the one under the mouse (never when there is only one tab: the last tab can't be
+//! closed).
 //! Click to switch, middle-click or × to close, "+" (or Ctrl+T) for a new one. When there are too
 //! many to fit, they all get narrower. Right-click a tab for Duplicate tab, Close tab, Close other
 //! tabs and Reopen closed tab.
@@ -20,7 +24,7 @@ use std::collections::HashMap;
 
 use crate::app::AppState;
 use crate::render::{Renderer, TextStyle};
-use crate::theme::{size, Color, Theme};
+use crate::theme::{size, CaptionStyle, Color, Paint, TabStyle, Theme};
 use crate::ui::{Command, Component, Ctx, DropTarget, Effect, Hit, Menu, MenuItem, MouseButton, MouseEvent, Point, Rect};
 
 /// Tabs start this far below the top of the title bar and reach down to the toolbar.
@@ -37,6 +41,15 @@ const TAB_SQUEEZED: f32 = 36.0;
 const PLUS: f32 = 28.0;
 /// Empty title bar always left to grab the window by.
 const DRAG_ROOM: f32 = 46.0;
+/// `tabs: pills`: how far a tab sits below the top of the title bar and above its bottom, and the
+/// space between two tabs.
+const PILL_TOP: f32 = 8.0;
+const PILL_BOTTOM: f32 = 4.0;
+const PILL_GAP: f32 = 4.0;
+/// `caption-buttons: marbles`: how big the marbles are, and how far the outer two sit in from the
+/// middle of their buttons, toward the middle one, so the three sit together as a group.
+const MARBLE: f32 = 16.0;
+const MARBLE_PULL: f32 = 10.0;
 
 /// The right-click menu of a tab, and its items.
 const MENU_TAB: u32 = 1;
@@ -72,9 +85,11 @@ pub struct TitleBar {
     hover: Option<Part>,
     /// The part a button went down on (it acts if the button comes up on the same part).
     pressed: Option<(Part, MouseButton)>,
-    /// Tab title widths, measured once per title (and font: `Renderer::font_generation`).
+    /// Tab title widths, measured once per title (and font: `Renderer::font_generation`; and in
+    /// bold with pills, where the current tab's name is bold).
     widths: HashMap<String, f32>,
     widths_font: u32,
+    widths_bold: bool,
     /// The tab the open right-click menu is about, by its id: while the menu is open a tab can open
     /// in front of it (a folder from another program), and the pick must not hit its neighbour.
     menu_tab: Option<u64>,
@@ -116,10 +131,11 @@ impl TitleBar {
         None
     }
 
-    fn measure(&mut self, r: &mut Renderer, title: &str) -> f32 {
+    fn measure(&mut self, r: &mut Renderer, title: &str, bold: bool) -> f32 {
         // Another font (the skin changed): measure again.
-        if self.widths_font != r.font_generation() {
+        if self.widths_font != r.font_generation() || self.widths_bold != bold {
             self.widths_font = r.font_generation();
+            self.widths_bold = bold;
             self.widths.clear();
         }
         if let Some(&w) = self.widths.get(title) {
@@ -128,15 +144,20 @@ impl TitleBar {
         if self.widths.len() > 256 {
             self.widths.clear();
         }
-        let w = r.measure(title, &TextStyle::new(Color::hex(0))).ceil();
+        let style = TextStyle::new(Color::hex(0));
+        let w = r.measure(title, &if bold { style.bold() } else { style }).ceil();
         self.widths.insert(title.to_string(), w);
         w
     }
 
     /// Places the tabs and "+" for this frame.
     fn layout_tabs(&mut self, r: &mut Renderer, app: &AppState) {
-        let y = self.rect.y + TAB_TOP;
-        let h = self.rect.h - TAB_TOP;
+        let pills = app.theme.tabs == TabStyle::Pills;
+        let (y, h, gap) = if pills {
+            (self.rect.y + PILL_TOP, self.rect.h - PILL_TOP - PILL_BOTTOM, PILL_GAP)
+        } else {
+            (self.rect.y + TAB_TOP, self.rect.h - TAB_TOP, 2.0)
+        };
         let left = self.rect.x + crate::logo::width(&app.theme) + 4.0;
         let room = (self.button(2).x - DRAG_ROOM - PLUS - 4.0 - left).max(0.0);
         let n = app.tabs.len().max(1) as f32;
@@ -145,13 +166,13 @@ impl TitleBar {
             .iter()
             .map(|t| {
                 let title = app.display_name(&t.path);
-                let text = self.measure(r, &title);
+                let text = self.measure(r, &title, pills);
                 (TAB_PAD + size::ICON + TAB_ICON_GAP + text + 6.0 + TAB_CLOSE + TAB_PAD * 0.5).clamp(TAB_MIN, TAB_MAX)
             })
             .collect();
-        let total: f32 = widths.iter().sum::<f32>() + 2.0 * (n - 1.0);
+        let total: f32 = widths.iter().sum::<f32>() + gap * (n - 1.0);
         if total > room {
-            let each = ((room - 2.0 * (n - 1.0)) / n).max(TAB_SQUEEZED);
+            let each = ((room - gap * (n - 1.0)) / n).max(TAB_SQUEEZED);
             widths.iter_mut().for_each(|w| *w = w.min(each));
         }
         self.tabs.clear();
@@ -160,13 +181,14 @@ impl TitleBar {
             let rect = Rect::new(x, y, w, h);
             let close = Rect::new(rect.right() - TAB_PAD * 0.5 - TAB_CLOSE, y + (h - TAB_CLOSE) / 2.0, TAB_CLOSE, TAB_CLOSE);
             self.tabs.push(TabSlot { rect, close });
-            x += w + 2.0;
+            x += w + gap;
         }
         self.plus = Rect::new(x + 2.0, y + (h - PLUS) / 2.0, PLUS, PLUS);
     }
 
     fn paint_tabs(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState) {
         self.layout_tabs(r, app);
+        let pills = theme.tabs == TabStyle::Pills;
         // Tabs never run under the caption buttons.
         r.push_clip(Rect::new(self.rect.x, self.rect.y, self.button(2).x - self.rect.x, self.rect.h));
         for (i, tab) in app.tabs.iter().enumerate() {
@@ -175,13 +197,22 @@ impl TitleBar {
             let dropping = self.drop_tab == Some(i);
             let hot = matches!(self.hover, Some(Part::Tab(t) | Part::TabClose(t)) if t == i) || dropping;
             let rect = slot.rect;
-            if active {
-                r.fill_rect(rect, theme.toolbar);
+            if pills {
+                paint_pill(r, theme, rect, active, hot);
+            } else if active {
+                r.fill_paint(rect, 0.0, &theme.tab_active);
                 r.fill_rect(Rect::new(rect.x, rect.y, rect.w, theme.tab_line_w), theme.tab_line);
             } else if hot {
-                r.fill_rect(rect, theme.toolbar.with_alpha(0.7));
+                // Part of the way to the current tab's look.
+                r.fill_paint(rect, 0.0, &theme.tab);
+                r.fill_paint(rect, 0.0, &theme.tab_active.with_strength(0.7));
+            } else {
+                r.fill_paint(rect, 0.0, &theme.tab);
             }
-            if dropping {
+            if dropping && pills {
+                let radius = theme.corner(rect.h);
+                r.stroke_round_rect(rect.inset(0.5, 0.5), (radius - 0.5).max(0.0), 1.0, theme.accent);
+            } else if dropping {
                 r.stroke_rect(rect, 1.0, theme.accent);
             }
 
@@ -191,7 +222,7 @@ impl TitleBar {
                 slot.close = Rect::default();
             }
             let close = slot.close;
-            let mid = rect.y + rect.h / 2.0 + if active { 1.0 } else { 0.0 };
+            let mid = rect.y + rect.h / 2.0 + if active && !pills { 1.0 } else { 0.0 };
             let mut x = rect.x + TAB_PAD;
             // The folder's icon, when there is room for it and a name.
             if rect.w >= 80.0 {
@@ -208,18 +239,26 @@ impl TitleBar {
                 x += size::ICON + TAB_ICON_GAP;
             }
             let right = if show_close { close.x - 4.0 } else { rect.right() - TAB_PAD * 0.75 };
-            let color = if active || hot { theme.text } else { theme.muted };
+            let color = if active {
+                theme.tab_active_text
+            } else if hot {
+                theme.text
+            } else {
+                theme.tab_text
+            };
             let title = app.display_name(&tab.path);
-            r.text(&title, Rect::new(x, mid - 10.0, (right - x).max(0.0), 20.0), &TextStyle::new(color));
+            // The current pill's name is bold.
+            let style = if pills && active { TextStyle::new(color).bold() } else { TextStyle::new(color) };
+            r.text(&title, Rect::new(x, mid - 10.0, (right - x).max(0.0), 20.0), &style);
 
             if show_close {
                 let close_hot = self.hover == Some(Part::TabClose(i));
                 if close_hot {
                     let fill = if self.pressed.is_some_and(|(p, _)| p == Part::TabClose(i)) { theme.button_pressed } else { theme.button_hover };
-                    r.fill_rect(close, fill);
+                    r.fill_paint(close, theme.corner(close.h), &fill.into());
                 }
                 let c = Point::new(close.x + close.w / 2.0, close.y + close.h / 2.0);
-                cross(r, c, 3.5, 1.2, if close_hot { theme.text } else { theme.muted });
+                cross(r, c, 3.5, 1.2, if close_hot { theme.text } else { theme.tab_text });
             }
         }
         r.pop_clip();
@@ -228,12 +267,15 @@ impl TitleBar {
         if self.plus.right() <= self.button(2).x {
             let hot = self.hover == Some(Part::NewTab);
             if hot {
-                r.fill_rect(self.plus, caption_hover(theme, self.pressed.is_some_and(|(p, _)| p == Part::NewTab)));
+                let fill = caption_hover(theme, self.pressed.is_some_and(|(p, _)| p == Part::NewTab));
+                r.fill_paint(self.plus, theme.corner(self.plus.h), &fill.into());
             }
             let c = Point::new(self.plus.x + self.plus.w / 2.0, self.plus.y + self.plus.h / 2.0);
-            let color = if hot { theme.text } else { theme.muted };
-            r.line(Point::new(c.x - 5.5, c.y), Point::new(c.x + 5.5, c.y), 1.2, color);
-            r.line(Point::new(c.x, c.y - 5.5), Point::new(c.x, c.y + 5.5), 1.2, color);
+            let color = if hot { theme.text } else { theme.tab_text };
+            // A bolder "+" beside pills, as their names are.
+            let w = if pills { 1.8 } else { 1.2 };
+            r.line(Point::new(c.x - 5.5, c.y), Point::new(c.x + 5.5, c.y), w, color);
+            r.line(Point::new(c.x, c.y - 5.5), Point::new(c.x, c.y + 5.5), w, color);
         }
     }
 
@@ -262,6 +304,25 @@ impl TitleBar {
             let b = self.button(i);
             let hot = self.hover == Some(part);
             let down = hot && self.pressed.is_some_and(|(p, _)| p == part);
+            if theme.caption_buttons == CaptionStyle::Marbles {
+                // Close and minimise lean toward maximise, the three as one group; each stays well
+                // inside its own button.
+                let pull = [-MARBLE_PULL, 0.0, MARBLE_PULL][i];
+                let c = Point::new(b.x + b.w / 2.0 + pull, b.y + b.h / 2.0);
+                let glass = if part == Part::Close { theme.marble_close } else { theme.marble };
+                let glass = if down {
+                    glass.darker(0.12)
+                } else if hot {
+                    glass.lighter(0.3)
+                } else if ctx.active {
+                    glass
+                } else {
+                    // Like the signs: a little faded while another window is active.
+                    glass.map(|c| c.mix(c.grey(), 0.5))
+                };
+                r.marble(c, MARBLE / 2.0, &glass);
+                continue;
+            }
             // Like Windows: the signs fade a little while another window is active.
             let mut glyph = if ctx.active { theme.muted } else { theme.muted.with_alpha(0.6) };
             if hot && part == Part::Close {
@@ -301,6 +362,25 @@ fn caption_hover(theme: &Theme, pressed: bool) -> Color {
     }
 }
 
+/// A tab as a pill (`tabs: pills`): a rounded box of the skin's `tab` paint (`tab-active` for the
+/// current one, lighter under the mouse), a shine along its top and a thin edge.
+fn paint_pill(r: &mut Renderer, theme: &Theme, rect: Rect, active: bool, hot: bool) {
+    let radius = theme.corner(rect.h);
+    let paint: Paint = if active {
+        theme.tab_active
+    } else if hot {
+        theme.tab.lighter(if theme.dark { 0.08 } else { 0.45 })
+    } else {
+        theme.tab
+    };
+    r.fill_paint(rect, radius, &paint);
+    r.fill_rect(Rect::new(rect.x + radius * 0.7, rect.y + 1.0, (rect.w - 1.4 * radius).max(0.0), 1.0), theme.highlight);
+    if active && theme.tab_line_w > 0.0 {
+        r.fill_rect(Rect::new(rect.x + radius, rect.y, (rect.w - 2.0 * radius).max(0.0), theme.tab_line_w), theme.tab_line);
+    }
+    r.stroke_round_rect(rect.inset(0.5, 0.5), (radius - 0.5).max(0.0), 1.0, theme.tab_border);
+}
+
 /// An "×" centred on `c`, `half` DIPs from the middle to each end.
 fn cross(r: &mut Renderer, c: Point, half: f32, width: f32, color: Color) {
     r.line(Point::new(c.x - half, c.y - half), Point::new(c.x + half, c.y + half), width, color);
@@ -317,7 +397,13 @@ impl Component for TitleBar {
     }
 
     fn paint(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState, ctx: &Ctx) {
-        r.fill_rect(self.rect, theme.titlebar);
+        r.fill_paint(self.rect, 0.0, &theme.titlebar_paint);
+        // The shine along its top edge, and with pills, a line along its bottom (the tabs don't
+        // run into the toolbar then).
+        r.fill_rect(Rect::new(self.rect.x, self.rect.y, self.rect.w, 1.0), theme.highlight);
+        if theme.tabs == TabStyle::Pills {
+            r.fill_rect(Rect::new(self.rect.x, self.rect.bottom() - 1.0, self.rect.w, 1.0), theme.toolbar_line);
+        }
 
         // The logo: part of the caption (it's no part in `part_at`), so it drags the window too.
         crate::logo::draw(r, theme, self.rect);

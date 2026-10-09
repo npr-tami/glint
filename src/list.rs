@@ -64,13 +64,13 @@ use crate::folder::{self, Entry, EntryKind};
 use crate::frame;
 use crate::icons;
 use crate::recycle::{self, BinItem};
-use crate::pathbar::{fill_box, outline_box};
+use crate::pathbar::{fill_box_paint, outline_box};
 use crate::render::{Align, Renderer, TextStyle};
 use crate::settings::{DateFormat, ListSize, SizeFormat, ViewMode};
 use crate::thumbs;
 use crate::views::{Flow, Geometry, Step, Tile, LIST_COLUMN_W, NAME_LINE_H, SCROLL_GUTTER, TILE_PAD, TILE_TEXT_GAP};
 use crate::textbox::{TextBox, TextEvent, TextEventKind};
-use crate::theme::{size, Theme};
+use crate::theme::{size, ButtonStyle, Paint, Theme};
 use crate::ui::{Anim, Command, Component, Ctx, CursorKind, Effect, Menu, MenuItem, MouseButton, MouseEvent, Point, Rect};
 // The right-click menus (menu.rs) and their keys.
 use crate::menu;
@@ -304,6 +304,9 @@ pub struct ListView {
     /// The skin's text size as a part of the standard one (the renderer draws every text that much
     /// bigger): columns widen with it.
     skin_text: f32,
+    /// How thick the scrollbar's thumb is and the space beside it, from the skin.
+    bar_w: f32,
+    bar_margin: f32,
     mouse: Option<Point>,
     drag: Drag,
     anim: Anim,
@@ -371,6 +374,8 @@ impl ListView {
             icon: size::ICON,
             font: size::FONT,
             skin_text: 1.0,
+            bar_w: size::SCROLLBAR_W,
+            bar_margin: size::SCROLLBAR_MARGIN,
             mouse: None,
             drag: Drag::None,
             anim: Anim::default(),
@@ -424,6 +429,8 @@ impl ListView {
         self.icon = if large { size::ICON_LARGE } else { size::ICON };
         self.font = if large { size::FONT_LARGE } else { size::FONT };
         self.skin_text = app.theme.font_size / size::FONT;
+        self.bar_w = app.theme.scrollbar_w;
+        self.bar_margin = app.theme.scrollbar_margin();
         let mode = app.tab().view_mode;
         self.flow = Flow::of(mode);
         self.tile = Tile::of(mode);
@@ -587,11 +594,18 @@ impl ListView {
     /// The scrollbar's track: on the right, or along the bottom in the List view.
     fn track(&self) -> Rect {
         let area = self.rows_area();
-        let (w, m) = (size::SCROLLBAR_W, size::SCROLLBAR_MARGIN);
+        let (w, m) = (self.bar_w, self.bar_margin);
         if self.flow == Flow::Columns {
             return Rect::new(area.x + m, self.rect.bottom() - w - m, (area.w - 2.0 * m).max(0.0), w);
         }
         Rect::new(self.rect.right() - w - m, area.y + m, w, (area.h - 2.0 * m).max(0.0))
+    }
+
+    /// The scrollbar's whole lane: the track and the space beside it (where a skin paints a track).
+    fn lane(&self) -> Rect {
+        let t = self.track();
+        let m = self.bar_margin;
+        Rect::new(t.x - m, t.y - m, t.w + 2.0 * m, t.h + 2.0 * m)
     }
 
     /// Whether `p` is on (or right next to) the scrollbar's track.
@@ -1047,18 +1061,25 @@ impl ListView {
         let this_pc = Self::is_this_pc(tab);
         let bin = recycle::is_bin(&tab.folder.path);
         let end = self.rect.right() - SCROLL_GUTTER;
+        r.fill_paint(header, 0.0, &theme.list_header);
         for (i, p) in self.cols.clone().iter().enumerate() {
             let cell = Rect::new(p.x, header.y, (p.x + p.w).min(end) - p.x, header.h);
             if cell.w <= 0.0 {
                 continue;
             }
             if hover_col == Some(p.col) && p.col.sort_key().is_some() {
-                r.fill_rect(cell, theme.hover);
+                r.fill_paint(cell, 0.0, &theme.hover_paint);
+            }
+            if i > 0 {
+                // The line between two column titles (none in most skins).
+                r.fill_rect(Rect::new(cell.x, cell.y, 1.0, cell.h), theme.column_line);
             }
             let label = p.col.title(this_pc, bin);
             let right = p.col.right_aligned();
             let text_rect = if i == 0 { Rect::new(cell.x + ROW_PAD + 4.0, cell.y, cell.w - ROW_PAD - 16.0, cell.h) } else { cell.inset(10.0, 0.0) };
-            let style = TextStyle::new(theme.muted).align(if right { Align::Right } else { Align::Left });
+            let style = TextStyle::new(theme.list_header_text).align(if right { Align::Right } else { Align::Left });
+            // With liquid buttons the titles are bold, as the sidebar's panel headers are.
+            let style = if theme.buttons == ButtonStyle::Liquid { style.bold() } else { style };
             r.text(label, text_rect, &style);
             // (None while the custom sort order decides.)
             if p.col.sort_key() == Some(tab.sort) && tab.custom.is_none() && !(this_pc && p.col == Col::Free && tab.sort != SortKey::Date) {
@@ -1067,7 +1088,7 @@ impl ListView {
                 let cx = if right { text_rect.right() - w - 9.0 } else { (text_rect.x + w + 9.0).min(text_rect.right() - 4.0) };
                 let cy = cell.y + cell.h / 2.0;
                 let d = if tab.descending { 1.5 } else { -1.5 };
-                r.polyline(&[Point::new(cx - 3.5, cy - d), Point::new(cx, cy + d), Point::new(cx + 3.5, cy - d)], 1.3, theme.muted);
+                r.polyline(&[Point::new(cx - 3.5, cy - d), Point::new(cx, cy + d), Point::new(cx + 3.5, cy - d)], 1.3, theme.list_header_text);
             }
         }
         r.fill_rect(Rect::new(header.x, header.bottom(), header.w, 1.0), theme.line);
@@ -1154,12 +1175,12 @@ impl ListView {
         }
 
         if let Some(thumb) = self.thumb(tab) {
-            let color = match self.drag {
-                Drag::Thumb { .. } => theme.accent,
-                _ if self.mouse.is_some_and(|p| self.near_track(p)) => theme.scroll_thumb_hover,
-                _ => theme.scroll_thumb,
+            let state = match self.drag {
+                Drag::Thumb { .. } => ThumbState::Dragged,
+                _ if self.mouse.is_some_and(|p| self.near_track(p)) => ThumbState::Hover,
+                _ => ThumbState::Rest,
             };
-            r.fill_round_rect(thumb, size::SCROLLBAR_W / 2.0, color);
+            paint_scrollbar(r, theme, self.lane(), thumb, state);
         }
     }
 
@@ -1180,7 +1201,7 @@ impl ListView {
     /// The colour of an item's name.
     fn name_color(theme: &Theme, e: &Entry, selected: bool, is_cut: bool) -> crate::theme::Color {
         if selected && !is_cut {
-            theme.text_strong
+            theme.selection_text
         } else if e.is_hidden() || is_cut {
             theme.muted
         } else {
@@ -1210,10 +1231,10 @@ impl ListView {
             // The folder something dragged over the list would go into: outlined in red.
             let dropping = self.drop_row.as_deref().is_some_and(|d| e.is_container() && e.path_in(&tab.folder.path).to_lowercase() == d);
             if selected {
-                r.fill_rect(line, theme.accent_tint);
+                r.fill_paint(line, 0.0, &theme.accent_tint_paint);
                 r.fill_rect(Rect::new(line.x, line.y, size::SELECT_EDGE, line.h), theme.select_edge);
             } else if hover == Some(row) || dropping {
-                r.fill_rect(line, theme.hover);
+                r.fill_paint(line, 0.0, &theme.hover_paint);
             }
             if dropping {
                 r.stroke_rect(line, 1.0, theme.accent);
@@ -1253,7 +1274,7 @@ impl ListView {
             let name_x = line.x + ROW_PAD + offset + self.icon + 8.0;
             let name_right = self.name_right();
             r.text(shown_name(e, hide_ext), Rect::new(name_x, y, name_right - name_x - 8.0, row_h), &TextStyle::new(name_color).size(self.font));
-            let detail = TextStyle::new(if selected { theme.text } else { theme.muted }).size(self.font);
+            let detail = TextStyle::new(if selected { theme.selection_details } else { theme.muted }).size(self.font);
             for p in cols.iter().skip(1) {
                 let w = (p.x + p.w).min(end) - p.x - 20.0;
                 if w <= 0.0 {
@@ -1293,10 +1314,10 @@ impl ListView {
             self.list_hit.push((row, item.right() - cell.x));
             let dropping = self.drop_row.as_deref().is_some_and(|d| e.is_container() && e.path_in(&tab.folder.path).to_lowercase() == d);
             if selected {
-                r.fill_rect(item, theme.accent_tint);
+                r.fill_paint(item, 0.0, &theme.accent_tint_paint);
                 r.fill_rect(Rect::new(item.x, item.y, size::SELECT_EDGE, item.h), theme.select_edge);
             } else if hover == Some(row) || dropping {
-                r.fill_rect(item, theme.hover);
+                r.fill_paint(item, 0.0, &theme.hover_paint);
             }
             if dropping {
                 r.stroke_rect(item, 1.0, theme.accent);
@@ -1327,10 +1348,10 @@ impl ListView {
             // In the skin's shape (round corners only in a rounded skin), with the skin's selection
             // edge along the bottom.
             if selected {
-                fill_box(r, theme, tile, 0.0, theme.accent_tint);
+                fill_box_paint(r, theme, tile, 0.0, &theme.accent_tint_paint);
                 r.fill_rect(Rect::new(tile.x + 8.0, tile.bottom() - 2.0, tile.w - 16.0, 2.0), theme.select_edge);
             } else if hover == Some(row) || dropping {
-                fill_box(r, theme, tile, 0.0, theme.hover);
+                fill_box_paint(r, theme, tile, 0.0, &theme.hover_paint);
             }
             if dropping {
                 outline_box(r, theme, tile.inset(0.5, 0.5), 0.0, 1.0, theme.accent);
@@ -1457,6 +1478,50 @@ impl ListView {
         if let Some(i) = first {
             tab.focus = Some(i);
             tab.anchor = Some(i);
+        }
+    }
+}
+
+/// How a scrollbar's thumb looks: at rest, with the mouse near it, or being dragged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThumbState {
+    Rest,
+    Hover,
+    Dragged,
+}
+
+/// Draws a scrollbar (the file list's, the sidebar's): the skin's track along `lane` if it paints
+/// one (with a line on the side facing the items), and the thumb in `thumb`: a bar with round ends
+/// in the skin's `scrollbar` paint (a gradient shades it across, like a rod), its edge and three
+/// grip lines across its middle if the skin has them. Being dragged, a flat thumb takes the accent
+/// colour and a shaded one gets a little darker.
+pub fn paint_scrollbar(r: &mut Renderer, theme: &Theme, lane: Rect, thumb: Rect, state: ThumbState) {
+    let upright = thumb.h >= thumb.w;
+    if !theme.scrollbar_track.is_clear() {
+        r.fill_paint(lane, 0.0, &theme.scrollbar_track);
+        let edge = if upright { Rect::new(lane.x, lane.y, 1.0, lane.h) } else { Rect::new(lane.x, lane.y, lane.w, 1.0) };
+        r.fill_rect(edge, theme.line);
+    }
+    let radius = thumb.w.min(thumb.h) / 2.0;
+    let shaded = theme.scroll_thumb_paint.gradient().is_some();
+    let paint = match state {
+        ThumbState::Dragged if shaded => theme.scroll_thumb_hover_paint.darker(0.1),
+        ThumbState::Dragged => Paint::Flat(theme.accent),
+        ThumbState::Hover => theme.scroll_thumb_hover_paint,
+        ThumbState::Rest => theme.scroll_thumb_paint,
+    };
+    r.fill_paint(thumb, radius, &paint);
+    if theme.scrollbar_border.a > 0.0 {
+        r.stroke_round_rect(thumb.inset(0.5, 0.5), (radius - 0.5).max(0.0), 1.0, theme.scrollbar_border);
+    }
+    let long = if upright { thumb.h } else { thumb.w };
+    if theme.scrollbar_grip && long >= 24.0 {
+        let c = Point::new(r.snap(thumb.x + thumb.w / 2.0), r.snap(thumb.y + thumb.h / 2.0));
+        let half = (thumb.w.min(thumb.h) * 0.28).max(2.0);
+        for k in -1..=1 {
+            let at = k as f32 * 3.0;
+            let line = if upright { Rect::new(c.x - half, c.y + at - 0.5, 2.0 * half, 1.0) } else { Rect::new(c.x + at - 0.5, c.y - half, 1.0, 2.0 * half) };
+            r.fill_rect(line, theme.scrollbar_grip_lines);
         }
     }
 }
@@ -1660,7 +1725,7 @@ impl Component for ListView {
         let tab = app.tab();
         self.take_size(app);
         self.place_columns(app);
-        r.fill_rect(self.rect, theme.panel);
+        r.fill_paint(self.rect, 0.0, &theme.panel_paint);
         r.push_clip(self.rect);
         if self.flow == Flow::Rows {
             self.paint_header(r, theme, tab);

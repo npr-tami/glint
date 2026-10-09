@@ -19,11 +19,11 @@
 use crate::app::{AppState, Tab};
 use crate::folder::{self, Entry, EntryKind};
 use crate::peek::{self, Answer, Ask, Facts, FactsCache, Peeker, TextLimits, What};
-use crate::pathbar::{fill_box, outline_box};
+use crate::pathbar::{fill_box, fill_box_paint, outline_box};
 use crate::recycle;
 use crate::render::{Align, Renderer, TextStyle};
 use crate::shell;
-use crate::theme::{Color, Theme};
+use crate::theme::{ButtonStyle, Color, Theme};
 use crate::thumbs::{self, Picture};
 use crate::ui::{Command, Ctx, Effect, MouseButton, MouseEvent, Point, Rect};
 
@@ -455,10 +455,17 @@ pub fn draw_rows(r: &mut Renderer, theme: &Theme, x: f32, y: f32, w: f32, limit:
     y
 }
 
-/// A drive's usage bar.
+/// A drive's usage bar: round ends in a rounded skin, with the path box's edge if the skin has one.
 pub fn draw_bar(r: &mut Renderer, theme: &Theme, rect: Rect, used: f32) {
-    r.fill_rect(rect, theme.bar_track);
-    r.fill_rect(Rect::new(rect.x, rect.y, rect.w * used.clamp(0.0, 1.0), rect.h), theme.accent);
+    let radius = theme.corner(rect.h);
+    r.fill_paint(rect, radius, &theme.bar_track_paint);
+    let w = rect.w * used.clamp(0.0, 1.0);
+    if w > 0.0 {
+        r.fill_paint(Rect::new(rect.x, rect.y, w.max(2.0 * radius).min(rect.w), rect.h), radius, &theme.usage_fill);
+    }
+    if radius > 0.0 {
+        r.stroke_round_rect(rect.inset(0.5, 0.5), (radius - 0.5).max(0.0), 1.0, theme.input_border);
+    }
 }
 
 /// Name, chips, usage bar and rows from the top of `area`; returns where they end.
@@ -540,6 +547,30 @@ fn button(r: &mut Renderer, theme: &Theme, rect: Rect, label: &str, hover: bool,
         return;
     }
     let style = TextStyle::new(text_color.unwrap_or(if accent { theme.on_accent } else { theme.text })).semibold().align(Align::Center);
+    if theme.buttons == ButtonStyle::Liquid {
+        // Glossy capsules, as SORT, VIEW and SETTINGS: the accent's glass for Open, the button's
+        // for the others; white words with a dark shadow.
+        // (A light accent is taken darker, so the white word on it stays easy to read.)
+        let lit = theme.accent_paint.base().lightness() > 0.55;
+        let glass = if accent && lit {
+            theme.accent_paint.darker(0.3)
+        } else if accent {
+            theme.accent_paint
+        } else if hover {
+            theme.chip_hover_paint
+        } else {
+            theme.chip_paint
+        };
+        let glass = if pressed { glass.darker(0.12) } else if hover && accent { glass.lighter(0.12) } else { glass };
+        let capsule = rect.inset(0.0, 2.0);
+        r.liquid_capsule(capsule, &glass);
+        let ink = text_color.unwrap_or(theme.button_text);
+        let style = TextStyle::new(ink).bold().align(Align::Center);
+        let shadow = glass.last().darker(0.5).with_alpha(0.8);
+        r.text(label, Rect::new(capsule.x + 6.0, capsule.y + 1.0, (capsule.w - 12.0).max(0.0), capsule.h), &style.color(shadow));
+        r.text(label, capsule.inset(6.0, 0.0), &style);
+        return;
+    }
     if accent {
         let fill = if pressed { blend(theme.accent, Color::hex(0), 0.18) } else if hover { blend(theme.accent, Color::hex(0xffffff), 0.1) } else { theme.accent };
         // In a slanted skin the right edge is cut at an angle (like AMD's Radeon software);
@@ -551,8 +582,8 @@ fn button(r: &mut Renderer, theme: &Theme, rect: Rect, label: &str, hover: bool,
             fill_box(r, theme, rect, 0.0, fill);
         }
     } else {
-        let fill = if pressed { theme.button_pressed } else if hover { theme.chip_hover } else { theme.chip };
-        fill_box(r, theme, rect, 0.0, fill);
+        let fill = if pressed { theme.button_pressed.into() } else if hover { theme.chip_hover_paint } else { theme.chip_paint };
+        fill_box_paint(r, theme, rect, 0.0, &fill);
         outline_box(r, theme, rect, 0.0, 1.0, theme.line);
     }
     r.text(label, rect.inset(6.0, 0.0), &style);
@@ -675,7 +706,7 @@ impl DetailsPanel {
             return;
         }
         self.take_answers();
-        r.fill_rect(rect, theme.panel);
+        r.fill_paint(rect, 0.0, &theme.panel_paint);
         r.push_clip(rect);
         let sel = selection(app);
         let (can_open, open_with, can_copy) = Self::buttons(&sel);
@@ -725,7 +756,7 @@ impl DetailsPanel {
         if area.h <= 0.0 {
             return;
         }
-        fill_box(r, theme, area, 0.0, theme.window);
+        fill_box_paint(r, theme, area, 0.0, &theme.window_paint);
         let px = (area.w.max(area.h) * scale).ceil() as u32;
         let icon_max = (area.h * 0.75).min(dims::ICON_MAX);
         match sel {

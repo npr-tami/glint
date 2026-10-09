@@ -46,8 +46,14 @@ use windows::Win32::Graphics::Direct2D::{
     ID2D1BitmapBrush, ID2D1DeviceContext, D2D1_BITMAP_BRUSH_PROPERTIES, D2D1_EXTEND_MODE_WRAP, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
 };
 use windows_core::Interface;
-use crate::theme::{size, Color};
+use crate::theme::{size, Color, Gradient, Paint, Stop, MAX_STOPS};
 use crate::ui::{Point, Rect};
+// Gradients (`fill_paint`, `marble`, `liquid_capsule`, `gloss`).
+use windows::Win32::Graphics::Direct2D::Common::D2D1_GRADIENT_STOP;
+use windows::Win32::Graphics::Direct2D::{
+    ID2D1GradientStopCollection, ID2D1LinearGradientBrush, ID2D1RadialGradientBrush, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA_2_2,
+    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES,
+};
 
 /// Fonts to try, best first. Windows 11 has the first, Windows 10 the second; the rest are for
 /// Wine and odd setups. DirectWrite fills in missing letters (e.g. Chinese names) by itself.
@@ -148,7 +154,44 @@ struct Target {
     /// Direct2D copies of the logo's pictures (logo.rs), dark ones then light ones, made the first
     /// time each is drawn (`Renderer::wordmark`).
     wordmarks: [Option<ID2D1Bitmap>; 2 * crate::logo::COUNT],
+    /// Gradients' brushes, by their colours (`Renderer::fill_paint`), made the first time each is
+    /// drawn and moved into place for each shape after that.
+    gradients: HashMap<GradientKey, GradientBrushes>,
 }
+
+/// What a gradient's brushes are kept by: its colours (8 bits each of red, green, blue and
+/// opacity) and their positions (in ten-thousandths). A fixed-size value, so looking one up never
+/// allocates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct GradientKey {
+    colors: [u32; MAX_STOPS],
+    at: [u16; MAX_STOPS],
+    len: u8,
+}
+
+impl GradientKey {
+    fn of(g: &Gradient) -> GradientKey {
+        let mut k = GradientKey { colors: [0; MAX_STOPS], at: [0; MAX_STOPS], len: 0 };
+        for (i, s) in g.stops().iter().enumerate() {
+            let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+            k.colors[i] = (b(s.color.r) << 24) | (b(s.color.g) << 16) | (b(s.color.b) << 8) | b(s.color.a);
+            k.at[i] = (s.at.clamp(0.0, 1.0) * 10_000.0).round() as u16;
+            k.len += 1;
+        }
+        k
+    }
+}
+
+/// A gradient's colours as Direct2D keeps them, and the brushes made from them (each made the
+/// first time it's needed).
+struct GradientBrushes {
+    stops: ID2D1GradientStopCollection,
+    linear: Option<ID2D1LinearGradientBrush>,
+    radial: Option<ID2D1RadialGradientBrush>,
+}
+
+/// More gradients than this (a skin has a few dozen) and the kept brushes start over.
+const MAX_CACHED_GRADIENTS: usize = 256;
 
 /// What the renderer keeps for drawing pictures (thumbs.rs), made from the render target.
 #[derive(Default)]
@@ -340,7 +383,7 @@ impl Renderer {
             };
             let brush = rt.CreateSolidColorBrush(&color_f(Color::hex(0)), None)?;
             let pictures = Pictures { dc: rt.cast::<ID2D1DeviceContext>().ok(), ..Pictures::default() };
-            self.target = Some(Target { rt, brush, bitmaps: Vec::new(), pictures, wordmarks: Default::default() });
+            self.target = Some(Target { rt, brush, bitmaps: Vec::new(), pictures, wordmarks: Default::default(), gradients: HashMap::new() });
         }
         Ok(())
     }
@@ -693,6 +736,256 @@ impl Renderer {
         }
         self.clip_depth -= 1;
     }
+}
+
+// ---------------------------------------------------------------- paints: gradients and glass
+
+/// The soft shadow under a marble: dark in the middle, fading out at its edge.
+const MARBLE_SHADOW: [Stop; 3] = [
+    Stop { at: 0.0, color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.32 } },
+    Stop { at: 0.72, color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.26 } },
+    Stop { at: 1.0, color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } },
+];
+
+// (Not every part draws with all of these yet.)
+#[allow(dead_code)]
+impl Renderer {
+    /// Fills `r` with a paint (theme.rs `Paint`), with corners `radius` DIPs round (0: square).
+    /// A flat paint draws exactly as `fill_rect` / `fill_round_rect`; a gradient runs across the
+    /// short side of `r`: top to bottom when it's wider than tall, left to right otherwise.
+    pub fn fill_paint(&mut self, r: Rect, radius: f32, paint: &Paint) {
+        let g = match paint {
+            Paint::Flat(c) if radius > 0.0 => return self.fill_round_rect(r, radius, *c),
+            Paint::Flat(c) => return self.fill_rect(r, *c),
+            Paint::Gradient(g) => g,
+        };
+        if r.is_empty() || paint.is_clear() || !self.in_frame {
+            return;
+        }
+        let rect = self.snapped(r);
+        let (a, b) = across(rect);
+        let Some(brush) = self.linear_brush(g, a, b) else { return };
+        let Some(t) = &self.target else { return };
+        // SAFETY: the rectangle lives across the calls; the brush belongs to this target.
+        unsafe {
+            if radius > 0.0 {
+                t.rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect, radiusX: radius, radiusY: radius }, &brush);
+            } else {
+                t.rt.FillRectangle(&rect, &brush);
+            }
+        }
+    }
+
+    /// A filled shape through `points` (closed automatically) in a paint - a slanted box. A
+    /// gradient runs across the short side of the shape's bounding box.
+    pub fn fill_polygon_paint(&mut self, points: &[Point], paint: &Paint) {
+        let g = match paint {
+            Paint::Flat(c) => return self.fill_polygon(points, *c),
+            Paint::Gradient(g) => g,
+        };
+        if points.len() < 3 || paint.is_clear() || !self.in_frame {
+            return;
+        }
+        let (mut lo, mut hi) = (points[0], points[0]);
+        for p in points {
+            (lo.x, lo.y, hi.x, hi.y) = (lo.x.min(p.x), lo.y.min(p.y), hi.x.max(p.x), hi.y.max(p.y));
+        }
+        let (a, b) = across(D2D_RECT_F { left: lo.x, top: lo.y, right: hi.x, bottom: hi.y });
+        let Some(geo) = self.path(points, true) else { return };
+        let Some(brush) = self.linear_brush(g, a, b) else { return };
+        let Some(t) = &self.target else { return };
+        // SAFETY: the geometry and brush are live; no opacity brush.
+        unsafe { t.rt.FillGeometry(&geo, &brush, None) };
+    }
+
+    /// A glass marble `radius` DIPs round centred on `c` (caption buttons, the toolbar's liquid
+    /// buttons): the paint as a round gradient lit from above (its first colour where the light
+    /// falls, its last at the rim), a soft shadow under it and a white shine on top. A flat paint
+    /// gets a lighter top and a darker rim of its own colour.
+    pub fn marble(&mut self, c: Point, radius: f32, paint: &Paint) {
+        if radius <= 0.0 || paint.is_clear() || !self.in_frame {
+            return;
+        }
+        let shadow = Gradient::new(&MARBLE_SHADOW);
+        if let Some(shadow) = shadow {
+            let at = Point::new(c.x, c.y + radius * 0.12 + 0.5);
+            self.fill_ellipse_radial(at, radius * 1.12 + 0.5, &shadow, at, radius * 1.12 + 0.5);
+        }
+        // Lit from a point a third of the way down (as CSS's "circle at 50% 32%"), the rim
+        // reaching to the far corners.
+        if let Paint::Gradient(glass) = marble_glass(paint) {
+            let light = Point::new(c.x, c.y - radius * 0.36);
+            self.fill_ellipse_radial(c, radius, &glass, light, radius * 1.7);
+        }
+        let shine = Rect::new(c.x - radius * 0.58, c.y - radius * 0.86, radius * 1.16, radius * 0.72);
+        self.gloss_ellipse(shine, 0.85);
+    }
+
+    /// A glossy pill filling `r` (the liquid SORT, VIEW and SETTINGS): the paint laid out like lit
+    /// glass (light at the top, darkest across the middle, a glow of light at the bottom), a white
+    /// shine over the top ~40 %, a thin darker edge and a slight shadow under it.
+    pub fn liquid_capsule(&mut self, r: Rect, paint: &Paint) {
+        if r.is_empty() || paint.is_clear() || !self.in_frame {
+            return;
+        }
+        let radius = (r.h.min(r.w) / 2.0).max(0.0);
+        self.fill_round_rect(Rect::new(r.x, r.y + 1.0, r.w, r.h), radius, Color::rgba(0, 0, 0, 0.22));
+        self.fill_paint(r, radius, &capsule_glass(paint));
+        let inset = radius * 0.6;
+        let band = Rect::new(r.x + inset, r.y + 1.0, (r.w - 2.0 * inset).max(0.0), r.h * 0.4);
+        self.gloss(band, band.h / 2.0, 0.72);
+        let edge = paint.last().darker(0.3);
+        self.stroke_round_rect(r.inset(0.5, 0.5), (radius - 0.5).max(0.0), 1.0, edge.with_alpha(edge.a * 0.45));
+    }
+
+    /// A soft white shine over `r` (corners `radius` round): white at `strength` opacity (0 to 1)
+    /// at the top, fading to almost nothing at the bottom. Put it over the top part of a shape.
+    pub fn gloss(&mut self, r: Rect, radius: f32, strength: f32) {
+        if r.is_empty() || strength <= 0.0 {
+            return;
+        }
+        self.fill_paint(r, radius, &shine(strength));
+    }
+
+    /// Fills `r` (corners `radius` round) with a paint whose gradient runs down from `top` to
+    /// `bottom`, whatever `r`'s shape: a tall sidebar shaded top to bottom like the bars, or a
+    /// part of a bar (a header with only its top corners round, drawn clipped) shaded as the
+    /// whole bar is. A flat paint draws as `fill_paint` does.
+    pub fn fill_paint_down(&mut self, r: Rect, radius: f32, paint: &Paint, top: f32, bottom: f32) {
+        let g = match paint {
+            Paint::Flat(c) if radius > 0.0 => return self.fill_round_rect(r, radius, *c),
+            Paint::Flat(c) => return self.fill_rect(r, *c),
+            Paint::Gradient(g) => g,
+        };
+        if r.is_empty() || paint.is_clear() || !self.in_frame {
+            return;
+        }
+        let rect = self.snapped(r);
+        let (a, b) = (Vector2 { X: rect.left, Y: self.snap(top) }, Vector2 { X: rect.left, Y: self.snap(bottom) });
+        let Some(brush) = self.linear_brush(g, a, b) else { return };
+        let Some(t) = &self.target else { return };
+        // SAFETY: the rectangle lives across the calls; the brush belongs to this target.
+        unsafe {
+            if radius > 0.0 {
+                t.rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect, radiusX: radius, radiusY: radius }, &brush);
+            } else {
+                t.rt.FillRectangle(&rect, &brush);
+            }
+        }
+    }
+
+    /// The linear brush of `g`, made the first time, set to run from `a` to `b`.
+    fn linear_brush(&mut self, g: &Gradient, a: Vector2, b: Vector2) -> Option<ID2D1LinearGradientBrush> {
+        let t = self.target.as_mut().filter(|_| self.in_frame)?;
+        let kept = gradient_brushes(&t.rt, &mut t.gradients, g)?;
+        if kept.linear.is_none() {
+            let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: a, endPoint: b };
+            // SAFETY: the properties live across the call; the stop collection belongs to this target.
+            kept.linear = unsafe { t.rt.CreateLinearGradientBrush(&props, None, &kept.stops) }.ok();
+        }
+        let brush = kept.linear.clone()?;
+        // SAFETY: plain setters on a live brush.
+        unsafe {
+            brush.SetStartPoint(a);
+            brush.SetEndPoint(b);
+        }
+        Some(brush)
+    }
+
+    /// Fills the circle of `radius` round `c` with `g` as a round gradient: its first colour at
+    /// `light`, its last `reach` DIPs away (and beyond).
+    fn fill_ellipse_radial(&mut self, c: Point, radius: f32, g: &Gradient, light: Point, reach: f32) {
+        let Some(t) = self.target.as_mut().filter(|_| self.in_frame) else { return };
+        let Some(kept) = gradient_brushes(&t.rt, &mut t.gradients, g) else { return };
+        if kept.radial.is_none() {
+            let props = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES { center: vec2(light), gradientOriginOffset: Vector2 { X: 0.0, Y: 0.0 }, radiusX: reach, radiusY: reach };
+            // SAFETY: the properties live across the call; the stop collection belongs to this target.
+            kept.radial = unsafe { t.rt.CreateRadialGradientBrush(&props, None, &kept.stops) }.ok();
+        }
+        let Some(brush) = kept.radial.clone() else { return };
+        let ellipse = D2D1_ELLIPSE { point: vec2(c), radiusX: radius, radiusY: radius };
+        // SAFETY: plain setters on a live brush; the ellipse lives across the call.
+        unsafe {
+            brush.SetCenter(vec2(light));
+            brush.SetGradientOriginOffset(Vector2 { X: 0.0, Y: 0.0 });
+            brush.SetRadiusX(reach);
+            brush.SetRadiusY(reach);
+            t.rt.FillEllipse(&ellipse, &brush);
+        }
+    }
+
+    /// A white shine in the ellipse filling `r`, fading from `strength` at its top to nothing.
+    fn gloss_ellipse(&mut self, r: Rect, strength: f32) {
+        let Paint::Gradient(g) = shine(strength) else { return };
+        let Some(brush) = self.linear_brush(&g, Vector2 { X: r.x, Y: r.y }, Vector2 { X: r.x, Y: r.bottom() }) else { return };
+        let Some(t) = &self.target else { return };
+        let ellipse = D2D1_ELLIPSE { point: vec2(Point::new(r.x + r.w / 2.0, r.y + r.h / 2.0)), radiusX: r.w / 2.0, radiusY: r.h / 2.0 };
+        // SAFETY: the ellipse lives across the call; the brush belongs to this target.
+        unsafe { t.rt.FillEllipse(&ellipse, &brush) };
+    }
+}
+
+/// The brushes kept for `g` (made with `rt`), its stop collection made the first time.
+fn gradient_brushes<'a>(rt: &ID2D1HwndRenderTarget, kept: &'a mut HashMap<GradientKey, GradientBrushes>, g: &Gradient) -> Option<&'a mut GradientBrushes> {
+    let key = GradientKey::of(g);
+    if !kept.contains_key(&key) {
+        if kept.len() >= MAX_CACHED_GRADIENTS {
+            kept.clear();
+        }
+        // Direct2D takes a gradient's colours with straight opacity; Wine's takes them premultiplied
+        // (a see-through white would come out solid white there).
+        let premultiply = crate::frame::is_wine();
+        let mut stops = [D2D1_GRADIENT_STOP::default(); MAX_STOPS];
+        for (d, s) in stops.iter_mut().zip(g.stops()) {
+            let c = if premultiply { Color { r: s.color.r * s.color.a, g: s.color.g * s.color.a, b: s.color.b * s.color.a, a: s.color.a } } else { s.color };
+            *d = D2D1_GRADIENT_STOP { position: s.at, color: color_f(c) };
+        }
+        // SAFETY: the stops live across the call, which copies them.
+        let collection = unsafe { rt.CreateGradientStopCollection(&stops[..g.stops().len()], D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) }.ok()?;
+        kept.insert(key, GradientBrushes { stops: collection, linear: None, radial: None });
+    }
+    kept.get_mut(&key)
+}
+
+/// Where a gradient starts and ends across a box: top to bottom on a wide box, left to right on a
+/// tall one.
+fn across(r: D2D_RECT_F) -> (Vector2, Vector2) {
+    if r.right - r.left >= r.bottom - r.top {
+        (Vector2 { X: r.left, Y: r.top }, Vector2 { X: r.left, Y: r.bottom })
+    } else {
+        (Vector2 { X: r.left, Y: r.top }, Vector2 { X: r.right, Y: r.top })
+    }
+}
+
+/// White from `strength` opacity to almost nothing: a shine.
+fn shine(strength: f32) -> Paint {
+    let s = strength.clamp(0.0, 1.0);
+    let white = Color::hex(0xffffff);
+    Paint::from_stops(&[Stop { at: 0.0, color: white.with_alpha(s) }, Stop { at: 1.0, color: white.with_alpha(s * 0.07) }])
+}
+
+/// A paint as a marble's glass: a gradient as it is (light point first, rim last); one colour
+/// gets a light point and a rim of its own.
+fn marble_glass(paint: &Paint) -> Paint {
+    match paint {
+        Paint::Gradient(_) => *paint,
+        Paint::Flat(c) => Paint::from_stops(&[Stop { at: 0.0, color: c.lighter(0.7) }, Stop { at: 0.45, color: *c }, Stop { at: 1.0, color: c.darker(0.35) }]),
+    }
+}
+
+/// A paint as a capsule's glass, from its light, middle and dark colours (as for a marble): light
+/// at the top, the middle colour going to the darkest across the middle, and a glow at the bottom
+/// where light comes through the glass.
+fn capsule_glass(paint: &Paint) -> Paint {
+    let g = marble_glass(paint);
+    let (light, mid, dark) = (g.color_at(0.0), g.color_at(0.45), g.color_at(1.0));
+    Paint::from_stops(&[
+        Stop { at: 0.0, color: light.mix(mid, 0.55) },
+        Stop { at: 0.35, color: mid.mix(dark, 0.45) },
+        Stop { at: 0.55, color: dark },
+        Stop { at: 0.78, color: dark.darker(0.12) },
+        Stop { at: 1.0, color: mid.mix(dark, 0.6) },
+    ])
 }
 
 // ---------------------------------------------------------------- pictures and monospaced text

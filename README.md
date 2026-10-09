@@ -17,7 +17,7 @@ Direct2D, so it opens instantly, stays out of your way and needs nothing install
   Bin, all through Windows' own copy engine (so Ctrl+Z in File Explorer still works), drag and drop
   to and from other apps, and right-click menus with other apps' items.
 - **A filter that searches as you type**, also through every subfolder.
-- **Skins**: AMD Radeon, NVIDIA and their light versions, or your own, made in the built-in
+- **Skins**: AMD Radeon, NVIDIA, Chrome and Gunmetal (with light and dark versions), or your own, made in the built-in
   **skin customiser** or in Notepad (skins are small `.glint` text files).
 - **Custom sort order**: write your own order, like `-folder_first -newest_first -image`, or rules for
   one folder with `in Downloads:`, with **suggestions as you type** and a live preview.

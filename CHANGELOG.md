@@ -9,6 +9,18 @@ The newest version is at the top.
 
 Glint stays at 0.x while it's in beta.
 
+## 0.9.0 (2026-10-09): Chrome and Gunmetal
+
+- **Two new skins: Chrome and Gunmetal.** Year 2000 chrome: shiny silver-blue (or dark
+  gunmetal) bars, glass marbles for minimise, maximise and close, glossy liquid buttons, rounded
+  tabs and sidebar panels. "Light or dark" switches between the two.
+- **Skins can do more**: gradients for any colour, liquid buttons, marble window buttons, pill
+  tabs, sidebar panels and a chrome scrollbar. Your own skins can use all of it.
+- **Every colour is in the skin customiser** now, in one list with clear names, plus the line
+  widths and a Style group.
+- **Logo** can also be chosen in the skin customiser. "Slanted box" is now just "Box".
+- OPEN SKINS FOLDER no longer closes the skin customiser.
+
 ## 0.8.0 (2026-10-09): first public beta
 
 - **A fast, lightweight file explorer** that draws everything itself: a single Glint.exe with

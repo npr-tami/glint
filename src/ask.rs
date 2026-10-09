@@ -8,12 +8,14 @@
 //! - Tab and the arrow keys move between the two buttons.
 //!
 //! It dims the part of the window below the toolbar (the files the question is about) and sits in
-//! the middle of it. The toolbar is left as it is, because its filter box is a real Windows text box
+//! the middle of it. In a skin with glass buttons (kit.rs `glass`) it is a rounded panel with
+//! glass buttons. The toolbar is left as it is, because its filter box is a real Windows text box
 //! that Glint's drawing can't cover.
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB};
 
 use crate::app::Question;
+use crate::kit::{self, Look};
 use crate::pathbar::{box_contains, fill_box, outline_box};
 use crate::render::{Align, Renderer, TextStyle};
 use crate::theme::{Color, Theme};
@@ -138,10 +140,22 @@ impl AskBox {
         let y = area.y + ((area.h - h) / 2.0 - 24.0).max(12.0);
         self.panel = Rect::new(x, y, w, h);
 
-        // A hairline frame, the panel, and the accent's line along its top like the toolbar's.
-        r.fill_rect(self.panel.inset(-1.0, -1.0), theme.line);
-        r.fill_rect(self.panel, theme.toolbar);
-        r.fill_rect(Rect::new(x, y, w, 2.0), theme.accent);
+        let glass = kit::glass(theme);
+        if glass {
+            // A rounded panel on a soft shadow, with the shine along its top.
+            let radius = theme.corner(h).max(6.0);
+            r.fill_round_rect(Rect::new(x - 1.0, y + 2.0, w + 2.0, h + 3.0), radius + 1.0, Color::rgba(0, 0, 0, 0.22));
+            r.fill_paint(self.panel, radius, &theme.toolbar_paint);
+            r.stroke_round_rect(self.panel.inset(0.5, 0.5), radius - 0.5, 1.0, theme.line);
+            if theme.highlight.a > 0.0 {
+                r.fill_rect(Rect::new(x + radius, y + 1.0, (w - 2.0 * radius).max(0.0), 1.0), theme.highlight);
+            }
+        } else {
+            // A hairline frame, the panel, and the accent's line along its top like the toolbar's.
+            r.fill_rect(self.panel.inset(-1.0, -1.0), theme.line);
+            r.fill_rect(self.panel, theme.toolbar);
+            r.fill_rect(Rect::new(x, y, w, 2.0), theme.accent);
+        }
 
         let mut line_y = y + 20.0;
         for t in &title {
@@ -163,6 +177,12 @@ impl AskBox {
         // Leaning the same way, the gap across between them is BUTTON_GAP.
         self.yes = Rect::new(self.no.x + self.lean - BUTTON_GAP - yes_w, by, yes_w, BUTTON_H);
 
+        if glass {
+            let look = |b: Button| Look { hover: self.hover == Some(b), pressed: self.pressed == Some(b) && self.hover == Some(b), focused: self.focus == b, enabled: true };
+            kit::primary_button(r, theme, self.yes, yes, look(Button::Yes));
+            kit::button(r, theme, self.no, "CANCEL", look(Button::No));
+            return;
+        }
         let yes_color = match (self.pressed, self.hover) {
             (Some(Button::Yes), Some(Button::Yes)) => theme.accent.with_alpha(0.75),
             (_, Some(Button::Yes)) => theme.accent.with_alpha(0.88),

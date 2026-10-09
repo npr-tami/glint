@@ -327,6 +327,8 @@ pub struct SettingsWindow {
     skins_generation: u64,
     /// The switches the person just flipped, gliding to their new place (kit.rs).
     flips: kit::Flips,
+    /// How thick the scrollbar is in the skin.
+    bar: kit::Bar,
 }
 
 /// The settings as written in settings.json.
@@ -503,6 +505,7 @@ pub fn create(owner: HWND, theme: &Theme, remembered: Option<[f32; 2]>, page: us
             skins: Vec::new(),
             skins_generation: 0,
             flips: kit::Flips::default(),
+            bar: kit::Bar::default(),
         };
         window.apply_theme(theme);
         let mut rc = RECT::default();
@@ -748,6 +751,7 @@ impl SettingsWindow {
     pub fn apply_theme(&mut self, theme: &Theme) {
         self.renderer.set_font(&theme.font, 1.0);
         self.layout_dirty = true;
+        self.bar = kit::Bar::of(theme);
         self.box_at = None; // the text box is placed again, with the new font
         let (bg, fg) = (theme.input.to_colorref(), theme.text.to_colorref());
         // SAFETY: a new brush replaces the old one, which is deleted (no control paints in between:
@@ -821,8 +825,7 @@ impl SettingsWindow {
     }
 
     fn track(&self) -> Rect {
-        let c = self.content_rect();
-        Rect::new(c.right() - size::SCROLLBAR_W - size::SCROLLBAR_MARGIN, c.y + size::SCROLLBAR_MARGIN, size::SCROLLBAR_W, (c.h - 2.0 * size::SCROLLBAR_MARGIN).max(0.0))
+        self.bar.track(self.content_rect())
     }
 
     /// From page coordinates to the window's (DIPs).
@@ -925,6 +928,9 @@ impl SettingsWindow {
             return;
         }
         self.renderer.clear(theme.window);
+        // The page list on the sidebar's colour (a gradient running down the whole window).
+        let below = Rect::new(0.0, size::TITLE_H, self.size.0, (self.size.1 - size::TITLE_H).max(0.0));
+        self.renderer.fill_paint(below, 0.0, &theme.sidebar_paint);
         self.paint_caption(theme);
         self.paint_nav(theme);
         self.paint_page(theme);
@@ -941,7 +947,7 @@ impl SettingsWindow {
         let close = self.close_rect();
         let r = &mut self.renderer;
         let bar = Rect::new(0.0, 0.0, self.size.0, size::TITLE_H);
-        r.fill_rect(bar, theme.window);
+        kit::title_bar(r, theme, bar);
         let x = kit::logo(r, theme, bar);
         let color = if self.active { theme.text } else { theme.muted };
         r.text("Settings", Rect::new(x + 10.0, 0.0, (self.size.0 - x - 10.0 - ksize::CLOSE_W).max(0.0), size::TITLE_H), &TextStyle::new(color).size(13.0).semibold());
@@ -959,7 +965,7 @@ impl SettingsWindow {
 
     fn paint_page(&mut self, theme: &Theme) {
         let content = self.content_rect();
-        self.renderer.fill_rect(content, theme.toolbar);
+        self.renderer.fill_paint(content, 0.0, &theme.toolbar_paint);
         self.renderer.push_clip(content);
         let dy = content.y - self.scroller.offset;
         let shift = |r: Rect| Rect::new(r.x, r.y + dy, r.w, r.h);

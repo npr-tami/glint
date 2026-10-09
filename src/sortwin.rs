@@ -915,11 +915,12 @@ impl SortWindow {
         let theme = app.theme.clone();
         let l = self.lay;
         self.renderer.clear(theme.window);
+        kit::backdrop(&mut self.renderer, &theme, Rect::new(0.0, 0.0, self.size.0, self.size.1));
         // The title bar: the logo, the name, ×.
         {
             let r = &mut self.renderer;
             let bar = Rect::new(0.0, 0.0, self.size.0, size::TITLE_H);
-            r.fill_rect(bar, theme.titlebar);
+            kit::title_bar(r, &theme, bar);
             let x = kit::logo(r, &theme, bar);
             let color = if self.active { theme.text } else { theme.muted };
             r.text("Sort order", Rect::new(x + 10.0, 0.0, (l.close.x - x - 10.0).max(0.0), size::TITLE_H), &TextStyle::new(color).size(13.0).semibold());
@@ -1094,6 +1095,9 @@ impl SortWindow {
         let first = (self.preview_scroll.offset / ROW_H).floor().max(0.0) as usize;
         let date_w = 110.0;
         let size_w = 70.0;
+        // The sizes end clear of the scrollbar, however thick the skin makes it.
+        let bar = kit::Bar::of(theme);
+        let right = inner.right() - 1.0 - if theme.scrollbar_track.is_clear() { bar.w + bar.margin } else { theme.scrollbar_lane() };
         for (i, row) in self.rows.iter().enumerate().skip(first) {
             let y = inner.y + 4.0 + i as f32 * ROW_H - self.preview_scroll.offset;
             if y > inner.bottom() {
@@ -1103,22 +1107,35 @@ impl SortWindow {
                 Row::Heading(text) => {
                     // "PICTURES  biggest first": the group, then its own order in softer text.
                     let (group, order) = text.split_once("  \u{00b7}  ").unwrap_or((text.as_str(), ""));
-                    let style = TextStyle::new(theme.accent).semibold().size(11.5);
+                    // In a skin with sidebar panels, on a header bar like theirs.
+                    let bar = kit::panels(theme);
+                    let (group_color, order_color) = if bar { (theme.panel_header_text, theme.panel_header_text.with_alpha(theme.panel_header_text.a * 0.75)) } else { (theme.accent, theme.muted) };
+                    if bar {
+                        let band = Rect::new(inner.x + 4.0, y + 2.0, (inner.w - 8.0).max(0.0), ROW_H - 4.0);
+                        let radius = theme.corner(band.h).min(6.0);
+                        r.fill_paint(band, radius, &theme.panel_header);
+                        if theme.highlight.a > 0.0 {
+                            r.fill_rect(Rect::new(band.x + radius, band.y + 1.0, (band.w - 2.0 * radius).max(0.0), 1.0), theme.highlight);
+                        }
+                    }
+                    let style = TextStyle::new(group_color).semibold().size(11.5);
                     let up = group.to_uppercase();
                     let w = r.measure(&up, &style);
                     r.text(&up, Rect::new(inner.x + 10.0, y, inner.w - 20.0, ROW_H), &style);
                     if !order.is_empty() {
-                        r.text(order, Rect::new(inner.x + 18.0 + w, y, (inner.w - w - 28.0).max(0.0), ROW_H), &TextStyle::new(theme.muted).size(11.5));
+                        r.text(order, Rect::new(inner.x + 18.0 + w, y, (inner.w - w - 28.0).max(0.0), ROW_H), &TextStyle::new(order_color).size(11.5));
                     }
-                    r.fill_rect(Rect::new(inner.x + 10.0, y + ROW_H - 2.0, inner.w - 20.0, 1.0), theme.line);
+                    if !bar {
+                        r.fill_rect(Rect::new(inner.x + 10.0, y + ROW_H - 2.0, inner.w - 20.0, 1.0), theme.line);
+                    }
                 }
                 Row::Item { name, folder, date, size } => {
                     let style = TextStyle::new(theme.text);
                     let mark = if *folder { "\u{25b8}" } else { "" };
                     r.text(mark, Rect::new(inner.x + 12.0, y, 12.0, ROW_H), &TextStyle::new(theme.muted).size(10.0));
-                    r.text(name, Rect::new(inner.x + 26.0, y, (inner.w - 36.0 - date_w - size_w).max(0.0), ROW_H), &if *folder { style.semibold() } else { style });
-                    r.text(date, Rect::new(inner.right() - 10.0 - size_w - date_w, y, date_w, ROW_H), &TextStyle::new(theme.muted).size(11.0));
-                    r.text(size, Rect::new(inner.right() - 10.0 - size_w, y, size_w, ROW_H), &TextStyle::new(theme.muted).size(11.0).align(Align::Right));
+                    r.text(name, Rect::new(inner.x + 26.0, y, (right - size_w - date_w - inner.x - 26.0).max(0.0), ROW_H), &if *folder { style.semibold() } else { style });
+                    r.text(date, Rect::new(right - size_w - date_w, y, date_w, ROW_H), &TextStyle::new(theme.muted).size(11.0));
+                    r.text(size, Rect::new(right - size_w, y, size_w, ROW_H), &TextStyle::new(theme.muted).size(11.0).align(Align::Right));
                 }
             }
         }
@@ -1126,8 +1143,7 @@ impl SortWindow {
             r.text("Nothing here", inner.inset(12.0, 0.0), &TextStyle::new(theme.muted));
         }
         r.pop_clip();
-        let track = Rect::new(list.right() - size::SCROLLBAR_W - size::SCROLLBAR_MARGIN, list.y + 3.0, size::SCROLLBAR_W, list.h - 6.0);
-        kit::scrollbar(r, theme, track, &self.preview_scroll, false);
+        kit::scrollbar(r, theme, bar.track(list), &self.preview_scroll, false);
     }
 
     /// The list under the cursor's line: up to eight suggestions, each with a few words.
@@ -1148,21 +1164,43 @@ impl SortWindow {
         }
         let r = &mut self.renderer;
         let bg = Rect::new(x, y, w, h);
-        r.fill_rect(Rect::new(bg.x + 2.0, bg.y + 3.0, bg.w, bg.h), Color::hex(0).with_alpha(0.18));
-        r.fill_rect(bg, theme.panel);
-        r.stroke_rect(bg, 1.0, theme.line);
+        // In a skin with sidebar panels: a rounded list in the sidebar panels' colour, the
+        // suggestion picked in the selection's colour with rounded ends, like a menu.
+        let rounded = kit::panels(theme);
+        let radius = if rounded { theme.corner(h).min(8.0) } else { 0.0 };
+        if rounded {
+            r.fill_round_rect(Rect::new(bg.x + 1.0, bg.y + 3.0, bg.w, bg.h), radius, Color::hex(0).with_alpha(0.22));
+            r.fill_paint(bg, radius, &theme.sidebar_panel);
+            let edge = if theme.input_border.a > 0.0 { theme.input_border } else { theme.line };
+            r.stroke_round_rect(bg.inset(0.5, 0.5), (radius - 0.5).max(0.0), 1.0, edge);
+        } else {
+            r.fill_rect(Rect::new(bg.x + 2.0, bg.y + 3.0, bg.w, bg.h), Color::hex(0).with_alpha(0.18));
+            r.fill_rect(bg, theme.panel);
+            r.stroke_rect(bg, 1.0, theme.line);
+        }
         for (k, s) in self.completion.items.iter().enumerate().skip(first).take(n) {
             let row = Rect::new(x + 3.0, y + 3.0 + (k - first) as f32 * POPUP_ROW, w - 6.0, POPUP_ROW);
             let picked = k == self.pick;
-            if picked {
+            if rounded {
+                if picked {
+                    r.fill_paint(row, (radius - 2.0).max(0.0), &theme.accent_tint_paint);
+                } else if self.hover == Some(Hot::Suggestion(k)) {
+                    r.fill_paint(row, (radius - 2.0).max(0.0), &theme.hover_paint);
+                }
+            } else if picked {
                 r.fill_rect(row, theme.accent_tint);
                 r.fill_rect(Rect::new(row.x, row.y, 2.0, row.h), theme.select_edge);
             } else if self.hover == Some(Hot::Suggestion(k)) {
                 r.fill_rect(row, theme.hover);
             }
             let label_w = (s.label.chars().count() as f32 * self.char_w + 12.0).min(row.w * 0.62);
-            r.mono_text(&s.label, Rect::new(row.x + 8.0, row.y, label_w, row.h), MONO, if picked { theme.text_strong } else { theme.text });
-            r.text(&s.hint, Rect::new(row.x + 14.0 + label_w, row.y, (row.w - label_w - 20.0).max(0.0), row.h), &TextStyle::new(theme.muted).size(11.0));
+            let (label_color, hint_color) = match (picked, rounded) {
+                (true, true) => (theme.selection_text, theme.selection_details),
+                (true, false) => (theme.text_strong, theme.muted),
+                _ => (theme.text, theme.muted),
+            };
+            r.mono_text(&s.label, Rect::new(row.x + 8.0, row.y, label_w, row.h), MONO, label_color);
+            r.text(&s.hint, Rect::new(row.x + 14.0 + label_w, row.y, (row.w - label_w - 20.0).max(0.0), row.h), &TextStyle::new(hint_color).size(11.0));
             self.suggestion_rects.push(row);
         }
         if first > 0 || first + n < self.completion.items.len() {

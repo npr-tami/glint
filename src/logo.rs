@@ -198,13 +198,16 @@ pub fn draw(r: &mut Renderer, theme: &Theme, bar: Rect) -> f32 {
         let (x, y, h, w) = (bar.x, bar.y, bar.h, size::LOGO_W);
         let lean = theme.logo_lean(h);
         let corner = theme.corner(h);
+        // In the skin's `logo` paint: a gradient runs down the whole box, whichever piece of it
+        // is being filled.
+        let paint = &theme.logo_paint;
         if corner > 0.0 {
             // Rounded skins round the one corner that isn't against the window's edges.
-            r.fill_round_rect(Rect::new(x, y, w, h), corner, theme.logo);
-            r.fill_rect(Rect::new(x, y, w, corner), theme.logo);
-            r.fill_rect(Rect::new(x, y, corner, h), theme.logo);
+            r.fill_paint_down(Rect::new(x, y, w, h), corner, paint, y, y + h);
+            r.fill_paint_down(Rect::new(x, y, w, corner), 0.0, paint, y, y + h);
+            r.fill_paint_down(Rect::new(x, y, corner, h), 0.0, paint, y, y + h);
         } else {
-            r.fill_polygon(&[Point::new(x, y), Point::new(x + w, y), Point::new(x + w - lean, y + h), Point::new(x, y + h)], theme.logo);
+            r.fill_polygon_paint(&[Point::new(x, y), Point::new(x + w, y), Point::new(x + w - lean, y + h), Point::new(x, y + h)], paint);
         }
         let style = TextStyle::new(theme.logo_ink).size(size::FONT_LOGO).bold().align(Align::Center);
         r.text(&theme.logo_text, Rect::new(x, y, w - lean * 0.85, h), &style);

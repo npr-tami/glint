@@ -1,0 +1,90 @@
+// Chrome - year 2000 chrome: brushed silver-blue bars, glossy liquid buttons, glass marbles for
+// minimise, maximise and close, rounded tabs and sidebar panels. Its dark other half is Gunmetal.
+// (How skins are written: see the top of AMD Radeon.)
+//
+// Gradients: colours separated by commas, each with where it sits ("#c3cddb 45%"); without a
+// %, spread evenly. They run top to bottom on bars and buttons, left to right on scrollbars.
+
+name: Chrome
+description: Year 2000 chrome: shiny silver-blue, liquid buttons
+dark: false
+twin: gunmetal
+
+// ---- colours
+accent: #5a82c8
+accent-text: #ffffff
+background: #f4f7fb, #cfd8e6
+title-bar: #fdfdfd, #c3cddb 45%, #8d9db8 55%, #dfe6f0
+toolbar: #f8fafd, #d4dcea
+panel: #ffffff
+sidebar: #dfe7f2, #b9c6db
+status-bar: #e9eef6, #c5d0e1
+input: #e9eef6, #ffffff
+input-border: #8fa3c2
+button: #ffffff, #b9c8e2 42%, #5c77a8         // the liquid glass: light point, body, rim
+button-hover: #ffffff, #cbd8ee 42%, #6c88bc
+button-text: #ffffff
+text: #112233
+text-bright: #163a70
+muted: #4d6896
+disabled: #a3b0c4
+selection: #b9d0f6, #6f93d1
+selection-text: #0a1f45
+selection-edge: none
+sidebar-selection: #a8c4f2, #5a82c8
+sidebar-selection-text: #ffffff
+hover: #eef3fb
+tool-hover: #e4eaf4
+tool-pressed: #d4dcea
+path-hover: #dfe7f3
+line: #a9b7cd
+scrollbar: #fdfdfd, #c3cddb 45%, #8d9db8 55%, #dfe6f0
+scrollbar-hover: #ffffff, #d3dbe7 45%, #9dadc6 55%, #e9eef5
+scrollbar-track: #c3cddb, #e4eaf3 40%, #f4f7fb
+scrollbar-border: #8fa3c2
+scrollbar-grip-lines: #4d6896
+usage-bar: #c9d3e2, #e9eef6
+usage-fill: #a8c4f2, #5a82c8
+logo: #a8c4f2, #5a82c8
+logo-letters: #ffffff
+tab: #e7edf6, #c3cede
+tab-active: #ffffff, #e2e9f3
+tab-text: #163a70
+tab-active-text: #163a70
+tab-border: #9fb0cc
+tab-line: accent
+highlight: #fffffff2
+toolbar-line: #a9b7cd
+sidebar-panel: #f4f7fb
+panel-header: #fefefe, #b7c4d9 50%, #9fb0cc
+panel-header-text: #163a70
+list-header: #ffffff, #d7dfeb
+list-header-text: #163a70
+column-line: #c8d2e2
+status-text: #163a70
+status-line: #a9b7cd
+marble: #ffffff, #9fb4d8 45%, #3d5a94
+marble-close: #ffffff, #ee99aa 45%, #aa2233
+caption-hover: #ffffff80
+caption-pressed: #ffffff40
+close-hover: #aa2233
+menus: light
+
+// ---- shapes and text
+shape: rounded
+slant: 0
+path-slant: 0
+radius: 10
+row-height: 26
+tab-line-width: 0
+toolbar-line-width: 1
+font: Verdana, Tahoma, Segoe UI
+font-size: 8pt
+
+// ---- styles
+buttons: liquid
+caption-buttons: marbles
+tabs: pills
+sidebar-style: panels
+scrollbar-grip: true
+scrollbar-width: 11

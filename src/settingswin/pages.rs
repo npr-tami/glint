@@ -437,7 +437,7 @@ fn appearance(f: &Facts) -> Vec<Item> {
         Item::Card(vec![
             Row::new("Skin", "Skin", None, Ctl::Choice("Skin", skins)),
             choice("Theme", "Light or dark", None, &[(S("system"), "Same as Windows"), (S("light"), "Light"), (S("dark"), "Dark")]),
-            choice("Logo", "Logo", None, &[(S("box"), "Slanted box"), (S("chrome"), "Chrome"), (S("none"), "None")]),
+            choice("Logo", "Logo", None, &[(S("box"), "Box"), (S("chrome"), "Chrome"), (S("none"), "None")]),
             Row::new("@SkinEditor", "Customise skins", None, Ctl::Button("CUSTOMISE\u{2026}".into(), Act::SkinEditor)),
         ]),
         Item::Heading("Layout"),
@@ -656,9 +656,10 @@ mod tests {
         let skin = rows(&items).find(|r| r.key == "Skin").unwrap();
         let Ctl::Choice(_, choices) = &skin.ctl else { panic!() };
         let labels: Vec<&str> = choices.iter().map(|(_, l)| l.as_str()).collect();
-        assert_eq!(labels, ["AMD Radeon", "AMD Radeon (Light)", "NVIDIA", "NVIDIA (Light)", "Moss", "Gone (file missing)"]);
+        assert_eq!(labels, ["AMD Radeon", "AMD Radeon (Light)", "NVIDIA", "NVIDIA (Light)", "Chrome", "Gunmetal", "Moss", "Gone (file missing)"]);
         assert_eq!(choices[0].0, Val::S("amd-radeon"));
-        assert_eq!(choices[4].0, Val::S("file:Moss"));
+        assert_eq!((&choices[4].0, &choices[5].0), (&Val::S("chrome"), &Val::S("gunmetal")), "a pair, side by side");
+        assert_eq!(choices[6].0, Val::S("file:Moss"));
         let theme = rows(&items).find(|r| r.key == "Theme").unwrap();
         let Ctl::Choice(_, modes) = &theme.ctl else { panic!() };
         assert_eq!(modes[0], (Val::S("system"), "Same as Windows".to_string()));

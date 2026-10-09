@@ -1701,6 +1701,10 @@ impl Window {
         let shown = self.renderer.begin() && {
             let Window { renderer, app, titlebar, toolbar, sidebar, list, status, side, ask, size: client, .. } = self;
             renderer.clear(app.theme.window);
+            if app.theme.window_paint.gradient().is_some() {
+                // A shaded background (in the gaps between the panels).
+                renderer.fill_paint(Rect::new(0.0, 0.0, client.0, client.1), 0.0, &app.theme.window_paint);
+            }
             titlebar.paint(renderer, &app.theme, app, &ctx);
             toolbar.paint(renderer, &app.theme, app, &ctx);
             if app.settings.show_sidebar {

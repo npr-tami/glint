@@ -634,7 +634,7 @@ pub struct Settings {
     /// Write unexpected errors and crashes to logs\error.log.
     pub error_log: bool,
     /// The look: a skin id (skin.rs) - "amd-radeon", "amd-radeon-light", "nvidia", "nvidia-light",
-    /// or "file:<name>" for one of the person's own in the skins folder. The light/dark choice
+    /// "chrome", "gunmetal", or "file:<name>" for one of the person's own in the skins folder. The light/dark choice
     /// ("Theme") switches it to its light or dark version (`AppState::set_dark`). Empty means
     /// AMD Radeon.
     pub skin: String,
