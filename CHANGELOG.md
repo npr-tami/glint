@@ -9,6 +9,13 @@ The newest version is at the top.
 
 Glint stays at 0.x while it's in beta.
 
+## 0.9.3 (2026-10-10): apps listed twice in the right-click menu
+
+- **WinRAR (and other apps) in Windows 11 menu mode work again.** Such apps can show up twice in
+  Windows' menu, and only one copy has its submenu filled; Glint now keeps that one instead of
+  always the first.
+- The log notes which menu items were left out and what each submenu had when it opened.
+
 ## 0.9.2 (2026-10-10): right-click submenus
 
 - **Submenus from other apps open again on slower PCs** (WinRAR ›, Send to ›, Give access to ›…).

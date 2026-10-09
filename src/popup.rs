@@ -18,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetMenuItemCount, GetMenuItemInfoW, InsertMenuItemW, RemoveMenu, SetMenuDefaultItem,
     TrackPopupMenuEx, HMENU, MENUITEMINFOW, MENU_ITEM_STATE, MENU_ITEM_TYPE, MFS_DEFAULT, MF_BYPOSITION, MF_CHECKED, MF_GRAYED,
     MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_BITMAP, MIIM_CHECKMARKS, MIIM_DATA, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING,
-    MIIM_SUBMENU, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN,
+    MIIM_SUBMENU, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WM_INITMENUPOPUP,
 };
 
 use crate::folder::wide;
@@ -122,7 +122,15 @@ pub fn forward(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
         HUNG.with(|h| h.set(0));
         log::line(&format!("shell menu {session}: Windows' items answer again"));
     }
-    match shellmenu::forward(session, msg, wparam, lparam) {
+    let answer = shellmenu::forward(session, msg, wparam, lparam);
+    if msg == WM_INITMENUPOPUP {
+        // What a submenu had when it opened (an empty one doesn't open at all): for the log.
+        // SAFETY: wparam is the submenu's handle, as the menu passed it.
+        let n = unsafe { GetMenuItemCount(Some(HMENU(wparam.0 as *mut _))) };
+        let how = match answer { Forwarded::Handled(_) => "answered", Forwarded::NotHandled => "not wanted", Forwarded::TimedOut => "too slow" };
+        log::line(&format!("shell menu {session}: submenu opening, Windows' items {how}, {n} entries"));
+    }
+    match answer {
         Forwarded::Handled(r) => Some(r),
         Forwarded::NotHandled => None,
         Forwarded::TimedOut => {

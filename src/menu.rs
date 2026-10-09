@@ -461,7 +461,8 @@ fn opens_terminal(item: &ShellItem) -> bool {
 /// Which of Windows' items repeat an earlier one: the same text with the same command (verb) or
 /// the same picture. Some apps add their item twice - PowerToys' "Rename with PowerRename" comes
 /// once from its old menu handler and once from its Windows 11 one, and Windows lists both. The
-/// repeats are left out (shellmenu.rs), so no item shows twice, in Glint's menu or Windows' own.
+/// repeats are left out (shellmenu.rs), so no item shows twice, in Glint's menu or Windows' own:
+/// the later copy, unless only the later one has entries in its submenu.
 /// The text always has to match: an app that gives all its items one verb (some do) keeps them
 /// all, and so does anything else that only looks alike.
 pub fn repeats(items: &[ShellItem]) -> Vec<usize> {
@@ -476,7 +477,16 @@ pub fn repeats(items: &[ShellItem]) -> Vec<usize> {
         let verbs = !b.verb.is_empty() && a.verb.eq_ignore_ascii_case(&b.verb);
         verbs || a.picture == b.picture || a.picture == PICTURE_UNKNOWN || b.picture == PICTURE_UNKNOWN
     };
-    (0..items.len()).filter(|&i| items[..i].iter().any(|earlier| same(earlier, &items[i]))).collect()
+    // Of two copies, the one whose submenu already has its entries stays (an app's Windows 11 copy
+    // can bring an empty submenu that only File Explorer's own menu fills); otherwise the first.
+    let mut out: Vec<usize> = Vec::new();
+    for i in 0..items.len() {
+        let Some(j) = (0..i).find(|&j| !out.contains(&j) && same(&items[j], &items[i])) else { continue };
+        let drop = if items[j].submenu != 0 && items[j].sub_items == 0 && items[i].sub_items > 0 { j } else { i };
+        out.push(drop);
+    }
+    out.sort_unstable();
+    out
 }
 
 #[cfg(test)]
@@ -569,5 +579,11 @@ mod tests {
         ];
         assert_eq!(repeats(&items), vec![4, 6, 10]);
         assert!(repeats(&[sep.clone(), sep]).is_empty(), "lines are tidied, not counted as repeats");
+        // An archiver listed twice: its Windows 11 copy first, with a submenu still empty, then its
+        // classic copy with the entries. The classic one stays.
+        let sub = |text: &str, picture: u64, sub_items: u32| ShellItem { text: text.into(), picture, submenu: 1, sub_items, ..Default::default() };
+        assert_eq!(repeats(&[sub("WinRAR", 6, 0), sub("WinRAR", 6, 9)]), vec![0]);
+        assert_eq!(repeats(&[sub("WinRAR", 6, 9), sub("WinRAR", 6, 0)]), vec![1]);
+        assert_eq!(repeats(&[sub("Send to", 0, 0), sub("Send to", 0, 0)]), vec![1], "both empty: the first stays");
     }
 }

@@ -134,6 +134,10 @@ pub struct ShellItem {
     /// two items that only share a name (menu::repeats): 0 = none, PICTURE_UNKNOWN = the app draws
     /// it itself, so it can't be compared.
     pub picture: u64,
+    /// How many entries its submenu had when the menu was read (0 for no submenu). Some submenus
+    /// are filled only when they open ("Send to"); an app's Windows 11 entry can come with an empty
+    /// one that only File Explorer's own menu fills (menu::repeats keeps the other copy then).
+    pub sub_items: u32,
 }
 
 /// See [`ShellItem::picture`].
@@ -630,6 +634,8 @@ fn build(session: u64, owner: HWND, req: &ShellRequest) -> Option<Built> {
     // "Rename with PowerRename"): the second goes, from Windows' whole menu too.
     let repeats = crate::menu::repeats(&items);
     if !repeats.is_empty() {
+        let names: Vec<String> = repeats.iter().map(|&i| format!("\"{}\" ({} in its submenu)", crate::menu::label_key(&items[i].text), items[i].sub_items)).collect();
+        log::line(&format!("shell menu {session}: leaving out {}", names.join(", ")));
         // SAFETY: the session's own menu, on this thread; the items list was just read from it.
         unsafe {
             for &i in repeats.iter().rev() {
@@ -739,6 +745,7 @@ unsafe fn read_items(menu: &IContextMenu, hmenu: HMENU) -> Vec<ShellItem> {
                 unchecked_bitmap: mii.hbmpUnchecked.0 as isize,
                 data: mii.dwItemData,
                 picture: picture_of(mii.hbmpItem.0 as isize),
+                sub_items: if mii.hSubMenu.is_invalid() { 0 } else { GetMenuItemCount(Some(mii.hSubMenu)).max(0) as u32 },
                 ..Default::default()
             };
             if !item.is_separator() && !item.is_owner_drawn() && mii.cch > 0 {
