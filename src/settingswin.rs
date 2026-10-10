@@ -1380,6 +1380,7 @@ impl SettingsWindow {
 
     /// Gives `key` a new value in `app.settings`, then does what that setting does right away.
     fn set_value(&mut self, app: &mut AppState, key: &'static str, value: Value) -> Vec<Ask> {
+        let before = app.settings.clone();
         if !set_in(&mut app.settings, key, value.clone()) {
             log::error(&format!("The Settings window couldn't give {key} the value {value}"));
             return Vec::new();
@@ -1388,7 +1389,7 @@ impl SettingsWindow {
         self.layout_dirty = true;
         self.invalidate();
         let mut asks = vec![Ask::RedrawMain];
-        asks.extend(pages::after_change(key, app).map(Ask::Command));
+        asks.extend(pages::after_change(key, &before, app).map(Ask::Command));
         asks
     }
 

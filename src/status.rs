@@ -139,8 +139,8 @@ impl StatusBar {
         if tab.loading.is_some() && tab.path != tab.folder.path {
             s.push_str("  \u{00b7}  loading\u{2026}");
         }
-        // The custom sort order decides (and for this folder, its own "in …:" rules).
-        if let Some(recipe) = tab.custom.as_ref().filter(|_| !tab.folder.path.is_empty()) {
+        // The custom sort order decides (and for this folder, its own "in …" rules).
+        if let Some(recipe) = tab.custom_here() {
             match recipe.folder_label(&tab.folder.path) {
                 Some(label) => s.push_str(&format!("  \u{00b7}  Custom sort ({label})")),
                 None => s.push_str("  \u{00b7}  Custom sort"),
@@ -211,5 +211,25 @@ impl Component for StatusBar {
         let inner = self.rect.inset(PAD, 0.0);
         r.text(&right, Rect::new(inner.right() - right_w - 1.0, inner.y, right_w + 1.0, inner.h), &style.align(Align::Right));
         r.text(&Self::left_text(app), Rect::new(inner.x, inner.y, inner.w - right_w - 16.0, inner.h), &style);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::Settings;
+
+    #[test]
+    fn says_custom_sort_where_it_decides() {
+        let text = |recipe: &str| {
+            let mut app = AppState::for_tests(Settings { custom_sort: true, sort_recipe: Some(recipe.into()), ..Default::default() });
+            app.tabs[0].folder.path = "C:\\t".into();
+            app.tabs[0].custom = app.custom_order();
+            StatusBar::left_text(&app)
+        };
+        assert!(text("-a_to_z").ends_with("Custom sort"), "{}", text("-a_to_z"));
+        assert!(text("in C:\\t (\n-newest_first\n)").ends_with("Custom sort (C:\\t)"));
+        // Rules only for another folder: this one sorts by its column, and says nothing.
+        assert!(!text("in C:\\elsewhere (\n-newest_first\n)").contains("Custom sort"));
     }
 }

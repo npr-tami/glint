@@ -18,9 +18,9 @@
 //!   the window stays active and keeps painting while it's open). Some items need their maker while
 //!   the menu is open: "Send to" fills itself when it opens (WM_INITMENUPOPUP), and many apps draw
 //!   their own icons (WM_MEASUREITEM, WM_DRAWITEM). Those messages are handed over with [`forward`]:
-//!   a SendMessage to the shell thread, which passes them to the session's IContextMenu3/2. The UI
-//!   thread waits for that, but only while the menu itself is open, and never longer than
-//!   FORWARD_WAIT_MS (SUBMENU_WAIT_MS for a submenu about to open).
+//!   posted to the shell thread, which passes them to the session's IContextMenu3/2 (posted, not
+//!   sent: see `forward`). The UI thread waits for that, but only while the menu itself is open, and
+//!   never longer than FORWARD_WAIT_MS (SUBMENU_WAIT_MS for a submenu about to open).
 //! - The picked command runs on the shell thread too ([`invoke`]); its session is let go a minute
 //!   later (LINGER), as some commands finish their work after the click.
 //!   Properties windows ([`properties`]) are opened from there as well, since the thread stays.
@@ -34,7 +34,8 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::core::{w, Interface, PCSTR, PCWSTR, PSTR, PWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, WAIT_OBJECT_0, WPARAM};
+use windows::Win32::System::Threading::{CreateEventW, SetEvent};
 use windows::Win32::Graphics::Gdi::HBITMAP;
 use windows::Win32::System::Com::{CoTaskMemFree, IBindCtx, IDataObject};
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT};
@@ -48,9 +49,10 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, GetMenuItemCount, GetMenuItemID,
-    GetMenuItemInfoW, GetSubMenu, GetMessageW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageTimeoutW, TranslateMessage, HMENU,
-    HWND_MESSAGE, MENUITEMINFOW, MFT_OWNERDRAW, MFT_SEPARATOR, MIIM_BITMAP, MIIM_CHECKMARKS, MIIM_DATA, MIIM_FTYPE, MIIM_ID,
-    MIIM_STATE, MIIM_STRING, MIIM_SUBMENU, MSG, SMTO_ABORTIFHUNG, SW_SHOWNORMAL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+    GetMenuItemInfoW, GetSubMenu, GetMessageW, MsgWaitForMultipleObjects, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SendMessageTimeoutW, TranslateMessage, HMENU, HWND_MESSAGE, MENUITEMINFOW, MFT_OWNERDRAW, MFT_SEPARATOR, MIIM_BITMAP, MIIM_CHECKMARKS,
+    MIIM_DATA, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING, MIIM_SUBMENU, MSG, PM_NOREMOVE, PM_QS_SENDMESSAGE, QS_SENDMESSAGE,
+    SMTO_ABORTIFHUNG, SW_SHOWNORMAL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
     WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WNDCLASSEXW,
 };
 // Leaving out items Windows lists twice (`build`).
@@ -135,8 +137,8 @@ pub struct ShellItem {
     /// it itself, so it can't be compared.
     pub picture: u64,
     /// How many entries its submenu had when the menu was read (0 for no submenu). Some submenus
-    /// are filled only when they open ("Send to"); an app's Windows 11 entry can come with an empty
-    /// one that only File Explorer's own menu fills (menu::repeats keeps the other copy then).
+    /// are filled only when they open ("Send to", an app's Windows 11 entry); of an item listed
+    /// twice, menu::repeats keeps the copy that is already filled.
     pub sub_items: u32,
 }
 
@@ -202,8 +204,8 @@ enum Job {
     Quit,
 }
 
-/// A menu message handed from the UI thread to the shell thread. It travels as an
-/// `Arc<Mutex<Forward>>` (WM_SHELL_FORWARD's lparam), not as a pointer into the UI thread's stack:
+/// A menu message handed from the UI thread to the shell thread. It travels in an `Arc<Handover>`
+/// (WM_SHELL_FORWARD's lparam), not as a pointer into the UI thread's stack:
 /// if an app's code takes too long, the UI thread stops waiting and moves on, and the shell thread
 /// must still be able to finish with it safely. For the same reason the item structs are copies.
 #[derive(Clone, Default)]
@@ -223,6 +225,58 @@ struct Forward {
 // Those are process-wide handles (numbers), handed to the shell thread to draw with while the menu
 // is open, exactly as Windows hands them to a window procedure.
 unsafe impl Send for Forward {}
+
+/// A `Forward` on its way to the shell thread and back, with an event the shell thread sets when
+/// it's done. Shared as an `Arc` (WM_SHELL_FORWARD's lparam), so whichever side lets go last
+/// closes the event.
+struct Handover {
+    forward: Mutex<Forward>,
+    done: HANDLE,
+}
+
+// SAFETY: the event handle is a process-wide handle, usable from any thread; it's closed once,
+// when the last owner lets go (Drop).
+unsafe impl Send for Handover {}
+unsafe impl Sync for Handover {}
+
+impl Handover {
+    fn new(f: Forward) -> Option<Self> {
+        // SAFETY: a plain unnamed manual-reset event, closed in Drop.
+        let done = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }.ok()?;
+        Some(Self { forward: Mutex::new(f), done })
+    }
+
+    /// On the UI thread: waits up to `ms` for the shell thread to be done. Messages sent to this
+    /// thread meanwhile are handled (as SendMessage's own wait does), in case an app's code sends
+    /// one to Glint's window while it works.
+    fn wait(&self, ms: u32) -> bool {
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(ms as u64);
+        loop {
+            let left = until.saturating_duration_since(std::time::Instant::now()).as_millis() as u32;
+            // SAFETY: waiting on our own live event; PeekMessage only handles sent messages here
+            // (it removes nothing from the queue).
+            unsafe {
+                match MsgWaitForMultipleObjects(Some(&[self.done]), false, left, QS_SENDMESSAGE) {
+                    WAIT_OBJECT_0 => return true,
+                    r if r.0 == WAIT_OBJECT_0.0 + 1 && left > 0 => {
+                        let mut msg = MSG::default();
+                        let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+                    }
+                    _ => return false,
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Handover {
+    fn drop(&mut self) {
+        // SAFETY: our own event, closed once.
+        unsafe {
+            let _ = CloseHandle(self.done);
+        }
+    }
+}
 
 static JOBS: Mutex<VecDeque<Job>> = Mutex::new(VecDeque::new());
 /// Built menus (None: it couldn't be built) waiting for the window to take them.
@@ -339,20 +393,24 @@ pub fn forward(session: u64, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Forwar
             _ => {}
         }
     }
-    let shared = Arc::new(Mutex::new(f));
+    let Some(shared) = Handover::new(f) else { return Forwarded::NotHandled };
+    let shared = Arc::new(shared);
     let theirs = Arc::into_raw(shared.clone());
-    let mut answer = 0usize;
+    // Posted, not sent: a thread that is answering a sent message can't call into another process
+    // (COM refuses with RPC_E_CANTCALLOUT_ININPUTSYNCCALL), and the Windows 11 menu items of apps
+    // (WinRAR's, say) live in another process. Their submenu then stayed empty.
     // SAFETY: the shell thread takes over `theirs` (Arc::from_raw) when the message arrives.
-    let sent = unsafe {
-        let wait = if msg == WM_INITMENUPOPUP { SUBMENU_WAIT_MS } else { FORWARD_WAIT_MS };
-        SendMessageTimeoutW(HWND(h as *mut _), WM_SHELL_FORWARD, WPARAM(0), LPARAM(theirs as isize), SMTO_ABORTIFHUNG, wait, Some(&mut answer))
-    };
-    if sent.0 == 0 {
-        // Timed out (the message may still be handled later; it then has its own copy) or never
-        // delivered (then that one copy is never freed: a few bytes).
+    if unsafe { PostMessageW(Some(HWND(h as *mut _)), WM_SHELL_FORWARD, WPARAM(0), LPARAM(theirs as isize)) }.is_err() {
+        // SAFETY: not delivered, so `theirs` is still ours.
+        drop(unsafe { Arc::from_raw(theirs) });
+        return Forwarded::NotHandled;
+    }
+    let wait = if msg == WM_INITMENUPOPUP { SUBMENU_WAIT_MS } else { FORWARD_WAIT_MS };
+    if !shared.wait(wait) {
+        // Timed out: the message may still be handled later; the shell thread has its own count.
         return Forwarded::TimedOut;
     }
-    let f = lock(&shared).clone();
+    let f = lock(&shared.forward).clone();
     if !f.handled {
         return Forwarded::NotHandled;
     }
@@ -530,13 +588,17 @@ unsafe extern "system" fn thread_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
         }
         WM_SHELL_FORWARD if lparam.0 != 0 => {
             // SAFETY: `forward` made this with Arc::into_raw and handed its count to us.
-            let shared = unsafe { Arc::from_raw(lparam.0 as *const Mutex<Forward>) };
+            let shared = unsafe { Arc::from_raw(lparam.0 as *const Handover) };
             // Worked on as a copy, so the lock isn't held while an app's code runs.
-            let mut f = lock(&shared).clone();
+            let mut f = lock(&shared.forward).clone();
             IN_FORWARD.store(true, Ordering::SeqCst);
             handle_forward(&mut f);
             IN_FORWARD.store(false, Ordering::SeqCst);
-            *lock(&shared) = f;
+            *lock(&shared.forward) = f;
+            // SAFETY: the Handover's own event, alive while `shared` is.
+            unsafe {
+                let _ = SetEvent(shared.done);
+            }
             LRESULT(0)
         }
         // SAFETY: default handling for everything else.
@@ -931,11 +993,12 @@ fn invoke_command(s: &Session, owner: HWND, verb: Verb, keys: Keys) -> windows::
 
 fn handle_forward(f: &mut Forward) {
     // The interfaces are cloned out (one AddRef) so no borrow is held while the app's code runs.
-    let (m3, m2) = SESSIONS.with(|s| s.borrow().get(&f.session).map(|s| (s.menu3.clone(), s.menu2.clone()))).unwrap_or_default();
+    let (m3, m2, hmenu) = SESSIONS.with(|s| s.borrow().get(&f.session).map(|s| (s.menu3.clone(), s.menu2.clone(), s.hmenu))).unwrap_or_default();
     // The item structs point to our copies.
     let lparam = match (&mut f.measure, &mut f.draw) {
         (Some(m), _) => LPARAM(m as *mut MEASUREITEMSTRUCT as isize),
         (_, Some(d)) => LPARAM(d as *mut DRAWITEMSTRUCT as isize),
+        _ if f.msg == WM_INITMENUPOPUP => LPARAM(place_in_windows_menu(hmenu, f.wparam, f.lparam)),
         _ => LPARAM(f.lparam),
     };
     let wparam = WPARAM(f.wparam);
@@ -954,6 +1017,22 @@ fn handle_forward(f: &mut Forward) {
                 f.handled = true;
             }
         }
+    }
+}
+
+/// WM_INITMENUPOPUP's lparam with the submenu's place in Windows' own menu, as File Explorer
+/// would pass it, when the submenu sits straight in it (in Glint's menu, Glint's items come
+/// first, so the place there differs). Deeper submenus keep theirs.
+fn place_in_windows_menu(hmenu: HMENU, submenu: usize, lparam: isize) -> isize {
+    if hmenu.is_invalid() {
+        return lparam;
+    }
+    // SAFETY: the session's menu, alive while its session is.
+    let n = unsafe { GetMenuItemCount(Some(hmenu)) }.max(0);
+    // SAFETY: as above.
+    match (0..n).find(|&p| unsafe { GetSubMenu(hmenu, p) }.0 as usize == submenu) {
+        Some(pos) => (lparam & !0xFFFF) | pos as isize,
+        None => lparam,
     }
 }
 

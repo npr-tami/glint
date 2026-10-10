@@ -21,7 +21,7 @@ use serde_json::{Map, Value};
 use crate::app::AppState;
 use crate::folder;
 use crate::life;
-use crate::settings::{Terminal, COLUMN_NAMES};
+use crate::settings::{Settings, Terminal, COLUMN_NAMES};
 use crate::update;
 use crate::ui::Command;
 
@@ -90,9 +90,9 @@ pub fn live(key: &str) -> bool {
 }
 
 /// What happens right away when the setting `key` got a new value in `app.settings` (from the
-/// Settings window). A command that comes back is the window's to run (light or dark repaints the
-/// whole window).
-pub fn after_change(key: &str, app: &mut AppState) -> Option<Command> {
+/// Settings window; `before` is the settings as they were). A command that comes back is the
+/// window's to run (light or dark repaints the whole window).
+pub fn after_change(key: &str, before: &Settings, app: &mut AppState) -> Option<Command> {
     match key {
         // Light or dark picks the skin's light or dark version (AppState::set_dark keeps "Skin" in
         // step with what's on screen).
@@ -155,7 +155,9 @@ pub fn after_change(key: &str, app: &mut AppState) -> Option<Command> {
         // The file list's (list.rs reads the rest - dates, sizes, extensions, clicks, Backspace - when
         // it uses them).
         "Size" => {
+            // Changed from the size before, so every tab keeps the same rows on screen.
             let size = app.settings.size;
+            app.settings.size = before.size;
             app.set_list_size(size);
             None
         }
@@ -459,8 +461,9 @@ fn appearance(f: &Facts) -> Vec<Item> {
 fn files(f: &Facts) -> Vec<Item> {
     use Val::S;
     let custom = f.values.get("CustomSort").and_then(Value::as_bool).unwrap_or(false);
-    // Greyed while the custom sort order is on: say why.
-    let folders_note = custom.then_some("Set by the custom sort order");
+    // While the custom sort order is on, it decides in the folders it has rules for (in the others,
+    // this still does): say so.
+    let folders_note = custom.then_some("Where the custom sort order has rules, it decides");
     let column = |name: &'static str, title: &str| Row::new("Columns", title, None, Ctl::ToggleIn("Columns", name));
     vec![
         Item::Heading("Show"),
@@ -478,7 +481,7 @@ fn files(f: &Facts) -> Vec<Item> {
         ]),
         Item::Heading("Sorting"),
         Item::Card(vec![
-            toggle("FoldersFirst", "Folders first", folders_note).needs("!CustomSort"),
+            toggle("FoldersFirst", "Folders first", folders_note),
             Row::new("CustomSort", "Custom sort order", None, Ctl::ButtonToggle("EDIT…".into(), Act::SortEditor, "CustomSort")),
         ]),
         Item::Heading("Deleting"),
@@ -528,7 +531,7 @@ fn about(f: &Facts) -> Vec<Item> {
     if let Some(said) = &f.cache_said {
         cache_note = format!("{cache_note}\n{said}");
     }
-    let mut portable_note = "Keep settings next to glint.exe".to_string();
+    let mut portable_note = "Keep Glint's files next to glint.exe, in \u{201c}Glint data\u{201d}".to_string();
     if f.portable_locked {
         portable_note.push_str("\nLocked while GLINT_SETTINGS_DIR is set (for testing)");
     }
@@ -537,7 +540,7 @@ fn about(f: &Facts) -> Vec<Item> {
     }
     vec![
         Item::Card(vec![
-            Row::new("@About", &format!("Glint {}", crate::log::VERSION), Some("A lightweight file explorer for Windows"), Ctl::None),
+            Row::new("@About", &format!("Glint {} (Beta)", crate::log::VERSION), Some("A lightweight file explorer for Windows. This is a beta, so some things may not work yet."), Ctl::None),
             Row::new("@Update", "Updates", Some(&f.update_said), Ctl::Button(if f.update_busy { "CHECKING…".into() } else { "CHECK FOR UPDATES".into() }, Act::Update)).needs("@UpdateReady"),
             toggle("CheckForUpdates", "Check for updates automatically", None).indent(),
         ]),
@@ -665,5 +668,20 @@ mod tests {
         assert_eq!(modes[0], (Val::S("system"), "Same as Windows".to_string()));
         let editor = rows(&items).find(|r| r.key == "@SkinEditor").unwrap();
         assert_eq!(editor.ctl, Ctl::Button("CUSTOMISE\u{2026}".into(), Act::SkinEditor));
+    }
+
+    /// A row size picked in the window keeps the same rows on screen, as the column titles' menu
+    /// does (the window has already put the new size in the settings when it asks).
+    #[test]
+    fn a_new_row_size_keeps_the_rows_on_screen() {
+        let mut app = AppState::for_tests(Settings::default());
+        let small = app.row_height();
+        app.tab_mut().scroll = 10.0 * small;
+        let before = app.settings.clone();
+        app.settings.size = crate::settings::ListSize::Large;
+        after_change("Size", &before, &mut app);
+        assert_eq!(app.settings.size, crate::settings::ListSize::Large);
+        assert!(app.row_height() > small);
+        assert!((app.tab().scroll - 10.0 * app.row_height()).abs() < 0.01, "still ten rows down");
     }
 }

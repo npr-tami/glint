@@ -107,6 +107,8 @@ const ROW_PAD_X: f32 = 16.0;
 const SWATCH: f32 = 26.0;
 /// A colour's box: wide enough for a short gradient.
 const HEX_W: f32 = 196.0;
+/// A colour's NONE button.
+const NONE_W: f32 = 54.0;
 const DROPDOWN_W: f32 = 200.0;
 const LOGO_FIELD_W: f32 = 140.0;
 /// What the Logo box says while it's empty: no word means the chrome wordmark.
@@ -130,6 +132,12 @@ const WM_APP_TEXT_KEY: u32 = WM_APP + 83;
 const SAVE_TIMER: usize = 1;
 const RETRY_TIMER: usize = 2;
 const SAVE_DELAY_MS: u32 = 600;
+/// Undo steps kept (all skins together).
+const UNDO_STEPS: usize = 200;
+/// Typing in the skin's text is one undo step until a pause this long (seconds).
+const TYPING_PAUSE: f64 = 1.5;
+/// The undo group for typing in the skin's text (a box being edited has its own number).
+const TEXT_GROUP: u64 = u64::MAX;
 /// The skin's text is kept below this (EM_LIMITTEXT), like the files Glint reads.
 const MAX_TEXT: usize = 256 * 1024;
 
@@ -244,16 +252,20 @@ enum Ctl {
     Logo,
 }
 
-/// Which part of a control: the main one (a colour's swatch), or a colour's #hex box.
+/// Which part of a control: the main one (a colour's swatch), a colour's #hex box, or its NONE
+/// button.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Part {
     Main,
     Hex,
+    Clear,
 }
 
 /// The buttons under the list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Btn {
+    Undo,
+    Redo,
     New,
     Duplicate,
     Rename,
@@ -263,7 +275,9 @@ enum Btn {
     Folder,
 }
 
-const BUTTONS: [(Btn, &str); 7] = [
+const BUTTONS: [(Btn, &str); 9] = [
+    (Btn::Undo, "UNDO"),
+    (Btn::Redo, "REDO"),
     (Btn::New, "NEW"),
     (Btn::Duplicate, "DUPLICATE"),
     (Btn::Rename, "RENAME"),
@@ -464,6 +478,15 @@ pub struct SkinWindow {
     setting_text: bool,
     /// Skins changed and waiting for SAVE_TIMER to save them.
     save_due: Vec<String>,
+    /// Undo and redo: a skin's text before a change, with its id; newest last.
+    undo: Vec<(String, String)>,
+    redo: Vec<(String, String)>,
+    /// The group of the last undo step and when it last grew: a box typed in (or the skin's
+    /// text typed in without a pause) is one step.
+    undo_group: Option<(u64, f64)>,
+    /// The group changes join while a box is being edited.
+    edit_group: Option<u64>,
+    next_group: u64,
     /// A line under the skin's name: what just happened (a copy made, a problem).
     status: Option<(String, bool)>,
     /// The status is this window's own (not the file worker's "Saved…"), which it doesn't hide.
@@ -586,6 +609,11 @@ pub fn create(owner: HWND, theme: &Theme) -> Option<SkinWindow> {
             text_at: None,
             setting_text: false,
             save_due: Vec::new(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            undo_group: None,
+            edit_group: None,
+            next_group: 1,
             status: None,
             status_mine: false,
             menu_for: None,
@@ -1072,7 +1100,7 @@ impl SkinWindow {
 
     /// The list of skins (its visible part, on screen).
     fn list_rect(&self) -> Rect {
-        let buttons = 4.0 * ksize::BUTTON_H + 3.0 * BUTTON_GAP + 2.0 * BUTTONS_PAD;
+        let buttons = 5.0 * ksize::BUTTON_H + 4.0 * BUTTON_GAP + 2.0 * BUTTONS_PAD;
         Rect::new(0.0, size::TITLE_H, LIST_W, (self.size.1 - size::TITLE_H - buttons).max(0.0))
     }
 
@@ -1081,13 +1109,15 @@ impl SkinWindow {
         let full = LIST_W - 2.0 * BUTTONS_PAD;
         let half = (full - BUTTON_GAP) / 2.0;
         let (row, col, wide) = match b {
-            Btn::New => (0, 0, false),
-            Btn::Duplicate => (0, 1, false),
-            Btn::Rename => (1, 0, false),
-            Btn::Delete => (1, 1, false),
-            Btn::Import => (2, 0, false),
-            Btn::Export => (2, 1, false),
-            Btn::Folder => (3, 0, true),
+            Btn::Undo => (0, 0, false),
+            Btn::Redo => (0, 1, false),
+            Btn::New => (1, 0, false),
+            Btn::Duplicate => (1, 1, false),
+            Btn::Rename => (2, 0, false),
+            Btn::Delete => (2, 1, false),
+            Btn::Import => (3, 0, false),
+            Btn::Export => (3, 1, false),
+            Btn::Folder => (4, 0, true),
         };
         let y = list.bottom() + BUTTONS_PAD + row as f32 * (ksize::BUTTON_H + BUTTON_GAP);
         let x = BUTTONS_PAD + col as f32 * (half + BUTTON_GAP);
@@ -1145,6 +1175,7 @@ impl SkinWindow {
         match (row.ctl, part) {
             (Ctl::Colour(_), Part::Hex) => Some(Rect::new(right - HEX_W, mid(ksize::FIELD_H), HEX_W, ksize::FIELD_H)),
             (Ctl::Colour(_), Part::Main) => Some(Rect::new(right - HEX_W - 10.0 - SWATCH, mid(SWATCH), SWATCH, SWATCH)),
+            (Ctl::Colour(_), Part::Clear) => Some(Rect::new(right - HEX_W - 10.0 - SWATCH - 8.0 - NONE_W, mid(ksize::FIELD_H), NONE_W, ksize::FIELD_H)),
             (Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Logo, Part::Main) => {
                 Some(Rect::new(right - DROPDOWN_W, mid(ksize::FIELD_H), DROPDOWN_W, ksize::FIELD_H))
             }
@@ -1347,6 +1378,8 @@ impl SkinWindow {
             let enabled = match b {
                 Btn::Rename | Btn::Delete => own,
                 Btn::Duplicate | Btn::Export => exists,
+                Btn::Undo => self.can_undo(app, false),
+                Btn::Redo => self.can_undo(app, true),
                 _ => true,
             };
             let me = Hot::Button(b);
@@ -1448,7 +1481,12 @@ impl SkinWindow {
             if rect.bottom() < page.y || rect.y > page.bottom() {
                 continue;
             }
-            let text_w = (rect.w - 2.0 * ROW_PAD_X - HEX_W - SWATCH - 40.0).max(80.0);
+            // (A colour's name ends a little before its NONE button.)
+            let text_w = match row.ctl {
+                Ctl::Colour(_) => rect.w - 2.0 * ROW_PAD_X - HEX_W - 10.0 - SWATCH - 8.0 - NONE_W - 8.0,
+                _ => rect.w - 2.0 * ROW_PAD_X - HEX_W - SWATCH - 40.0,
+            }
+            .max(80.0);
             let title_color = if enabled { theme.text } else { theme.muted };
             if row.note.is_empty() {
                 self.renderer.text(row.title, Rect::new(rect.x + ROW_PAD_X, rect.y + ((rect.h - 19.0) / 2.0).round(), text_w, 19.0), &TextStyle::new(title_color));
@@ -1465,11 +1503,17 @@ impl SkinWindow {
             // The Logo setting isn't the skin's: it can always be changed.
             let main_look = self.look_of(row.ctl, Part::Main, enabled || row.ctl == Ctl::Logo);
             let hex_look = self.look_of(row.ctl, Part::Hex, enabled);
+            let clear = self.part_rect(&row, Part::Clear).map(shift);
+            let clear_on = enabled && matches!(row.ctl, Ctl::Colour(c) if self.colours.get(c).is_some_and(|s| s.text != "none"));
+            let clear_look = self.look_of(row.ctl, Part::Clear, clear_on);
             let label = self.choice_label(row.ctl, &app.theme);
             let r = &mut self.renderer;
             match row.ctl {
                 Ctl::Colour(i) => {
                     let Some(c) = self.colours.get(i) else { continue };
+                    if let Some(n) = clear {
+                        kit::button(r, theme, n, "NONE", clear_look);
+                    }
                     if let Some(s) = main {
                         swatch(r, theme, s, &c.paint, main_look);
                     }
@@ -1693,9 +1737,13 @@ impl SkinWindow {
             }
         }
         for row in &self.rows {
-            for part in [Part::Main, Part::Hex] {
+            for part in [Part::Clear, Part::Main, Part::Hex] {
                 let Some(r) = self.part_rect(row, part).map(|r| self.on_page(r)) else { continue };
-                let hit = if matches!(row.ctl, Ctl::Dark | Ctl::Grip) { kit::toggle_contains(r, p) } else { r.contains(p) };
+                let hit = match (row.ctl, part) {
+                    (Ctl::Dark | Ctl::Grip, _) => kit::toggle_contains(r, p),
+                    (_, Part::Clear) => kit::button_contains(r, p),
+                    _ => r.contains(p),
+                };
                 if hit {
                     return Some(Hot::Ctl(row.ctl, part));
                 }
@@ -1839,6 +1887,7 @@ impl SkinWindow {
                 spots.push(Spot::Ctl(row.ctl, Part::Main));
                 if matches!(row.ctl, Ctl::Colour(_)) {
                     spots.push(Spot::Ctl(row.ctl, Part::Hex));
+                    spots.push(Spot::Ctl(row.ctl, Part::Clear));
                 }
             }
         }
@@ -1892,6 +1941,8 @@ impl SkinWindow {
             _ if is(VK_ESCAPE) || (ctrl && vk == 'W' as u16) => asks.push(Ask::Job(Job::Close)),
             // Light or dark, as in the main window: switches to the skin's twin (if it has one).
             _ if ctrl && shift && vk == 'L' as u16 => asks.push(Ask::Command(Command::ToggleTheme)),
+            _ if ctrl && vk == 'Z' as u16 => asks.extend(self.undo_step(app, shift)),
+            _ if ctrl && vk == 'Y' as u16 => asks.extend(self.undo_step(app, true)),
             _ if is(VK_TAB) => self.move_focus(if shift { -1 } else { 1 }, app),
             _ if self.focus == Spot::List && (is(VK_UP) || is(VK_DOWN) || is(VK_HOME) || is(VK_END)) => {
                 let at = self.items.iter().position(|i| i.id.eq_ignore_ascii_case(&app.settings.skin));
@@ -1977,6 +2028,7 @@ impl SkinWindow {
         let name = app.skins.free_name("My skin");
         let text = skin::copy_text(&from_text, &name, &from_name);
         let new = app.skins.add(&name, &text);
+        self.forget_steps(&new);
         app.pick_skin(&new);
         self.say(format!("Made {name}, your copy of {from_name}"), false);
         self.layout_dirty = true;
@@ -1990,13 +2042,85 @@ impl SkinWindow {
         self.status_mine = false;
         let Some(id) = self.editable(app) else { return Vec::new() };
         let Some(text) = app.skins.find(&id).map(|e| e.text.clone()) else { return Vec::new() };
-        let mut new = text;
+        let mut new = text.clone();
         for (key, value) in changes {
             new = skin::with_value(&new, key, value);
+        }
+        if new != text {
+            self.remember(&id, text, self.edit_group);
         }
         app.skins.set_text(&id, &new);
         app.apply_skin();
         self.save_soon(&id);
+        self.invalidate();
+        vec![Ask::RedrawMain]
+    }
+
+    /// Keeps `before` (skin `id`'s text before a change) as an undo step - unless the change is
+    /// part of the same `group` as the last step (one box typed in), which already has it.
+    fn remember(&mut self, id: &str, before: String, group: Option<u64>) {
+        let now = self.now();
+        let joins = match (group, self.undo_group) {
+            (Some(g), Some((last, at))) => g == last && (g != TEXT_GROUP || now - at < TYPING_PAUSE),
+            _ => false,
+        };
+        self.undo_group = group.map(|g| (g, now));
+        self.redo.retain(|s| s.0 != id);
+        if joins && self.undo.last().is_some_and(|s| s.0 == id) {
+            return;
+        }
+        self.undo.push((id.to_string(), before));
+        if self.undo.len() > UNDO_STEPS {
+            self.undo.remove(0);
+        }
+    }
+
+    /// Forgets skin `id`'s undo and redo steps: the id is a new skin's now. (A skin deleted outside
+    /// the customiser - its file deleted in a folder - leaves its steps behind, and a new skin can
+    /// get its name; undoing in the new one mustn't bring the old one's text.)
+    fn forget_steps(&mut self, id: &str) {
+        self.undo.retain(|s| s.0 != id);
+        self.redo.retain(|s| s.0 != id);
+    }
+
+    /// Whether the skin in use has a step to undo (or to redo).
+    fn can_undo(&self, app: &AppState, redo: bool) -> bool {
+        // (A skin whose file is gone has nothing to undo into.)
+        if app.skins.find(&app.settings.skin).is_none_or(|e| e.built_in()) {
+            return false;
+        }
+        let steps = if redo { &self.redo } else { &self.undo };
+        steps.iter().any(|s| s.0 == app.settings.skin)
+    }
+
+    /// Undoes the last change to the skin in use (or redoes the last one undone).
+    fn undo_step(&mut self, app: &mut AppState, redo: bool) -> Vec<Ask> {
+        self.end_editing(app, true);
+        let id = app.settings.skin.clone();
+        let Some(now) = app.skins.find(&id).filter(|e| !e.built_in()).map(|e| e.text.clone()) else { return Vec::new() };
+        let (from, to) = if redo { (&mut self.redo, &mut self.undo) } else { (&mut self.undo, &mut self.redo) };
+        // (A step that wouldn't change anything, like a box put back with Esc, is passed over.)
+        let text = loop {
+            let Some(at) = from.iter().rposition(|s| s.0 == id) else { return Vec::new() };
+            let (_, text) = from.remove(at);
+            if text != now {
+                break text;
+            }
+        };
+        to.push((id.clone(), now));
+        self.undo_group = None;
+        let was_dark = app.dark;
+        app.skins.set_text(&id, &text);
+        app.apply_skin();
+        if app.dark != was_dark {
+            // "Light or dark" follows, as when the Dark skin switch is flipped.
+            app.pick_skin(&id);
+        }
+        self.save_soon(&id);
+        if self.advanced {
+            self.sync_text(app);
+        }
+        self.layout_dirty = true;
         self.invalidate();
         vec![Ask::RedrawMain]
     }
@@ -2028,6 +2152,12 @@ impl SkinWindow {
         match (ctl, part) {
             // A gradient's swatch: the picker changes its first colour.
             (Ctl::Colour(i), Part::Main) => vec![Ask::Job(Job::Colour { at: i, initial: self.colour(app, i).paint.first().to_colorref() })],
+            (Ctl::Colour(i), Part::Clear) => {
+                if self.colour(app, i).text == "none" {
+                    return Vec::new();
+                }
+                self.change(app, &[(COLOURS[i].0, "none".to_string())])
+            }
             (Ctl::Colour(i), Part::Hex) => {
                 let now = self.colour(app, i);
                 let own = Self::own_value(app, i);
@@ -2162,6 +2292,8 @@ impl SkinWindow {
         // Only the logo's word has a hint: empty means the chrome wordmark.
         self.edit_box.set_hint(if matches!(what, Editing::LogoText(_)) { LOGO_HINT } else { "" });
         self.editing = Some(what);
+        self.edit_group = Some(self.next_group);
+        self.next_group += 1;
         self.edit_at = None; // placed on the next frame
         self.edit_fresh = true;
         self.edit_box.set_text(text);
@@ -2181,6 +2313,12 @@ impl SkinWindow {
         self.edit_box.hide();
         self.edit_at = None;
         self.invalidate();
+        let asks = self.finish_editing(what, typed, keep, app);
+        self.edit_group = None;
+        asks
+    }
+
+    fn finish_editing(&mut self, what: Editing, typed: String, keep: bool, app: &mut AppState) -> Vec<Ask> {
         match what {
             Editing::Hex(i, before) => {
                 let typed = if keep { typed_value(COLOURS[i].0, &typed) } else { None };
@@ -2206,6 +2344,16 @@ impl SkinWindow {
                 }
                 if let Some(new_id) = app.skins.rename(&id, &name) {
                     self.save_due.retain(|d| *d != id);
+                    if new_id != id {
+                        self.forget_steps(&new_id);
+                    }
+                    // The steps go with the skin, under its new name: undoing a change made before
+                    // the rename mustn't bring the old name back into the text (its file and id stay
+                    // the new ones).
+                    for step in self.undo.iter_mut().chain(self.redo.iter_mut()).filter(|s| s.0 == id) {
+                        step.0 = new_id.clone();
+                        step.1 = skin::with_value(&step.1, "name", &name);
+                    }
                     if app.settings.skin == id {
                         app.settings.skin = new_id;
                     }
@@ -2235,6 +2383,8 @@ impl SkinWindow {
         self.end_editing(app, true);
         let current = app.skins.find(&app.settings.skin).cloned();
         match b {
+            Btn::Undo => self.undo_step(app, false),
+            Btn::Redo => self.undo_step(app, true),
             Btn::New => {
                 // A new skin starts as AMD Radeon, light or dark as Glint is now.
                 let base = if app.dark { skin::DEFAULT } else { skin::DEFAULT_LIGHT };
@@ -2287,6 +2437,7 @@ impl SkinWindow {
 
     /// A skin was just made: use it, and show it in the list.
     fn after_new(&mut self, app: &mut AppState, id: &str) -> Vec<Ask> {
+        self.forget_steps(id);
         app.pick_skin(id);
         self.layout(app);
         if let Some(item) = self.items.iter().find(|i| i.id == id) {
@@ -2316,6 +2467,8 @@ impl SkinWindow {
                 let name = app.skins.find(&id).map(|e| e.name.clone()).unwrap_or_default();
                 let dark = app.dark;
                 self.save_due.retain(|d| *d != id);
+                self.undo.retain(|s| s.0 != id);
+                self.redo.retain(|s| s.0 != id);
                 app.skins.delete(&id);
                 // Glint goes back to AMD Radeon (light or dark as it was).
                 if app.settings.skin == id {
@@ -2413,6 +2566,9 @@ impl SkinWindow {
         }
         let typed = self.text_box_text();
         self.text_shown = typed.clone();
+        if let Some(old) = app.skins.find(&id).map(|e| e.text.clone()).filter(|t| *t != typed) {
+            self.remember(&id, old, Some(TEXT_GROUP));
+        }
         app.skins.set_text(&id, &typed);
         app.apply_skin();
         self.save_soon(&id);

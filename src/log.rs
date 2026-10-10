@@ -26,6 +26,8 @@ use crate::settings;
 
 /// Glint's version, as Cargo.toml says ("0.8.0").
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The timing log starts again after this many bytes.
+const TIMING_LOG_MAX: u64 = 1024 * 1024;
 /// The error log starts again after this many bytes.
 const ERROR_LOG_MAX: u64 = 1024 * 1024;
 
@@ -38,6 +40,10 @@ pub fn line(text: &str) {
     let Some(p) = path() else { return };
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+        // It starts again once it's big, so it never piles up in the temp folder.
+        if f.metadata().is_ok_and(|m| m.len() > TIMING_LOG_MAX) {
+            let _ = f.set_len(0);
+        }
         let _ = writeln!(f, "{stamp:.3} {text}");
     }
 }

@@ -102,10 +102,10 @@ pub fn complete(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str
     let trimmed = &before[lead..];
     let none = Completion { start: caret, end: caret, ..Completion::default() };
 
-    // "in " → folders
-    if trimmed.len() >= 3 && trimmed[..3].eq_ignore_ascii_case("in ") {
+    // "in " → folders (`get`: the third byte can be inside a letter, as in "señor")
+    if trimmed.get(..3).is_some_and(|head| head.eq_ignore_ascii_case("in ")) {
         let typed = trimmed[3..].trim_start();
-        if typed.contains(':') && !looks_like_path(typed) || typed.ends_with(':') {
+        if typed.contains(':') && !looks_like_path(typed) || typed.ends_with([':', '(']) {
             return none;
         }
         let start = caret - typed.len();
@@ -118,9 +118,12 @@ pub fn complete(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str
                 Some(names) => {
                     let items = names.iter().map(|n| (n.clone(), Suggestion { insert: format!("{dir}{n}\\"), label: n.clone(), hint: "folder".into() })).collect();
                     done.items = rank(items, partial);
-                    // "C:\Users\me\" itself, finished with the colon.
+                    // "C:\Users\me\" itself, with its rules to follow in ( ). (A drive keeps its
+                    // backslash: "C:\ (".)
                     if partial.is_empty() && !names.is_empty() {
-                        done.items.push(Suggestion { insert: format!("{}:", typed.trim_end_matches('\\')), label: ":".into(), hint: "this folder".into() });
+                        let this = typed.trim_end_matches('\\');
+                        let this = if this.len() == 2 && this.ends_with(':') { &typed[..3] } else { this };
+                        done.items.push(Suggestion { insert: format!("{this} ("), label: "(".into(), hint: "this folder".into() });
                     }
                 }
                 None => done.wants = Some(real),
@@ -132,11 +135,11 @@ pub fn complete(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str
             let known = PLACE_NAMES.iter().any(|n| n.eq_ignore_ascii_case(&p.name)) && p.hint == "Quick access";
             let drive = p.path.len() <= 3 && p.path.ends_with('\\');
             let insert = if known {
-                format!("{}:", p.name)
+                format!("{} (", p.name)
             } else if drive {
                 p.path.clone()
             } else {
-                format!("{}:", p.path)
+                format!("{} (", p.path)
             };
             let s = Suggestion { insert, label: p.name.clone(), hint: if known || drive { p.hint.clone() } else { format!("{} \u{00b7} {}", p.hint, p.path) } };
             items.push((p.name.clone(), s.clone()));
@@ -279,9 +282,9 @@ mod tests {
     fn folders_after_in() {
         let c = at_end("-a_to_z\nin do");
         assert_eq!(labels(&c)[..3], ["Documents", "Downloads", "docs"]);
-        assert_eq!(c.items[0].insert, "Documents:");
-        assert_eq!(c.items[2].insert, "C:\\src\\docs:");
-        assert_eq!(c.ghost("-a_to_z\nin do").as_deref(), Some("cuments:"));
+        assert_eq!(c.items[0].insert, "Documents (");
+        assert_eq!(c.items[2].insert, "C:\\src\\docs (");
+        assert_eq!(c.ghost("-a_to_z\nin do").as_deref(), Some("cuments ("));
         assert_eq!(&"-a_to_z\nin do"[c.start..c.end], "do");
         // A path: the real folders in it (listed in the background).
         let c = at_end("in C:\\Us");
@@ -289,6 +292,10 @@ mod tests {
         assert_eq!(c.items[0].insert, "C:\\Users\\");
         assert_eq!(at_end("in D:\\Work\\").wants.as_deref(), Some("D:\\Work"));
         assert!(at_end("in Downloads:").items.is_empty());
+        assert!(at_end("in Downloads (").items.is_empty());
+        // A folder itself: its rules follow in brackets.
+        let this = |text: &str| at_end(text).items.into_iter().find(|s| s.label == "(").map(|s| s.insert);
+        assert_eq!(this("in C:\\").as_deref(), Some("C:\\ ("));
     }
 
     #[test]
@@ -320,5 +327,14 @@ mod tests {
         assert_eq!(c.items[0].insert, "-image_last");
         assert_eq!(c.items[0].hint, "at the very bottom");
         assert!(!labels(&at_end("-image_")).contains(&"image_by_day"), "_by_ only on date orders");
+    }
+
+    #[test]
+    fn letters_of_more_than_one_byte() {
+        // "ñ" takes the third and fourth bytes, "€" the second to fourth: "in " is looked for in
+        // the first three.
+        assert!(at_end("señor").items.is_empty());
+        assert!(at_end("a€").items.is_empty());
+        assert!(at_end("in Dö").items.is_empty());
     }
 }

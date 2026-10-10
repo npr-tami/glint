@@ -22,8 +22,8 @@
 //!   --version             print the version ("Glint 0.8.0") and end; no window
 //!   --after-update        started by the Glint that just updated itself: open last time's tabs
 //!
-//! Settings are in %APPDATA%\Glint\config\settings.json, or in config\ next to glint.exe when
-//! that folder exists (portable); see settings.rs.
+//! Settings are in %APPDATA%\Glint\config\settings.json, or in Glint data\config\ next to
+//! glint.exe when that folder exists (portable); see settings.rs.
 //!
 //! For measuring and testing (environment variables):
 //!   GLINT_FRAME_LOG=1        write how long every frame took to the log (%TEMP%\glint.log)
@@ -177,8 +177,13 @@ fn main() {
     }
     let hidden = main && switches.background;
 
+    // Glint's files where they belong (a Portable switch moves them now), before anything reads them.
+    let unsettled = if main { settings::settle() } else { Vec::new() };
     let loaded = settings::load();
     log::set_error_log(loaded.error_log);
+    for problem in unsettled {
+        log::error(&problem);
+    }
     let tray_icon = loaded.tray_icon;
     let dark = dark.unwrap_or_else(|| settings::dark_for(loaded.theme));
     // Just updated (update.rs): the same tabs as before, whatever "When Glint starts, open" says.

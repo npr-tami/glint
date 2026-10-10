@@ -172,8 +172,10 @@ pub fn folder_effect(sources: &[String], dest: &str, keys: u32, allowed: u32) ->
     }
     // The program the drag came from doesn't allow that (a read-only place offers only copying).
     // Explorer then does what is allowed - unless a key asked for something in particular, or the
-    // items are already where they were dropped (that does nothing; Ctrl copies them there).
-    if keyed || same_folder {
+    // items are already where they were dropped (that does nothing; Ctrl copies them there). With
+    // the right button the drop shows a menu of what can be done ("Create shortcuts here" right
+    // where the items are), so it goes on with the first of those.
+    if (keyed || same_folder) && keys & MK_RBUTTON.0 == 0 {
         return None;
     }
     [DropHow::Copy, DropHow::Move, DropHow::Link].into_iter().find(|&h| possible(h))
@@ -516,7 +518,9 @@ impl IDropTarget_Impl for Target_Impl {
             Some(d) if !WAITING.with(|w| w.get()) => dropped_files(d),
             _ => Vec::new(),
         };
-        let mut msg = DragMsg::new(Phase::Drop, at, keys.0, allowed);
+        // The button is up by now, so the key state no longer says which one it was.
+        let held = if right { keys.0 | MK_RBUTTON.0 } else { keys.0 };
+        let mut msg = DragMsg::new(Phase::Drop, at, held, allowed);
         msg.files = files;
         msg.send(self.hwnd);
         let shown = if msg.handled { msg.effect & allowed } else { 0 };
@@ -912,6 +916,20 @@ mod tests {
         assert_eq!(folder_effect(&here, "C:\\x", MK_SHIFT.0, ALL), None);
         assert_eq!(folder_effect(&here, "C:\\x\\", MK_CONTROL.0, ALL), Some(DropHow::Copy));
         assert_eq!(folder_choices(&here, "C:\\x", ALL), vec![DropHow::Copy, DropHow::Link]);
+    }
+
+    #[test]
+    fn a_right_button_drop_where_they_are_shows_its_menu() {
+        // Explorer's menu, with "Copy here" and "Create shortcuts here", right where the items are.
+        let here = paths(&["C:\\x\\a.txt", "C:\\x\\b.txt"]);
+        let right = MK_RBUTTON.0;
+        assert_eq!(folder_effect(&here, "C:\\x", right, ALL), Some(DropHow::Copy), "the menu's first choice");
+        assert_eq!(folder_effect(&here, "C:\\x", right | MK_SHIFT.0, ALL), Some(DropHow::Copy));
+        assert_eq!(folder_effect(&here, "C:\\x", right, DROPEFFECT_MOVE.0), None, "nothing the menu could offer");
+        // Never into itself, whatever the button.
+        let folder = paths(&["C:\\Projects\\glint"]);
+        assert_eq!(folder_effect(&folder, "C:\\Projects\\glint", right, ALL), None);
+        assert_eq!(folder_effect(&folder, "C:\\Projects\\glint\\src", right, ALL), None);
     }
 
     #[test]

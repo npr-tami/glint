@@ -100,15 +100,17 @@ pub struct Tab {
     pub show_system: bool,
     pub folders_first: bool,
     /// The custom sort order, while it's on ("CustomSort"): it sorts instead of the column, and
-    /// decides where folders go (folders_first is left alone).
+    /// decides where folders go (folders_first is left alone), in folders it has rules for (see
+    /// `custom_here`).
     pub custom: Option<Arc<Recipe>>,
     /// Searching the folder's subfolders for the filter text (search.rs): while this is set,
     /// `folder` holds the results (each with its full path as `target`) and the folder's own
     /// listing waits in the search.
     pub search: Option<Search>,
     /// The folder on its way was asked for by `AppState::navigate`: if it turns out to be a file,
-    /// the file opens and the tab stays where it was (a file path typed in the path bar).
-    opens_file: bool,
+    /// the file opens and the tab stays where it was (a file path typed in the path bar). Holds
+    /// the Forward list going there emptied, to put back then.
+    opens_file: Option<Vec<String>>,
     /// How many entries show when no filter is typed (the listing minus hidden items), for "3 of
     /// 12 items".
     pub visible_total: usize,
@@ -148,6 +150,13 @@ pub struct Tab {
 }
 
 impl Tab {
+    /// The custom sort order, when it decides this folder's order: it's on, this is a real folder
+    /// (This PC's drives keep their own order), and some of its rules are for this folder. In a
+    /// folder none are for (only "in …" rules, for other folders), the column sorts as usual.
+    pub fn custom_here(&self) -> Option<&Arc<Recipe>> {
+        self.custom.as_ref().filter(|r| !self.folder.path.is_empty() && r.applies(&self.folder.path))
+    }
+
     fn new(id: u64, path: String) -> Tab {
         Tab {
             id,
@@ -168,7 +177,7 @@ impl Tab {
             folders_first: true,
             custom: None,
             search: None,
-            opens_file: false,
+            opens_file: None,
             visible_total: 0,
             scroll: 0.0,
             reveal_focus: false,
@@ -258,10 +267,9 @@ impl Tab {
                 self.view.push(i as u32);
             }
         }
-        match &self.custom {
-            // This PC's drives keep their own order.
-            Some(recipe) if !self.folder.path.is_empty() => recipe.sort(entries, &mut self.view, &self.folder.path, &sortrecipe::Clock::now()),
-            _ => folder::sort_view(entries, &mut self.view, self.sort, self.descending, self.folders_first),
+        match self.custom_here().cloned() {
+            Some(recipe) => recipe.sort(entries, &mut self.view, &self.folder.path, &sortrecipe::Clock::now()),
+            None => folder::sort_view(entries, &mut self.view, self.sort, self.descending, self.folders_first),
         }
         // The tree view: each open folder's items right under it, sorted among themselves.
         if self.tree.is_open() {
@@ -667,10 +675,11 @@ impl AppState {
         self.tab_mut().reveal_focus = true;
     }
 
-    /// A column picked while the custom sort order is on: that means "sort by this", so the custom
-    /// order goes off, and the status bar says how to get it back.
+    /// A column picked while the custom sort order decides this folder: that means "sort by this",
+    /// so the custom order goes off, and the status bar says how to get it back. (In a folder it
+    /// has no rules for, the column just sorts that folder, and the custom order stays on.)
     fn custom_sort_off_for_column(&mut self) {
-        if self.settings.custom_sort {
+        if self.settings.custom_sort && self.tab().custom_here().is_some() {
             self.set_custom_sort(false, None);
             self.say("Custom sort is off. SORT \u{203a} Custom order turns it on again");
         }
@@ -792,10 +801,13 @@ impl AppState {
             Command::Properties => self.properties(),
             Command::OpenTerminal(dir) => self.open_terminal(dir),
             Command::SortBy(key) => {
+                // While the custom sort order decides, no column is the sorted one (its title has no
+                // arrow), so a click on one is a first click, not a second that turns it around.
+                let custom = self.tab().custom_here().is_some();
                 self.custom_sort_off_for_column();
                 let t = self.tab_mut();
                 // Newest and biggest first feel natural.
-                let desc = if t.sort == key { !t.descending } else { matches!(key, SortKey::Date | SortKey::Created | SortKey::Size) };
+                let desc = if t.sort == key && !custom { !t.descending } else { matches!(key, SortKey::Date | SortKey::Created | SortKey::Size) };
                 t.set_sort(key, desc);
             }
             Command::SetSort(key, desc) => {
@@ -857,10 +869,10 @@ impl AppState {
         }
         let old = std::mem::replace(&mut t.path, path);
         t.back.push(old);
-        t.forward.clear();
+        let forward = std::mem::take(&mut t.forward);
         t.select_after_load = None;
         self.start_load(self.active);
-        self.tab_mut().opens_file = true;
+        self.tab_mut().opens_file = Some(forward);
     }
 
     pub fn back(&mut self) {
@@ -951,7 +963,7 @@ impl AppState {
     /// of that folder (F5, a file job changed something in it), the search runs again instead;
     /// going to another folder ends the search.
     fn start_load(&mut self, tab_index: usize) {
-        self.tabs[tab_index].opens_file = false;
+        self.tabs[tab_index].opens_file = None;
         if let Some(root) = self.tabs[tab_index].search.as_ref().map(|s| s.root.clone()) {
             if self.tabs[tab_index].path == root {
                 self.note = None;
@@ -1104,13 +1116,16 @@ impl AppState {
                 Loaded::Folder { tab_id, generation, folder, finished } => {
                     let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab_id) else { continue };
                     let Some(p) = t.loading.take_if(|p| p.generation == generation) else { continue };
-                    if std::mem::take(&mut t.opens_file) && folder.error.as_deref() == Some(folder::NOT_A_FOLDER) && folder.path == t.path {
+                    let opens_file = t.opens_file.take();
+                    if let Some(forward) = opens_file.filter(|_| folder.error.as_deref() == Some(folder::NOT_A_FOLDER) && folder.path == t.path) {
                         // A file's path was typed (or pasted) into the path bar: it opens in its app,
-                        // and the tab goes back to the folder it showed, which is still on screen.
+                        // and the tab goes back to the folder it showed, which is still on screen
+                        // (with Forward as it was).
                         shell::open(&folder.path);
                         if let Some(prev) = t.back.pop() {
                             t.path = prev;
                         }
+                        t.forward = forward;
                         let name = folder::file_name(&folder.path).to_string();
                         self.say(format!("Opened \u{201c}{name}\u{201d}"));
                         changed = true;
@@ -1285,11 +1300,17 @@ impl AppState {
     /// Back and Forward lists, follow it - as in Explorer. (Glint's own renames can call this too.)
     pub fn folder_moved(&mut self, from: &str, to: &str) {
         for t in &mut self.tabs {
+            let shown = t.folder.path.clone();
             let searched = t.search.as_mut().map(|s| [&mut s.root, &mut s.listing.path]).into_iter().flatten();
             for p in [&mut t.path, &mut t.folder.path].into_iter().chain(searched).chain(t.back.iter_mut()).chain(t.forward.iter_mut()) {
                 if let Some(moved) = moved_path(p, from, to) {
                     *p = moved;
                 }
+            }
+            // The custom sort order can have rules for one place and not the other: sorted again
+            // now (the reading that follows finds the same items, and leaves the order alone).
+            if t.folder.path != shown {
+                t.rebuild_view();
             }
         }
     }
@@ -1357,7 +1378,12 @@ impl AppState {
     }
 
     fn copy_paths(&mut self) {
-        let paths = self.selected_paths();
+        // (This PC has no path of its own: nothing is copied over what's on the clipboard.)
+        let paths: Vec<String> = self.selected_paths().into_iter().filter(|p| !p.is_empty()).collect();
+        if paths.is_empty() {
+            self.say("This PC has no path to copy");
+            return;
+        }
         let hwnd = HWND(self.hwnd.load(Ordering::SeqCst) as *mut _);
         let text = paths.iter().map(|p| if p.contains(' ') { format!("\"{p}\"") } else { p.clone() }).collect::<Vec<_>>().join("\r\n");
         let note = if shell::copy_text(hwnd, &text) {
@@ -2083,5 +2109,71 @@ mod tests {
         assert_eq!(moved_path("C:\\a", "C:\\a\\b", "C:\\a\\c"), None);
         assert_eq!(moved_path("", "C:\\a", "C:\\b"), None);
         assert_eq!(moved_path("C:\\é\\x", "C:\\é", "C:\\e").as_deref(), Some("C:\\e\\x"));
+    }
+
+    #[test]
+    fn this_pc_has_no_path_to_copy() {
+        let mut a = AppState::for_tests(Settings::default());
+        a.tabs[0].path = String::new();
+        a.copy_paths();
+        assert_eq!(a.note(), Some("This PC has no path to copy"));
+    }
+
+    #[test]
+    fn a_column_clicked_while_the_custom_order_sorts_is_a_first_click() {
+        let mut a = AppState::for_tests(Settings { custom_sort: true, ..Default::default() });
+        a.hidden = true; // (no folder watch in a test)
+        let custom = a.custom_order();
+        a.tabs[0] = tab_with(&["b.txt", "a.txt", "c.txt"]);
+        a.tabs[0].custom = custom;
+        // Under the custom order the tab is still sorted by name, A to Z, but no column shows it.
+        a.run(Command::SortBy(SortKey::Name));
+        assert!(a.tab().custom.is_none());
+        assert_eq!(shown(a.tab()), ["a.txt", "b.txt", "c.txt"], "A to Z, as a first click on Name sorts");
+        // Clicked again: turned around.
+        a.run(Command::SortBy(SortKey::Name));
+        assert_eq!(shown(a.tab()), ["c.txt", "b.txt", "a.txt"]);
+    }
+
+    #[test]
+    fn a_folder_the_custom_order_has_no_rules_for_sorts_by_its_column() {
+        // Rules for another folder only: this one keeps its column, and a click on one sorts it
+        // without turning the custom order off (it still decides in that other folder).
+        let recipe = "in C:\\elsewhere:\n-a_to_z".to_string();
+        let mut a = AppState::for_tests(Settings { custom_sort: true, sort_recipe: Some(recipe), ..Default::default() });
+        a.hidden = true; // (no folder watch in a test)
+        let custom = a.custom_order();
+        a.tabs[0] = tab_with(&["b.txt", "a.txt", "c.txt"]);
+        a.tabs[0].custom = custom;
+        a.tabs[0].set_sort(SortKey::Name, true);
+        assert!(a.tab().custom_here().is_none());
+        assert_eq!(shown(a.tab()), ["c.txt", "b.txt", "a.txt"], "Z to A, as its column says");
+        a.run(Command::SortBy(SortKey::Name));
+        assert!(a.settings.custom_sort && a.tab().custom.is_some(), "still on for the other folder");
+        assert_eq!(shown(a.tab()), ["a.txt", "b.txt", "c.txt"], "a second click on Name turns it around");
+    }
+
+    #[test]
+    fn a_folder_with_its_own_rules_is_sorted_by_them() {
+        // Only this folder's rules (in brackets): they decide here, and a column click turns the
+        // custom order off, as with rules for every folder.
+        let recipe = "in C:\\x (\n-z_to_a\n)\n# nothing for other folders".to_string();
+        let mut a = AppState::for_tests(Settings { custom_sort: true, sort_recipe: Some(recipe), ..Default::default() });
+        a.hidden = true; // (no folder watch in a test)
+        let custom = a.custom_order();
+        a.tabs[0] = tab_with(&["b.txt", "a.txt", "c.txt"]);
+        a.tabs[0].custom = custom;
+        a.tabs[0].rebuild_view();
+        assert!(a.tab().custom_here().is_some());
+        assert_eq!(shown(a.tab()), ["c.txt", "b.txt", "a.txt"], "Z to A, as its rules say");
+        // Renamed: the folder has no rules under its new name, so its column sorts it again.
+        a.folder_moved("C:\\x", "C:\\y");
+        assert!(a.tab().custom_here().is_none());
+        assert_eq!(shown(a.tab()), ["a.txt", "b.txt", "c.txt"]);
+        a.folder_moved("C:\\y", "C:\\x");
+        assert_eq!(shown(a.tab()), ["c.txt", "b.txt", "a.txt"]);
+        a.run(Command::SortBy(SortKey::Name));
+        assert!(!a.settings.custom_sort && a.tab().custom.is_none());
+        assert_eq!(shown(a.tab()), ["a.txt", "b.txt", "c.txt"], "A to Z, as a first click on Name sorts");
     }
 }

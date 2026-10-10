@@ -907,7 +907,7 @@ fn download(release: &Release, cache: &Path) -> Result<PathBuf, String> {
 
 /// Deletes the downloads earlier updates left in `cache` (`Glint-<version>.exe`). One that another
 /// Glint is writing right now can't be deleted and stays.
-fn remove_downloads(cache: &Path) {
+pub(crate) fn remove_downloads(cache: &Path) {
     let Ok(entries) = std::fs::read_dir(cache) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_lowercase();

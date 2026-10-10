@@ -65,7 +65,7 @@ All code is in `src/`.
 | `app/skins.rs` | Using a skin: picking one, light and dark versions, applying changes. |
 | `folder.rs` | The disk: reading folders, drives, sorting, the filter's rules, formatting sizes and dates, path helpers. |
 | `search.rs` | Searching subfolders for the filter text on a thread of its own. |
-| `sortrecipe.rs` | The custom sort order language: groups, `_first` / `_last`, `in <folder>:`, typo hints. |
+| `sortrecipe.rs` | The custom sort order language: groups, `_first` / `_last`, `in <folder> (` … `)` (or the older `in <folder>:`), typo hints. |
 | `complete.rs` | Suggestions while typing a sort order. |
 | `sortwin.rs` | The sort editor window, with its live preview and presets. |
 | `watch.rs` | Watching the folder on screen (ReadDirectoryChangesW), folding bursts of changes into one. |
@@ -78,7 +78,7 @@ All code is in `src/`.
 | `popup.rs` | Showing those menus, with Windows' items merged in. |
 | `shellmenu.rs` | Windows' own right-click menu (IContextMenu) on a thread of its own. |
 | `shell.rs` | Doors into Windows: open, Open with, the terminal, the clipboard, known folders, `shell:` places, light or dark. |
-| `settings.rs` | settings.json and the config / cache / logs folders (and portable mode). |
+| `settings.rs` | settings.json and Glint's folder with config / cache / logs (and portable mode, which moves it). |
 | `settingswin.rs` | The Settings window. |
 | `settingswin/pages.rs` | The Settings window's pages, row by row, each bound to a setting. |
 | `kit.rs` | Controls drawn by Glint for its own windows: switch, drop-down, button, card, scroller. |

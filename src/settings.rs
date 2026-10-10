@@ -1,14 +1,14 @@
 //! Remembering things between runs: the folders Glint keeps its files in, and settings.json.
 //!
-//! **Folders.** Normally:
-//! - `%APPDATA%\Glint\config` for settings.json and the `skins` folder (skin.rs);
-//! - `%LOCALAPPDATA%\Glint\cache` for things Glint can always make again;
-//! - `%LOCALAPPDATA%\Glint\logs` for error.log.
+//! **Folders.** All of Glint's files are in one folder, `%APPDATA%\Glint`:
+//! - `config` for settings.json and the `skins` folder (skin.rs);
+//! - `cache` for things Glint can always make again;
+//! - `logs` for error.log.
 //!
-//! **Portable mode:** when a folder called `config` sits next to glint.exe (empty, or with Glint's
-//! own settings.json - not another program's), Glint uses `config\`, `cache\` and `logs\` next to
-//! glint.exe instead, so the whole folder can go on a USB stick. (`GLINT_SETTINGS_DIR` points all
-//! three somewhere else, for testing.)
+//! **Portable mode:** when a folder called `Glint data` sits next to glint.exe, that is Glint's
+//! folder instead, so the whole folder can go on a USB stick. Switching Portable in Settings moves
+//! the files from one place to the other when Glint next starts (`settle`), as nothing has them
+//! open then. (`GLINT_SETTINGS_DIR` points them somewhere else, for testing.)
 //!
 //! **settings.json** uses plain names and values ("Startup": "restore", "Theme": "dark",
 //! "ShowHidden"...), so the file is easy to read and edit by hand.
@@ -67,23 +67,60 @@ pub struct Folders {
     pub portable: bool,
 }
 
-/// The folders, worked out once (main.rs asks first, at start).
+/// The folders, worked out once: the main Glint `settle`s them first, at start.
 pub fn folders() -> &'static Folders {
-    static FOLDERS: OnceLock<Folders> = OnceLock::new();
     FOLDERS.get_or_init(find_folders)
 }
+
+static FOLDERS: OnceLock<Folders> = OnceLock::new();
+
+/// The folder next to glint.exe that makes Glint portable, and holds all its files then.
+pub const PORTABLE_FOLDER: &str = "Glint data";
+/// A note in the config folder: Glint's files move to the other place at the next start (Settings
+/// > About > Portable). Its first line says where to: "portable" or "installed".
+const MOVE_NOTE: &str = "moving.txt";
+/// What is in Glint's folder, moved together.
+const PARTS: [&str; 3] = ["config", "cache", "logs"];
 
 fn find_folders() -> Folders {
     if let Some(dir) = std::env::var_os("GLINT_SETTINGS_DIR").filter(|d| !d.is_empty()) {
         let dir = PathBuf::from(dir);
         return Folders { cache: dir.join("cache"), logs: dir.join("logs"), config: dir, portable: false };
     }
-    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
-    if let Some(dir) = exe_dir.filter(|d| d.join("config").is_dir() && glint_config(&d.join("config"))) {
-        return Folders { config: dir.join("config"), cache: dir.join("cache"), logs: dir.join("logs"), portable: true };
+    find_in(exe_dir().as_deref(), &installed_dirs().0)
+}
+
+fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf))
+}
+
+/// Glint's one folder, with config, cache and logs in it: `Glint data` next to glint.exe when that
+/// makes Glint portable, else `home` (%APPDATA%\Glint). An older Glint's portable files straight
+/// next to glint.exe (until `settle` moves them into `Glint data`) count as portable too.
+fn find_in(exe_dir: Option<&Path>, home: &Path) -> Folders {
+    let at = |dir: &Path, portable| Folders { config: dir.join("config"), cache: dir.join("cache"), logs: dir.join("logs"), portable };
+    if let Some(exe_dir) = exe_dir {
+        let portable = exe_dir.join(PORTABLE_FOLDER);
+        if makes_portable(&portable) {
+            return at(&portable, true);
+        }
+        if older_portable(exe_dir) {
+            return at(exe_dir, true);
+        }
     }
-    let (roaming, local) = installed_dirs();
-    Folders { config: roaming.join("config"), cache: local.join("cache"), logs: local.join("logs"), portable: false }
+    at(home, false)
+}
+
+/// Whether `Glint data` next to glint.exe makes Glint portable: it has Glint's config folder, or it
+/// is empty (made by hand for that). What's left after Glint's files moved away doesn't.
+fn makes_portable(dir: &Path) -> bool {
+    dir.join("config").is_dir() || std::fs::read_dir(dir).is_ok_and(|mut e| e.next().is_none())
+}
+
+/// An older Glint's portable files: a `config` folder straight next to glint.exe that is Glint's.
+fn older_portable(exe_dir: &Path) -> bool {
+    let config = exe_dir.join("config");
+    config.is_dir() && glint_config(&config)
 }
 
 /// Keys every settings.json Glint writes has, and other programs' hardly would.
@@ -92,7 +129,7 @@ const GLINT_KEYS: [&str; 6] = ["\"ActiveTab\"", "\"Startup\"", "\"ShowHidden\"",
 /// Whether a `config` folder next to glint.exe is Glint's: it holds no settings.json yet (made empty
 /// to make Glint portable), or Glint's own. A folder of that name that belongs to another program
 /// (glint.exe put in a folder with other tools) must not make Glint portable: Glint would rewrite that
-/// program's settings.json as its own, and "Clear cache" would empty the `cache` folder beside it.
+/// program's settings.json as its own.
 fn glint_config(dir: &Path) -> bool {
     match std::fs::read(dir.join(FILE_NAME)) {
         Ok(bytes) => {
@@ -105,8 +142,8 @@ fn glint_config(dir: &Path) -> bool {
     }
 }
 
-/// "%APPDATA%\Glint" and "%LOCALAPPDATA%\Glint": where Glint keeps its files when it
-/// isn't portable.
+/// "%APPDATA%\Glint" (Glint's folder when it isn't portable) and "%LOCALAPPDATA%\Glint" (where
+/// older versions kept the cache and logs).
 pub(crate) fn installed_dirs() -> (PathBuf, PathBuf) {
     // The known-folder lookup doesn't check that the folder exists (that could wait on a server),
     // and the environment is the fallback for odd starts.
@@ -118,126 +155,92 @@ pub(crate) fn installed_dirs() -> (PathBuf, PathBuf) {
     (roaming, local)
 }
 
-/// The settings file's full path (in the config folder in use now, see `config_now`).
+/// The settings file's full path.
 pub fn file_path() -> PathBuf {
     config_now().join(FILE_NAME)
 }
 
-// ---------------------------------------------------------------- portable, switched while running
+// ---------------------------------------------------------------- putting the files in place
 
-/// The config folder in use since Portable was switched in the Settings window, and whether it is
-/// the portable one. None: the one Glint started with (`folders()`).
-static CONFIG_NOW: Mutex<Option<(PathBuf, bool)>> = Mutex::new(None);
-
-/// The config folder settings.json is written to now: the one Glint started with, or the other one
-/// once Portable was switched (Settings > About), which takes effect at once.
-pub fn config_now() -> PathBuf {
-    match &*CONFIG_NOW.lock().unwrap_or_else(PoisonError::into_inner) {
-        Some((dir, _)) => dir.clone(),
-        None => folders().config.clone(),
+/// Puts Glint's files where they belong, before anything reads them. Only the main Glint does this
+/// (an extra window or a second start leaves the files alone while another Glint uses them), and
+/// only before `folders` is first asked. Returns what went wrong, for the error log.
+/// - An older Glint's portable files (config, cache, logs straight next to glint.exe) go into
+///   `Glint data`.
+/// - An older Glint's logs in %LOCALAPPDATA%\Glint go into %APPDATA%\Glint; its cache goes.
+/// - A move asked for in Settings (Portable, MOVE_NOTE) happens now, while nothing has the files
+///   open.
+/// - settings.json.old, which older versions left when Portable was switched, goes.
+pub fn settle() -> Vec<String> {
+    if test_folders() || FOLDERS.get().is_some() {
+        return Vec::new();
+    }
+    let (home, local) = installed_dirs();
+    match exe_dir() {
+        Some(exe_dir) => settle_in(&exe_dir, &home, &local),
+        None => Vec::new(),
     }
 }
 
-/// Whether settings are kept next to glint.exe now (see `config_now`).
-pub fn portable_now() -> bool {
-    match &*CONFIG_NOW.lock().unwrap_or_else(PoisonError::into_inner) {
-        Some((_, portable)) => *portable,
-        None => folders().portable,
-    }
-}
-
-/// Whether the folders were pointed elsewhere for testing (GLINT_SETTINGS_DIR): then Portable can't
-/// be switched.
-pub fn test_folders() -> bool {
-    std::env::var_os("GLINT_SETTINGS_DIR").is_some_and(|d| !d.is_empty())
-}
-
-/// Moves the settings next to glint.exe (`on`) or back to %APPDATA% (Settings > About > Portable).
-/// Touches the disk: call it on a background thread.
-/// Returns what to tell the person, or why it couldn't be done.
-///
-/// Nothing is ever deleted:
-/// - Turning it on copies the config folder into a new `config` folder next to glint.exe, and
-///   settings are written there from now on.
-/// - Turning it off copies that folder back to %APPDATA% (an older settings.json there is kept as
-///   settings.json.old) and then renames the folder next to glint.exe to `config.off`, because a
-///   folder called `config` there is what makes Glint portable at the next start.
-///
-/// Settings aren't saved while this runs, so no save lands in the folder being left behind. The
-/// cache and error.log move at the next start.
-pub fn set_portable(on: bool) -> Result<String, String> {
-    if test_folders() {
-        return Err("Portable can't be switched while GLINT_SETTINGS_DIR is set (it's for testing).".to_string());
-    }
-    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).ok_or("Glint couldn't find out where glint.exe is.")?;
-    let portable = exe_dir.join("config");
-    let installed = installed_dirs().0.join("config");
-    if same_path(&portable.to_string_lossy(), &installed.to_string_lossy()) {
-        // glint.exe sits in Glint's own %APPDATA% folder: both are the same folder.
-        return Err(format!("glint.exe is already in the settings folder ({}).", exe_dir.display()));
-    }
-    // Holding the writer: a save waits until the folder has moved (and then goes to the new one).
-    let _no_saving = writer();
-    if portable_now() == on {
-        return Ok(format!("The settings are already in {}.", config_now().display()));
-    }
-    if on {
-        if portable.is_dir() && !glint_config(&portable) {
-            return Err(format!("The config folder next to glint.exe ({}) belongs to another program. Put Glint in a folder of its own first.", portable.display()));
+fn settle_in(exe_dir: &Path, home: &Path, local: &Path) -> Vec<String> {
+    let mut problems = Vec::new();
+    let portable = exe_dir.join(PORTABLE_FOLDER);
+    if !portable.join("config").exists() && older_portable(exe_dir) {
+        // (Only Glint's own files: a cache or logs folder there may be shared with another program.)
+        if let Err(e) = move_folder(&exe_dir.join("config"), &portable.join("config")) {
+            problems.push(format!("Glint's settings next to glint.exe couldn't be moved into {} ({e}).", portable.display()));
         }
-        let made = !portable.exists();
-        if let Err(e) = std::fs::create_dir_all(&portable) {
-            return Err(format!("Glint can't write to {} ({e}). Move Glint to a folder you can write to.", exe_dir.display()));
+        for log in ["error.log", "error.old.log"] {
+            let _ = move_file(&exe_dir.join("logs").join(log), &portable.join("logs").join(log));
         }
-        let mut copied = Vec::new();
-        if let Err(e) = copy_folder(&installed, &portable, &mut copied) {
-            // Take back only what this just made: the copies, then the folders if that left them empty.
-            for file in copied.iter().rev() {
-                let _ = std::fs::remove_file(file);
+        crate::update::remove_downloads(&exe_dir.join("cache"));
+        let _ = std::fs::remove_dir(exe_dir.join("logs"));
+        let _ = std::fs::remove_dir(exe_dir.join("cache"));
+    }
+    if local != home && local.is_dir() {
+        let _ = move_folder(&local.join("logs"), &home.join("logs"));
+        let _ = std::fs::remove_dir_all(local.join("cache"));
+        let _ = std::fs::remove_dir(local);
+    }
+    let found = find_in(Some(exe_dir), home);
+    let mine = |portable_folder: bool| if portable_folder { portable.clone() } else { home.to_path_buf() };
+    if let Some(to_portable) = move_wanted(&found.config) {
+        let _ = std::fs::remove_file(found.config.join(MOVE_NOTE));
+        if to_portable != found.portable && found.config == mine(found.portable).join("config") {
+            let (from, to) = (mine(found.portable), mine(to_portable));
+            for part in PARTS {
+                if let Err(e) = move_folder(&from.join(part), &to.join(part)) {
+                    problems.push(format!("Glint's {part} folder couldn't be moved from {} to {} ({e}).", from.display(), to.display()));
+                }
             }
-            if made {
-                remove_empty_folders(&portable);
-            }
-            return Err(format!("Couldn't copy the settings next to glint.exe ({}): {e}", exe_dir.display()));
+            // What's left of the old place goes when nothing else is in it.
+            let _ = std::fs::remove_dir(&from);
         }
-        *CONFIG_NOW.lock().unwrap_or_else(PoisonError::into_inner) = Some((portable.clone(), true));
-        Ok(format!("Settings moved to {}. Restart Glint to finish.", portable.display()))
-    } else {
-        let mut copied = Vec::new();
-        if let Err(e) = std::fs::create_dir_all(&installed).and_then(|_| copy_folder(&portable, &installed, &mut copied)) {
-            return Err(format!("Couldn't copy the settings to {}: {e}", installed.display()));
-        }
-        let off = free_name(&exe_dir, "config.off");
-        if let Err(e) = std::fs::rename(&portable, &off) {
-            return Err(format!(
-                "The settings were copied to {}, but the config folder next to glint.exe couldn't be renamed ({e}). Close any file in it and try again.",
-                installed.display()
-            ));
-        }
-        *CONFIG_NOW.lock().unwrap_or_else(PoisonError::into_inner) = Some((installed.clone(), false));
-        Ok(format!(
-            "Settings moved to {}. The old folder is now {} (safe to delete). Restart Glint to finish.",
-            installed.display(),
-            off.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned())
-        ))
+    }
+    let found = find_in(Some(exe_dir), home);
+    let _ = std::fs::remove_file(found.config.join(format!("{FILE_NAME}.old")));
+    problems
+}
+
+/// Where a move asked for in Settings goes (MOVE_NOTE in `config`): true for next to glint.exe.
+fn move_wanted(config: &Path) -> Option<bool> {
+    let text = std::fs::read_to_string(config.join(MOVE_NOTE)).ok()?;
+    match text.lines().next().map(str::trim) {
+        Some("portable") => Some(true),
+        Some("installed") => Some(false),
+        _ => None,
     }
 }
 
-/// Whether a file system entry is a link or junction (never followed, copied or deleted here).
-fn is_link(meta: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    meta.file_type().is_symlink() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+/// Moves the folder `from` to `to` and returns once `from` is gone (or was never there): a rename
+/// when `to` isn't there yet and both are on the same drive; else file by file (copied and then
+/// deleted across drives), a file in `to` with the same name replaced. Links and junctions aren't
+/// followed: they stay behind, and so does their folder.
+fn move_folder(from: &Path, to: &Path) -> std::io::Result<()> {
+    move_level(from, to, 0)
 }
 
-/// Copies the files of `from` into `to`, subfolders too (links and junctions are left out), and
-/// lists each copy made. A settings.json already in `to` is kept as settings.json.old first. A
-/// missing `from` copies nothing. Each copy is checked to be as long as its original.
-fn copy_folder(from: &Path, to: &Path, copied: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    copy_level(from, to, copied, 0)
-}
-
-fn copy_level(from: &Path, to: &Path, copied: &mut Vec<PathBuf>, depth: u32) -> std::io::Result<()> {
+fn move_level(from: &Path, to: &Path, depth: u32) -> std::io::Result<()> {
     let entries = match std::fs::read_dir(from) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -245,6 +248,12 @@ fn copy_level(from: &Path, to: &Path, copied: &mut Vec<PathBuf>, depth: u32) -> 
     };
     if depth > 8 {
         return Ok(()); // nothing Glint writes is this deep
+    }
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if !to.exists() && std::fs::rename(from, to).is_ok() {
+        return Ok(());
     }
     std::fs::create_dir_all(to)?;
     for entry in entries {
@@ -255,46 +264,101 @@ fn copy_level(from: &Path, to: &Path, copied: &mut Vec<PathBuf>, depth: u32) -> 
         }
         let target = to.join(entry.file_name());
         if meta.is_dir() {
-            copy_level(&entry.path(), &target, copied, depth + 1)?;
-            continue;
-        }
-        if depth == 0 && entry.file_name().eq_ignore_ascii_case(FILE_NAME) && target.exists() {
-            std::fs::copy(&target, target.with_file_name(format!("{FILE_NAME}.old")))?;
-        }
-        std::fs::copy(entry.path(), &target)?;
-        copied.push(target.clone());
-        // (What std::fs::copy says it copied isn't reliable everywhere - under Wine it's 0 - so the
-        // copy itself is measured.)
-        if std::fs::metadata(&target)?.len() != meta.len() {
-            return Err(std::io::Error::other(format!("{} wasn't copied whole", entry.path().display())));
+            move_level(&entry.path(), &target, depth + 1)?;
+        } else {
+            move_file(&entry.path(), &target)?;
         }
     }
+    let _ = std::fs::remove_dir(from);
     Ok(())
 }
 
-/// Removes `dir` and the folders in it, as far as they are empty (a folder with anything in it
-/// stays: `remove_dir` only removes empty folders).
-fn remove_empty_folders(dir: &Path) {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if std::fs::symlink_metadata(entry.path()).is_ok_and(|m| m.is_dir() && !is_link(&m)) {
-                remove_empty_folders(&entry.path());
-            }
-        }
+/// Moves one file, replacing one of the same name: renamed, or copied (checked whole) and deleted
+/// when it goes to another drive. A missing file moves nothing.
+fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    let len = match std::fs::metadata(from) {
+        Ok(m) => m.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    let _ = std::fs::remove_dir(dir);
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(from, to)?;
+    // (What std::fs::copy says it copied isn't reliable everywhere - under Wine it's 0 - so the copy
+    // itself is measured.)
+    if std::fs::metadata(to)?.len() != len {
+        let _ = std::fs::remove_file(to);
+        return Err(std::io::Error::other(format!("{} wasn't copied whole", from.display())));
+    }
+    std::fs::remove_file(from)
 }
 
-/// `name` in `dir`, or "name 2", "name 3"... when it's taken.
-fn free_name(dir: &Path, name: &str) -> PathBuf {
-    let mut n = 1;
-    loop {
-        let candidate = if n == 1 { dir.join(name) } else { dir.join(format!("{name} {n}")) };
-        if !candidate.exists() || n > 999 {
-            return candidate;
-        }
-        n += 1;
+// ---------------------------------------------------------------- portable, switched while running
+
+/// Where Portable was switched to in the Settings window this run (the move happens at the next
+/// start). None: as Glint started.
+static PORTABLE_WANTED: Mutex<Option<bool>> = Mutex::new(None);
+
+/// The config folder settings.json and the skins are in (until the next start, also after Portable
+/// was switched: the files move then).
+pub fn config_now() -> PathBuf {
+    folders().config.clone()
+}
+
+/// Whether Portable is on: as Glint started, or as it was switched since (see `set_portable`).
+pub fn portable_now() -> bool {
+    PORTABLE_WANTED.lock().unwrap_or_else(PoisonError::into_inner).unwrap_or(folders().portable)
+}
+
+/// Whether the folders were pointed elsewhere for testing (GLINT_SETTINGS_DIR): then Portable can't
+/// be switched.
+pub fn test_folders() -> bool {
+    std::env::var_os("GLINT_SETTINGS_DIR").is_some_and(|d| !d.is_empty())
+}
+
+/// Portable on (Glint's files next to glint.exe, in `Glint data`) or off (in %APPDATA%\Glint), from
+/// Settings > About. Glint has its files open while it runs, so they move at the next start
+/// (`settle`): this leaves a note saying so in the config folder, or takes it away again when
+/// Portable is switched back before that. Touches the disk: call it on a background thread.
+pub fn set_portable(on: bool) -> Result<String, String> {
+    if test_folders() {
+        return Err("Portable can't be switched while GLINT_SETTINGS_DIR is set (it's for testing).".to_string());
     }
+    let exe_dir = exe_dir().ok_or("Glint couldn't find out where glint.exe is.")?;
+    let f = folders();
+    let note = f.config.join(MOVE_NOTE);
+    if on == f.portable {
+        let _ = std::fs::remove_file(&note);
+        *PORTABLE_WANTED.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        return Ok(format!("The settings stay in {}.", f.config.display()));
+    }
+    let to = if on { exe_dir.join(PORTABLE_FOLDER) } else { installed_dirs().0 };
+    if on && !to.exists() {
+        // Can Glint write next to glint.exe? (The folder itself would make Glint portable already,
+        // so it goes again: the move makes it.)
+        if let Err(e) = std::fs::create_dir(&to) {
+            return Err(format!("Glint can't write to {} ({e}). Move Glint to a folder you can write to.", exe_dir.display()));
+        }
+        let _ = std::fs::remove_dir(&to);
+    }
+    let what = if on { "portable" } else { "installed" };
+    let text = format!("{what}\r\nGlint moves its files to {} when it next starts.\r\n", to.display());
+    if let Err(e) = std::fs::create_dir_all(&f.config).and_then(|_| std::fs::write(&note, text)) {
+        return Err(format!("{} couldn't be written ({e}).", note.display()));
+    }
+    *PORTABLE_WANTED.lock().unwrap_or_else(PoisonError::into_inner) = Some(on);
+    Ok(format!("Glint's files move to {} when Glint next starts.", to.display()))
+}
+
+/// Whether a file system entry is a link or junction (never followed, moved or deleted here).
+fn is_link(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    meta.file_type().is_symlink() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 // ---------------------------------------------------------------- the cache
@@ -1644,26 +1708,90 @@ mod tests {
     }
 
     #[test]
-    fn copying_a_settings_folder() {
-        let base = std::env::temp_dir().join(format!("glint-settings-copy-test-{}", std::process::id()));
+    fn moving_a_folder() {
+        let base = std::env::temp_dir().join(format!("glint-settings-move-test-{}", std::process::id()));
         let (from, to) = (base.join("from"), base.join("to"));
         let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(from.join("themes")).unwrap();
+        std::fs::create_dir_all(from.join("skins")).unwrap();
         std::fs::write(from.join(FILE_NAME), "{\"ShowHidden\": true}").unwrap();
-        std::fs::write(from.join("themes").join("mine.css"), "x").unwrap();
-        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(from.join("skins").join("mine.skin"), "x").unwrap();
+        std::fs::create_dir_all(to.join("skins")).unwrap();
         std::fs::write(to.join(FILE_NAME), "older").unwrap();
-        let mut copied = Vec::new();
-        copy_folder(&from, &to, &mut copied).unwrap();
-        assert_eq!(copied.len(), 2);
+        std::fs::write(to.join("skins").join("other.skin"), "y").unwrap();
+        // Into a folder that's there: file by file, the moved ones replacing theirs.
+        move_folder(&from, &to).unwrap();
+        assert!(!from.exists());
         assert_eq!(std::fs::read_to_string(to.join(FILE_NAME)).unwrap(), "{\"ShowHidden\": true}");
-        assert_eq!(std::fs::read_to_string(to.join(format!("{FILE_NAME}.old"))).unwrap(), "older", "the older file is kept");
-        assert_eq!(std::fs::read_to_string(to.join("themes").join("mine.css")).unwrap(), "x");
-        // A folder that isn't there copies nothing; emptying only removes empty folders.
-        copy_folder(&base.join("missing"), &to, &mut copied).unwrap();
-        remove_empty_folders(&to);
-        assert!(to.join(FILE_NAME).exists(), "a folder with files in it stays");
-        assert_eq!(free_name(&base, "from"), base.join("from 2"));
+        assert_eq!(std::fs::read_to_string(to.join("skins").join("mine.skin")).unwrap(), "x");
+        assert!(to.join("skins").join("other.skin").exists(), "what was there and isn't replaced stays");
+        assert_eq!(std::fs::read_dir(&to).unwrap().count(), 2, "nothing extra is left (no .old)");
+        // Where nothing is yet: one rename. A folder that isn't there moves nothing.
+        move_folder(&to, &base.join("renamed")).unwrap();
+        assert!(!to.exists() && base.join("renamed").join("skins").join("other.skin").exists());
+        move_folder(&base.join("missing"), &base.join("made")).unwrap();
+        assert!(!base.join("made").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn portable_moves_the_files_at_the_next_start() {
+        let base = std::env::temp_dir().join(format!("glint-portable-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (exe, home, local) = (base.join("Glint"), base.join("Roaming").join("Glint"), base.join("Local").join("Glint"));
+        let glint_settings = serde_json::to_string_pretty(&Settings::default()).unwrap();
+        std::fs::create_dir_all(&exe).unwrap();
+        std::fs::create_dir_all(home.join("config")).unwrap();
+        std::fs::write(home.join("config").join(FILE_NAME), &glint_settings).unwrap();
+        std::fs::write(home.join("config").join(format!("{FILE_NAME}.old")), "left by an older Glint").unwrap();
+        // An older Glint kept its logs and cache in %LOCALAPPDATA%: the logs come along, the cache goes.
+        std::fs::create_dir_all(local.join("logs")).unwrap();
+        std::fs::create_dir_all(local.join("cache")).unwrap();
+        std::fs::write(local.join("logs").join("error.log"), "an error").unwrap();
+        std::fs::write(local.join("cache").join("Glint-0.8.0.exe"), "x").unwrap();
+        assert!(settle_in(&exe, &home, &local).is_empty());
+        let f = find_in(Some(&exe), &home);
+        assert!(!f.portable && f.config == home.join("config"));
+        assert!(home.join("logs").join("error.log").exists() && !local.exists());
+        assert!(!home.join("config").join(format!("{FILE_NAME}.old")).exists());
+        // Portable on, from Settings: the note, then the move at the next start.
+        std::fs::write(f.config.join(MOVE_NOTE), "portable\r\nGlint moves its files...\r\n").unwrap();
+        assert!(settle_in(&exe, &home, &local).is_empty());
+        let f = find_in(Some(&exe), &home);
+        assert!(f.portable && f.config == exe.join(PORTABLE_FOLDER).join("config"));
+        assert_eq!(std::fs::read_to_string(f.config.join(FILE_NAME)).unwrap(), glint_settings);
+        assert!(f.logs.join("error.log").exists());
+        assert!(!f.config.join(MOVE_NOTE).exists() && !home.exists(), "nothing is left behind");
+        // And off again.
+        std::fs::write(f.config.join(MOVE_NOTE), "installed\r\n").unwrap();
+        assert!(settle_in(&exe, &home, &local).is_empty());
+        let f = find_in(Some(&exe), &home);
+        assert!(!f.portable && f.config == home.join("config") && f.config.join(FILE_NAME).exists());
+        assert!(!exe.join(PORTABLE_FOLDER).exists());
+        // A note for where the files are already changes nothing.
+        std::fs::write(f.config.join(MOVE_NOTE), "installed\r\n").unwrap();
+        assert!(settle_in(&exe, &home, &local).is_empty());
+        assert!(find_in(Some(&exe), &home).config.join(FILE_NAME).exists() && !f.config.join(MOVE_NOTE).exists());
+        // An older Glint's portable files straight next to glint.exe go into "Glint data" (only
+        // Glint's own: its error logs and downloads).
+        std::fs::create_dir_all(exe.join("config")).unwrap();
+        std::fs::create_dir_all(exe.join("logs")).unwrap();
+        std::fs::create_dir_all(exe.join("cache")).unwrap();
+        std::fs::write(exe.join("config").join(FILE_NAME), &glint_settings).unwrap();
+        std::fs::write(exe.join("logs").join("error.log"), "an error").unwrap();
+        std::fs::write(exe.join("cache").join("Glint-0.9.0.exe"), "x").unwrap();
+        std::fs::write(exe.join("cache").join("theirs.txt"), "x").unwrap();
+        assert!(find_in(Some(&exe), &home).portable, "still portable before it moves");
+        assert!(settle_in(&exe, &home, &local).is_empty());
+        let f = find_in(Some(&exe), &home);
+        assert!(f.portable && f.config == exe.join(PORTABLE_FOLDER).join("config") && f.config.join(FILE_NAME).exists());
+        assert!(f.logs.join("error.log").exists() && !exe.join("config").exists() && !exe.join("logs").exists());
+        assert!(!exe.join("cache").join("Glint-0.9.0.exe").exists() && exe.join("cache").join("theirs.txt").exists());
+        // An empty "Glint data" made by hand makes Glint portable; one with only leftovers doesn't.
+        let _ = std::fs::remove_dir_all(exe.join(PORTABLE_FOLDER));
+        std::fs::create_dir_all(exe.join(PORTABLE_FOLDER)).unwrap();
+        assert!(find_in(Some(&exe), &home).portable);
+        std::fs::write(exe.join(PORTABLE_FOLDER).join("notes.txt"), "x").unwrap();
+        assert!(!find_in(Some(&exe), &home).portable);
         let _ = std::fs::remove_dir_all(&base);
     }
 

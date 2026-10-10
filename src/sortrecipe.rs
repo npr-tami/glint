@@ -2,12 +2,15 @@
 //! -exe_last  (sort syntax v3).
 //!
 //! - **Groups** (-folder, -updated, -image, -png…) are the kinds of things, in the order they should
-//!   come; `_first` / `_last` put one at the very top or bottom. Each item goes in the most exact
-//!   group that fits it (a name rule beats a time, which beats -hidden, a size, one file type, a kind
-//!   and -folder). Things that fit no group go where -other is, or after the other groups.
+//!   come; `_first` / `_last` put one at the very top or bottom, with the lines stacked right under
+//!   it, in their order (up to a blank line or the next `_first` / `_last`). Each item goes in the
+//!   first group, in the order written, that fits it, so a line only gets what the lines above it
+//!   left (-png above -image gives .png files their own place; below it, -png gets nothing). Things
+//!   that fit no group go where -other is, or after the other groups.
 //! - **Order rules** (-newest, -biggest, -a_to_z…; `_first` / `_last` say which end, `_by_day…` round
 //!   dates) order things in every group - or in one group, when written after it on its line.
-//! - `in Downloads:` (or a full path) starts rules for that folder only.
+//! - `in Downloads (` … `)` (or a full path) holds rules for that folder only; the lines after the
+//!   `)` are for every folder again. The older `in Downloads:` runs to the next `in` or the end.
 //! - **Forgiving**: the dash is optional, spaces work instead of underscores (`newest first`), and
 //!   plain words mean rules (date, size, type, name, folders). The text stays as typed; it's only
 //!   read this way.
@@ -31,10 +34,14 @@ pub struct Message {
     pub span: Option<(usize, usize)>,
     /// What to put there instead (clicking the hint does it).
     pub fix: Option<String>,
+    /// What the fix's link says, when the fix itself wouldn't read well there (it adds a line, or
+    /// takes something away). None: the fix as it is.
+    pub fix_label: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Place {
+    #[default]
     Normal,
     First,
     Last,
@@ -114,10 +121,14 @@ enum Takes {
 struct Group {
     name: String,
     label: String,
-    exactness: f64,
     place: Place,
     takes: Takes,
     orders: Vec<Order>,
+    /// The rule as written (-image), and its line, for tips about the lines after it.
+    written: String,
+    line: usize,
+    /// Where it goes: its own _first / _last, or that of the _first / _last line it's stacked under.
+    tier: Place,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -125,6 +136,8 @@ struct Rules {
     groups: Vec<Group>,
     orders: Vec<Order>,
     line: usize,
+    /// The _first / _last line the next lines are stacked under (Normal: none, after a blank line).
+    stack: Place,
 }
 
 /// The time now, and how far local time is from UTC, to tell which day something was changed.
@@ -521,34 +534,29 @@ fn meaning(word: &str, written: &str) -> Meaning {
     }
 }
 
-fn group(name: impl Into<String>, label: impl Into<String>, exactness: f64, takes: Takes) -> Group {
-    Group { name: name.into(), label: label.into(), exactness, place: Place::Normal, takes, orders: Vec::new() }
-}
-
-/// A shorter time is more exact: the last 2 hours beats the last 24 hours, which beats the last week.
-fn date_exactness(hours: f64) -> f64 {
-    50.0 + 10.0 / (1.0 + hours / 24.0)
+fn group(name: impl Into<String>, label: impl Into<String>, takes: Takes) -> Group {
+    Group { name: name.into(), label: label.into(), place: Place::Normal, takes, orders: Vec::new(), written: String::new(), line: 0, tier: Place::Normal }
 }
 
 fn type_group(ext: &str) -> Group {
-    group(format!(".{ext}"), format!(".{ext} files"), 30.0, Takes::Ext(ext.to_string()))
+    group(format!(".{ext}"), format!(".{ext} files"), Takes::Ext(ext.to_string()))
 }
 
 /// The group a word names: Ok(None) when it names none, Err when it's a rule Glint knows written
 /// wrong (and what to write).
 fn make_group(w: &str, written: &str) -> Result<Option<Group>, String> {
-    let since = |name: String, hours: f64, label: String, created: bool| group(name, label, date_exactness(hours), Takes::Since { hours, created });
+    let since = |name: String, hours: f64, label: String, created: bool| group(name, label, Takes::Since { hours, created });
     match w {
-        "folder" => return Ok(Some(group("folder", "folders", 10.0, Takes::Folders))),
-        "file" => return Ok(Some(group("file", "files", 10.0, Takes::Files))),
-        "other" => return Ok(Some(group("other", "everything else", 0.0, Takes::Nothing))),
-        "hidden" => return Ok(Some(group("hidden", "hidden", 40.0, Takes::Hidden))),
-        "empty" => return Ok(Some(group("empty", "empty files", 36.0, Takes::Empty))),
+        "folder" => return Ok(Some(group("folder", "folders", Takes::Folders))),
+        "file" => return Ok(Some(group("file", "files", Takes::Files))),
+        "other" => return Ok(Some(group("other", "everything else", Takes::Nothing))),
+        "hidden" => return Ok(Some(group("hidden", "hidden", Takes::Hidden))),
+        "empty" => return Ok(Some(group("empty", "empty files", Takes::Empty))),
         // Dates take files only: a folder's date changes whenever anything inside it does.
         "updated" => return Ok(Some(since("updated".into(), 24.0, "updated in the last 24 hours".into(), false))),
         "added" => return Ok(Some(since("added".into(), 24.0, "added in the last 24 hours".into(), true))),
-        "today" => return Ok(Some(group("today", "changed today", date_exactness(24.0), Takes::Today))),
-        "yesterday" => return Ok(Some(group("yesterday", "changed yesterday", date_exactness(24.0), Takes::Yesterday))),
+        "today" => return Ok(Some(group("today", "changed today", Takes::Today))),
+        "yesterday" => return Ok(Some(group("yesterday", "changed yesterday", Takes::Yesterday))),
         _ => {}
     }
     // -.blend (a file type with a dot)
@@ -591,7 +599,7 @@ fn make_group(w: &str, written: &str) -> Result<Option<Group>, String> {
             if n == 1 { "" } else { "s" }
         );
         if kind == "older_than" {
-            return Ok(Some(group(format!("older:{hours}"), format!("older than {n} {unit_name}"), 45.0 + (hours / 87_600.0).min(4.0), Takes::Older { hours })));
+            return Ok(Some(group(format!("older:{hours}"), format!("older than {n} {unit_name}"), Takes::Older { hours })));
         }
         let shown = if n == 1 { unit_name } else { format!("{n} {unit_name}") };
         return Ok(Some(since(format!("{kind}:{hours}"), hours, format!("{kind} in the last {shown}"), kind == "added")));
@@ -614,12 +622,10 @@ fn make_group(w: &str, written: &str) -> Result<Option<Group>, String> {
         };
         let bytes = (number * factor).min((u64::MAX / 2) as f64) as u64;
         let shown = format!("{digits} {}", if unit.starts_with('b') { "bytes".to_string() } else { unit.to_uppercase() });
-        let log = (bytes.max(1) as f64).log10();
-        // A bigger "bigger than" (and a smaller "smaller than") is more exact.
         return Ok(Some(if kind == "smaller" {
-            group(format!("smaller:{bytes}"), format!("smaller than {shown}"), 35.0 + (20.0 - log) / 100.0, Takes::Smaller(bytes))
+            group(format!("smaller:{bytes}"), format!("smaller than {shown}"), Takes::Smaller(bytes))
         } else {
-            group(format!("bigger:{bytes}"), format!("bigger than {shown}"), 35.0 + log / 100.0, Takes::Bigger(bytes))
+            group(format!("bigger:{bytes}"), format!("bigger than {shown}"), Takes::Bigger(bytes))
         }));
     }
     // -name_has_screenshot, -name_starts_with_img, -name_ends_with_final
@@ -636,13 +642,13 @@ fn make_group(w: &str, written: &str) -> Result<Option<Group>, String> {
         }
         let shown = text.replace('_', " ");
         return Ok(Some(match how {
-            "starts_with" => group(format!("name^{text}"), format!("names starting with \"{shown}\""), 70.0, Takes::NameStarts(text.into())),
-            "ends_with" => group(format!("name${text}"), format!("names ending with \"{shown}\""), 70.0, Takes::NameEnds(text.into())),
-            _ => group(format!("name~{text}"), format!("names with \"{shown}\""), 70.0, Takes::NameHas(text.into())),
+            "starts_with" => group(format!("name^{text}"), format!("names starting with \"{shown}\""), Takes::NameStarts(text.into())),
+            "ends_with" => group(format!("name${text}"), format!("names ending with \"{shown}\""), Takes::NameEnds(text.into())),
+            _ => group(format!("name~{text}"), format!("names with \"{shown}\""), Takes::NameHas(text.into())),
         }));
     }
     if let Some(list) = kind(w) {
-        return Ok(Some(group(w, kind_label(w), 20.0, Takes::Kind(list))));
+        return Ok(Some(group(w, kind_label(w), Takes::Kind(list))));
     }
     // A file type without the dot: -exe, -png, -torrent
     if known_type(w) {
@@ -778,8 +784,17 @@ impl Recipe {
         // throwaway set under a folder Glint doesn't know.
         let mut current: Option<Option<usize>> = Some(None);
         let mut scratch = Rules::default();
+        // A "(" whose ")" hasn't come yet: the line it ends, as written ("in Downloads ("), and its
+        // number.
+        let mut open: Option<(String, usize)> = None;
+        // The line before (notes and blank lines aside), when it was an "in …" line without a
+        // bracket: its words ("in Downloads"), its number, where its words end (a "(" on the next
+        // line belongs there) and where the line does (its notes after that are kept).
+        let mut bare_in: Option<(String, usize, usize, usize)> = None;
         let mut offset = 0;
+        let mut last_line = 0;
         for (i, raw_line) in text.split('\n').enumerate() {
+            last_line = i + 1;
             let line_no = i + 1;
             let line_start = offset;
             offset += raw_line.len() + 1;
@@ -787,45 +802,214 @@ impl Recipe {
             let lead = content.len() - content.trim_start().len();
             let line = content.trim();
             if line.is_empty() {
+                // A blank line ends a stack under a _first / _last line (a line of notes doesn't).
+                if raw_line.trim().is_empty() {
+                    match current {
+                        Some(None) => r.everywhere.stack = Place::Normal,
+                        Some(Some(i)) => r.folders[i].2.stack = Place::Normal,
+                        None => scratch.stack = Place::Normal,
+                    }
+                }
                 continue;
             }
             let at = line_start + lead;
-            // "in Downloads:" - rules for one folder (the colon may be left out).
-            if let Some(rest) = strip_in(line) {
-                let label = rest.trim_end_matches(':').trim().trim_matches('"').to_string();
-                let span = Some((at, at + line.len()));
-                match place_path(&label).filter(|_| !label.is_empty()) {
-                    Some(path) => {
-                        r.folders.push((path, label, Rules { line: line_no, ..Rules::default() }));
-                        current = Some(Some(r.folders.len() - 1));
+            let span = Some((at, at + line.len()));
+            // The whole line with its line break, for a fix that takes the line away: a blank line
+            // left in its place would end a stack. (With a note on it, just the words go.)
+            let whole = if raw_line.trim() == line { Some((line_start, offset.min(text.len()))) } else { span };
+            let bare = bare_in.take();
+            // ")" ends a folder's rules: the lines after it are for every folder again. (A ")" with
+            // a colon after it, as in "):", is read the same way, but marked.)
+            if let Some(after) = line.strip_prefix(')').filter(|a| a.trim().chars().all(|c| matches!(c, ':' | ';' | ',' | '.'))) {
+                if open.is_some() && !after.trim().is_empty() {
+                    r.messages.push(Message {
+                        line: line_no,
+                        text: "A ) on its own closes the folder's rules: nothing goes after it.".into(),
+                        error: true,
+                        span,
+                        fix: Some(")".into()),
+                        fix_label: Some("just )".into()),
+                    });
+                }
+                close_bracket(&mut r, &mut open, &mut current, line_no, whole);
+                continue;
+            }
+            // "(" on a line of its own.
+            if line == "(" {
+                match bare {
+                    // Under "in Downloads": it goes at the end of that line (with any notes
+                    // between them kept).
+                    Some((words, in_line, words_end, line_end)) => {
+                        let between = text[line_end..at].trim_end();
+                        r.messages.push(Message {
+                            line: line_no,
+                            text: format!("Put the ( at the end of the \"in\" line above: {words} ("),
+                            error: true,
+                            span: Some((words_end, at + 1)),
+                            fix: Some(format!(" ({between}")),
+                            fix_label: Some(format!("{words} (")),
+                        });
+                        open = Some((format!("{words} ("), in_line));
                     }
+                    None => {
+                        close_earlier(&mut r, &mut open, line_no, span, line);
+                        r.messages.push(Message {
+                            line: line_no,
+                            text: "This ( has no folder: a folder's own rules start with a line like \"in Downloads (\".".into(),
+                            error: true,
+                            span,
+                            fix: None,
+                            fix_label: None,
+                        });
+                        open = Some(("(".into(), line_no));
+                        r.everywhere.stack = Place::Normal;
+                        current = None; // the lines in it are still checked, but not used
+                        scratch = Rules::default();
+                    }
+                }
+                continue;
+            }
+            // "in Downloads (" … ")", or "in Downloads:" to the next "in" - rules for one folder
+            // (the colon may be left out).
+            if let Some(rest) = strip_in(line) {
+                close_earlier(&mut r, &mut open, line_no, span, line);
+                // Lines after a folder's rules don't stack under the rules for every folder above.
+                r.everywhere.stack = Place::Normal;
+                // All on one line ("in Downloads (-newest_first)"): read as meant, but marked.
+                if let Some((path, label, rules_at, rules)) = one_line_block(rest) {
+                    r.messages.push(Message {
+                        line: line_no,
+                        text: format!("Put the rules on the lines under \"in {label} (\", and the ) on a line of its own."),
+                        error: true,
+                        span,
+                        fix: Some(if rules.is_empty() { format!("in {label} (\n)") } else { format!("in {label} (\n{rules}\n)") }),
+                        fix_label: Some("put them on lines of their own".into()),
+                    });
+                    let i = folder_rules(&mut r, path, label, line_no);
+                    let mut messages = Vec::new();
+                    read_line(&tokenize(rules, at + line.len() - rest.len() + rules_at), line_no, &mut r.folders[i].2, &mut messages);
+                    r.messages.extend(messages);
+                    current = Some(None);
+                    continue;
+                }
+                let bracket = rest.trim_end_matches(|c: char| c == ':' || c.is_whitespace()).ends_with('(');
+                let label = folder_name(rest);
+                if bracket {
+                    if !rest.ends_with('(') {
+                        // "in Downloads (:" - read as meant, but marked.
+                        let keep = line.trim_end_matches(|c: char| c == ':' || c.is_whitespace()).len();
+                        r.messages.push(Message {
+                            line: line_no,
+                            text: "Nothing goes after the (: the folder's rules go on the lines under it.".into(),
+                            error: true,
+                            span: Some((at + keep, at + line.len())),
+                            fix: Some(String::new()),
+                            fix_label: Some("remove the :".into()),
+                        });
+                    }
+                    open = Some((line.to_string(), line_no));
+                } else {
+                    // (A drive keeps its colon: "in C:".)
+                    let words = if label.ends_with(":\\") { line } else { line.trim_end_matches(':').trim_end() };
+                    bare_in = Some((words.to_string(), line_no, at + words.len(), at + line.len()));
+                }
+                match place_path(&label).filter(|_| !label.is_empty()) {
+                    Some(path) => current = Some(Some(folder_rules(&mut r, path, label, line_no))),
                     None => {
                         let suggestion = closest(&label, PLACE_NAMES.iter().copied());
                         let hint = suggestion.map_or(String::new(), |s| format!(" Did you mean \"{s}\"?"));
                         r.messages.push(Message {
                             line: line_no,
-                            text: format!("\"{label}\" isn't a folder Glint knows.{hint} Write one of {}, or a full path like in C:\\Users\\me\\Work:", PLACE_NAMES.join(", ")),
+                            text: format!("\"{label}\" isn't a folder Glint knows.{hint} Write one of {}, or a full path, like C:\\Users\\me\\Work.", PLACE_NAMES.join(", ")),
                             error: true,
                             span,
-                            fix: suggestion.map(|s| format!("in {s}:")),
+                            fix: suggestion.map(|s| if bracket { format!("in {s} (") } else { format!("in {s}:") }),
+                            fix_label: None,
                         });
                         current = None; // rules below it are still checked, but not used
+                        scratch = Rules::default();
                     }
                 }
                 continue;
             }
-            if line.ends_with(':') {
-                let name = line.trim_end_matches(':').trim();
-                r.messages.push(Message {
-                    line: line_no,
-                    text: format!("To give a folder its own rules, start the line with \"in\": in {name}:"),
-                    error: true,
-                    span: Some((at, at + line.len())),
-                    fix: Some(format!("in {name}:")),
-                });
-                continue;
+            // The words to read as rules: the line, or (with a stray "(" or ":" after them) the
+            // words before it.
+            let mut words = line;
+            if (line.ends_with(':') || line.ends_with('(')) && !tokenize(line, at).last().is_some_and(|t| is_rule(t.text)) {
+                let mark = if line.trim_end_matches(|c: char| c == ':' || c.is_whitespace()).ends_with('(') { "(" } else { ":" };
+                let name = line.trim_end_matches(|c: char| c == ':' || c == '(' || c.is_whitespace());
+                if name.is_empty() || has_dash(name) {
+                    // After a rule, or on its own: it does nothing.
+                    r.messages.push(Message {
+                        line: line_no,
+                        text: format!("This {mark} does nothing here: a folder's own rules start with a line like \"in Downloads (\"."),
+                        error: true,
+                        span: if name.is_empty() { whole } else { Some((at + name.len(), at + line.len())) },
+                        fix: Some(String::new()),
+                        fix_label: Some(format!("remove the {mark}")),
+                    });
+                    if name.is_empty() {
+                        continue;
+                    }
+                    words = name;
+                } else {
+                    // A folder without "in" before it.
+                    let with = if mark == "(" { format!("in {name} (") } else { format!("in {name}:") };
+                    r.messages.push(Message {
+                        line: line_no,
+                        text: format!("To give a folder its own rules, start the line with \"in\": {with}"),
+                        error: true,
+                        span,
+                        fix: Some(with),
+                        fix_label: None,
+                    });
+                    if mark == "(" {
+                        // Its ")" closes it (rather than being marked too). The lines in it are
+                        // still checked, but not used until it's put right.
+                        close_earlier(&mut r, &mut open, line_no, span, line);
+                        open = Some((line.to_string(), line_no));
+                        r.everywhere.stack = Place::Normal;
+                        current = None;
+                        scratch = Rules::default();
+                    }
+                    continue;
+                }
             }
-            let tokens = tokenize(line, at);
+            let mut tokens = tokenize(words, at);
+            // A ")" on a line of rules, at its start or end: the folder's rules end there. Read as
+            // meant, but marked. (Not one that closes a "(" in the same word: -name_has_(1).)
+            if let Some(t) = tokens.first().filter(|t| t.text.starts_with(')') && !is_rule(t.text)).cloned() {
+                let away = if t.text == ")" { (t.start, tokens.get(1).map_or(t.end, |n| n.start)) } else { (t.start, t.start + 1) };
+                if t.text == ")" {
+                    tokens.remove(0);
+                } else {
+                    tokens[0].text = &t.text[1..];
+                    tokens[0].start += 1;
+                }
+                if open.is_some() {
+                    r.messages.push(Message {
+                        line: line_no,
+                        text: "Put the ) on a line of its own.".into(),
+                        error: true,
+                        span,
+                        fix: Some(format!(")\n{}", &text[away.1..at + words.len()])),
+                        fix_label: Some("put the ) on its own line".into()),
+                    });
+                }
+                close_bracket(&mut r, &mut open, &mut current, line_no, Some(away));
+            }
+            let mut close_after = None;
+            if let Some(t) = tokens.last().filter(|t| t.text.ends_with(')') && !t.text.contains('(') && !is_rule(t.text)).cloned() {
+                let n = tokens.len();
+                let away = if t.text == ")" { (if n > 1 { tokens[n - 2].end } else { t.start }, t.end) } else { (t.end - 1, t.end) };
+                if t.text == ")" {
+                    tokens.pop();
+                } else {
+                    tokens[n - 1].text = &t.text[..t.text.len() - 1];
+                    tokens[n - 1].end -= 1;
+                }
+                close_after = Some(away);
+            }
             let mut messages = Vec::new();
             let rules = match current {
                 Some(None) => &mut r.everywhere,
@@ -834,12 +1018,37 @@ impl Recipe {
             };
             read_line(&tokens, line_no, rules, &mut messages);
             r.messages.extend(messages);
+            if let Some(away) = close_after {
+                if open.is_some() {
+                    r.messages.push(Message {
+                        line: line_no,
+                        text: "Put the ) on a line of its own.".into(),
+                        error: true,
+                        span,
+                        fix: Some(format!("{}\n)", &text[at..away.0])),
+                        fix_label: Some("put the ) on its own line".into()),
+                    });
+                }
+                close_bracket(&mut r, &mut open, &mut current, line_no, Some(away));
+            }
+        }
+        if let Some((what, line)) = open {
+            // Closing it at the end is what was meant, most likely.
+            let end = text.len();
+            r.messages.push(Message {
+                line: last_line,
+                text: format!("\"{what}\" on line {line} isn't closed: put a ) on a line of its own after its rules."),
+                error: true,
+                span: Some((end, end)),
+                fix: Some(if text.ends_with('\n') || text.is_empty() { ")".into() } else { "\n)".into() }),
+                fix_label: Some("close it with )".into()),
+            });
         }
         let mut tips = Vec::new();
         check_useless(&r.everywhere, "", &mut tips);
         for (_, label, rules) in &r.folders {
             if rules.groups.is_empty() && rules.orders.is_empty() {
-                tips.push(Message { line: rules.line, text: format!("\"in {label}:\" has no rules under it yet."), error: false, span: None, fix: None });
+                tips.push(Message { line: rules.line, text: format!("\"in {label}\" has no rules in it yet."), error: false, span: None, fix: None, fix_label: None });
             }
             check_useless(rules, &format!(" (in {label})"), &mut tips);
         }
@@ -856,9 +1065,16 @@ impl Recipe {
         self.folders.iter().find(|(p, ..)| same_path(p, folder)).map_or(&self.everywhere, |(_, _, r)| r)
     }
 
-    /// The name as written of the "in …:" rules this folder gets, if any.
+    /// The name as written of the "in …" rules this folder gets, if any.
     pub fn folder_label(&self, folder: &str) -> Option<&str> {
         self.folders.iter().find(|(p, ..)| same_path(p, folder)).map(|(_, l, _)| l.as_str())
+    }
+
+    /// Whether any rules are for this folder: its own "in …" rules, or rules for every folder.
+    /// With none (only "in …" rules, for other folders), it sorts by its column as usual.
+    pub fn applies(&self, folder: &str) -> bool {
+        let rules = self.rules_for(folder);
+        !rules.groups.is_empty() || !rules.orders.is_empty()
     }
 
     /// Whether the rules for this folder have groups (the preview then shows group headings).
@@ -916,14 +1132,91 @@ impl Recipe {
     }
 }
 
-/// "in Downloads:" -> "Downloads:" (any capitals for "in").
+/// "in Downloads (" -> "Downloads (" (any capitals for "in").
 fn strip_in(line: &str) -> Option<&str> {
     let head = line.get(..3)?;
     (head.eq_ignore_ascii_case("in ") || head.eq_ignore_ascii_case("in\t")).then(|| line[3..].trim_start()).filter(|r| !r.is_empty())
 }
 
+/// The folder of an "in" line, as written: "Downloads (" -> "Downloads", and a drive's colon kept
+/// ("C: (" -> "C:\").
+fn folder_name(rest: &str) -> String {
+    let name = rest.trim_end_matches(|c: char| c == ':' || c == '(' || c.is_whitespace());
+    if name.len() == 1 && name.as_bytes()[0].is_ascii_alphabetic() && rest[1..].trim_start().starts_with(':') {
+        return format!("{name}:\\");
+    }
+    name.trim_matches('"').to_string()
+}
+
+/// An "in" line with the folder's rules on it too ("Downloads (-newest_first)", or "Downloads ()"):
+/// the folder's path and name, and its rules with where they start in `rest`. Only for a folder
+/// Glint knows by name, or with a rule (a dash) right after the "(": a full path can have brackets
+/// of its own ("C:\Program Files (x86)").
+fn one_line_block(rest: &str) -> Option<(String, String, usize, &str)> {
+    let body = rest.trim_end_matches(':').trim_end().strip_suffix(')')?;
+    body.match_indices('(').find_map(|(p, _)| {
+        let label = body[..p].trim().trim_matches('"');
+        let after = &body[p + 1..];
+        let rules = after.trim();
+        let named = PLACE_NAMES.iter().any(|n| n.eq_ignore_ascii_case(label));
+        if label.is_empty() || !(named || has_dash(rules)) {
+            return None;
+        }
+        Some((place_path(label)?, label.to_string(), p + 1 + after.len() - after.trim_start().len(), rules))
+    })
+}
+
+/// The rules of a folder, ready for its lines (a folder written twice gets the lines of both).
+fn folder_rules(r: &mut Recipe, path: String, label: String, line: usize) -> usize {
+    let i = r.folders.iter().position(|(p, ..)| same_path(p, &path)).unwrap_or_else(|| {
+        r.folders.push((path, label, Rules { line, ..Rules::default() }));
+        r.folders.len() - 1
+    });
+    r.folders[i].2.stack = Place::Normal;
+    i
+}
+
+/// A ")": the folder's rules end, and the lines after it are for every folder again. With no "("
+/// to close, it's marked, with a fix that takes it away (`away`: what goes).
+fn close_bracket(r: &mut Recipe, open: &mut Option<(String, usize)>, current: &mut Option<Option<usize>>, line: usize, away: Option<(usize, usize)>) {
+    if open.take().is_some() {
+        *current = Some(None);
+        r.everywhere.stack = Place::Normal;
+    } else {
+        r.messages.push(Message {
+            line,
+            text: "This ) has nothing to close: there's no \"in \u{2026} (\" above it.".into(),
+            error: true,
+            span: away,
+            fix: Some(String::new()),
+            fix_label: Some("remove the )".into()),
+        });
+    }
+}
+
+/// A new "(" while one is still open: the one above ends here, marked, with a fix that closes it
+/// (`written`: the new line, which the fix puts after the ")").
+fn close_earlier(r: &mut Recipe, open: &mut Option<(String, usize)>, line: usize, span: Option<(usize, usize)>, written: &str) {
+    if let Some((before, _)) = open.take() {
+        r.messages.push(Message {
+            line,
+            text: format!("\"{before}\" isn't closed with ) before this line, so its rules end here."),
+            error: true,
+            span,
+            fix: Some(format!(")\n{written}")),
+            fix_label: Some("close the one above with )".into()),
+        });
+    }
+}
+
+/// Whether a word as written is a rule (a group or an order).
+fn is_rule(raw: &str) -> bool {
+    let word = normalize(raw);
+    matches!(meaning(&word, &word), Meaning::Order(_) | Meaning::Group(_))
+}
+
 /// Notes start with # (or //) and are left out.
-fn strip_note(line: &str) -> &str {
+pub fn strip_note(line: &str) -> &str {
     let mut end = line.len();
     for mark in ["#", "//"] {
         let mut from = 0;
@@ -1010,7 +1303,7 @@ fn read_line(tokens: &[Token], line: usize, into: &mut Rules, messages: &mut Vec
         }
         let written = format!("-{word}");
         let span = Some((start, end));
-        let say = |messages: &mut Vec<Message>, text: String, error: bool, fix: Option<String>| messages.push(Message { line, text, error, span, fix });
+        let say = |messages: &mut Vec<Message>, text: String, error: bool, fix: Option<String>| messages.push(Message { line, text, error, span, fix, fix_label: None });
         match meaning(&word, &written) {
             Meaning::Order(o) => {
                 let (_, _, grain) = split(&word);
@@ -1038,7 +1331,8 @@ fn read_line(tokens: &[Token], line: usize, into: &mut Rules, messages: &mut Vec
             Meaning::Unknown => {
                 let (rule, place, grain) = split(&word);
                 let words = rule_words();
-                let close = closest(&rule, words.iter().copied());
+                // (Nothing is close to a word without a letter or a digit in it: "}".)
+                let close = closest(&rule, words.iter().copied()).filter(|_| rule.chars().any(char::is_alphanumeric));
                 let plain = !rule.is_empty() && rule.len() <= 8 && rule.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
                 if close.is_none() && plain && n == 1 {
                     // Not a rule: a file type (-blend).
@@ -1057,6 +1351,7 @@ fn read_line(tokens: &[Token], line: usize, into: &mut Rules, messages: &mut Vec
                         let fixed = format!("{c}{}", ending(place, grain));
                         say(messages, format!("\"{}\" isn't a rule. Did you mean -{fixed}?", raw.trim_start_matches(['-', '–', '—'])), true, Some(if dash { format!("-{fixed}") } else { fixed }));
                     }
+                    None if !rule.chars().any(char::is_alphanumeric) => say(messages, format!("\"{raw}\" isn't a rule."), true, None),
                     None => say(messages, format!("\"{written}\" isn't a rule. The guide lists them (for files ending in .{rule}, write -.{rule})."), true, None),
                 }
             }
@@ -1064,19 +1359,89 @@ fn read_line(tokens: &[Token], line: usize, into: &mut Rules, messages: &mut Vec
     }
 }
 
-fn add_group(into: &mut Rules, g: Group, written: &str, line: usize, span: Option<(usize, usize)>, messages: &mut Vec<Message>) -> usize {
+fn add_group(into: &mut Rules, mut g: Group, written: &str, line: usize, span: Option<(usize, usize)>, messages: &mut Vec<Message>) -> usize {
     if let Some(i) = into.groups.iter().position(|x| x.name == g.name) {
-        messages.push(Message { line, text: format!("{written}: {} already have a line above, so this one is left out.", into.groups[i].label), error: false, span, fix: None });
+        messages.push(Message { line, text: format!("{written}: {} already have a line above, so this one is left out.", into.groups[i].label), error: false, span, fix: None, fix_label: None });
         return i;
     }
+    // A _first / _last line takes the lines stacked under it along to the top / bottom (one that's
+    // left out doesn't start a stack).
+    if g.place != Place::Normal {
+        into.stack = g.place;
+    }
+    g.tier = into.stack;
+    // Each thing goes in the first group that takes it, so one that takes all of this one's
+    // leaves it nothing. So do -folder and -file together, for a group that takes both.
+    let both = || {
+        let folders = into.groups.iter().position(|x| matches!(x.takes, Takes::Folders))?;
+        let files = into.groups.iter().position(|x| matches!(x.takes, Takes::Files))?;
+        let both_kinds = matches!(g.takes, Takes::Hidden | Takes::NameStarts(_) | Takes::NameEnds(_) | Takes::NameHas(_));
+        both_kinds.then(|| (&into.groups[folders.min(files)], &into.groups[folders.max(files)]))
+    };
+    if let Some(above) = into.groups.iter().find(|x| covers(&x.takes, &g.takes)) {
+        let (w, what) = (&above.written, what_it_takes(&g));
+        let text = if above.line == line {
+            format!("{written}: {w} before it already takes {what}, so it never gets anything. Write it before {w} to give them their own place.")
+        } else {
+            format!("{written}: {w} above already takes {what}, so this line never gets anything. Move it above {w} to give them their own place.")
+        };
+        messages.push(Message { line, text, error: false, span, fix: None, fix_label: None });
+    } else if let Some((a, b)) = both() {
+        let text = if b.line == line {
+            format!("{written}: {} and {} before it already take everything, so it never gets anything. Write it before them.", a.written, b.written)
+        } else {
+            format!("{written}: {} and {} above already take everything, so this line never gets anything. Move it above them.", a.written, b.written)
+        };
+        messages.push(Message { line, text, error: false, span, fix: None, fix_label: None });
+    } else if let Some(head) = into.groups.last().filter(|h| g.place == Place::Normal && g.tier == Place::Last && h.place == Place::Last && h.line != line) {
+        // The first line stacked under a _last line: it goes down too, which is easy to miss.
+        let w = &head.written;
+        let text = format!("{written}: stacked under {w}, so it goes to the very bottom with it, as do the lines under it up to a blank line. Put a blank line after {w} to keep them in their place.");
+        messages.push(Message { line, text, error: false, span, fix: None, fix_label: None });
+    }
+    g.written = written.to_string();
+    g.line = line;
     into.groups.push(g);
     into.groups.len() - 1
+}
+
+/// Whether a group takes everything another would (so the other, after it, gets nothing). Only
+/// where the rules alone make it plain: not -today after -updated, as one counts days and the
+/// other hours.
+fn covers(a: &Takes, b: &Takes) -> bool {
+    match (a, b) {
+        (Takes::Files, Takes::Empty | Takes::Since { .. } | Takes::Today | Takes::Yesterday | Takes::Older { .. } | Takes::Bigger(_) | Takes::Smaller(_) | Takes::Kind(_) | Takes::Ext(_)) => true,
+        (Takes::Kind(list), Takes::Ext(x)) => list.contains(&x.as_str()),
+        (Takes::Since { hours: a, created: ca }, Takes::Since { hours: b, created: cb }) => ca == cb && a >= b,
+        (Takes::Older { hours: a }, Takes::Older { hours: b }) => a <= b,
+        (Takes::Bigger(a), Takes::Bigger(b)) => a <= b,
+        (Takes::Smaller(a), Takes::Smaller(b)) => a >= b,
+        (Takes::Smaller(a), Takes::Empty) => *a > 0,
+        (Takes::NameHas(a), Takes::NameHas(b) | Takes::NameStarts(b)) => b.contains(a.as_str()),
+        (Takes::NameStarts(a), Takes::NameStarts(b)) => b.starts_with(a.as_str()),
+        (Takes::NameEnds(a), Takes::NameEnds(b)) => b.ends_with(a.as_str()),
+        _ => false,
+    }
+}
+
+/// What a group takes, said after "takes": "all .png files", "all files bigger than 100 MB",
+/// "everything whose name starts with "img"".
+fn what_it_takes(g: &Group) -> String {
+    let shown = |t: &str| t.replace('_', " ");
+    match &g.takes {
+        Takes::Since { .. } | Takes::Today | Takes::Yesterday | Takes::Older { .. } | Takes::Bigger(_) | Takes::Smaller(_) => format!("all files {}", g.label),
+        Takes::Kind(_) if g.name == "code" => "all code files".into(),
+        Takes::NameStarts(t) => format!("everything whose name starts with \"{}\"", shown(t)),
+        Takes::NameEnds(t) => format!("everything whose name ends with \"{}\"", shown(t)),
+        Takes::NameHas(t) => format!("everything with \"{}\" in its name", shown(t)),
+        _ => format!("all {}", g.label),
+    }
 }
 
 fn add_order(into: &mut Vec<Order>, o: Order, written: &str, for_whom: &str, line: usize, span: Option<(usize, usize)>, messages: &mut Vec<Message>) {
     if into.iter().any(|x| x.key == o.key) {
         let text = format!("{written}: there's already an order rule for the {}{for_whom} before it, so this one never decides anything.", key_name(o.key));
-        messages.push(Message { line, text, error: false, span, fix: None });
+        messages.push(Message { line, text, error: false, span, fix: None, fix_label: None });
         return;
     }
     into.push(o);
@@ -1101,6 +1466,7 @@ fn check_useless(rules: &Rules, place: &str, out: &mut Vec<Message>) {
                 error: false,
                 span: None,
                 fix: None,
+                fix_label: None,
             });
         }
     };
@@ -1134,7 +1500,9 @@ fn takes(g: &Group, e: &Entry, clock: &Clock) -> bool {
         Takes::Smaller(b) => !dir && e.size < *b,
         Takes::NameStarts(t) => plain(&e.name).starts_with(t.as_str()),
         Takes::NameEnds(t) => {
-            let stem = if dir || e.ext.is_empty() { e.name.as_str() } else { &e.name[..e.name.len() - e.ext.len() - 1] };
+            // (Cut at the name's own last dot: the extension is kept in lower case, which can be
+            // longer or shorter than in the name.)
+            let stem = if dir || e.ext.is_empty() { e.name.as_str() } else { e.name.rfind('.').map_or(e.name.as_str(), |i| &e.name[..i]) };
             plain(stem).ends_with(t.as_str())
         }
         Takes::NameHas(t) => plain(&e.name).contains(t.as_str()),
@@ -1143,26 +1511,21 @@ fn takes(g: &Group, e: &Entry, clock: &Clock) -> bool {
     }
 }
 
-/// Where an item goes (smaller comes first: the _first groups, the others in the order written,
-/// things that fit nothing, the _last groups) and its group (None: it fits no group and there's
-/// no -other).
+/// Where an item goes (smaller comes first: the _first groups and the lines stacked under them,
+/// the others in the order written, things that fit nothing, the _last groups and the lines stacked
+/// under them) and its group: the first one written that takes it, else -other (None: it fits no
+/// group and there's no -other).
 fn group_index(rules: &Rules, e: &Entry, clock: &Clock) -> (i64, Option<usize>) {
-    let mut best: Option<usize> = None;
-    for (i, g) in rules.groups.iter().enumerate() {
-        if best.is_none_or(|b| g.exactness > rules.groups[b].exactness) && takes(g, e, clock) {
-            best = Some(i);
-        }
-    }
-    let best = match best.or_else(|| rules.groups.iter().position(|g| g.name == "other")) {
-        Some(b) => b,
-        None => return (199_999, None), // after the other groups, before the _last ones
+    let found = rules.groups.iter().position(|g| takes(g, e, clock)).or_else(|| rules.groups.iter().position(|g| g.name == "other"));
+    let Some(i) = found else {
+        return (199_999, None); // after the other groups, before the _last ones and their stacks
     };
-    let tier = match rules.groups[best].place {
+    let tier = match rules.groups[i].tier {
         Place::First => 0,
         Place::Normal => 100_000,
         Place::Last => 200_000,
     };
-    (tier + best as i64, Some(best))
+    (tier + i as i64, Some(i))
 }
 
 fn group_of<'a>(rules: &'a Rules, e: &Entry, clock: &Clock) -> (i64, Option<&'a Group>) {
@@ -1205,24 +1568,26 @@ pub fn cached(text: &str) -> Arc<Recipe> {
 /// What a new custom sort order starts with: explained, and a useful order in itself.
 pub const STARTER: &str = "# My sort order. Lines starting with # are notes.
 # Write the kinds of things in the order you want them.
-# _first / _last put one at the very top / bottom.
+# Each thing goes on the first line that fits it.
+# _first / _last put one at the very top / bottom, with the lines under it up to a blank line.
 
 -newest_first            # newest first in every group
 -folder_first            # folders at the very top
--updated                 # files changed in the last 24 hours
+-updated                 # files of every kind changed in the last 24 hours
 -document
 -image -biggest_first    # pictures, the biggest first
 -video
--program_last            # programs at the very bottom
+-program_last            # the other programs at the very bottom
 
-# Just for Downloads: everything newest first, all mixed.
-in Downloads:
+# Just for Downloads, in place of the lines above: newest first, all mixed.
+in Downloads (
 -newest_first
+)
 ";
 
 /// "Start from…": ready-made sort orders (name, text).
 pub const PRESETS: &[(&str, &str)] = &[
-    ("Downloads: newest first, installers last", "-a_to_z\n-folder_first\n\nin Downloads:\n-newest_first\n-program_last\n"),
+    ("Downloads: newest first, installers last", "-a_to_z\n-folder_first\n\nin Downloads (\n-newest_first\n-program_last\n)\n"),
     ("Photos: pictures newest first", "-a_to_z\n-folder_first\n-image -newest_first\n-video -newest_first\n"),
     ("Code project: folders, then by type", "-folder_first\n-by_type\n-a_to_z\n"),
     ("Plain A\u{2013}Z", "-a_to_z\n"),
@@ -1246,8 +1611,8 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("By day, A to Z within each day", "-newest_by_day\n-a_to_z\n-folder_first"),
     ("Biggest first", "-biggest_first\n-folder_first"),
     ("By type, then A to Z", "-by_type\n-a_to_z\n-folder_first"),
-    ("Hidden things at the bottom", "-a_to_z\n-folder_first\n-hidden_last"),
-    ("Downloads newest first, elsewhere folders first", "-a_to_z\n-folder_first\n\nin Downloads:\n-newest_first"),
+    ("Hidden things at the bottom", "-a_to_z\n-hidden_last\n-folder_first"),
+    ("Downloads newest first, elsewhere folders first", "-a_to_z\n-folder_first\n\nin Downloads (\n-newest_first\n)"),
 ];
 
 #[cfg(test)]
@@ -1325,12 +1690,21 @@ mod tests {
     // Every kind of rule, case by case.
 
     #[test]
+    fn a_name_whose_extension_changes_length_in_lower_case() {
+        // "İ" is 2 bytes and its lower case 3, the Kelvin sign 3 bytes and "k" 1: the name is
+        // cut where its own dot is, not by the lower-cased extension's length.
+        let rule = "-name_ends_with_é";
+        assert_eq!(name_of(rule, &f("aé.İ", NOW, 1)), name_of(rule, &f("aé.txt", NOW, 1)));
+        assert_eq!(name_of(rule, &f("aé.\u{212a}b", NOW, 1)), name_of(rule, &f("aé.txt", NOW, 1)));
+    }
+
+    #[test]
     fn the_users_own_example() {
         const MINE: &str = "-newest_first\n-updated\n-exe\n-image\n-video";
         assert!(Recipe::parse(MINE).messages.is_empty(), "{:?}", Recipe::parse(MINE).messages);
         assert_eq!(order(MINE), "b.exe,a.txt,m.txt,s.png,z.exe,p.png,q.jpg,Zeta,c.pdf,Alpha");
         assert_eq!(order("-a_to_z\n-folder\n-png\n-image"), "Alpha,Zeta,p.png,s.png,q.jpg,a.txt,b.exe,c.pdf,m.txt,z.exe");
-        assert_eq!(order("-folder\n-image\n-updated"), "Alpha,Zeta,p.png,q.jpg,a.txt,b.exe,m.txt,s.png,c.pdf,z.exe");
+        assert_eq!(order("-folder\n-image\n-updated"), "Alpha,Zeta,p.png,q.jpg,s.png,a.txt,b.exe,m.txt,c.pdf,z.exe");
         assert_eq!(name_of("-updated\n-folder", &d("Fresh", NOW - 5 * 60 * 10_000_000)), "folders");
         assert_eq!(order("-folder\n-a_to_z"), "Alpha,Zeta,a.txt,b.exe,c.pdf,m.txt,p.png,q.jpg,s.png,z.exe");
         assert_eq!(order("-folder\n-file\n-name"), order("-folder\n-a_to_z"));
@@ -1342,7 +1716,9 @@ mod tests {
         assert!(errors("-imgae").iter().any(|m| m.text.contains("-image")), "a typo isn't taken as a file type");
         assert!(!Recipe::parse(STARTER).has_errors());
         for (name, text) in EXAMPLES.iter().chain(PRESETS) {
-            assert!(!Recipe::parse(text).has_errors(), "{name}: {:?}", errors(text));
+            let r = Recipe::parse(text);
+            assert!(!r.has_errors(), "{name}: {:?}", errors(text));
+            assert!(r.messages.iter().all(|m| !m.text.contains("never gets anything")), "{name}: {:?}", r.messages);
         }
         assert!(GROUP_RULES.iter().all(|(r, _)| *r != "-file"));
     }
@@ -1372,10 +1748,13 @@ mod tests {
         assert_eq!(name_of("-updated_3_days", &f("c.pdf", NOW - 3 * D, 1)), "updated in the last 3 days");
         assert_eq!(name_of("-updated_3_days", &f("old.pdf", NOW - 4 * D, 1)), "everything else");
         assert_eq!(name_of("-updated_2_hours\n-updated", &f("x.txt", NOW - H, 1)), "updated in the last 2 hours");
-        assert_eq!(name_of("-updated\n-updated_2_hours", &f("x.txt", NOW - H, 1)), "updated in the last 2 hours");
+        assert_eq!(name_of("-updated\n-updated_2_hours", &f("x.txt", NOW - H, 1)), "updated in the last 24 hours");
+        assert!(Recipe::parse("-updated\n-updated_2_hours").messages.iter().any(|m| m.line == 2 && !m.error && m.text.contains("never gets anything")));
         assert_eq!(name_of("-older_than_1_year", &f("old.txt", NOW - 400 * D, 1)), "older than 1 year");
-        assert_eq!(name_of("-image\n-bigger_than_200b", &f("q.jpg", NOW, 900)), "bigger than 200 bytes");
-        assert_eq!(name_of("-png\n-name_has_screenshot", &f("Screenshot 2026-09-30.png", NOW - 9 * D, 1)), "names with \"screenshot\"");
+        assert_eq!(name_of("-image\n-bigger_than_200b", &f("q.jpg", NOW, 900)), "pictures");
+        assert_eq!(name_of("-bigger_than_200b\n-image", &f("q.jpg", NOW, 900)), "bigger than 200 bytes");
+        assert_eq!(name_of("-png\n-name_has_screenshot", &f("Screenshot 2026-09-30.png", NOW - 9 * D, 1)), ".png files");
+        assert_eq!(name_of("-name_has_screenshot\n-png", &f("Screenshot 2026-09-30.png", NOW - 9 * D, 1)), "names with \"screenshot\"");
         assert_ne!(name_of("-name_starts_with_img", &f("IMG_2041.jpg", NOW, 1)), "everything else");
         let mut copy = f("copy.txt", NOW - 90 * D, 1);
         copy.created = NOW - H;
@@ -1384,6 +1763,101 @@ mod tests {
         assert!(errors("-bigger_than_lots").iter().any(|m| m.text.contains("100mb")));
         assert!(errors("-documnet_first").iter().any(|m| m.text.contains("-document_first")), "a typo keeps the _first");
         assert!(is_order_word("-biggest_last") && is_order_word("-newest_first_by_day") && !is_order_word("-image_last"));
+    }
+
+    #[test]
+    fn the_order_written_decides() {
+        // Folders, then pictures, then .exe files, then the rest.
+        assert_eq!(order("-folder_first\n-image\n-exe"), "Alpha,Zeta,p.png,q.jpg,s.png,b.exe,z.exe,a.txt,c.pdf,m.txt");
+        // -updated below them gets only what they leave: today's s.png stays with the pictures,
+        // b.exe with the .exe files. Above them, it takes those first.
+        assert_eq!(order("-folder_first\n-image\n-exe\n-updated"), "Alpha,Zeta,p.png,q.jpg,s.png,b.exe,z.exe,a.txt,m.txt,c.pdf");
+        assert_eq!(order("-folder_first\n-updated\n-image\n-exe"), "Alpha,Zeta,a.txt,b.exe,m.txt,s.png,p.png,q.jpg,z.exe,c.pdf");
+        // The starter has -updated above -program_last, so b.exe (changed an hour ago) is with the
+        // updated files and z.exe with the programs at the bottom.
+        let b = f("b.exe", NOW - H, 500);
+        assert_eq!(name_of(STARTER, &b), "updated in the last 24 hours");
+        assert_eq!(name_of(STARTER, &f("z.exe", NOW - 2 * D, 100)), "programs");
+        assert_eq!(sorted_in(STARTER, "C:\\t").join(","), "Zeta,Alpha,b.exe,a.txt,m.txt,s.png,c.pdf,q.jpg,p.png,z.exe");
+        // _first and _last still go to the very top and bottom, written anywhere; and a _last
+        // line written first takes its things first (a blank line ends the _last line's stack).
+        assert_eq!(order("-exe_last\n\n-image\n-folder_first"), "Alpha,Zeta,p.png,q.jpg,s.png,a.txt,c.pdf,m.txt,b.exe,z.exe");
+        assert_eq!(order("-program_last\n\n-updated\n-folder_first"), "Alpha,Zeta,a.txt,m.txt,s.png,c.pdf,p.png,q.jpg,b.exe,z.exe");
+        // The lines stacked right under a _first line go up with it, in their order: a b c d_first e
+        // is d, e, a, b, c. Up to a blank line (not a line of notes) or the next _first / _last.
+        // (Which line each thing goes on is still the first written that fits: -updated gets what
+        // -document and -image above it leave.)
+        assert_eq!(order("-video\n-document\n-image\n-folder_first\n-updated"), "Alpha,Zeta,b.exe,a.txt,c.pdf,m.txt,p.png,q.jpg,s.png,z.exe");
+        assert_eq!(order("-image\n-folder_first\n-updated\n-exe"), "Alpha,Zeta,a.txt,b.exe,m.txt,z.exe,p.png,q.jpg,s.png,c.pdf");
+        assert_eq!(order("-image\n-folder_first -updated -exe"), order("-image\n-folder_first\n-updated\n-exe"));
+        assert_eq!(order("-image\n-folder_first\n# recent files next\n-updated\n-exe"), order("-image\n-folder_first\n-updated\n-exe"));
+        assert_eq!(order("-image\n-folder_first\n\n-updated"), "Alpha,Zeta,p.png,q.jpg,s.png,a.txt,b.exe,m.txt,c.pdf,z.exe");
+        assert_eq!(order("-image\n-folder_first\n-exe_last\n-updated"), "Alpha,Zeta,p.png,q.jpg,s.png,c.pdf,b.exe,z.exe,a.txt,m.txt");
+        // The same under a _last line: down with it.
+        assert_eq!(order("-program_last\n-image\n\n-folder_first"), "Alpha,Zeta,a.txt,c.pdf,m.txt,b.exe,z.exe,p.png,q.jpg,s.png");
+        // Rules for one folder have their own stacks.
+        assert_eq!(sorted_in("-folder_first\nin C:\\t:\n-image\n-folder_first\n-updated", "C:\\t").join(","), "Alpha,Zeta,a.txt,b.exe,m.txt,p.png,q.jpg,s.png,c.pdf,z.exe");
+        // A _first / _last line that's left out (its things have a line above) starts no stack.
+        assert_eq!(order("-image\n-image_first\n-exe"), order("-image\n-exe"));
+        assert_eq!(order("-folder\n-image\n\n-folder_first\n-exe"), order("-folder\n-image\n\n-exe"));
+        assert_eq!(order("-folder_first\n-image\n\n-image_last\n-exe"), order("-folder_first\n-image\n\n-exe"));
+        assert_eq!(order("-folder_first\n-image\n-folder_last\n-exe"), order("-folder_first\n-image\n-exe"));
+        assert!(Recipe::parse("-image\n-image_first\n-exe").messages.iter().any(|m| m.line == 2 && m.text.contains("left out")));
+        // The first line stacked under a _last line is pointed out, as it goes down too.
+        let down = |text: &str| Recipe::parse(text).messages.into_iter().filter(|m| m.text.contains("stacked under")).collect::<Vec<_>>();
+        let m = down("-folder_first\n-program_last\n-updated\n-image");
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!(m[0].text, "-updated: stacked under -program_last, so it goes to the very bottom with it, as do the lines under it up to a blank line. Put a blank line after -program_last to keep them in their place.");
+        assert_eq!((m[0].line, m[0].error), (3, false));
+        assert_eq!(down("-program_last\n# the rest\n-image").len(), 1);
+        assert!(down("-folder_first\n-program_last\n\n-updated").is_empty());
+        assert!(down("-folder_first\n-program_last -updated").is_empty());
+        assert!(down("-image\n-folder_first\n-updated").is_empty());
+        assert!(down(STARTER).is_empty());
+        assert_eq!(name_of("-folder_first\n-program_last\n-updated", &b), "programs");
+        // A hidden folder stays with -folder_first written above -hidden_last.
+        let mut git = d(".git", NOW - D);
+        git.attributes = 0x2;
+        assert_eq!(name_of("-folder_first\n-hidden_last", &git), "folders");
+        assert_eq!(name_of("-hidden_last\n-folder_first", &git), "hidden");
+
+        // A line that can't get anything is pointed out, where it is.
+        let never = |text: &str| Recipe::parse(text).messages.into_iter().find(|m| m.text.contains("never gets anything"));
+        let text = "-image\n-png";
+        let m = never(text).unwrap();
+        assert_eq!(m.text, "-png: -image above already takes all .png files, so this line never gets anything. Move it above -image to give them their own place.");
+        assert_eq!((m.line, m.error, m.fix.as_deref()), (2, false, None));
+        assert_eq!(&text[m.span.unwrap().0..m.span.unwrap().1], "-png");
+        assert!(never("-png\n-image").is_none());
+        assert!(never("-image -png").unwrap().text.contains("-image before it"));
+        for (useless, fine) in [
+            ("-file\n-.blend", "-.blend\n-file"),
+            ("-file\n-empty", "-empty\n-file"),
+            ("-file\n-image", "-image\n-file"),
+            ("-updated_3_days\n-updated", "-updated\n-updated_3_days"),
+            ("-updated\n-updated_1_day", "-added\n-updated"),
+            ("-bigger_than_1mb\n-bigger_than_1gb", "-bigger_than_1gb\n-bigger_than_1mb"),
+            ("-smaller_than_1gb\n-smaller_than_1mb", "-smaller_than_1mb\n-smaller_than_1gb"),
+            ("-older_than_1_month\n-older_than_1_year", "-older_than_1_year\n-older_than_1_month"),
+            ("-name_has_shot\n-name_starts_with_screenshot", "-name_starts_with_screenshot\n-name_has_shot"),
+            ("-folder\n-file\n-hidden", "-folder\n-hidden\n-file"),
+            ("-file\n-folder\n-name_has_x", "-hidden\n-file\n-folder"),
+        ] {
+            assert!(never(useless).is_some(), "{useless}");
+            assert!(never(fine).is_none(), "{fine}: {:?}", never(fine));
+        }
+        assert_eq!(
+            never("-name_has_shot\n-name_starts_with_screenshot").unwrap().text,
+            "-name_starts_with_screenshot: -name_has_shot above already takes everything whose name starts with \"screenshot\", so this line never gets anything. Move it above -name_has_shot to give them their own place."
+        );
+        assert_eq!(never("-folder_first\n-file\n-hidden_last").unwrap().text, "-hidden_last: -folder_first and -file above already take everything, so this line never gets anything. Move it above them.");
+        assert!(never("-folder\n-file -hidden").unwrap().text.contains("-folder and -file before it"));
+        // Not for days against hours, for -other, or across folders.
+        assert!(never("-updated\n-today").is_none());
+        assert!(never("-file\n-other").is_none());
+        assert!(never("-folder\n-file\n-other").is_none());
+        assert!(never("-image\nin C:\\t:\n-png").is_none());
+        assert_eq!(never("-image\nin C:\\t:\n-image\n-png").unwrap().line, 4);
     }
 
     #[test]
@@ -1403,6 +1877,116 @@ mod tests {
         assert_eq!(Recipe::parse(r).folder_label(&downloads), Some("Downloads"));
         // The colon may be left out; a full path works too.
         assert_eq!(sorted_in("-a_to_z\n-folder\nin C:\\t\n-newest_first", "C:\\T")[0], "b.exe");
+        // With only "in …" rules, other folders have none (they keep their column's order).
+        let only = Recipe::parse("in Downloads (\n-newest_first\n)");
+        assert!(only.applies(&downloads) && !only.applies("C:\\t"));
+        assert!(Recipe::parse("-a_to_z\nin Downloads:\n-newest_first").applies("C:\\t"));
+        assert!(!Recipe::parse("in C:\\t:\n# nothing yet").applies("C:\\t"));
+    }
+
+    #[test]
+    fn a_folders_rules_in_brackets() {
+        let downloads = place_path("Downloads").unwrap();
+        // The lines after ")" are for every folder again.
+        let r = "-folder_first\nin Downloads (\n-newest_first\n)\n-image";
+        assert!(Recipe::parse(r).messages.is_empty(), "{:?}", Recipe::parse(r).messages);
+        assert_eq!(sorted_in(r, &downloads)[0], "b.exe");
+        assert_eq!(order(r), order("-folder_first\n-image"));
+        assert_eq!(order("in Downloads(\n-newest_first\n)\n-folder_first"), order("-folder_first"));
+        // ...and don't stack under a _first line above the folder's rules.
+        assert_eq!(order("-folder_first\nin Downloads (\n-newest_first\n)\n-updated\n-image"), order("-folder_first\n\n-updated\n-image"));
+        // "in Downloads:" still runs to the next "in" or the end.
+        let colon = Recipe::parse("in Downloads:\n-newest_first\n-image");
+        assert!(!colon.has_errors() && !colon.applies("C:\\t"));
+        // A path with brackets in it, and a folder written twice.
+        let x86 = Recipe::parse("in C:\\Program Files (x86) (\n-newest_first\n)");
+        assert!(!x86.has_errors());
+        assert_eq!(x86.folder_label("C:\\Program Files (x86)"), Some("C:\\Program Files (x86)"));
+        assert_eq!(sorted_in("in C:\\t (\n-folder_first\n)\nin C:\\t (\n-image\n)", "C:\\t").join(","), order("-folder_first\n-image"));
+
+        // A drive, written with or without its backslash.
+        for text in ["in C: (\n-newest_first\n)", "in C:\\ (\n-newest_first\n)"] {
+            let r = Recipe::parse(text);
+            assert!(!r.has_errors(), "{text:?}: {:?}", r.messages);
+            assert_eq!(r.folder_label("C:\\"), Some("C:\\"), "{text:?}");
+        }
+        // A ")" in a name rule is part of it.
+        for text in ["-name_has_(1)", "name has (1)", "in Downloads (\n-name_has_(1)\n)"] {
+            assert!(!Recipe::parse(text).has_errors(), "{text:?}: {:?}", errors(text));
+        }
+
+        // Mistakes: one each, with a fix that puts it right. A fix that adds a line or takes
+        // something away says what it does.
+        let fixed = |text: &str| {
+            let all = errors(text);
+            assert_eq!(all.len(), 1, "{text:?}: {all:?}");
+            let m = all.into_iter().next().unwrap();
+            let (a, b) = m.span.unwrap();
+            let fix = m.fix.as_deref().unwrap_or_else(|| panic!("no fix in {text:?}"));
+            if fix.is_empty() || fix.contains('\n') || fix.starts_with(' ') {
+                assert!(m.fix_label.as_ref().is_some_and(|l| !l.is_empty() && !l.contains('\n')), "{m:?}");
+            }
+            let after = format!("{}{fix}{}", &text[..a], &text[b..]);
+            assert!(!Recipe::parse(&after).has_errors(), "{after:?}: {:?}", errors(&after));
+            (m, after)
+        };
+        // ...and where the mistake is read as meant, the order stays as it was.
+        let both = |text: &str| (order(text), sorted_in(text, &downloads).join(","));
+        let same = |text: &str| {
+            let (m, after) = fixed(text);
+            assert_eq!(both(text), both(&after), "{text:?} -> {after:?}");
+            (m, after)
+        };
+        let (m, after) = same("in Downloads (\n-newest_first");
+        assert_eq!((m.line, m.text.as_str()), (2, "\"in Downloads (\" on line 1 isn't closed: put a ) on a line of its own after its rules."));
+        assert_eq!(m.fix_label.as_deref(), Some("close it with )"));
+        assert_eq!(after, "in Downloads (\n-newest_first\n)");
+        assert_eq!(same("in Downloads (\n-newest_first\n").1, "in Downloads (\n-newest_first\n)");
+        // A stray ")" goes with its line: a blank line left behind would end the stack.
+        let (m, after) = same("-a_to_z\n)\n-folder");
+        assert_eq!((m.line, m.text.as_str(), after.as_str()), (2, "This ) has nothing to close: there's no \"in \u{2026} (\" above it.", "-a_to_z\n-folder"));
+        assert_eq!(m.fix_label.as_deref(), Some("remove the )"));
+        assert_eq!(same("-exe\n-folder_first\n)\n-image").1, "-exe\n-folder_first\n-image");
+        assert_eq!(same("-exe\n-folder_first\n)  # done\n-image").1, "-exe\n-folder_first\n  # done\n-image");
+        assert_eq!(same("-a_to_z\n)").1, "-a_to_z\n");
+        assert_eq!(same("-folder_first )\n-image").1, "-folder_first\n-image");
+        let (m, after) = same("in Downloads (\n-newest_first\nin Desktop (\n-a_to_z\n)");
+        assert_eq!(m.line, 3);
+        assert_eq!(after, "in Downloads (\n-newest_first\n)\nin Desktop (\n-a_to_z\n)");
+        // A ")" not on a line of its own still closes there.
+        assert_eq!(same("in Downloads (\n-newest_first\n-program_last)\n-folder_first").1, "in Downloads (\n-newest_first\n-program_last\n)\n-folder_first");
+        assert_eq!(same("in Downloads (\n-newest_first )\n-folder_first").1, "in Downloads (\n-newest_first\n)\n-folder_first");
+        assert_eq!(same("in Downloads (\n-newest_first\n) -folder_first").1, "in Downloads (\n-newest_first\n)\n-folder_first");
+        assert_eq!(same("in Downloads (\n-newest_first\n):\n-folder_first").1, "in Downloads (\n-newest_first\n)\n-folder_first");
+        assert_eq!(same("in Downloads (:\n-newest_first\n)\n-folder_first").1, "in Downloads (\n-newest_first\n)\n-folder_first");
+        // A "(" under the "in" line goes up to it.
+        let (m, after) = same("in Downloads\n(\n-newest_first\n)\n-folder_first");
+        assert_eq!((m.line, m.fix_label.as_deref()), (2, Some("in Downloads (")));
+        assert_eq!(after, "in Downloads (\n-newest_first\n)\n-folder_first");
+        assert_eq!(same("in Downloads:  # mine\n\n(\n-newest_first\n)").1, "in Downloads (  # mine\n-newest_first\n)");
+        assert_eq!(fixed("in C:\n(\n-newest_first\n)").1, "in C: (\n-newest_first\n)");
+        // All on one line.
+        assert_eq!(same("in Downloads (-newest_first)\n-folder_first").1, "in Downloads (\n-newest_first\n)\n-folder_first");
+        assert_eq!(same("in Downloads ( -newest_first -program_last )").1, "in Downloads (\n-newest_first -program_last\n)");
+        assert_eq!(same("in C:\\Program Files (x86) (-newest_first)").1, "in C:\\Program Files (x86) (\n-newest_first\n)");
+        assert_eq!(same("in Downloads ()\n-folder_first").1, "in Downloads (\n)\n-folder_first");
+        // A "(" after a rule does nothing.
+        assert_eq!(same("-image (\n-a_to_z").1, "-image\n-a_to_z");
+        // No rule is close to a bracket of another kind.
+        let m = errors("in Downloads (\n-newest_first\n}\n)");
+        assert_eq!((m.len(), m[0].text.as_str(), m[0].fix.is_none()), (1, "\"}\" isn't a rule.", true));
+        // Read as meant once it's put right; until then the folder's lines aren't used, and its
+        // ")" closes it (so the lines after it stay for every folder).
+        assert_eq!(fixed("Downloads (\n-newest_first\n)").1, "in Downloads (\n-newest_first\n)");
+        let after = fixed("Downloads (\n-newest_first\n)\n-folder_first").1;
+        assert_eq!(both(&after), both("in Downloads (\n-newest_first\n)\n-folder_first"));
+        assert_eq!(fixed("in Downlods (\n-newest_first\n)").1, "in Downloads (\n-newest_first\n)");
+        // No folder to give it to: no fix, but its ")" closes it.
+        let m = errors("(\n-newest_first\n)\n-folder_first");
+        assert_eq!((m.len(), m[0].line, m[0].fix.is_none()), (1, 1, true), "{m:?}");
+        assert_eq!(order("(\n-newest_first\n)\n-folder_first"), order("-folder_first"));
+        // (Before it's fixed, the folder's rules still end at the next "in".)
+        assert_eq!(sorted_in("in Downloads (\n-newest_first\nin C:\\t (\n-a_to_z\n)", &downloads)[0], "b.exe");
     }
 
     // Friendlier: the same rules, written more freely.

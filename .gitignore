@@ -3,3 +3,4 @@ target/
 config/
 cache/
 logs/
+test-build/

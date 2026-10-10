@@ -1253,6 +1253,9 @@ impl Window {
         if self.side.preview_open() {
             // The preview is in its place; the panel comes back when the preview closes.
             self.app.say(if show { "The details panel shows when the preview closes" } else { "Details panel hidden" });
+        } else if show && self.side.rect().is_empty() {
+            // No room for it next to the list (side.rs): it shows once the window is wider.
+            self.app.say("Make the window wider to show the details panel");
         } else {
             self.app.say(if show { "Details panel shown (Alt+P hides it)" } else { "Details panel hidden (Alt+P shows it)" });
         }
@@ -2218,8 +2221,12 @@ impl Window {
                 Some(LRESULT(0))
             }
             WM_XBUTTONUP => {
-                let cmd = if hi_word(wparam.0) == 1 { Command::Back } else { Command::Forward };
-                self.apply(Part::List, Effect::Command(cmd));
+                // (Not while a question is open: like every other click, the box takes it, and the
+                // folder it asks about stays on screen.)
+                if self.app.question.is_none() {
+                    let cmd = if hi_word(wparam.0) == 1 { Command::Back } else { Command::Forward };
+                    self.apply(Part::List, Effect::Command(cmd));
+                }
                 Some(LRESULT(1))
             }
             WM_KEYDOWN | WM_SYSKEYDOWN => {

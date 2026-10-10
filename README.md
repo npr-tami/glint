@@ -20,7 +20,8 @@ Direct2D, so it opens instantly, stays out of your way and needs nothing install
 - **Skins**: AMD Radeon, NVIDIA, Chrome and Gunmetal (with light and dark versions), or your own, made in the built-in
   **skin customiser** or in Notepad (skins are small `.glint` text files).
 - **Custom sort order**: write your own order, like `-folder_first -newest_first -image`, or rules for
-  one folder with `in Downloads:`, with **suggestions as you type** and a live preview.
+  one folder between `in Downloads (` and `)` (the lines after the `)` are for every folder), with
+  **suggestions as you type** and a live preview. A folder with no rules sorts by its column.
 - **Your default file explorer**, if you like: folders, drives and Win+E open in Glint.
 - **Background mode**: closing the window keeps Glint ready in the tray, so the next window opens
   instantly. It can start with Windows too.
@@ -33,9 +34,9 @@ Get `Glint.exe` from the [Releases page](https://github.com/npr-tami/glint/relea
 file: put it in a folder of its own and run it. Windows may warn that it doesn't know the program
 ("Windows protected your PC": More info, then Run anyway).
 
-**Portable mode:** make an empty folder called `config` next to `Glint.exe` (or switch on Settings >
-About > Portable), and Glint keeps its settings, cache and logs next to itself, so the whole folder
-can go on a USB stick.
+**Portable mode:** switch on Settings > About > Portable (or make an empty folder called
+`Glint data` next to `Glint.exe`), and Glint keeps all its files in `Glint data` next to itself, so
+the whole folder can go on a USB stick. Switching it moves the files when Glint next starts.
 
 ## Build it yourself
 
@@ -61,11 +62,13 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 ## Where it keeps settings
 
-| What | Normally | Portable |
-|---|---|---|
-| Settings (`settings.json`) and your skins | `%APPDATA%\Glint\config` | `config\` next to Glint.exe |
-| Cache | `%LOCALAPPDATA%\Glint\cache` | `cache\` next to Glint.exe |
-| Error log | `%LOCALAPPDATA%\Glint\logs` | `logs\` next to Glint.exe |
+Everything is in one folder: `%APPDATA%\Glint`, or `Glint data` next to Glint.exe when portable.
+
+| What | In that folder |
+|---|---|
+| Settings (`settings.json`) and your skins | `config` |
+| Cache | `cache` |
+| Error log | `logs` |
 
 Settings > About shows where they are, with a button to open the folder.
 

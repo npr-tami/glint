@@ -9,6 +9,57 @@ The newest version is at the top.
 
 Glint stays at 0.x while it's in beta.
 
+## 0.11.0 (2026-10-10): the sort order you write, WinRAR's submenu in Windows 11 menu mode
+
+- **WinRAR's submenu is no longer empty** when WinRAR uses its Windows 11 context menu. The same
+  goes for other apps whose Windows 11 menu items have a submenu.
+- **The custom sort order keeps the order you write**: each thing goes on the first line that fits
+  it. A line like `-updated` or `-png` no longer pulls things out of a line above it, so with
+  `-image` above `-updated`, a picture changed today stays with the pictures (and with
+  `-folder_first` above `-hidden_last`, hidden folders stay with the folders). Glint points out a
+  line that can't get anything because the lines above take it all.
+- **Lines stacked under a `_first` line go up with it**, in their order: with `-image`, then
+  `-folder_first` and `-updated` right under it, folders come first and `-updated` second. Lines
+  under a `_last` line go down with it, and Glint points them out. A blank line ends the stack (a
+  line of notes doesn't): in an order written before, a blank line after the `_first` or `_last`
+  line keeps the lines under it where they were.
+- **A folder the custom sort order has no rules for sorts by its column**: with only `in …` rules
+  (say for Downloads), other folders keep the column and direction you pick instead of A to Z, and
+  clicking a column there no longer turns the custom order off for Downloads. Folders first in
+  Settings can be changed while the custom order is on, since it still counts in those folders.
+- **A folder's own rules go in brackets**: `in Downloads (`, its rules, then `)` on a line of its
+  own. The lines after the `)` are for every folder again. `in Downloads:` still works and runs to
+  the next `in` or the end. A missing, extra or misplaced bracket is marked, with a fix. A folder
+  written twice gets the rules of both (before, the second was left out).
+
+## 0.10.4 (2026-10-10): undo in the skin editor, one folder for Glint's files
+
+- **Undo and redo in the skin editor**: UNDO and REDO buttons, or Ctrl+Z and Ctrl+Y.
+- **Colours can be set to none**: each colour has a NONE button.
+- **All of Glint's files are in one folder**: `%APPDATA%\Glint` (settings, skins, cache and logs),
+  or `Glint data` next to Glint.exe when portable. Files from older versions move there by
+  themselves.
+- **Portable moves the files** from one place to the other when Glint next starts, instead of
+  copying them and leaving `.old` and `config.off` copies behind (and works while Glint has its
+  settings open, which it always does).
+- About says Glint is a beta. The timing log in the temp folder starts again once it reaches 1 MB.
+
+Fixes:
+
+- Typing a letter like "ñ" or "ö" near the start of a line in the sort order window no longer
+  closes Glint, and neither does a sort rule on a name whose extension has letters like "İ".
+- A column clicked while the custom sort order is on sorts A to Z (or newest/biggest first), not
+  backwards. The right-click menu's "Sort by" no longer checks a column then.
+- Typing a file's path in the path bar keeps the Forward button working.
+- The mouse's Back and Forward buttons wait while a question (like "Delete permanently?") is open.
+- A row size picked in Settings keeps the same rows on screen.
+- Alt+P says when the window is too narrow for the details panel.
+- Right-dragging files a little within their own folder shows the menu ("Create shortcuts here").
+- Copy path in This PC with nothing selected no longer empties the clipboard.
+- Skin editor: undoing after a rename keeps the new name; undoing the Dark skin switch also
+  switches "Light or dark" back; a new skin doesn't get a deleted skin's undo steps; UNDO is
+  greyed out for a skin whose file is gone.
+
 ## 0.9.3 (2026-10-10): apps listed twice in the right-click menu
 
 - **WinRAR (and other apps) in Windows 11 menu mode work again.** Such apps can show up twice in

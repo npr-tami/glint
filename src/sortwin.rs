@@ -187,7 +187,7 @@ pub struct SortWindow {
     rows: Vec<Row>,
     preview_scroll: kit::Scroller,
     preview_title: String,
-    seen: (u64, String, usize, u64),
+    seen: Option<Seen>,
     /// The problems' links, as last drawn: (where, message number).
     fixes: Vec<(Rect, usize)>,
     /// Suggestions' rows, as last drawn.
@@ -307,7 +307,7 @@ pub fn create(owner: HWND, app: &AppState) -> Option<SortWindow> {
             rows: Vec::new(),
             preview_scroll: kit::Scroller::default(),
             preview_title: String::new(),
-            seen: (0, String::new(), usize::MAX, 0),
+            seen: None,
             fixes: Vec::new(),
             suggestion_rects: Vec::new(),
             flips: kit::Flips::default(),
@@ -387,6 +387,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
     // SAFETY: default handling.
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// What the preview was made from: the folder on screen (which tab, where, how many items, when
+/// it was read), and how that tab sorts and what it shows (in a folder the rules don't cover, the
+/// preview follows its column).
+type Seen = ((u64, String, usize, u64), (folder::SortKey, bool, bool, bool, bool));
+
+fn seen(tab: &crate::app::Tab) -> Seen {
+    (
+        (tab.id, tab.folder.path.clone(), tab.folder.entries.len(), tab.load_ms.map_or(0, f64::to_bits)),
+        (tab.sort, tab.descending, tab.folders_first, tab.show_hidden, tab.show_system),
+    )
 }
 
 /// The folders "in" can be followed by: the user's places, pinned folders, the open tabs' folders,
@@ -803,8 +815,15 @@ impl SortWindow {
         let real = !tab.folder.path.is_empty() && !tab.folder.entries.is_empty() && !crate::recycle::is_bin(&tab.folder.path);
         let (entries, path) = if real { (tab.folder.entries.clone(), tab.folder.path.clone()) } else { (examples(clock.now), String::new()) };
         let mut view: Vec<u32> = (0..entries.len() as u32).filter(|&i| real.then_some(&entries[i as usize]).is_none_or(|e| e.is_visible(tab.show_hidden, tab.show_system))).collect();
-        self.recipe.sort(&entries, &mut view, &path, &clock);
-        let groups = self.recipe.has_groups(&path);
+        // No rules for this folder (only "in …" rules, for other folders): it keeps its column's
+        // order, as in the list. (The example files get the rules for every folder.)
+        let ruled = self.recipe.applies(&path);
+        if ruled {
+            self.recipe.sort(&entries, &mut view, &path, &clock);
+        } else {
+            folder::sort_view(&entries, &mut view, tab.sort, tab.descending, tab.folders_first);
+        }
+        let groups = ruled && self.recipe.has_groups(&path);
         self.rows.clear();
         let mut last = None;
         for &i in view.iter().take(PREVIEW_MAX) {
@@ -824,24 +843,30 @@ impl SortWindow {
         self.preview_title = if real {
             let name = folder::file_name(&path).to_string();
             match self.recipe.folder_label(&path) {
-                Some(label) => format!("Preview  \u{00b7}  {name}  (in {label}:)"),
+                Some(label) if ruled => format!("Preview  \u{00b7}  {name}  (in {label})"),
+                Some(label) => format!("Preview  \u{00b7}  {name}  (in {label}: no rules yet, sorted by its column)"),
+                None if !ruled => format!("Preview  \u{00b7}  {name}  (no rules for it: sorted by its column)"),
                 None => format!("Preview  \u{00b7}  {name}"),
             }
+        } else if !ruled {
+            "Preview  \u{00b7}  example files  (no rules for every folder: sorted by the column)".into()
         } else {
             "Preview  \u{00b7}  example files".into()
         };
         if view.len() > PREVIEW_MAX {
             self.preview_title.push_str(&format!("  \u{00b7}  first {PREVIEW_MAX}"));
         }
-        self.seen = (tab.id, tab.folder.path.clone(), tab.folder.entries.len(), tab.load_ms.map_or(0, f64::to_bits));
+        self.seen = Some(seen(tab));
     }
 
-    /// WATCH_TIMER: another folder on screen (or it changed): the preview and the folders follow.
+    /// WATCH_TIMER: another folder on screen (or it changed, or it's sorted another way): the
+    /// preview and the folders follow.
     fn watch(&mut self, app: &AppState) {
-        let tab = app.tab();
-        let seen = (tab.id, tab.folder.path.clone(), tab.folder.entries.len(), tab.load_ms.map_or(0, f64::to_bits));
-        if seen != self.seen {
-            self.places = places(app);
+        let now = seen(app.tab());
+        if self.seen.as_ref() != Some(&now) {
+            if self.seen.as_ref().is_none_or(|s| s.0 != now.0) {
+                self.places = places(app);
+            }
             self.make_preview(app);
             self.invalidate();
         }
@@ -892,11 +917,11 @@ impl SortWindow {
     /// The compact guide, broken to fit.
     fn guide_lines(&mut self, width: f32) -> Vec<String> {
         const GUIDE: [&str; 5] = [
-            "Groups, in order:  -folder -image -video -audio -document -archive -program -code -hidden -png \u{2026} -other",
+            "Groups, in order (each thing goes on the first line that fits):  -folder -png -image -video -audio -document -archive -program -code -hidden \u{2026} -other",
             "Order in groups:  -newest -oldest -biggest -smallest -a_to_z -by_type  (-newest_by_day)",
-            "_first / _last: very top or bottom.  After a group, an order is its own:  -image -biggest",
+            "_first / _last: that line and the ones under it (up to a blank line) go to the very top or bottom.  After a group, an order is its own:  -image -biggest",
             "Exact:  -updated_3_days  -older_than_1_year  -bigger_than_100mb  -name_has_invoice",
-            "in Downloads:  rules for one folder.   # a note.   Spaces work: newest first",
+            "One folder:  in Downloads (  with its rules on the lines under it, then  )  on a line of its own.   # a note.   Spaces work: newest first",
         ];
         let style = TextStyle::new(Color::hex(0)).size(ksize::NOTE_FONT);
         GUIDE.iter().flat_map(|g| kit::wrap(&mut self.renderer, g, &style, width)).collect()
@@ -997,10 +1022,12 @@ impl SortWindow {
                     let (a, b) = (col(sel_a.max(start)), col(sel_b.min(end)) + if sel_b > end { 0.5 } else { 0.0 });
                     r.fill_rect(Rect::new(x0 + a * cw, y, ((b - a) * cw).max(2.0), LINE_H), theme.accent_tint);
                 }
-                // The words, coloured: notes muted, "in …:" strong, order rules in the accent.
+                // The words, coloured: notes muted, "in … (", ")" and "(" strong, order rules in the
+                // accent.
                 let trimmed = row.trim_start();
-                let note = row.find('#').filter(|&i| i == 0 || row[..i].ends_with(char::is_whitespace));
-                let is_in = trimmed.len() > 3 && trimmed[..3].eq_ignore_ascii_case("in ");
+                let code = sortrecipe::strip_note(row);
+                let note = (code.len() < row.len()).then_some(code.len());
+                let is_in = trimmed.len() > 3 && trimmed.get(..3).is_some_and(|head| head.eq_ignore_ascii_case("in ")) || matches!(code.trim(), ")" | "(");
                 let mut i = 0;
                 for piece in row.split_inclusive(char::is_whitespace) {
                     let word = piece.trim_end();
@@ -1063,7 +1090,7 @@ impl SortWindow {
             let mut text = if m.line > 0 { format!("Line {}: {}", m.line, m.text) } else { m.text.clone() };
             let mut x_end = p.right();
             if let Some(fix) = &m.fix {
-                let label = format!("Fix: {fix}");
+                let label = format!("Fix: {}", m.fix_label.as_deref().unwrap_or(fix));
                 let style = TextStyle::new(theme.accent).semibold();
                 let w = r.measure(&label, &style) + 4.0;
                 let rect = Rect::new(p.right() - w, y, w, PROBLEM_H);

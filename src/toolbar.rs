@@ -426,9 +426,11 @@ impl Toolbar {
     fn sort_menu(&self, app: &AppState) -> Effect {
         let t = app.tab();
         let b = self.rect_of(Part::Sort);
-        // While the custom sort order is on, it decides (no column is checked).
+        // While the custom sort order decides here, no column is checked. (It can be on and still
+        // leave a folder it has no rules for to its column.)
         let custom = app.settings.custom_sort;
-        let key = |id, label, k| MenuItem::new(id, label).checked(t.sort == k && !custom);
+        let here = t.custom_here().is_some();
+        let key = |id, label, k| MenuItem::new(id, label).checked(t.sort == k && !here);
         Effect::Menu(Menu {
             tag: MENU_SORT,
             at: Point::new(b.x, b.bottom() + 2.0),
@@ -439,8 +441,8 @@ impl Toolbar {
                 key(3, "Type", SortKey::Type),
                 key(4, "Size", SortKey::Size),
                 MenuItem::separator(),
-                MenuItem::new(5, "Ascending").checked(!t.descending && !custom),
-                MenuItem::new(6, "Descending").checked(t.descending && !custom),
+                MenuItem::new(5, "Ascending").checked(!t.descending && !here),
+                MenuItem::new(6, "Descending").checked(t.descending && !here),
                 MenuItem::separator(),
                 MenuItem::new(8, "Custom order").checked(custom),
                 MenuItem::new(9, "Edit custom order\u{2026}"),

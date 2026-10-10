@@ -168,7 +168,9 @@ pub fn for_background(app: &AppState, at: Point, how: How) -> Effect {
     }
     let t = app.tab();
     let real = !t.path.is_empty();
-    let key = |id, label, k| MenuItem::new(id, label).checked(t.sort == k);
+    // While the custom sort order decides here, no column is checked (as in the SORT menu).
+    let custom = t.custom_here().is_some();
+    let key = |id, label, k| MenuItem::new(id, label).checked(t.sort == k && !custom);
     let sort = vec![
         key(PICK_SORT_NAME, "Name", SortKey::Name),
         key(PICK_SORT_DATE, "Date modified", SortKey::Date),
@@ -176,8 +178,8 @@ pub fn for_background(app: &AppState, at: Point, how: How) -> Effect {
         key(PICK_SORT_TYPE, "Type", SortKey::Type),
         key(PICK_SORT_SIZE, "Size", SortKey::Size),
         MenuItem::separator(),
-        MenuItem::new(PICK_ASCENDING, "Ascending").checked(!t.descending),
-        MenuItem::new(PICK_DESCENDING, "Descending").checked(t.descending),
+        MenuItem::new(PICK_ASCENDING, "Ascending").checked(!t.descending && !custom),
+        MenuItem::new(PICK_DESCENDING, "Descending").checked(t.descending && !custom),
     ];
     let mut items = vec![view_menu(app), MenuItem::submenu("Sort by", sort), MenuItem::new(PICK_REFRESH, "Refresh\tF5"), MenuItem::separator()];
     if real {
@@ -247,15 +249,17 @@ fn bin_items(app: &AppState, at: Point) -> Effect {
 fn bin_background(app: &AppState, at: Point) -> Effect {
     let t = app.tab();
     let any = !t.folder.entries.is_empty() && !t.waiting_long();
-    let key = |id, label, k| MenuItem::new(id, label).checked(t.sort == k);
+    // While the custom sort order decides here too, no column is checked.
+    let custom = t.custom_here().is_some();
+    let key = |id, label, k| MenuItem::new(id, label).checked(t.sort == k && !custom);
     let sort = vec![
         key(PICK_SORT_NAME, "Name", SortKey::Name),
         key(PICK_SORT_DATE, "Date deleted", SortKey::Date),
         key(PICK_SORT_TYPE, "Type", SortKey::Type),
         key(PICK_SORT_SIZE, "Size", SortKey::Size),
         MenuItem::separator(),
-        MenuItem::new(PICK_ASCENDING, "Ascending").checked(!t.descending),
-        MenuItem::new(PICK_DESCENDING, "Descending").checked(t.descending),
+        MenuItem::new(PICK_ASCENDING, "Ascending").checked(!t.descending && !custom),
+        MenuItem::new(PICK_DESCENDING, "Descending").checked(t.descending && !custom),
     ];
     let items = vec![
         MenuItem::new(PICK_RESTORE_ALL, "Restore all").disabled(!any),
@@ -462,7 +466,7 @@ fn opens_terminal(item: &ShellItem) -> bool {
 /// the same picture. Some apps add their item twice - PowerToys' "Rename with PowerRename" comes
 /// once from its old menu handler and once from its Windows 11 one, and Windows lists both. The
 /// repeats are left out (shellmenu.rs), so no item shows twice, in Glint's menu or Windows' own:
-/// the later copy, unless only the later one has entries in its submenu.
+/// the later copy, unless the later one has more entries in its submenu.
 /// The text always has to match: an app that gives all its items one verb (some do) keeps them
 /// all, and so does anything else that only looks alike.
 pub fn repeats(items: &[ShellItem]) -> Vec<usize> {
@@ -477,12 +481,12 @@ pub fn repeats(items: &[ShellItem]) -> Vec<usize> {
         let verbs = !b.verb.is_empty() && a.verb.eq_ignore_ascii_case(&b.verb);
         verbs || a.picture == b.picture || a.picture == PICTURE_UNKNOWN || b.picture == PICTURE_UNKNOWN
     };
-    // Of two copies, the one whose submenu already has its entries stays (an app's Windows 11 copy
-    // can bring an empty submenu that only File Explorer's own menu fills); otherwise the first.
+    // Of two copies, the one whose submenu has more entries stays (an app's Windows 11 copy brings
+    // its submenu nearly empty and fills it only when it opens); otherwise the first.
     let mut out: Vec<usize> = Vec::new();
     for i in 0..items.len() {
         let Some(j) = (0..i).find(|&j| !out.contains(&j) && same(&items[j], &items[i])) else { continue };
-        let drop = if items[j].submenu != 0 && items[j].sub_items == 0 && items[i].sub_items > 0 { j } else { i };
+        let drop = if items[j].submenu != 0 && items[i].sub_items > items[j].sub_items { j } else { i };
         out.push(drop);
     }
     out.sort_unstable();
@@ -500,6 +504,24 @@ mod tests {
         // Search results from two folders: Windows would look for the second in the first's folder.
         assert!(!one_folder(&paths(&["C:\\a\\notes.txt", "C:\\b\\notes.txt"])));
         assert!(!one_folder(&[]));
+    }
+
+    #[test]
+    fn sort_by_checks_nothing_while_the_custom_order_sorts() {
+        let checked = |custom_sort: bool, recipe: Option<&str>| {
+            let settings = crate::settings::Settings { custom_sort, sort_recipe: recipe.map(str::to_string), ..Default::default() };
+            let mut app = AppState::for_tests(settings);
+            app.tabs[0].folder.path = "C:\\t".into();
+            app.tabs[0].custom = app.custom_order();
+            let Effect::FilesMenu(m) = for_background(&app, Point::new(0.0, 0.0), How::default()) else { panic!("no menu") };
+            let sort = m.menu.items.into_iter().find(|i| i.label == "Sort by").expect("Sort by").submenu;
+            sort.into_iter().filter(|i| i.checked).map(|i| i.label).collect::<Vec<_>>()
+        };
+        assert_eq!(checked(false, None), ["Name", "Ascending"]);
+        assert!(checked(true, None).is_empty(), "the custom order decides, not a column");
+        assert!(checked(true, Some("in C:\\t (\n-newest_first\n)")).is_empty(), "its rules for this folder decide");
+        // Rules only for another folder: this one sorts by its column.
+        assert_eq!(checked(true, Some("in C:\\elsewhere (\n-newest_first\n)")), ["Name", "Ascending"]);
     }
 
     #[test]
@@ -584,6 +606,9 @@ mod tests {
         let sub = |text: &str, picture: u64, sub_items: u32| ShellItem { text: text.into(), picture, submenu: 1, sub_items, ..Default::default() };
         assert_eq!(repeats(&[sub("WinRAR", 6, 0), sub("WinRAR", 6, 9)]), vec![0]);
         assert_eq!(repeats(&[sub("WinRAR", 6, 9), sub("WinRAR", 6, 0)]), vec![1]);
+        // A placeholder that stays put doesn't make a copy win.
+        assert_eq!(repeats(&[sub("WinRAR", 6, 1), sub("WinRAR", 6, 2)]), vec![0]);
+        assert_eq!(repeats(&[sub("WinRAR", 6, 2), sub("WinRAR", 6, 2)]), vec![1]);
         assert_eq!(repeats(&[sub("Send to", 0, 0), sub("Send to", 0, 0)]), vec![1], "both empty: the first stays");
     }
 }

@@ -1082,7 +1082,7 @@ impl ListView {
             let style = if theme.buttons == ButtonStyle::Liquid { style.bold() } else { style };
             r.text(label, text_rect, &style);
             // (None while the custom sort order decides.)
-            if p.col.sort_key() == Some(tab.sort) && tab.custom.is_none() && !(this_pc && p.col == Col::Free && tab.sort != SortKey::Date) {
+            if p.col.sort_key() == Some(tab.sort) && tab.custom_here().is_none() && !(this_pc && p.col == Col::Free && tab.sort != SortKey::Date) {
                 // A small chevron beside the sorted column's title: up = A to Z / oldest first.
                 let w = r.measure(label, &style);
                 let cx = if right { text_rect.right() - w - 9.0 } else { (text_rect.x + w + 9.0).min(text_rect.right() - 4.0) };
