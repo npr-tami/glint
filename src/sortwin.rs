@@ -57,7 +57,7 @@ use crate::sortrecipe::{self, Clock, Recipe};
 use crate::theme::{size, Color, Theme};
 use crate::ui::{Menu, MenuItem, Point, Rect};
 
-pub const TITLE: &str = "Custom sort order";
+pub const TITLE: &str = "Sort order and views";
 
 /// The window's width beside the main window, in DIPs.
 const WIDTH: f32 = 470.0;
@@ -916,12 +916,13 @@ impl SortWindow {
 
     /// The compact guide, broken to fit.
     fn guide_lines(&mut self, width: f32) -> Vec<String> {
-        const GUIDE: [&str; 5] = [
+        const GUIDE: [&str; 6] = [
             "Groups, in order (each thing goes on the first line that fits):  -folder -png -image -video -audio -document -archive -program -code -hidden \u{2026} -other",
             "Order in groups:  -newest -oldest -biggest -smallest -a_to_z -by_type  (-newest_by_day)",
             "_first / _last: that line and the ones under it (up to a blank line) go to the very top or bottom.  After a group, an order is its own:  -image -biggest",
             "Exact:  -updated_3_days  -older_than_1_year  -bigger_than_100mb  -name_has_invoice",
             "One folder:  in Downloads (  with its rules on the lines under it, then  )  on a line of its own.   # a note.   Spaces work: newest first",
+            "Views:  -details -list -tree -medium_icons -large_icons -extra_large_icons.  In a folder's rules, for that folder; outside them, for every folder without its own. They work with custom sort off too.",
         ];
         let style = TextStyle::new(Color::hex(0)).size(ksize::NOTE_FONT);
         GUIDE.iter().flat_map(|g| kit::wrap(&mut self.renderer, g, &style, width)).collect()
@@ -948,7 +949,7 @@ impl SortWindow {
             kit::title_bar(r, &theme, bar);
             let x = kit::logo(r, &theme, bar);
             let color = if self.active { theme.text } else { theme.muted };
-            r.text("Sort order", Rect::new(x + 10.0, 0.0, (l.close.x - x - 10.0).max(0.0), size::TITLE_H), &TextStyle::new(color).size(13.0).semibold());
+            r.text("Sort order and views", Rect::new(x + 10.0, 0.0, (l.close.x - x - 10.0).max(0.0), size::TITLE_H), &TextStyle::new(color).size(13.0).semibold());
             let hot = self.hover == Some(Hot::Close);
             kit::close_button(r, &theme, l.close, hot, hot && self.pressed == Some(Hot::Close), self.active);
             // A hairline down the side it shares with the main window.
@@ -1022,8 +1023,8 @@ impl SortWindow {
                     let (a, b) = (col(sel_a.max(start)), col(sel_b.min(end)) + if sel_b > end { 0.5 } else { 0.0 });
                     r.fill_rect(Rect::new(x0 + a * cw, y, ((b - a) * cw).max(2.0), LINE_H), theme.accent_tint);
                 }
-                // The words, coloured: notes muted, "in … (", ")" and "(" strong, order rules in the
-                // accent.
+                // The words, coloured: notes muted, "in … (", ")" and "(" strong, order rules and
+                // views in the accent.
                 let trimmed = row.trim_start();
                 let code = sortrecipe::strip_note(row);
                 let note = (code.len() < row.len()).then_some(code.len());
@@ -1040,7 +1041,7 @@ impl SortWindow {
                         theme.muted
                     } else if is_in {
                         theme.text_strong
-                    } else if sortrecipe::is_order_word(word) {
+                    } else if sortrecipe::is_order_word(word) || sortrecipe::is_view_word(word) {
                         theme.accent
                     } else {
                         theme.text

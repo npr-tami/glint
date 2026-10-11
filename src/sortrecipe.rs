@@ -11,6 +11,10 @@
 //!   dates) order things in every group - or in one group, when written after it on its line.
 //! - `in Downloads (` … `)` (or a full path) holds rules for that folder only; the lines after the
 //!   `)` are for every folder again. The older `in Downloads:` runs to the next `in` or the end.
+//! - **Views** (-large_icons, -details, -list, -tree…) say how a folder is shown. In a folder's
+//!   `in … (` rules they're for that folder (not its subfolders); outside them, for every folder
+//!   without a view of its own. Folders with none keep the tab's own view (VIEW, Settings). Views
+//!   work with the custom sort order on or off: they don't sort anything.
 //! - **Forgiving**: the dash is optional, spaces work instead of underscores (`newest first`), and
 //!   plain words mean rules (date, size, type, name, folders). The text stays as typed; it's only
 //!   read this way.
@@ -22,6 +26,7 @@ use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
 
 use crate::folder::{self, Entry};
+use crate::settings::ViewMode;
 
 /// A note about the rules: a mistake (that rule is skipped) or a tip.
 #[derive(Clone, Debug, PartialEq)]
@@ -135,6 +140,8 @@ struct Group {
 struct Rules {
     groups: Vec<Group>,
     orders: Vec<Order>,
+    /// How the folder is shown (-large_icons…), and the line that says so.
+    view: Option<(ViewMode, usize)>,
     line: usize,
     /// The _first / _last line the next lines are stacked under (Normal: none, after a blank line).
     stack: Place,
@@ -257,6 +264,48 @@ pub const EXACT_RULES: &[(&str, &str)] = &[
     ("-name_starts_with_", "names starting with…"),
     ("-name_ends_with_", "names ending with…"),
 ];
+
+/// Views, how a folder is shown: (rule, a few words about it).
+pub const VIEW_RULES: &[(&str, &str)] = &[
+    ("-details", "view: rows with columns"),
+    ("-list", "view: names in columns"),
+    ("-tree", "view: details, folders open in place"),
+    ("-medium_icons", "view: medium icons"),
+    ("-large_icons", "view: large icons"),
+    ("-extra_large_icons", "view: extra large icons"),
+];
+
+/// The words for the views (without "view_" before or "_view" after), and the view.
+const VIEW_WORDS: &[(&str, ViewMode)] = &[
+    ("details", ViewMode::Details),
+    ("detail", ViewMode::Details),
+    ("list", ViewMode::List),
+    ("tree", ViewMode::Tree),
+    ("medium_icons", ViewMode::Medium),
+    ("medium", ViewMode::Medium),
+    ("icons", ViewMode::Medium),
+    ("large_icons", ViewMode::Large),
+    ("large", ViewMode::Large),
+    ("big_icons", ViewMode::Large),
+    ("extra_large_icons", ViewMode::ExtraLarge),
+    ("extra_large", ViewMode::ExtraLarge),
+    ("extralarge", ViewMode::ExtraLarge),
+    ("xl_icons", ViewMode::ExtraLarge),
+    ("huge_icons", ViewMode::ExtraLarge),
+];
+
+/// The view a word (normalised) names: -large_icons, -view_details, -list_view.
+fn view_word(word: &str) -> Option<ViewMode> {
+    let w = word.strip_prefix("view_").unwrap_or(word);
+    let w = w.strip_suffix("_view").unwrap_or(w);
+    VIEW_WORDS.iter().find(|(v, _)| *v == w).map(|&(_, m)| m)
+}
+
+/// Whether a rule as written is a view (-large_icons): the editor colours those, and they take no
+/// _first / _last.
+pub fn is_view_word(raw: &str) -> bool {
+    view_word(&normalize(raw)).is_some()
+}
 
 /// The words that can follow "in" for a folder rule.
 pub const PLACE_NAMES: &[&str] = &["Downloads", "Desktop", "Documents", "Pictures", "Music", "Videos", "Home"];
@@ -416,6 +465,7 @@ fn rule_words() -> Vec<&'static str> {
     v.extend(["updated_3_days", "added_3_days", "older_than_1_year", "bigger_than_100mb", "smaller_than_1mb"]);
     v.extend(KINDS.iter().flat_map(|(_, list)| list.iter().copied()));
     v.extend(OTHER_TYPES);
+    v.extend(VIEW_WORDS.iter().map(|(w, _)| *w));
     let mut seen = std::collections::HashSet::new();
     v.retain(|w| seen.insert(*w));
     v
@@ -505,6 +555,8 @@ pub fn is_order_word(raw: &str) -> bool {
 enum Meaning {
     Order(Order),
     Group(Group),
+    /// How the folder is shown (-large_icons).
+    View(ViewMode),
     /// A word Glint recognises, written wrong (-updated_3_dys): what to write instead.
     Explained(String),
     /// _by_… on something that isn't a date order.
@@ -514,7 +566,14 @@ enum Meaning {
 
 /// What a rule word (normalised) means.
 fn meaning(word: &str, written: &str) -> Meaning {
+    if let Some(v) = view_word(word) {
+        return Meaning::View(v);
+    }
     let (rule, place, grain) = split(word);
+    if let Some(v) = view_word(&rule).filter(|_| place != Place::Normal || grain.is_some()) {
+        let w = VIEW_RULES.iter().find(|(r, _)| view_word(&r[1..]) == Some(v)).map_or("-details", |(r, _)| r);
+        return Meaning::Explained(format!("\"{written}\": a view is just {w}, without _first, _last or _by_\u{2026}"));
+    }
     let rule = alias(&rule).to_string();
     if let Some((key, desc)) = order_word(&rule) {
         let descending = desc ^ (place == Place::Last);
@@ -1047,7 +1106,7 @@ impl Recipe {
         let mut tips = Vec::new();
         check_useless(&r.everywhere, "", &mut tips);
         for (_, label, rules) in &r.folders {
-            if rules.groups.is_empty() && rules.orders.is_empty() {
+            if rules.groups.is_empty() && rules.orders.is_empty() && rules.view.is_none() {
                 tips.push(Message { line: rules.line, text: format!("\"in {label}\" has no rules in it yet."), error: false, span: None, fix: None, fix_label: None });
             }
             check_useless(rules, &format!(" (in {label})"), &mut tips);
@@ -1075,6 +1134,16 @@ impl Recipe {
     pub fn applies(&self, folder: &str) -> bool {
         let rules = self.rules_for(folder);
         !rules.groups.is_empty() || !rules.orders.is_empty()
+    }
+
+    /// How this folder is shown, when the rules say: its own "in …" view, else the view for every
+    /// folder. None for This PC (no path) and for folders the rules give no view.
+    pub fn view_for(&self, folder: &str) -> Option<ViewMode> {
+        if folder.is_empty() {
+            return None;
+        }
+        let own = self.folders.iter().find(|(p, ..)| same_path(p, folder)).and_then(|(_, _, r)| r.view);
+        own.or(self.everywhere.view).map(|(v, _)| v)
     }
 
     /// Whether the rules for this folder have groups (the preview then shows group headings).
@@ -1212,7 +1281,7 @@ fn close_earlier(r: &mut Recipe, open: &mut Option<(String, usize)>, line: usize
 /// Whether a word as written is a rule (a group or an order).
 fn is_rule(raw: &str) -> bool {
     let word = normalize(raw);
-    matches!(meaning(&word, &word), Meaning::Order(_) | Meaning::Group(_))
+    matches!(meaning(&word, &word), Meaning::Order(_) | Meaning::Group(_) | Meaning::View(_))
 }
 
 /// Notes start with # (or //) and are left out.
@@ -1263,7 +1332,7 @@ fn joined_len(tokens: &[Token], i: usize) -> usize {
     }
     for n in (2..=most).rev() {
         let word = tokens[i..i + n].iter().map(|t| normalize(t.text)).collect::<Vec<_>>().join("_");
-        if let Meaning::Order(_) | Meaning::Group(_) = meaning(&word, &word) {
+        if let Meaning::Order(_) | Meaning::Group(_) | Meaning::View(_) = meaning(&word, &word) {
             // "name has screenshot newest" is "name has screenshot", then "newest".
             let name_words = ["name_has_", "name_contains_", "name_starts_with_", "name_ends_with_"];
             if let Some(prefix) = name_words.iter().find(|p| word.starts_with(*p)) {
@@ -1327,6 +1396,19 @@ fn read_line(tokens: &[Token], line: usize, into: &mut Rules, messages: &mut Vec
                 line_groups.push(add_group(into, g, &written, line, span, messages));
                 last_was_order = false;
             }
+            Meaning::View(v) => match into.view {
+                // The first view written is the one (a later one is left out, like a second order
+                // rule for the same thing).
+                Some((first, at)) => {
+                    let text = if first == v {
+                        format!("{written}: the view is already {} (line {at}), so this one does nothing.", first.name().to_lowercase())
+                    } else {
+                        format!("{written}: line {at} already says {}, so this one is left out (one view per folder).", first.name().to_lowercase())
+                    };
+                    say(messages, text, false, None);
+                }
+                None => into.view = Some((v, line)),
+            },
             Meaning::Explained(text) | Meaning::BadGrain(text) => say(messages, text, true, None),
             Meaning::Unknown => {
                 let (rule, place, grain) = split(&word);
@@ -1583,6 +1665,9 @@ pub const STARTER: &str = "# My sort order. Lines starting with # are notes.
 in Downloads (
 -newest_first
 )
+
+# Views work the same way: -large_icons (or -details, -list, -tree...) in a
+# folder's rules opens that folder with large icons.
 ";
 
 /// "Start from…": ready-made sort orders (name, text).
@@ -2042,5 +2127,81 @@ mod tests {
         let monday = clock().day(NOW) - 2; // 7 October 2026 is a Wednesday
         assert_eq!(monday.div_euclid(7), clock().day(NOW).div_euclid(7));
         assert_ne!((monday - 1).div_euclid(7), monday.div_euclid(7));
+    }
+
+    #[test]
+    fn views_are_read_for_one_folder_or_every_folder() {
+        let r = Recipe::parse("-a_to_z\n\nin C:\\pics (\n-large_icons\n-newest_first\n)\nin C:\\code (\n-by_type\n)\n");
+        assert!(!r.has_errors(), "{:?}", r.messages);
+        assert_eq!(r.view_for("C:\\pics"), Some(ViewMode::Large));
+        assert_eq!(r.view_for("c:\\PICS\\"), Some(ViewMode::Large), "case and a last backslash don't matter");
+        assert_eq!(r.view_for("C:\\pics\\2026"), None, "not its subfolders");
+        assert_eq!(r.view_for("C:\\code"), None, "rules without a view");
+        assert_eq!(r.view_for("C:\\other"), None);
+        assert_eq!(r.view_for(""), None, "This PC");
+        assert!(r.applies("C:\\pics"), "its sort rules still sort");
+        // Outside the folders' rules: for every folder without a view of its own.
+        let r = Recipe::parse("-details\nin C:\\pics (\n-extra_large_icons\n)\nin C:\\code (\n-by_type\n)\n");
+        assert_eq!(r.view_for("C:\\pics"), Some(ViewMode::ExtraLarge));
+        assert_eq!(r.view_for("C:\\code"), Some(ViewMode::Details), "a folder's rules without a view keep the one for every folder");
+        assert_eq!(r.view_for("C:\\other"), Some(ViewMode::Details));
+    }
+
+    #[test]
+    fn a_view_alone_sorts_nothing() {
+        // A folder with only a view: it's sorted by its column, as before, and isn't "empty".
+        let r = Recipe::parse("in C:\\pics (\n-large_icons\n)\n");
+        assert!(r.messages.is_empty(), "{:?}", r.messages);
+        assert!(!r.applies("C:\\pics") && !r.has_groups("C:\\pics"));
+        assert_eq!(r.view_for("C:\\pics"), Some(ViewMode::Large));
+        // One line works too (marked, like other rules).
+        let r = Recipe::parse("in C:\\pics (-tree)");
+        assert_eq!(r.view_for("C:\\pics"), Some(ViewMode::Tree));
+    }
+
+    #[test]
+    fn views_can_be_written_many_ways() {
+        for (text, view) in [
+            ("-details", ViewMode::Details),
+            ("details", ViewMode::Details),
+            ("-list", ViewMode::List),
+            ("-tree", ViewMode::Tree),
+            ("-medium_icons", ViewMode::Medium),
+            ("medium icons", ViewMode::Medium),
+            ("-large-icons", ViewMode::Large),
+            ("-large", ViewMode::Large),
+            ("large icons -newest_first", ViewMode::Large),
+            ("-Extra_Large_Icons", ViewMode::ExtraLarge),
+            ("extra large icons", ViewMode::ExtraLarge),
+            ("-view_list", ViewMode::List),
+            ("-details_view", ViewMode::Details),
+        ] {
+            let r = Recipe::parse(&format!("in C:\\x (\n{text}\n)"));
+            assert!(!r.has_errors(), "{text}: {:?}", r.messages);
+            assert_eq!(r.view_for("C:\\x"), Some(view), "{text}");
+        }
+        // The rules after a view on its line still count.
+        let r = Recipe::parse("-large_icons -newest_first");
+        assert!(r.applies("C:\\x"));
+        // A view rule in VIEW_RULES (the guide, the suggestions) reads as itself.
+        for (rule, _) in VIEW_RULES {
+            assert!(is_view_word(rule) && Recipe::parse(rule).messages.is_empty(), "{rule}");
+        }
+    }
+
+    #[test]
+    fn view_mistakes_are_explained() {
+        // A typo: "did you mean".
+        let r = Recipe::parse("in C:\\x (\n-larg_icons\n)");
+        let m = r.messages.iter().find(|m| m.error).expect("a mistake");
+        assert_eq!(m.fix.as_deref(), Some("-large_icons"), "{m:?}");
+        assert_eq!(r.view_for("C:\\x"), None);
+        // _first on a view.
+        let r = Recipe::parse("-details_first");
+        assert!(r.has_errors() && r.messages[0].text.contains("-details"), "{:?}", r.messages);
+        // Two views for one folder: the first one is it.
+        let r = Recipe::parse("in C:\\x (\n-list\n-tree\n)");
+        assert_eq!(r.view_for("C:\\x"), Some(ViewMode::List));
+        assert!(!r.has_errors() && r.messages.iter().any(|m| m.line == 3 && m.text.contains("one view per folder")), "{:?}", r.messages);
     }
 }

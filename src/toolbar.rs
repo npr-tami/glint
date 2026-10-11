@@ -47,11 +47,13 @@ const MENU_SETTINGS: u32 = 2;
 const MENU_HIDDEN: u32 = 3;
 /// Right-click on the path.
 const MENU_PATH: u32 = 4;
-/// VIEW's menu: the views (from VIEW_FIRST, in `ViewMode::ALL`'s order) and two switches.
+/// VIEW's menu: the views (from VIEW_FIRST, in `ViewMode::ALL`'s order), the view rules and two
+/// switches.
 const MENU_VIEW: u32 = 5;
 const VIEW_FIRST: u32 = 1;
 const VIEW_SIDEBAR: u32 = 20;
 const VIEW_STATUS_BAR: u32 = 21;
+const VIEW_RULES: u32 = 22;
 
 /// The SETTINGS button's right-click menu: what the Settings window doesn't have, and a shortcut to
 /// its About page.
@@ -451,8 +453,8 @@ impl Toolbar {
         })
     }
 
-    /// VIEW: the six views (the tab's is checked) with Explorer's keys, and the sidebar and status
-    /// bar switches.
+    /// VIEW: the six views (the tab's is checked) with Explorer's keys, the views for folders (in
+    /// the custom sort order's editor), and the sidebar and status bar switches.
     fn view_menu(&self, app: &AppState) -> Effect {
         let b = self.rect_of(Part::View);
         let mut items: Vec<MenuItem> = ViewMode::ALL
@@ -460,6 +462,8 @@ impl Toolbar {
             .enumerate()
             .map(|(i, (v, name))| MenuItem::new(VIEW_FIRST + i as u32, &format!("{name}\tCtrl+Shift+{}", i + 1)).checked(app.tab().view_mode == *v))
             .collect();
+        items.push(MenuItem::separator());
+        items.push(MenuItem::new(VIEW_RULES, "Views for folders\u{2026}"));
         items.push(MenuItem::separator());
         items.push(MenuItem::new(VIEW_SIDEBAR, "Sidebar\tCtrl+B").checked(app.settings.show_sidebar));
         items.push(MenuItem::new(VIEW_STATUS_BAR, "Status bar").checked(app.settings.show_status_bar));
@@ -824,6 +828,7 @@ impl Component for Toolbar {
             (MENU_SORT, 8) => Effect::Command(Command::SetCustomSort(!app.settings.custom_sort)),
             (MENU_SORT, 9) => Effect::Command(Command::OpenSortEditor),
             (MENU_SETTINGS, _) => self.settings_pick(item),
+            (MENU_VIEW, VIEW_RULES) => Effect::Command(Command::OpenSortEditor),
             (MENU_VIEW, VIEW_SIDEBAR) => Effect::Command(Command::ToggleSidebar),
             (MENU_VIEW, VIEW_STATUS_BAR) => Effect::Command(Command::ShowStatusBar(!app.settings.show_status_bar)),
             (MENU_VIEW, n) => match n.checked_sub(VIEW_FIRST).and_then(|i| ViewMode::ALL.get(i as usize)) {

@@ -57,7 +57,7 @@ impl AppState {
             }
             // From the right, so the first Ctrl+Shift+T brings back the leftmost.
             for (index, t) in old.into_iter().enumerate().rev().filter(|_| seen) {
-                self.closed.push(ClosedTab { index, path: t.path, back: t.back, forward: t.forward, sort: t.sort, descending: t.descending, view: t.view_mode });
+                self.closed.push(ClosedTab { index, path: t.path, back: t.back, forward: t.forward, sort: t.sort, descending: t.descending, view: t.own_view });
             }
             let extra = self.closed.len().saturating_sub(CLOSED_TABS_KEPT);
             self.closed.drain(..extra);

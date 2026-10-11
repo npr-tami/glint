@@ -103,6 +103,9 @@ pub struct Tab {
     /// decides where folders go (folders_first is left alone), in folders it has rules for (see
     /// `custom_here`).
     pub custom: Option<Arc<Recipe>>,
+    /// The same rules, read for their views (-large_icons…), whether the custom sort order is on or
+    /// off: a folder they give a view is shown that way (`own_view` elsewhere).
+    pub views: Option<Arc<Recipe>>,
     /// Searching the folder's subfolders for the filter text (search.rs): while this is set,
     /// `folder` holds the results (each with its full path as `target`) and the folder's own
     /// listing waits in the search.
@@ -137,9 +140,12 @@ pub struct Tab {
     pub rename_request: Option<RenameRequest>,
     /// Waiting for the item Windows' "New ›" makes, to open its name box (app/files.rs).
     appear: Option<files::Appear>,
-    /// How the list shows this tab: details, list, icons or tree (the VIEW button). Remembered
-    /// with the tab.
+    /// How the list shows this tab now: details, list, icons or tree (the VIEW button, or the view
+    /// rules for this folder).
     pub view_mode: ViewMode,
+    /// The tab's own view, for folders the view rules say nothing about (the VIEW button picked in
+    /// one of those, Settings' View). Remembered with the tab.
+    pub own_view: ViewMode,
     /// The folders open in the tree view, whose items follow the folder's own in `folder.entries`
     /// (app/tree.rs).
     pub tree: Tree,
@@ -176,6 +182,7 @@ impl Tab {
             show_system: false,
             folders_first: true,
             custom: None,
+            views: None,
             search: None,
             opens_file: None,
             visible_total: 0,
@@ -191,6 +198,7 @@ impl Tab {
             rename_request: None,
             appear: None,
             view_mode: ViewMode::Details,
+            own_view: ViewMode::Details,
             tree: Tree::default(),
             lines: None,
         }
@@ -504,7 +512,7 @@ impl AppState {
             tab.sort = settings::sort_key(saved.sort_column);
             tab.descending = saved.sort_descending;
             if let Some(v) = saved.view {
-                tab.view_mode = v;
+                tab.set_own_view(v);
             }
             app.tabs.push(tab);
         }
@@ -563,7 +571,8 @@ impl AppState {
         tab.show_system = self.settings.show_system;
         tab.folders_first = self.settings.folders_first;
         tab.custom = self.custom_order();
-        tab.view_mode = self.settings.view;
+        tab.views = Some(self.view_rules());
+        tab.set_own_view(self.settings.view);
         tab
     }
 
@@ -583,7 +592,7 @@ impl AppState {
         s.tabs = self
             .tabs
             .iter()
-            .map(|t| SavedTab { path: t.path.clone(), sort_column: settings::sort_number(t.sort), sort_descending: t.descending, view: Some(t.view_mode) })
+            .map(|t| SavedTab { path: t.path.clone(), sort_column: settings::sort_number(t.sort), sort_descending: t.descending, view: Some(t.own_view) })
             .collect();
         s.active_tab = self.active;
         s.sort_column = settings::sort_number(self.tab().sort);
@@ -660,17 +669,34 @@ impl AppState {
         self.settings.custom_sort.then(|| sortrecipe::cached(self.settings.sort_recipe.as_deref().unwrap_or(sortrecipe::STARTER)))
     }
 
+    /// The rules as read for their views (-large_icons…): the custom sort order's text, used
+    /// whether sorting by it is on or off.
+    pub fn view_rules(&self) -> Arc<Recipe> {
+        sortrecipe::cached(self.settings.sort_recipe.as_deref().unwrap_or(sortrecipe::STARTER))
+    }
+
     /// Turns the custom sort order on or off, with new rules when `recipe` is given (the sort
-    /// editor, the SORT menu, Settings), and sorts every tab again at once.
+    /// editor, the SORT menu, Settings), and sorts every tab again at once. New rules also show
+    /// each tab's folder in the view they give it (or the tab's own, when they no longer give one).
     pub fn set_custom_sort(&mut self, on: bool, recipe: Option<String>) {
         if let Some(text) = recipe {
             self.settings.sort_recipe = Some(text);
         }
         self.settings.custom_sort = on;
         let custom = self.custom_order();
+        let views = self.view_rules();
+        let mut views_changed = false;
         for t in &mut self.tabs {
             t.custom = custom.clone();
+            // (Only when the rules changed: turning sorting on or off keeps a view picked by hand.)
+            if !t.views.as_ref().is_some_and(|v| Arc::ptr_eq(v, &views)) {
+                t.views = Some(views.clone());
+                views_changed |= tree::follow_view_rules(t);
+            }
             t.rebuild_view();
+        }
+        if views_changed {
+            self.sync_branch_watch();
         }
         self.tab_mut().reveal_focus = true;
     }
@@ -913,7 +939,8 @@ impl AppState {
         let at = if self.tabs.is_empty() { 0 } else { self.active + 1 };
         let mut tab = self.make_tab(path);
         if let Some(cur) = self.tabs.get(self.active) {
-            (tab.sort, tab.descending, tab.view_mode) = (cur.sort, cur.descending, cur.view_mode);
+            (tab.sort, tab.descending) = (cur.sort, cur.descending);
+            tab.set_own_view(cur.own_view);
         }
         self.tabs.insert(at, tab);
         self.active = at;
@@ -923,9 +950,10 @@ impl AppState {
     /// A copy of tab `i` (folder, history, sort) right after it, made active.
     fn duplicate_tab(&mut self, i: usize) {
         let Some(src) = self.tabs.get(i) else { return };
-        let (path, back, forward, sort, descending, view) = (src.path.clone(), src.back.clone(), src.forward.clone(), src.sort, src.descending, src.view_mode);
+        let (path, back, forward, sort, descending, view) = (src.path.clone(), src.back.clone(), src.forward.clone(), src.sort, src.descending, src.own_view);
         let mut tab = self.make_tab(path);
-        (tab.back, tab.forward, tab.sort, tab.descending, tab.view_mode) = (back, forward, sort, descending, view);
+        (tab.back, tab.forward, tab.sort, tab.descending) = (back, forward, sort, descending);
+        tab.set_own_view(view);
         self.tabs.insert(i + 1, tab);
         self.active = i + 1;
         self.start_load(i + 1);
@@ -936,7 +964,7 @@ impl AppState {
             return;
         }
         let t = self.tabs.remove(i);
-        self.closed.push(ClosedTab { index: i, path: t.path, back: t.back, forward: t.forward, sort: t.sort, descending: t.descending, view: t.view_mode });
+        self.closed.push(ClosedTab { index: i, path: t.path, back: t.back, forward: t.forward, sort: t.sort, descending: t.descending, view: t.own_view });
         if self.closed.len() > CLOSED_TABS_KEPT {
             self.closed.remove(0);
         }
@@ -953,7 +981,8 @@ impl AppState {
         };
         let at = c.index.min(self.tabs.len());
         let mut tab = self.make_tab(c.path);
-        (tab.back, tab.forward, tab.sort, tab.descending, tab.view_mode) = (c.back, c.forward, c.sort, c.descending, c.view);
+        (tab.back, tab.forward, tab.sort, tab.descending) = (c.back, c.forward, c.sort, c.descending);
+        tab.set_own_view(c.view);
         self.tabs.insert(at, tab);
         self.active = at;
         self.start_load(at);
@@ -1447,7 +1476,8 @@ impl AppState {
     fn open_tab_behind(&mut self, path: String) {
         let mut tab = self.make_tab(path);
         if let Some(cur) = self.tabs.get(self.active) {
-            (tab.sort, tab.descending, tab.view_mode) = (cur.sort, cur.descending, cur.view_mode);
+            (tab.sort, tab.descending) = (cur.sort, cur.descending);
+            tab.set_own_view(cur.own_view);
         }
         self.tabs.insert((self.active + 1).min(self.tabs.len()), tab);
     }
@@ -1785,6 +1815,12 @@ fn apply_listing(t: &mut Tab, folder: Folder) {
     let focus_name = t.focus.filter(|_| refresh).and_then(|i| t.folder.entries.get(i)).map(|e| e.key());
     if folder.path != t.folder.path {
         t.tree.clear(); // another folder: nothing in it is open in the tree yet
+        // Another folder: the view the rules give it, or the tab's own.
+        let view = t.view_for(&folder.path);
+        if t.view_mode != view {
+            t.view_mode = view;
+            t.lines = None; // (a step means something else in another view)
+        }
     }
     t.folder = folder;
     // The folders open in the tree view: their items come after the folder's own again.
@@ -2175,5 +2211,82 @@ mod tests {
         a.run(Command::SortBy(SortKey::Name));
         assert!(!a.settings.custom_sort && a.tab().custom.is_none());
         assert_eq!(shown(a.tab()), ["a.txt", "b.txt", "c.txt"], "A to Z, as a first click on Name sorts");
+    }
+
+    /// A tab at C:\\x with these view rules (whether custom sort is on or off).
+    fn with_views(rules: &str, custom_sort: bool) -> AppState {
+        let mut a = AppState::for_tests(Settings { custom_sort, sort_recipe: Some(rules.into()), ..Default::default() });
+        a.hidden = true; // (no folder watch in a test)
+        let views = a.view_rules();
+        a.tabs[0].views = Some(views);
+        a
+    }
+
+    fn open(a: &mut AppState, path: &str) {
+        apply_listing(a.tab_mut(), Folder { path: path.into(), entries: vec![file("a.txt")], ..Default::default() });
+    }
+
+    #[test]
+    fn a_folder_with_a_view_rule_is_shown_that_way() {
+        let mut a = with_views("in C:\\pics (\n-large_icons\n)\n", false);
+        open(&mut a, "C:\\x");
+        assert_eq!(a.tab().view_mode, ViewMode::Details, "no rule: the tab's own");
+        open(&mut a, "C:\\pics");
+        assert_eq!(a.tab().view_mode, ViewMode::Large, "with custom sort off too");
+        open(&mut a, "C:\\pics\\2026");
+        assert_eq!(a.tab().view_mode, ViewMode::Details, "subfolders don't get it");
+        // The VIEW button in a folder without a rule: the tab's own view, for every such folder.
+        a.set_view(ViewMode::List);
+        assert_eq!((a.tab().view_mode, a.tab().own_view), (ViewMode::List, ViewMode::List));
+        open(&mut a, "C:\\pics");
+        assert_eq!(a.tab().view_mode, ViewMode::Large);
+        // In the folder with the rule: just for now.
+        a.set_view(ViewMode::Tree);
+        assert_eq!((a.tab().view_mode, a.tab().own_view), (ViewMode::Tree, ViewMode::List));
+        assert!(a.note().is_some_and(|n| n.contains("for now")));
+        open(&mut a, "C:\\x");
+        assert_eq!(a.tab().view_mode, ViewMode::List);
+        open(&mut a, "C:\\pics");
+        assert_eq!(a.tab().view_mode, ViewMode::Large, "the rule again");
+        // Saved with the tab: its own view, not the rule's.
+        assert_eq!(a.snapshot().tabs[0].view, Some(ViewMode::List));
+        // A refresh keeps a view picked by hand.
+        a.set_view(ViewMode::Medium);
+        open(&mut a, "C:\\pics");
+        assert_eq!(a.tab().view_mode, ViewMode::Medium);
+    }
+
+    #[test]
+    fn new_view_rules_show_at_once() {
+        let mut a = with_views("-a_to_z\n", true);
+        open(&mut a, "C:\\x");
+        // Typed in the editor: the folder on screen follows.
+        a.set_custom_sort(true, Some("-a_to_z\nin C:\\x (\n-extra_large_icons\n)\n".into()));
+        assert_eq!(a.tab().view_mode, ViewMode::ExtraLarge);
+        // Custom sort turned off (a column click): views stay, and so does one picked by hand.
+        a.set_view(ViewMode::List);
+        a.set_custom_sort(false, None);
+        assert_eq!(a.tab().view_mode, ViewMode::List);
+        // The rule taken out: the tab's own view again.
+        a.set_custom_sort(false, Some("-a_to_z\n".into()));
+        assert_eq!(a.tab().view_mode, ViewMode::Details);
+    }
+
+    #[test]
+    fn settings_view_leaves_folders_with_a_view_rule_alone() {
+        let mut a = with_views("in C:\\pics (\n-large_icons\n)\n", false);
+        open(&mut a, "C:\\pics");
+        a.set_view_everywhere(ViewMode::List);
+        assert_eq!((a.tab().view_mode, a.tab().own_view), (ViewMode::Large, ViewMode::List));
+        open(&mut a, "C:\\x");
+        assert_eq!(a.tab().view_mode, ViewMode::List);
+        // A view for every folder: everything but the folders with their own.
+        let mut a = with_views("-details\nin C:\\pics (\n-large_icons\n)\n", false);
+        a.set_view_everywhere(ViewMode::Medium);
+        open(&mut a, "C:\\x");
+        assert_eq!(a.tab().view_mode, ViewMode::Details);
+        // The Recycle Bin keeps the tab's own.
+        open(&mut a, crate::recycle::LOCATION);
+        assert_eq!(a.tab().view_mode, ViewMode::Medium);
     }
 }

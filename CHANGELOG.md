@@ -12,6 +12,20 @@ Each new number counts as newer than the one before it (1.0.12-beta.1, 1.0.12-be
 1.0.13-beta.1, ...), so the updater offers them in that order. Versions up to 0.11.0 used
 MAJOR.MINOR.PATCH, where a new feature bumped the middle number.
 
+## 1.0.13-beta.1 (2026-10-11): a view for each folder
+
+- **Folders can have a view of their own**: in the custom sort order (VIEW > Views for folders...,
+  or SORT > Edit custom order...), put a view in a folder's rules, and that folder always opens
+  that way, while the others keep the view you picked with VIEW. For example, a line
+  `in Pictures (`, then `-large_icons` on the next line, then `)` on a line of its own shows
+  Pictures with large icons.
+  The views are `-details`, `-list`, `-tree`, `-medium_icons`, `-large_icons` and
+  `-extra_large_icons` (spaces work too: `large icons`). A view written outside any folder's rules
+  is for every folder without a view of its own. A folder's subfolders don't get its view. Views
+  work even with the custom sort order switched off, since they don't sort anything.
+- **Picking a view with VIEW in such a folder** is just for now: the folder's own view comes back
+  the next time you open it. Elsewhere, VIEW changes the tab's view as before.
+
 ## 1.0.12-beta.1 (2026-10-11): new version numbers
 
 - **Version numbers have a new form**: 1.0.12-beta.1 is the release after 0.11.0. Every new

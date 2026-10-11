@@ -17,7 +17,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::folder;
-use crate::sortrecipe::{self, EXACT_RULES, GROUP_RULES, ORDER_RULES, PLACE_NAMES};
+use crate::sortrecipe::{self, EXACT_RULES, GROUP_RULES, ORDER_RULES, PLACE_NAMES, VIEW_RULES};
 
 /// One suggestion: what replaces the word being typed, what the list shows, and a few words about it.
 #[derive(Clone, Debug, PartialEq)]
@@ -185,7 +185,7 @@ pub fn complete(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str
     if let Some(cut) = norm.rfind('_') {
         let (base, partial) = (&norm[..cut], &norm[cut..]);
         let order = sortrecipe::is_order_word(base);
-        let group = !order && !base.is_empty() && sortrecipe::Recipe::parse(&format!("-{base}")).messages.is_empty();
+        let group = !order && !base.is_empty() && !sortrecipe::is_view_word(base) && sortrecipe::Recipe::parse(&format!("-{base}")).messages.is_empty();
         if order || group {
             let mut ends: Vec<(&str, &str)> = if order { vec![("_first", "this end first"), ("_last", "turned around")] } else { vec![("_first", "at the very top"), ("_last", "at the very bottom")] };
             let date = order && ["newest", "oldest", "date", "modified", "latest", "created"].iter().any(|d| base.starts_with(d));
@@ -197,7 +197,7 @@ pub fn complete(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str
         }
     }
     // Rule words.
-    for (rule, hint) in GROUP_RULES.iter().chain(ORDER_RULES).chain(EXACT_RULES) {
+    for (rule, hint) in GROUP_RULES.iter().chain(ORDER_RULES).chain(EXACT_RULES).chain(VIEW_RULES) {
         let w = &rule[1..];
         items.push((w.to_string(), Suggestion { insert: format!("{dash}{w}"), label: rule.to_string(), hint: hint.to_string() }));
     }
@@ -276,6 +276,15 @@ mod tests {
 
     fn labels(c: &Completion) -> Vec<&str> {
         c.items.iter().map(|s| s.label.as_str()).collect()
+    }
+
+    #[test]
+    fn views_are_suggested() {
+        let c = at_end("in Downloads (\n-larg");
+        assert_eq!(c.items[0].insert, "-large_icons");
+        assert!(labels(&at_end("-ext")).contains(&"-extra_large_icons"));
+        // A view takes no _first / _last.
+        assert!(!labels(&at_end("-large_icons_")).iter().any(|l| l.ends_with("_first")));
     }
 
     #[test]

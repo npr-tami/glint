@@ -22,6 +22,8 @@ Direct2D, so it opens instantly, stays out of your way and needs nothing install
 - **Custom sort order**: write your own order, like `-folder_first -newest_first -image`, or rules for
   one folder between `in Downloads (` and `)` (the lines after the `)` are for every folder), with
   **suggestions as you type** and a live preview. A folder with no rules sorts by its column.
+- **A view for each folder**: put `-large_icons` (or `-details`, `-list`, `-tree`…) in a folder's rules and it
+  always opens that way; the other folders keep the view you picked.
 - **Your default file explorer**, if you like: folders, drives and Win+E open in Glint.
 - **Background mode**: closing the window keeps Glint ready in the tray, so the next window opens
   instantly. It can start with Windows too.

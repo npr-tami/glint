@@ -236,6 +236,27 @@ impl Tab {
         }
     }
 
+    /// The view the view rules give a folder, if any. (The Recycle Bin and This PC have none.)
+    fn ruled_view(&self, folder: &str) -> Option<ViewMode> {
+        self.views.as_ref().filter(|_| !recycle::is_bin(folder)).and_then(|r| r.view_for(folder))
+    }
+
+    /// The view for a folder shown in this tab: the one the view rules give it, else the tab's own.
+    pub fn view_for(&self, folder: &str) -> ViewMode {
+        self.ruled_view(folder).unwrap_or(self.own_view)
+    }
+
+    /// Whether the view rules give the folder on screen a view of its own.
+    pub fn view_ruled(&self) -> bool {
+        self.ruled_view(&self.folder.path).is_some()
+    }
+
+    /// The tab's own view, shown now too (a new or restored tab, before its folder is read).
+    pub fn set_own_view(&mut self, mode: ViewMode) {
+        self.own_view = mode;
+        self.view_mode = mode;
+    }
+
     /// Whether entry `index` is a folder open in the tree.
     pub fn is_expanded(&self, index: usize) -> bool {
         self.tree.is_open() && self.folder.entries.get(index).is_some_and(|e| e.is_container() && self.tree.has(&e.path_in(&self.folder.path)))
@@ -277,22 +298,36 @@ impl BranchWatch {
 impl AppState {
     /// The VIEW button, Ctrl+Shift+1 to 6, right-click > View: the tab on screen shows its items
     /// this way (new tabs opened from it too). Leaving the tree view closes its open folders.
+    ///
+    /// In a folder the view rules give a view (-large_icons in its "in … (" rules), the pick is just
+    /// for now: the rules' view comes back when the folder is opened again. Elsewhere it's the
+    /// tab's own view, for every folder the rules say nothing about.
     pub fn set_view(&mut self, mode: ViewMode) {
         let t = self.tab_mut();
         if t.view_mode == mode {
             return;
         }
         change_view(t, mode);
+        let ruled = t.view_ruled();
+        if !ruled {
+            t.own_view = mode;
+        }
         let n = ViewMode::ALL.iter().position(|(v, _)| *v == mode).unwrap_or(0) + 1;
-        self.say(format!("{} (Ctrl+Shift+{n})", mode.name()));
+        if ruled {
+            self.say(format!("{} (Ctrl+Shift+{n}) for now: the view rules give this folder its own view", mode.name()));
+        } else {
+            self.say(format!("{} (Ctrl+Shift+{n})", mode.name()));
+        }
     }
 
     /// The Settings window's "View": every open tab shows its items this way (and new windows and
     /// tabs without a view of their own do, from `settings.view`).
+    /// Folders the view rules give a view keep it.
     pub fn set_view_everywhere(&mut self, mode: ViewMode) {
         self.settings.view = mode;
-        for t in self.tabs.iter_mut().filter(|t| t.view_mode != mode) {
-            change_view(t, mode);
+        for t in &mut self.tabs {
+            t.own_view = mode;
+            follow_view_rules(t);
         }
         self.sync_branch_watch();
     }
@@ -488,6 +523,17 @@ impl AppState {
     }
 }
 
+/// Shows the tab's folder in the view it should have now (the rules', or the tab's own). Returns
+/// whether that changed it.
+pub(super) fn follow_view_rules(t: &mut Tab) -> bool {
+    let want = t.view_for(&t.folder.path);
+    if t.view_mode == want {
+        return false;
+    }
+    change_view(t, want);
+    true
+}
+
 /// A tab changes its view: the scroll starts at the top (it means something else in another
 /// view), the cursor is shown, and leaving the tree view closes its open folders.
 fn change_view(t: &mut Tab, mode: ViewMode) {
@@ -531,7 +577,7 @@ mod tests {
 
     fn tab() -> Tab {
         let mut t = Tab::new(1, "C:\\x".into());
-        t.view_mode = ViewMode::Tree;
+        t.set_own_view(ViewMode::Tree);
         apply_listing(&mut t, listing("C:\\x", &["b.txt", "src/", "a.txt", "docs/"]));
         t
     }

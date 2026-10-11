@@ -447,7 +447,7 @@ fn appearance(f: &Facts) -> Vec<Item> {
             choice(
                 "View",
                 "View",
-                Some("Changes every tab"),
+                Some("Every tab, but folders with a view of their own keep it (VIEW \u{203a} Views for folders)"),
                 &[(S("details"), "Details"), (S("list"), "List"), (S("medium"), "Medium icons"), (S("large"), "Large icons"), (S("extralarge"), "Extra large icons"), (S("tree"), "Tree")],
             ),
             choice("Size", "Row size", None, &[(S("small"), "Small"), (S("medium"), "Medium"), (S("large"), "Large")]),

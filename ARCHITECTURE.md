@@ -65,7 +65,7 @@ All code is in `src/`.
 | `app/skins.rs` | Using a skin: picking one, light and dark versions, applying changes. |
 | `folder.rs` | The disk: reading folders, drives, sorting, the filter's rules, formatting sizes and dates, path helpers. |
 | `search.rs` | Searching subfolders for the filter text on a thread of its own. |
-| `sortrecipe.rs` | The custom sort order language: groups, `_first` / `_last`, `in <folder> (` … `)` (or the older `in <folder>:`), typo hints. |
+| `sortrecipe.rs` | The custom sort order language: groups, `_first` / `_last`, `in <folder> (` … `)` (or the older `in <folder>:`), views per folder (`-large_icons`), typo hints. |
 | `complete.rs` | Suggestions while typing a sort order. |
 | `sortwin.rs` | The sort editor window, with its live preview and presets. |
 | `watch.rs` | Watching the folder on screen (ReadDirectoryChangesW), folding bursts of changes into one. |
