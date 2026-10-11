@@ -12,6 +12,13 @@ Each new number counts as newer than the one before it (1.0.12-beta.1, 1.0.12-be
 1.0.13-beta.1, ...), so the updater offers them in that order. Versions up to 0.11.0 used
 MAJOR.MINOR.PATCH, where a new feature bumped the middle number.
 
+## 1.0.14-beta.1 (2026-10-11): a simpler sort order window
+
+- **The sort order window is simpler** (SORT > Edit custom order..., or VIEW > Views for
+  folders...): the preview is gone, since the folder beside it already shows the result as you
+  type, so the rules box gets the whole window. The guide stays hidden until you click GUIDE; it
+  then shows at the bottom, starting with an example.
+
 ## 1.0.13-beta.1 (2026-10-11): a view for each folder
 
 - **Folders can have a view of their own**: in the custom sort order (VIEW > Views for folders...,

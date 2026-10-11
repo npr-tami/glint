@@ -800,8 +800,9 @@ pub struct Settings {
     pub column_widths: Option<Vec<f32>>,
     /// The last one-time settings upgrade step done.
     pub upgraded: i32,
-    /// The sort order editor's guide is hidden.
-    pub sort_guide_hidden: bool,
+    /// The sort order editor's guide is shown (GUIDE; hidden at first). (Older versions wrote
+    /// "SortGuideHidden", shown at first: it's left out, so everyone starts with it hidden.)
+    pub sort_guide_shown: bool,
     /// The skin editor's guide is hidden.
     pub theme_guide_hidden: bool,
     /// The group Glint Minimal's icon rail shows: quick | pinned | pc.
@@ -866,7 +867,7 @@ impl Default for Settings {
             sidebar_width: 0,
             column_widths: None,
             upgraded: 0,
-            sort_guide_hidden: false,
+            sort_guide_shown: false,
             theme_guide_hidden: false,
             rail_group: RailGroup::Quick,
             logo: LogoStyle::Box,
@@ -1640,7 +1641,7 @@ mod tests {
             ("Upgraded", serde_json::json!(0)),
             ("CustomSort", serde_json::json!(false)),
             ("SortRecipe", Value::Null),
-            ("SortGuideHidden", serde_json::json!(false)),
+            ("SortGuideShown", serde_json::json!(false)),
             ("ThemeGuideHidden", serde_json::json!(false)),
             ("StayRunning", serde_json::json!(true)),
             ("TrayIcon", serde_json::json!(true)),

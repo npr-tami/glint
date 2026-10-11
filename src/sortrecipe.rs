@@ -97,6 +97,8 @@ struct Order {
     key: Key,
     descending: bool,
     grain: Option<Grain>,
+    /// How it reads ("newest first"), for the tests' group headings.
+    #[cfg_attr(not(test), allow(dead_code))]
     text: String,
 }
 
@@ -1146,13 +1148,15 @@ impl Recipe {
         own.or(self.everywhere.view).map(|(v, _)| v)
     }
 
-    /// Whether the rules for this folder have groups (the preview then shows group headings).
+    /// Whether the rules for this folder have groups.
+    #[cfg(test)]
     pub fn has_groups(&self, folder: &str) -> bool {
         !self.rules_for(folder).groups.is_empty()
     }
 
-    /// The preview's heading for an item's group: its name, and its own order if it has one
+    /// A heading for an item's group: its name, and its own order if it has one
     /// ("pictures  ·  biggest first").
+    #[cfg(test)]
     pub fn group_heading(&self, e: &Entry, folder: &str, clock: &Clock) -> String {
         match group_of(self.rules_for(folder), e, clock).1 {
             None => "everything else".into(),
@@ -1165,11 +1169,6 @@ impl Recipe {
     #[cfg(test)]
     pub fn group_name(&self, e: &Entry, folder: &str, clock: &Clock) -> String {
         group_of(self.rules_for(folder), e, clock).1.map_or_else(|| "everything else".into(), |g| g.label.clone())
-    }
-
-    /// Which group each item goes in, as a number: the same number, the same group.
-    pub fn group_number(&self, e: &Entry, folder: &str, clock: &Clock) -> i64 {
-        group_of(self.rules_for(folder), e, clock).0
     }
 
     /// Sorts `view` (indexes into `entries`) the way the rules for `folder` say.
@@ -1610,6 +1609,7 @@ fn group_index(rules: &Rules, e: &Entry, clock: &Clock) -> (i64, Option<usize>) 
     (tier + i as i64, Some(i))
 }
 
+#[cfg(test)]
 fn group_of<'a>(rules: &'a Rules, e: &Entry, clock: &Clock) -> (i64, Option<&'a Group>) {
     let (pos, g) = group_index(rules, e, clock);
     (pos, g.map(|g| &rules.groups[g]))

@@ -9,17 +9,15 @@
 //!   takes one, Up / Down pick, Esc closes the list.
 //! - **Problems** under it: the line's mistake first; one with a fix ("did you mean -newest?")
 //!   is a link that fixes it.
-//! - **The switch** (custom sort on or off), **START FROM…** (ready-made orders) and a compact
-//!   guide that can be hidden ("SortGuideHidden").
-//! - **A preview** of the folder on screen sorted by the rules, with a heading for each group
-//!   ("pictures  ·  newest first"). Example files when no folder is open.
+//! - **The switch** (custom sort on or off), **START FROM…** (ready-made orders) and **GUIDE**,
+//!   which shows a short guide at the bottom (hidden at first; "SortGuideShown"). The rules box
+//!   takes the rest of the window: the main window beside it shows the result.
 //!
-//! Every change is used a moment after typing stops (PREVIEW_TIMER): the preview, every open tab,
-//! and settings.json ("SortRecipe"). Like the skin customiser, its state lives in the main window's
+//! Every change is used a moment after typing stops (APPLY_TIMER): every open tab, and
+//! settings.json ("SortRecipe"). Like the skin customiser, its state lives in the main window's
 //! state and its messages go through the main window's guard; menus, showing and closing come back
 //! as a [`Job`].
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use windows::core::{w, PCWSTR};
@@ -47,13 +45,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::app::AppState;
 use crate::complete::{self, Completion, Lister, Place};
-use crate::folder::{self, Entry, EntryKind};
+use crate::folder::{self, EntryKind};
 use crate::frame;
 use crate::kit::{self, size as ksize, Look};
 use crate::log;
 use crate::render::{Align, FrameResult, Renderer, TextStyle};
 use crate::shell;
-use crate::sortrecipe::{self, Clock, Recipe};
+use crate::sortrecipe::{self, Recipe};
 use crate::theme::{size, Color, Theme};
 use crate::ui::{Menu, MenuItem, Point, Rect};
 
@@ -68,7 +66,8 @@ const LINE_H: f32 = 19.0;
 const BOX_PAD: f32 = 8.0;
 const PROBLEM_H: f32 = 18.0;
 const GUIDE_LINE: f32 = 16.0;
-const ROW_H: f32 = 22.0;
+/// The guide's example lines: the rules box's font, a little smaller.
+const GUIDE_MONO: f32 = 11.5;
 const POPUP_ROW: f32 = 22.0;
 const POPUP_MAX: usize = 8;
 const POPUP_W: f32 = 330.0;
@@ -77,15 +76,13 @@ const PROBLEM_RED: Color = Color::hex(0xe5484d);
 
 /// A folder's subfolders were listed for the suggestions (complete::Lister).
 const WM_APP_LISTED: u32 = WM_APP + 86;
-/// Typing stopped: use the rules (preview, tabs, settings).
+/// Typing stopped: use the rules (tabs, settings).
 const APPLY_TIMER: usize = 1;
 const APPLY_DELAY_MS: u32 = 250;
-/// Looks for a new folder on screen in the main window (the preview follows it).
+/// Looks for a new folder on screen in the main window (its subfolders are suggested after "in").
 const WATCH_TIMER: usize = 2;
 const WATCH_MS: u32 = 400;
 const MENU_START_FROM: u32 = 1;
-/// How many items the preview shows at most.
-const PREVIEW_MAX: usize = 400;
 
 /// Something the main window does for this window after the message.
 #[derive(Clone, Debug)]
@@ -129,13 +126,6 @@ enum Hot {
     Suggestion(usize),
 }
 
-/// A line of the preview.
-#[derive(Clone, Debug)]
-enum Row {
-    Heading(String),
-    Item { name: String, folder: bool, date: String, size: String },
-}
-
 /// Where everything is, worked out before each frame.
 #[derive(Clone, Copy, Debug, Default)]
 struct Layout {
@@ -146,7 +136,6 @@ struct Layout {
     editor: Rect,
     problems: Rect,
     guide: Rect,
-    preview: Rect,
 }
 
 pub struct SortWindow {
@@ -183,16 +172,22 @@ pub struct SortWindow {
     /// The text last used (in the tabs and settings.json).
     applied: String,
     apply_due: bool,
-    /// The preview: its rows, scroll, what it shows and what it was made from.
-    rows: Vec<Row>,
-    preview_scroll: kit::Scroller,
-    preview_title: String,
+    /// The folder on screen when the suggestions' places were made (they follow it).
     seen: Option<Seen>,
     /// The problems' links, as last drawn: (where, message number).
     fixes: Vec<(Rect, usize)>,
     /// Suggestions' rows, as last drawn.
     suggestion_rects: Vec<Rect>,
     flips: kit::Flips,
+}
+
+/// The GUIDE button's words: it shows the guide, or hides it.
+fn guide_label(app: &AppState) -> &'static str {
+    if app.settings.sort_guide_shown {
+        "HIDE GUIDE"
+    } else {
+        "GUIDE"
+    }
 }
 
 /// Registers the window class (once; registering again just fails harmlessly).
@@ -304,9 +299,6 @@ pub fn create(owner: HWND, app: &AppState) -> Option<SortWindow> {
             places: Vec::new(),
             lister: Lister::default(),
             apply_due: false,
-            rows: Vec::new(),
-            preview_scroll: kit::Scroller::default(),
-            preview_title: String::new(),
             seen: None,
             fixes: Vec::new(),
             suggestion_rects: Vec::new(),
@@ -319,7 +311,7 @@ pub fn create(owner: HWND, app: &AppState) -> Option<SortWindow> {
         }
         window.renderer.resize(rc.right as u32, rc.bottom as u32);
         window.places = places(app);
-        window.make_preview(app);
+        window.seen = Some(seen(app.tab()));
         let _ = SetTimer(Some(hwnd), WATCH_TIMER, WATCH_MS, None);
         Some(window)
     }
@@ -389,16 +381,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
-/// What the preview was made from: the folder on screen (which tab, where, how many items, when
-/// it was read), and how that tab sorts and what it shows (in a folder the rules don't cover, the
-/// preview follows its column).
-type Seen = ((u64, String, usize, u64), (folder::SortKey, bool, bool, bool, bool));
+/// The folder on screen: which tab, where, how many items, when it was read.
+type Seen = (u64, String, usize, u64);
 
 fn seen(tab: &crate::app::Tab) -> Seen {
-    (
-        (tab.id, tab.folder.path.clone(), tab.folder.entries.len(), tab.load_ms.map_or(0, f64::to_bits)),
-        (tab.sort, tab.descending, tab.folders_first, tab.show_hidden, tab.show_system),
-    )
+    (tab.id, tab.folder.path.clone(), tab.folder.entries.len(), tab.load_ms.map_or(0, f64::to_bits))
 }
 
 /// The folders "in" can be followed by: the user's places, pinned folders, the open tabs' folders,
@@ -424,46 +411,6 @@ fn places(app: &AppState) -> Vec<Place> {
         out.push(Place { name: d.name.clone(), path: d.root.clone(), hint: "Drive".into() });
     }
     out
-}
-
-/// Example files for the preview when no folder is open.
-fn examples(now: u64) -> Vec<Entry> {
-    const MIN: u64 = 600_000_000;
-    const HOUR: u64 = 60 * MIN;
-    const DAY: u64 = 24 * HOUR;
-    let make = |name: &str, folder: bool, size: u64, ago: u64| Entry {
-        name: name.into(),
-        lower: name.to_lowercase(),
-        kind: if folder { EntryKind::Folder } else { EntryKind::File },
-        size,
-        modified: now.saturating_sub(ago),
-        created: now.saturating_sub(ago).saturating_sub(HOUR),
-        attributes: 0,
-        ext: if folder { String::new() } else { folder::extension(name) },
-        type_name: Arc::from(if folder { "File folder".to_string() } else { format!("{} File", folder::extension(name).to_uppercase()) }),
-        target: None,
-        free: 0,
-    };
-    vec![
-        make("Projects", true, 0, 12 * DAY),
-        make("Photos 2026", true, 0, 3 * HOUR),
-        make("Old stuff", true, 0, 300 * DAY),
-        make("setup.exe", false, 84_000_000, HOUR),
-        make("report.pdf", false, 1_200_000, 5 * HOUR),
-        make("notes.txt", false, 2_000, 20 * MIN),
-        make("holiday.jpg", false, 3_400_000, DAY),
-        make("screenshot.png", false, 900_000, 4 * DAY),
-        make("design.psd", false, 90_000_000, DAY + 2 * HOUR),
-        make("budget.xlsx", false, 45_000, 3 * DAY),
-        make("script.ps1", false, 4_000, 2 * DAY),
-        make("archive.zip", false, 250_000_000, 9 * DAY),
-        make("clip.mp4", false, 120_000_000, 15 * DAY),
-        make("song.mp3", false, 6_100_000, 40 * DAY),
-        make("Work.lnk", false, 1_000, 60 * DAY),
-        make("installer.msi", false, 30_000_000, 20 * DAY),
-        make("taxes 2024.pdf", false, 310_000, 400 * DAY),
-        make("Screenshot 2026-09-30.png", false, 1_400_000, 7 * DAY),
-    ]
 }
 
 /// Reads the clipboard's text (None when there's none).
@@ -798,7 +745,6 @@ impl SortWindow {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), APPLY_TIMER);
         }
-        self.make_preview(app);
         if self.text == self.applied {
             return Vec::new();
         }
@@ -808,67 +754,12 @@ impl SortWindow {
         vec![Ask::RedrawMain]
     }
 
-    /// The preview: the folder on screen (or example files) sorted by the rules as typed.
-    fn make_preview(&mut self, app: &AppState) {
-        let tab = app.tab();
-        let clock = Clock::now();
-        let real = !tab.folder.path.is_empty() && !tab.folder.entries.is_empty() && !crate::recycle::is_bin(&tab.folder.path);
-        let (entries, path) = if real { (tab.folder.entries.clone(), tab.folder.path.clone()) } else { (examples(clock.now), String::new()) };
-        let mut view: Vec<u32> = (0..entries.len() as u32).filter(|&i| real.then_some(&entries[i as usize]).is_none_or(|e| e.is_visible(tab.show_hidden, tab.show_system))).collect();
-        // No rules for this folder (only "in …" rules, for other folders): it keeps its column's
-        // order, as in the list. (The example files get the rules for every folder.)
-        let ruled = self.recipe.applies(&path);
-        if ruled {
-            self.recipe.sort(&entries, &mut view, &path, &clock);
-        } else {
-            folder::sort_view(&entries, &mut view, tab.sort, tab.descending, tab.folders_first);
-        }
-        let groups = ruled && self.recipe.has_groups(&path);
-        self.rows.clear();
-        let mut last = None;
-        for &i in view.iter().take(PREVIEW_MAX) {
-            let e = &entries[i as usize];
-            if groups {
-                let g = self.recipe.group_number(e, &path, &clock);
-                if last != Some(g) {
-                    last = Some(g);
-                    self.rows.push(Row::Heading(self.recipe.group_heading(e, &path, &clock)));
-                }
-            }
-            let folder = e.is_container();
-            let date = folder::format_date_as(e.modified, crate::settings::DateFormat::Relative);
-            let size = if folder { String::new() } else { folder::format_size(e.size) };
-            self.rows.push(Row::Item { name: e.name.clone(), folder, date, size });
-        }
-        self.preview_title = if real {
-            let name = folder::file_name(&path).to_string();
-            match self.recipe.folder_label(&path) {
-                Some(label) if ruled => format!("Preview  \u{00b7}  {name}  (in {label})"),
-                Some(label) => format!("Preview  \u{00b7}  {name}  (in {label}: no rules yet, sorted by its column)"),
-                None if !ruled => format!("Preview  \u{00b7}  {name}  (no rules for it: sorted by its column)"),
-                None => format!("Preview  \u{00b7}  {name}"),
-            }
-        } else if !ruled {
-            "Preview  \u{00b7}  example files  (no rules for every folder: sorted by the column)".into()
-        } else {
-            "Preview  \u{00b7}  example files".into()
-        };
-        if view.len() > PREVIEW_MAX {
-            self.preview_title.push_str(&format!("  \u{00b7}  first {PREVIEW_MAX}"));
-        }
-        self.seen = Some(seen(tab));
-    }
-
-    /// WATCH_TIMER: another folder on screen (or it changed, or it's sorted another way): the
-    /// preview and the folders follow.
+    /// WATCH_TIMER: another folder on screen (or it changed): its subfolders are suggested.
     fn watch(&mut self, app: &AppState) {
         let now = seen(app.tab());
         if self.seen.as_ref() != Some(&now) {
-            if self.seen.as_ref().is_none_or(|s| s.0 != now.0) {
-                self.places = places(app);
-            }
-            self.make_preview(app);
-            self.invalidate();
+            self.places = places(app);
+            self.seen = Some(now);
         }
     }
 
@@ -881,24 +772,25 @@ impl SortWindow {
         l.switch = Rect::new(PAD, y + 4.0, ksize::TOGGLE_W, ksize::TOGGLE_H);
         let bw = kit::button_width(&mut self.renderer, "START FROM\u{2026}");
         l.start_from = Rect::new(w - PAD - bw, y, bw, ksize::BUTTON_H);
-        if app.settings.sort_guide_hidden {
-            let gw = kit::button_width(&mut self.renderer, "GUIDE");
-            l.guide_button = Rect::new(l.start_from.x - 8.0 - gw, y, gw, ksize::BUTTON_H);
-        }
+        let gw = kit::button_width(&mut self.renderer, guide_label(app));
+        l.guide_button = Rect::new(l.start_from.x - 8.0 - gw, y, gw, ksize::BUTTON_H);
         y += ksize::BUTTON_H + 12.0;
-        let rest = h - y - PAD;
-        let editor_h = (rest * 0.36).clamp(7.0 * LINE_H, 16.0 * LINE_H) + 2.0 * BOX_PAD;
-        l.editor = Rect::new(PAD, y, w - 2.0 * PAD, editor_h);
-        y += editor_h + 6.0;
-        let problems = self.shown_problems().len().min(3);
-        l.problems = Rect::new(PAD, y, w - 2.0 * PAD, problems as f32 * PROBLEM_H);
-        y += l.problems.h + if problems > 0 { 8.0 } else { 2.0 };
-        if !app.settings.sort_guide_hidden {
-            let lines = self.guide_lines(w - 2.0 * PAD).len();
-            l.guide = Rect::new(PAD, y, w - 2.0 * PAD, 22.0 + lines as f32 * GUIDE_LINE);
-            y += l.guide.h + 10.0;
+        // From the bottom up: the guide (when shown, at most half the window), the problems, and
+        // the rules box in all the rest.
+        let mut bottom = h - PAD;
+        if app.settings.sort_guide_shown {
+            let lines = self.guide_lines(w - 2.0 * PAD).len() as f32;
+            let gh = (22.0 + lines * GUIDE_LINE).min(((bottom - y) * 0.5).max(22.0 + 3.0 * GUIDE_LINE));
+            bottom -= gh;
+            l.guide = Rect::new(PAD, bottom, w - 2.0 * PAD, gh);
+            bottom -= 10.0;
         }
-        l.preview = Rect::new(PAD, y, w - 2.0 * PAD, (h - y - 8.0).max(0.0));
+        let problems = self.shown_problems().len().min(3);
+        let ph = problems as f32 * PROBLEM_H;
+        bottom -= ph;
+        l.problems = Rect::new(PAD, bottom, w - 2.0 * PAD, ph);
+        bottom -= if problems > 0 { 6.0 } else { 0.0 };
+        l.editor = Rect::new(PAD, y, w - 2.0 * PAD, (bottom - y).max(4.0 * LINE_H + 2.0 * BOX_PAD));
         self.lay = l;
     }
 
@@ -914,18 +806,37 @@ impl SortWindow {
         v
     }
 
-    /// The compact guide, broken to fit.
-    fn guide_lines(&mut self, width: f32) -> Vec<String> {
-        const GUIDE: [&str; 6] = [
-            "Groups, in order (each thing goes on the first line that fits):  -folder -png -image -video -audio -document -archive -program -code -hidden \u{2026} -other",
-            "Order in groups:  -newest -oldest -biggest -smallest -a_to_z -by_type  (-newest_by_day)",
-            "_first / _last: that line and the ones under it (up to a blank line) go to the very top or bottom.  After a group, an order is its own:  -image -biggest",
-            "Exact:  -updated_3_days  -older_than_1_year  -bigger_than_100mb  -name_has_invoice",
-            "One folder:  in Downloads (  with its rules on the lines under it, then  )  on a line of its own.   # a note.   Spaces work: newest first",
-            "Views:  -details -list -tree -medium_icons -large_icons -extra_large_icons.  In a folder's rules, for that folder; outside them, for every folder without its own. They work with custom sort off too.",
+    /// The guide, broken to fit: (line, whether it's an example line, in the rules box's font).
+    fn guide_lines(&mut self, width: f32) -> Vec<(String, bool)> {
+        // An example first (lines starting with "|", shown as typed), then the words.
+        const GUIDE: &[&str] = &[
+            "For example:",
+            "|in Downloads (",
+            "|newest_first      # newest at the top",
+            "|folder_last       # folders at the bottom",
+            "|)",
+            "|in Pictures (",
+            "|large_icons       # opens with large icons",
+            "|newest_first",
+            "|)",
+            "A folder's rules go between \"in <folder> (\" and \")\". Rules outside them are for every other folder.",
+            "Sort:  newest, oldest, biggest, smallest, a_to_z, by_type",
+            "Kinds:  folder, image, video, music, document, program, other (everything else)",
+            "A sort on its own line is for everything. After a kind, on the same line, it's just for that kind:  folder a_to_z",
+            "Add _first or _last to put a kind at the very top or bottom:  folder_first",
+            "View:  details, list, tree, medium_icons, large_icons, extra_large_icons",
+            "More:  updated_first, bigger_than_100mb, name_has_invoice, newest_by_day",
+            "A line starting with # is a note.",
         ];
         let style = TextStyle::new(Color::hex(0)).size(ksize::NOTE_FONT);
-        GUIDE.iter().flat_map(|g| kit::wrap(&mut self.renderer, g, &style, width)).collect()
+        let mut out = Vec::new();
+        for g in GUIDE {
+            match g.strip_prefix('|') {
+                Some(code) => out.push((code.to_string(), true)),
+                None => out.extend(kit::wrap(&mut self.renderer, g, &style, width).into_iter().map(|l| (l, false))),
+            }
+        }
+        out
     }
 
     fn paint(&mut self, app: &mut AppState) {
@@ -934,7 +845,7 @@ impl SortWindow {
         }
         self.layout(app);
         let now = self.now();
-        let mut more = self.preview_scroll.tick(now) | self.flips.tick(now);
+        let mut more = self.flips.tick(now);
         if !self.renderer.begin() {
             return;
         }
@@ -966,25 +877,33 @@ impl SortWindow {
             let label = if on { "Custom sort is on" } else { "Off: the columns decide" };
             r.text(label, Rect::new(l.switch.right() + 10.0, l.switch.y - 4.0, 200.0, l.switch.h + 8.0), &TextStyle::new(theme.text));
             kit::button(r, &theme, l.start_from, "START FROM\u{2026}", start_look);
-            if l.guide_button.w > 0.0 {
-                kit::button(r, &theme, l.guide_button, "GUIDE", guide_look);
-            }
+            kit::button(r, &theme, l.guide_button, guide_label(app), guide_look);
         }
         self.paint_editor(&theme);
         self.paint_problems(&theme);
         if l.guide.h > 0.0 {
             let lines = self.guide_lines(l.guide.w);
             let r = &mut self.renderer;
+            r.push_clip(l.guide);
             r.text("Guide", Rect::new(l.guide.x, l.guide.y, 100.0, 18.0), &TextStyle::new(theme.text).semibold());
-            let hide = Rect::new(l.guide.right() - 40.0, l.guide.y, 40.0, 18.0);
-            let hot = self.hover == Some(Hot::Guide);
-            r.text("Hide", hide, &TextStyle::new(if hot { theme.text } else { theme.accent }).align(Align::Right));
             let style = TextStyle::new(theme.muted).size(ksize::NOTE_FONT);
-            for (i, line) in lines.iter().enumerate() {
-                r.text(line, Rect::new(l.guide.x, l.guide.y + 22.0 + i as f32 * GUIDE_LINE, l.guide.w, GUIDE_LINE), &style);
+            let cw = r.mono_char_width(GUIDE_MONO);
+            for (i, (line, example)) in lines.iter().enumerate() {
+                let at = Rect::new(l.guide.x, l.guide.y + 22.0 + i as f32 * GUIDE_LINE, l.guide.w, GUIDE_LINE);
+                if *example {
+                    // As in the rules box: the rules in the text colour, the note after # muted.
+                    let (code, note) = line.split_at(line.find('#').unwrap_or(line.len()));
+                    r.mono_text(code, Rect::new(at.x + 8.0, at.y, at.w, at.h), GUIDE_MONO, theme.text);
+                    if !note.is_empty() {
+                        let x = at.x + 8.0 + code.chars().count() as f32 * cw;
+                        r.mono_text(note, Rect::new(x, at.y, (at.right() - x).max(0.0), at.h), GUIDE_MONO, theme.muted);
+                    }
+                } else {
+                    r.text(line, at, &style);
+                }
             }
+            r.pop_clip();
         }
-        self.paint_preview(&theme);
         self.paint_suggestions(&theme);
         if self.renderer.end() == FrameResult::DeviceLost {
             more = true;
@@ -1108,72 +1027,6 @@ impl SortWindow {
         }
     }
 
-    fn paint_preview(&mut self, theme: &Theme) {
-        let p = self.lay.preview;
-        if p.h < 40.0 {
-            return;
-        }
-        let r = &mut self.renderer;
-        r.text(&self.preview_title, Rect::new(p.x, p.y, p.w, 20.0), &TextStyle::new(theme.text).semibold());
-        let list = Rect::new(p.x, p.y + 24.0, p.w, p.h - 24.0);
-        kit::card(r, theme, list);
-        let inner = list.inset(1.0, 1.0);
-        self.preview_scroll.set_extent(self.rows.len() as f32 * ROW_H + 8.0, inner.h);
-        r.push_clip(inner);
-        let first = (self.preview_scroll.offset / ROW_H).floor().max(0.0) as usize;
-        let date_w = 110.0;
-        let size_w = 70.0;
-        // The sizes end clear of the scrollbar, however thick the skin makes it.
-        let bar = kit::Bar::of(theme);
-        let right = inner.right() - 1.0 - if theme.scrollbar_track.is_clear() { bar.w + bar.margin } else { theme.scrollbar_lane() };
-        for (i, row) in self.rows.iter().enumerate().skip(first) {
-            let y = inner.y + 4.0 + i as f32 * ROW_H - self.preview_scroll.offset;
-            if y > inner.bottom() {
-                break;
-            }
-            match row {
-                Row::Heading(text) => {
-                    // "PICTURES  biggest first": the group, then its own order in softer text.
-                    let (group, order) = text.split_once("  \u{00b7}  ").unwrap_or((text.as_str(), ""));
-                    // In a skin with sidebar panels, on a header bar like theirs.
-                    let bar = kit::panels(theme);
-                    let (group_color, order_color) = if bar { (theme.panel_header_text, theme.panel_header_text.with_alpha(theme.panel_header_text.a * 0.75)) } else { (theme.accent, theme.muted) };
-                    if bar {
-                        let band = Rect::new(inner.x + 4.0, y + 2.0, (inner.w - 8.0).max(0.0), ROW_H - 4.0);
-                        let radius = theme.corner(band.h).min(6.0);
-                        r.fill_paint(band, radius, &theme.panel_header);
-                        if theme.highlight.a > 0.0 {
-                            r.fill_rect(Rect::new(band.x + radius, band.y + 1.0, (band.w - 2.0 * radius).max(0.0), 1.0), theme.highlight);
-                        }
-                    }
-                    let style = TextStyle::new(group_color).semibold().size(11.5);
-                    let up = group.to_uppercase();
-                    let w = r.measure(&up, &style);
-                    r.text(&up, Rect::new(inner.x + 10.0, y, inner.w - 20.0, ROW_H), &style);
-                    if !order.is_empty() {
-                        r.text(order, Rect::new(inner.x + 18.0 + w, y, (inner.w - w - 28.0).max(0.0), ROW_H), &TextStyle::new(order_color).size(11.5));
-                    }
-                    if !bar {
-                        r.fill_rect(Rect::new(inner.x + 10.0, y + ROW_H - 2.0, inner.w - 20.0, 1.0), theme.line);
-                    }
-                }
-                Row::Item { name, folder, date, size } => {
-                    let style = TextStyle::new(theme.text);
-                    let mark = if *folder { "\u{25b8}" } else { "" };
-                    r.text(mark, Rect::new(inner.x + 12.0, y, 12.0, ROW_H), &TextStyle::new(theme.muted).size(10.0));
-                    r.text(name, Rect::new(inner.x + 26.0, y, (right - size_w - date_w - inner.x - 26.0).max(0.0), ROW_H), &if *folder { style.semibold() } else { style });
-                    r.text(date, Rect::new(right - size_w - date_w, y, date_w, ROW_H), &TextStyle::new(theme.muted).size(11.0));
-                    r.text(size, Rect::new(right - size_w, y, size_w, ROW_H), &TextStyle::new(theme.muted).size(11.0).align(Align::Right));
-                }
-            }
-        }
-        if self.rows.is_empty() {
-            r.text("Nothing here", inner.inset(12.0, 0.0), &TextStyle::new(theme.muted));
-        }
-        r.pop_clip();
-        kit::scrollbar(r, theme, bar.track(list), &self.preview_scroll, false);
-    }
-
     /// The list under the cursor's line: up to eight suggestions, each with a few words.
     fn paint_suggestions(&mut self, theme: &Theme) {
         self.suggestion_rects.clear();
@@ -1259,7 +1112,7 @@ impl SortWindow {
         if l.start_from.contains(p) {
             return Some(Hot::StartFrom);
         }
-        if l.guide_button.contains(p) || (l.guide.h > 0.0 && Rect::new(l.guide.right() - 40.0, l.guide.y, 40.0, 18.0).contains(p)) {
+        if l.guide_button.contains(p) {
             return Some(Hot::Guide);
         }
         if let Some((_, i)) = self.fixes.iter().find(|(r, _)| r.contains(p)) {
@@ -1313,7 +1166,7 @@ impl SortWindow {
                 asks.push(Ask::Job(Job::Menu(Menu { tag: MENU_START_FROM, at: Point::new(b.right(), b.bottom() + 2.0), items, right_aligned: true })));
             }
             Some(Hot::Guide) => {
-                app.settings.sort_guide_hidden = !app.settings.sort_guide_hidden;
+                app.settings.sort_guide_shown = !app.settings.sort_guide_shown;
             }
             Some(Hot::Fix(i)) => self.fix(i, app),
             Some(Hot::Editor) => {
@@ -1368,9 +1221,6 @@ impl SortWindow {
             let lines = self.text.matches('\n').count() as f32 + 1.0;
             let max = (lines * LINE_H - (self.lay.editor.h - 2.0 * BOX_PAD)).max(0.0);
             self.scroll.1 = (self.scroll.1 - notches * 3.0 * LINE_H).clamp(0.0, max);
-        } else {
-            let now = self.now();
-            self.preview_scroll.scroll_by(-notches * 3.0 * ROW_H, now);
         }
         self.invalidate();
     }
