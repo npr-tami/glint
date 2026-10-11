@@ -1,6 +1,6 @@
 [package]
 name = "glint"
-version = "1.0.14-beta.1"
+version = "1.0.15-beta.1"
 edition = "2021"
 description = "A fast, lightweight file explorer for Windows that draws everything itself"
 license = "MIT"

@@ -20,7 +20,8 @@ Direct2D, so it opens instantly, stays out of your way and needs nothing install
 - **Skins**: AMD Radeon, NVIDIA, Chrome and Gunmetal (with light and dark versions), or your own, made in the built-in
   **skin customiser** or in Notepad (skins are small `.glint` text files).
 - **Custom sort order**: write your own order, like `-folder_first -newest_first -image`, or rules for
-  one folder between `in Downloads (` and `)` (the lines after the `)` are for every folder), with
+  one folder between `in Downloads (` and `)` (the lines after the `)` are for every folder), the same
+  rules for several folders with `in = (` and their paths, one per line, with
   **suggestions as you type** and a live preview. A folder with no rules sorts by its column.
 - **A view for each folder**: put `-large_icons` (or `-details`, `-list`, `-tree`…) in a folder's rules and it
   always opens that way; the other folders keep the view you picked.

@@ -151,6 +151,21 @@ pub fn complete(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str
         return done;
     }
 
+    // A path on a line of its own (a folder of "in = ("): its subfolders.
+    if trimmed.contains('\\') && (trimmed.starts_with(['~', '%', '\\']) || trimmed.as_bytes().get(1) == Some(&b':')) {
+        let cut = trimmed.rfind('\\').map_or(0, |i| i + 1);
+        let (dir, partial) = trimmed.split_at(cut);
+        let mut done = Completion { start: caret - trimmed.len(), end: caret, ..Completion::default() };
+        match listed(&folder::normalize(dir)) {
+            Some(names) => {
+                let items = names.iter().map(|n| (n.clone(), Suggestion { insert: format!("{dir}{n}\\"), label: n.clone(), hint: "folder".into() })).collect();
+                done.items = rank(items, partial);
+            }
+            None => done.wants = Some(folder::normalize(dir)),
+        }
+        return done;
+    }
+
     // The word being typed (from the last space to the cursor).
     let word_start = before.rfind(is_sep).map_or(0, |i| i + before[i..].chars().next().map_or(1, char::len_utf8));
     let word = &before[word_start..];
@@ -305,6 +320,16 @@ mod tests {
         // A folder itself: its rules follow in brackets.
         let this = |text: &str| at_end(text).items.into_iter().find(|s| s.label == "(").map(|s| s.insert);
         assert_eq!(this("in C:\\").as_deref(), Some("C:\\ ("));
+    }
+
+    #[test]
+    fn folders_on_lines_of_their_own() {
+        // The folders of "in = (", one per line.
+        let c = at_end("in = (\nC:\\Us");
+        assert_eq!(labels(&c), ["Users"]);
+        assert_eq!(c.items[0].insert, "C:\\Users\\");
+        assert_eq!(at_end("in = (\n  D:\\Work\\").wants.as_deref(), Some("D:\\Work"));
+        assert!(labels(&at_end("in = (\nC:\\x\n-new")).contains(&"-newest"), "rules after them as usual");
     }
 
     #[test]

@@ -820,6 +820,7 @@ impl SortWindow {
             "|newest_first",
             "|)",
             "A folder's rules go between \"in <folder> (\" and \")\". Rules outside them are for every other folder.",
+            "Several folders, the same rules: write \"in = (\", then each folder's path on a line of its own, then the rules, then \")\".",
             "Sort:  newest, oldest, biggest, smallest, a_to_z, by_type",
             "Kinds:  folder, image, video, music, document, program, other (everything else)",
             "A sort on its own line is for everything. After a kind, on the same line, it's just for that kind:  folder a_to_z",

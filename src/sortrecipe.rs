@@ -11,6 +11,8 @@
 //!   dates) order things in every group - or in one group, when written after it on its line.
 //! - `in Downloads (` … `)` (or a full path) holds rules for that folder only; the lines after the
 //!   `)` are for every folder again. The older `in Downloads:` runs to the next `in` or the end.
+//! - `in = (` … `)` gives several folders the same rules: the lines in it that are paths (or a
+//!   folder Glint knows by name) are the folders, the others their rules.
 //! - **Views** (-large_icons, -details, -list, -tree…) say how a folder is shown. In a folder's
 //!   `in … (` rules they're for that folder (not its subfolders); outside them, for every folder
 //!   without a view of its own. Folders with none keep the tab's own view (VIEW, Settings). Views
@@ -848,6 +850,9 @@ impl Recipe {
         // A "(" whose ")" hasn't come yet: the line it ends, as written ("in Downloads ("), and its
         // number.
         let mut open: Option<(String, usize)> = None;
+        // An open "in = (": the folders listed in it so far. Its rules are read into `scratch`, and
+        // every folder gets them when it closes.
+        let mut multi: Option<Multi> = None;
         // The line before (notes and blank lines aside), when it was an "in …" line without a
         // bracket: its words ("in Downloads"), its number, where its words end (a "(" on the next
         // line belongs there) and where the line does (its notes after that are kept).
@@ -892,7 +897,7 @@ impl Recipe {
                         fix_label: Some("just )".into()),
                     });
                 }
-                close_bracket(&mut r, &mut open, &mut current, line_no, whole);
+                close_bracket(&mut r, &mut open, &mut current, &mut multi, &scratch, line_no, whole);
                 continue;
             }
             // "(" on a line of its own.
@@ -913,7 +918,7 @@ impl Recipe {
                         open = Some((format!("{words} ("), in_line));
                     }
                     None => {
-                        close_earlier(&mut r, &mut open, line_no, span, line);
+                        close_earlier(&mut r, &mut open, &mut multi, &scratch, line_no, span, line);
                         r.messages.push(Message {
                             line: line_no,
                             text: "This ( has no folder: a folder's own rules start with a line like \"in Downloads (\".".into(),
@@ -930,12 +935,48 @@ impl Recipe {
                 }
                 continue;
             }
+            // A folder of an "in = (": a path on a line of its own (or a folder Glint knows by name).
+            if let Some(m) = multi.as_mut() {
+                if let Some(written) = multi_folder(line) {
+                    match place_path(written) {
+                        Some(path) => m.folders.push((path, written.to_string(), line_no)),
+                        None => r.messages.push(Message {
+                            line: line_no,
+                            text: format!("\"{written}\" isn't a full path: write it like C:\\Users\\me\\Pictures or ~\\Pictures."),
+                            error: true,
+                            span,
+                            fix: None,
+                            fix_label: None,
+                        }),
+                    }
+                    continue;
+                }
+            }
             // "in Downloads (" … ")", or "in Downloads:" to the next "in" - rules for one folder
             // (the colon may be left out).
             if let Some(rest) = strip_in(line) {
-                close_earlier(&mut r, &mut open, line_no, span, line);
+                close_earlier(&mut r, &mut open, &mut multi, &scratch, line_no, span, line);
                 // Lines after a folder's rules don't stack under the rules for every folder above.
                 r.everywhere.stack = Place::Normal;
+                // "in = (": the same rules for several folders, listed on the lines under it.
+                if let Some(after) = rest.strip_prefix('=') {
+                    let after = after.trim();
+                    if after != "(" {
+                        r.messages.push(Message {
+                            line: line_no,
+                            text: "Write it as \"in = (\", then the folders and their rules on the lines under it, and a ) at the end.".into(),
+                            error: true,
+                            span,
+                            fix: Some("in = (".into()),
+                            fix_label: None,
+                        });
+                    }
+                    open = Some(("in = (".into(), line_no));
+                    multi = Some(Multi { line: line_no, folders: Vec::new() });
+                    current = None;
+                    scratch = Rules { line: line_no, ..Rules::default() };
+                    continue;
+                }
                 // All on one line ("in Downloads (-newest_first)"): read as meant, but marked.
                 if let Some((path, label, rules_at, rules)) = one_line_block(rest) {
                     r.messages.push(Message {
@@ -1027,7 +1068,7 @@ impl Recipe {
                     if mark == "(" {
                         // Its ")" closes it (rather than being marked too). The lines in it are
                         // still checked, but not used until it's put right.
-                        close_earlier(&mut r, &mut open, line_no, span, line);
+                        close_earlier(&mut r, &mut open, &mut multi, &scratch, line_no, span, line);
                         open = Some((line.to_string(), line_no));
                         r.everywhere.stack = Place::Normal;
                         current = None;
@@ -1057,7 +1098,7 @@ impl Recipe {
                         fix_label: Some("put the ) on its own line".into()),
                     });
                 }
-                close_bracket(&mut r, &mut open, &mut current, line_no, Some(away));
+                close_bracket(&mut r, &mut open, &mut current, &mut multi, &scratch, line_no, Some(away));
             }
             let mut close_after = None;
             if let Some(t) = tokens.last().filter(|t| t.text.ends_with(')') && !t.text.contains('(') && !is_rule(t.text)).cloned() {
@@ -1090,9 +1131,10 @@ impl Recipe {
                         fix_label: Some("put the ) on its own line".into()),
                     });
                 }
-                close_bracket(&mut r, &mut open, &mut current, line_no, Some(away));
+                close_bracket(&mut r, &mut open, &mut current, &mut multi, &scratch, line_no, Some(away));
             }
         }
+        finish_multi(&mut r, &mut multi, &scratch);
         if let Some((what, line)) = open {
             // Closing it at the end is what was meant, most likely.
             let end = text.len();
@@ -1246,8 +1288,9 @@ fn folder_rules(r: &mut Recipe, path: String, label: String, line: usize) -> usi
 
 /// A ")": the folder's rules end, and the lines after it are for every folder again. With no "("
 /// to close, it's marked, with a fix that takes it away (`away`: what goes).
-fn close_bracket(r: &mut Recipe, open: &mut Option<(String, usize)>, current: &mut Option<Option<usize>>, line: usize, away: Option<(usize, usize)>) {
+fn close_bracket(r: &mut Recipe, open: &mut Option<(String, usize)>, current: &mut Option<Option<usize>>, multi: &mut Option<Multi>, scratch: &Rules, line: usize, away: Option<(usize, usize)>) {
     if open.take().is_some() {
+        finish_multi(r, multi, scratch);
         *current = Some(None);
         r.everywhere.stack = Place::Normal;
     } else {
@@ -1264,8 +1307,9 @@ fn close_bracket(r: &mut Recipe, open: &mut Option<(String, usize)>, current: &m
 
 /// A new "(" while one is still open: the one above ends here, marked, with a fix that closes it
 /// (`written`: the new line, which the fix puts after the ")").
-fn close_earlier(r: &mut Recipe, open: &mut Option<(String, usize)>, line: usize, span: Option<(usize, usize)>, written: &str) {
+fn close_earlier(r: &mut Recipe, open: &mut Option<(String, usize)>, multi: &mut Option<Multi>, scratch: &Rules, line: usize, span: Option<(usize, usize)>, written: &str) {
     if let Some((before, _)) = open.take() {
+        finish_multi(r, multi, scratch);
         r.messages.push(Message {
             line,
             text: format!("\"{before}\" isn't closed with ) before this line, so its rules end here."),
@@ -1274,6 +1318,51 @@ fn close_earlier(r: &mut Recipe, open: &mut Option<(String, usize)>, line: usize
             fix: Some(format!(")\n{written}")),
             fix_label: Some("close the one above with )".into()),
         });
+    }
+}
+
+/// An open "in = (": its line, and the folders listed in it so far (path, as written, line).
+struct Multi {
+    line: usize,
+    folders: Vec<(String, String, usize)>,
+}
+
+/// A line of an "in = (" that names a folder rather than rules: a path ("C:\\Pictures",
+/// "~\\Pictures", "\\\\server\\share", "%USERPROFILE%\\Pictures"), or a folder Glint knows by name
+/// ("Downloads"). Returns it as written, without quotes.
+fn multi_folder(line: &str) -> Option<&str> {
+    let written = line.trim().trim_matches('"').trim();
+    let b = written.as_bytes();
+    let path = written.starts_with('~')
+        || written.starts_with("\\\\")
+        || written.starts_with('%')
+        || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b.len() == 2 || matches!(b[2], b'\\' | b'/')));
+    let named = PLACE_NAMES.iter().any(|n| n.eq_ignore_ascii_case(written));
+    (path || named).then_some(written)
+}
+
+/// An "in = (" ends: each of its folders gets its rules (added to any it has from elsewhere).
+fn finish_multi(r: &mut Recipe, multi: &mut Option<Multi>, scratch: &Rules) {
+    let Some(m) = multi.take() else { return };
+    if m.folders.is_empty() {
+        r.messages.push(Message {
+            line: m.line,
+            text: "\"in = (\" has no folders yet: put each folder's path on a line of its own under it, like ~\\Pictures.".into(),
+            error: true,
+            span: None,
+            fix: None,
+            fix_label: None,
+        });
+        return;
+    }
+    for (path, label, line) in m.folders {
+        let i = folder_rules(r, path, label, line);
+        let rules = &mut r.folders[i].2;
+        rules.groups.extend(scratch.groups.iter().cloned());
+        rules.orders.extend(scratch.orders.iter().cloned());
+        if rules.view.is_none() {
+            rules.view = scratch.view;
+        }
     }
 }
 
@@ -2203,5 +2292,34 @@ mod tests {
         let r = Recipe::parse("in C:\\x (\n-list\n-tree\n)");
         assert_eq!(r.view_for("C:\\x"), Some(ViewMode::List));
         assert!(!r.has_errors() && r.messages.iter().any(|m| m.line == 3 && m.text.contains("one view per folder")), "{:?}", r.messages);
+    }
+
+    #[test]
+    fn one_block_for_several_folders() {
+        let text = "-a_to_z\nin = (\nC:\\pics\nC:/photos/  # a note\n\"C:\\my pics\"\n-large_icons\n-newest_first\n)\nin C:\\code (\n-by_type\n)\n";
+        let r = Recipe::parse(text);
+        assert!(!r.has_errors(), "{:?}", r.messages);
+        for folder in ["C:\\pics", "C:\\photos", "C:\\my pics"] {
+            assert_eq!(r.view_for(folder), Some(ViewMode::Large), "{folder}");
+            assert_eq!(sorted_in(text, folder), sorted_in("-newest_first", folder), "{folder}");
+        }
+        assert_eq!(r.view_for("C:\\code"), None, "the next block is its own");
+        assert_eq!(sorted_in(text, "C:\\other"), sorted_in("-a_to_z", "C:\\other"), "after the ) the rules are for every folder again");
+        // A folder also written on its own gets both.
+        let r = Recipe::parse("in C:\\pics (\n-list\n)\nin = (\nC:\\pics\nC:\\x\n-large_icons\n-newest_first\n)\n");
+        assert!(!r.has_errors(), "{:?}", r.messages);
+        assert_eq!(r.view_for("C:\\pics"), Some(ViewMode::List), "the first view stays");
+        assert_eq!(r.view_for("C:\\x"), Some(ViewMode::Large));
+    }
+
+    #[test]
+    fn mistakes_in_one_block_for_several_folders() {
+        assert!(errors("in = (\n-large_icons\n)\n").iter().any(|m| m.text.contains("no folders")));
+        assert!(errors("in =\nC:\\x\n-large_icons\n)\n").iter().any(|m| m.fix.as_deref() == Some("in = (")));
+        let r = Recipe::parse("in = (\nC:\\x\n-large_icons\n");
+        assert!(r.messages.iter().any(|m| m.text.contains("isn't closed")), "{:?}", r.messages);
+        assert_eq!(r.view_for("C:\\x"), Some(ViewMode::Large), "closed at the end, as meant");
+        // A path outside "in = (" is still a mistake.
+        assert!(!errors("C:\\x\n").is_empty());
     }
 }

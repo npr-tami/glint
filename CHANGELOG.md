@@ -12,6 +12,26 @@ Each new number counts as newer than the one before it (1.0.12-beta.1, 1.0.12-be
 1.0.13-beta.1, ...), so the updater offers them in that order. Versions up to 0.11.0 used
 MAJOR.MINOR.PATCH, where a new feature bumped the middle number.
 
+## 1.0.15-beta.1 (2026-10-11): the same rules for several folders
+
+- **One set of rules for several folders**: in the custom sort order (SORT > Edit custom
+  order..., or VIEW > Views for folders...), start with `in = (`, put each folder's full path on
+  a line of its own, then the rules, and end with `)`. For example:
+
+  ```
+  in = (
+  C:\Users\me\Pictures\Wallpapers
+  ~\Documents\Photos
+  large_icons
+  newest_first
+  )
+  ```
+
+  Every folder listed gets those rules, so they don't have to be written out again for each one.
+  Paths can start with `~` (your home folder), use `/` or `\`, and have spaces. Typing a path
+  suggests the folders in it, and the guide (GUIDE) has a line about it. `in Downloads (` and the
+  other rules work as before.
+
 ## 1.0.14-beta.1 (2026-10-11): a simpler sort order window
 
 - **The sort order window is simpler** (SORT > Edit custom order..., or VIEW > Views for
