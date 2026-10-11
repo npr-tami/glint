@@ -88,7 +88,7 @@ if Glint.exe is gone). Whatever was there before is put back.
 
 ## Status: beta
 
-Glint is in beta (0.x): it's used every day, but expect rough edges. Bug reports and ideas are
+Glint is in beta (versions like 1.0.12-beta.1, see [CHANGELOG.md](CHANGELOG.md)): it's used every day, but expect rough edges. Bug reports and ideas are
 welcome in [Issues](https://github.com/npr-tami/glint/issues).
 
 The most useful keyboard shortcuts:

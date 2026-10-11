@@ -179,7 +179,15 @@ mod tests {
     fn the_resource_file_has_the_same_version() {
         let rc = include_str!("../res/glint.rc");
         assert!(rc.contains(&format!("\"FileVersion\", \"{VERSION}\"")), "res/glint.rc and Cargo.toml disagree on the version");
-        let numbers = VERSION.replace('.', ",");
-        assert!(rc.contains(&format!("FILEVERSION {numbers},0")), "FILEVERSION in res/glint.rc");
+        // Windows takes four plain numbers: MAJOR.MINOR.PATCH and the beta build ("1.0.12-beta.2" is
+        // 1,0,12,2), or 0 for a version without one.
+        let (core, pre) = VERSION.split_once('-').unwrap_or((VERSION, ""));
+        let build = pre.rsplit('.').next().filter(|n| n.parse::<u16>().is_ok()).unwrap_or("0");
+        let numbers = format!("{},{build}", core.replace('.', ","));
+        assert!(rc.contains(&format!("FILEVERSION {numbers}\n")) || rc.contains(&format!("FILEVERSION {numbers}\r\n")), "FILEVERSION in res/glint.rc");
+        assert!(rc.contains(&format!("\"ProductVersion\", \"{VERSION}\"")), "ProductVersion in res/glint.rc");
+        assert!(rc.contains(&format!("PRODUCTVERSION {numbers}\n")) || rc.contains(&format!("PRODUCTVERSION {numbers}\r\n")), "PRODUCTVERSION in res/glint.rc");
+        let manifest = include_str!("../res/glint.manifest");
+        assert!(manifest.contains(&format!("name=\"Glint\" version=\"{}.{build}\"", core)), "the version in res/glint.manifest");
     }
 }

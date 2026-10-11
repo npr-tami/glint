@@ -8,8 +8,8 @@
 
 // 1 VERSIONINFO = VS_VERSION_INFO; FILEOS 0x40004 = VOS_NT_WINDOWS32; FILETYPE 1 = VFT_APP.
 1 VERSIONINFO
-FILEVERSION 0,11,0,0
-PRODUCTVERSION 0,11,0,0
+FILEVERSION 1,0,12,1
+PRODUCTVERSION 1,0,12,1
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -20,9 +20,9 @@ BEGIN
       VALUE "FileDescription", "Glint"
       VALUE "ProductName", "Glint"
       VALUE "CompanyName", "tamara"
-      VALUE "FileVersion", "0.11.0"
+      VALUE "FileVersion", "1.0.12-beta.1"
       VALUE "LegalCopyright", "Copyright (c) 2026 tamara. MIT License."
-      VALUE "ProductVersion", "0.11.0"
+      VALUE "ProductVersion", "1.0.12-beta.1"
       VALUE "OriginalFilename", "glint.exe"
     END
   END

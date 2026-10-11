@@ -4,10 +4,12 @@
 //! and has a ready-built Glint.exe attached.
 //!
 //! **Looking** (`start_check`, on a thread of its own; nothing here ever runs on the UI thread):
-//! - GitHub is asked for the newest release (`api.github.com/repos/<owner>/<name>/releases/latest`,
-//!   which leaves out drafts and pre-releases), over HTTPS with WinHTTP: the system's proxy
-//!   settings, HTTPS certificates always checked, and a time limit on every step.
-//! - Its tag (a leading "v" left out) is compared with Glint's own version (`Version`, semver).
+//! - GitHub is asked for its recent releases (`api.github.com/repos/<owner>/<name>/releases`), over
+//!   HTTPS with WinHTTP: the system's proxy settings, HTTPS certificates always checked, and a time
+//!   limit on every step. Drafts are left out. Releases marked pre-release are left out too, unless
+//!   Glint is a beta itself ("1.0.12-beta.1"): a beta follows the betas.
+//! - The highest tag (a leading "v" left out) is compared with Glint's own version (`Version`,
+//!   semver: 1.0.12-beta.2 comes after 1.0.12-beta.1, and 1.0.12 after both).
 //!   Newer: the CHANGELOG.md sections since Glint's own version (the file as it is at that tag) go
 //!   into the prompt, or the release's own text when CHANGELOG.md can't be read.
 //! - A newer release without its Glint.exe yet (still being built) isn't offered.
@@ -166,6 +168,11 @@ impl Version {
             None => Vec::new(),
         };
         Some(Version { numbers, pre })
+    }
+
+    /// Whether this is a beta or other pre-release version ("1.0.12-beta.1").
+    pub fn is_beta(&self) -> bool {
+        !self.pre.is_empty()
     }
 }
 
@@ -656,12 +663,13 @@ fn read_latest(json: &[u8], ours: &Version) -> Found {
 }
 
 /// What GitHub's list of recent releases (`json`) means for Glint at version `ours`: the release
-/// with the highest version number, drafts and pre-releases left out, judged as `read_latest` does.
+/// with the highest version number, judged as `read_latest` does. Drafts are left out, and so are
+/// pre-releases unless `ours` is a beta itself.
 fn read_releases(json: &[u8], ours: &Version) -> Found {
     let Ok(list) = serde_json::from_slice::<Vec<ReleaseJson>>(json) else { return Found::Failed("GitHub's list of releases couldn't be read".into()) };
     let best = list
         .into_iter()
-        .filter(|r| !r.draft && !r.prerelease && valid_tag(r.tag_name.trim()))
+        .filter(|r| !r.draft && (!r.prerelease || ours.is_beta()) && valid_tag(r.tag_name.trim()))
         .filter_map(|r| Version::parse(r.tag_name.trim()).map(|v| (v, r)))
         .max_by(|a, b| a.0.cmp(&b.0));
     match best {
@@ -673,7 +681,7 @@ fn read_releases(json: &[u8], ours: &Version) -> Found {
 /// What one release means for Glint at version `ours`. A newer release's changelog is its own
 /// text for now (`whats_new` may find better).
 fn read_release(release: ReleaseJson, ours: &Version) -> Found {
-    if release.draft || release.prerelease {
+    if release.draft || release.prerelease && !ours.is_beta() {
         return Found::Unavailable("the newest release isn't out yet".into());
     }
     let tag = release.tag_name.trim();
@@ -1311,6 +1319,16 @@ mod tests {
         let draft = latest_json("v0.9.5", &exe("v0.9.5")).replace("\"draft\": false", "\"draft\": true");
         let list = format!("[{pre},{draft},{}]", latest_json("v0.9.0", &exe("v0.9.0")));
         assert!(matches!(read_releases(list.as_bytes(), &ours), Found::Newer(r) if r.version == "0.9.0"));
+        // A beta follows the betas, pre-release or not, the highest one winning.
+        let beta = v("1.0.12-beta.1");
+        let b2 = latest_json("v1.0.12-beta.2", &exe("v1.0.12-beta.2"));
+        let b10 = latest_json("v1.0.12-beta.10", &exe("v1.0.12-beta.10")).replace("\"prerelease\": false", "\"prerelease\": true");
+        let list = format!("[{b2},{b10},{draft}]");
+        assert!(matches!(read_releases(list.as_bytes(), &beta), Found::Newer(r) if r.version == "1.0.12-beta.10"));
+        assert!(matches!(read_releases(list.as_bytes(), &ours), Found::Newer(r) if r.version == "1.0.12-beta.2"));
+        assert_eq!(read_releases(format!("[{b2}]").as_bytes(), &v("1.0.12-beta.2")), Found::UpToDate("1.0.12-beta.2".into()));
+        // 0.11.0 is older than any 1.0.x beta.
+        assert!(matches!(read_releases(format!("[{b2}]").as_bytes(), &v("0.11.0")), Found::Newer(_)));
         // Nothing newer, nothing at all, or something that isn't a list.
         assert_eq!(read_releases(format!("[{}]", latest_json("v0.8.0", &exe("v0.8.0"))).as_bytes(), &ours), Found::UpToDate("0.8.0".into()));
         assert_eq!(read_releases(b"[]", &ours), Found::Unavailable("no release yet".into()));

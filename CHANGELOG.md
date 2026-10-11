@@ -2,12 +2,21 @@
 
 The newest version is at the top.
 
-**Version numbers** are MAJOR.MINOR.PATCH (semantic versioning):
-- **PATCH** (0.8.1): bug fixes only, nothing new.
-- **MINOR** (0.9.0): new features; what worked before keeps working.
-- **MAJOR** (1.0.0): changes that break something that worked before.
+**Version numbers** look like **1.0.12-beta.2** while Glint is in beta:
+- **1.0** stays the same through the betas.
+- **12** is the release: it goes up by one with every new release, features and fixes alike.
+- **-beta.2** is the build of that release: a rebuild of the same release (a quick fix to it)
+  only bumps this number.
 
-Glint stays at 0.x while it's in beta.
+Each new number counts as newer than the one before it (1.0.12-beta.1, 1.0.12-beta.2,
+1.0.13-beta.1, ...), so the updater offers them in that order. Versions up to 0.11.0 used
+MAJOR.MINOR.PATCH, where a new feature bumped the middle number.
+
+## 1.0.12-beta.1 (2026-10-11): new version numbers
+
+- **Version numbers have a new form**: 1.0.12-beta.1 is the release after 0.11.0. Every new
+  release raises the 12 by one (1.0.13-beta.1 next); a quick fix to the same release only raises
+  the beta number (1.0.12-beta.2). Settings > About shows the whole number.
 
 ## 0.11.0 (2026-10-10): the sort order you write, WinRAR's submenu in Windows 11 menu mode
 

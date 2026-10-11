@@ -540,7 +540,7 @@ fn about(f: &Facts) -> Vec<Item> {
     }
     vec![
         Item::Card(vec![
-            Row::new("@About", &format!("Glint {} (Beta)", crate::log::VERSION), Some("A lightweight file explorer for Windows. This is a beta, so some things may not work yet."), Ctl::None),
+            Row::new("@About", &format!("Glint {}", crate::log::VERSION), Some("A lightweight file explorer for Windows. This is a beta, so some things may not work yet."), Ctl::None),
             Row::new("@Update", "Updates", Some(&f.update_said), Ctl::Button(if f.update_busy { "CHECKING…".into() } else { "CHECK FOR UPDATES".into() }, Act::Update)).needs("@UpdateReady"),
             toggle("CheckForUpdates", "Check for updates automatically", None).indent(),
         ]),
