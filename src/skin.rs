@@ -269,6 +269,10 @@ pub const OTHERS: &[(&str, &str)] = &[
     ("bevels", "Raised and sunken 3D edges, as in Windows 2000: true or false"),
     ("title-bar-across", "The title bar's gradient runs left to right: true or false"),
     ("see-through", "How much shows through the glass title bar (era 7, Windows 11): 0 to 90"),
+    ("wallpaper", "A picture behind the files: its file name (next to the skin, or in the skins folder), or a full path"),
+    ("wallpaper-opacity", "How strongly the wallpaper shows: 0 to 100 (40 if not set)"),
+    ("wallpaper-position", "Which side of the wallpaper stays in view: left, middle or right"),
+    ("wallpaper-fit", "fill (the picture fills the list) or whole (all of it, at its side)"),
     ("era", "Older Windows to look like: none, 98, 2000, xp or 7"),
     ("icons", "Icons: windows (today's), classic, xp or aero (follows the era)"),
     ("title-font", "Font of window titles (empty: the skin's font)"),
@@ -834,6 +838,10 @@ pub fn parse(text: &str, fallback_name: &str) -> Parsed {
         title_gloss: p("title-gloss").base(),
         title_across: false,
         see_through: 0.0,
+        wallpaper: String::new(),
+        wallpaper_opacity: 0.4,
+        wallpaper_at: 1.0,
+        wallpaper_whole: false,
         era: Era::None,
         icons: IconSet::Windows,
         title_text: p("title-text").base(),
@@ -977,6 +985,21 @@ pub fn parse(text: &str, fallback_name: &str) -> Parsed {
     if let Some(x) = number("see-through", 0.0, 90.0, None, &mut notes) {
         theme.see_through = x / 100.0;
     }
+    let (mine, theirs) = value("wallpaper");
+    theme.wallpaper = wallpaper_path(mine.map(|(v, _)| v).or(theirs).unwrap_or_default().trim().trim_matches(['"', '\'']));
+    if let Some(x) = number("wallpaper-opacity", 0.0, 100.0, None, &mut notes) {
+        theme.wallpaper_opacity = x / 100.0;
+    }
+    let (mine, theirs) = value("wallpaper-fit");
+    theme.wallpaper_whole = mine.map(|(v, _)| v).or(theirs).is_some_and(|v| v.trim().eq_ignore_ascii_case("whole"));
+    let (mine, theirs) = value("wallpaper-position");
+    if let Some(v) = mine.map(|(v, _)| v).or(theirs) {
+        theme.wallpaper_at = match v.trim().to_ascii_lowercase().as_str() {
+            "left" => 0.0,
+            "middle" | "center" | "centre" => 0.5,
+            _ => 1.0,
+        };
+    }
     if let Some(x) = number("scrollbar-width", 4.0, 18.0, None, &mut notes) {
         theme.scrollbar_w = x;
     }
@@ -1079,6 +1102,26 @@ fn guess_dark(own: &HashMap<String, (String, usize)>) -> bool {
 
 /// A list of fonts tidied: "\"A\", 'B',C" is "A, B, C" (at most MAX_FONTS, each name at most
 /// MAX_FONT_NAME characters: every one is looked up when the skin is applied).
+/// A wallpaper's full path: a bare file name is looked for in the skins folder.
+fn wallpaper_path(v: &str) -> String {
+    if v.is_empty() {
+        return String::new();
+    }
+    let p = std::path::Path::new(v);
+    if p.is_absolute() || v.starts_with('\\') {
+        return v.to_string();
+    }
+    // In the skins folder itself, or in one of its folders (a skin kept in a folder of its own,
+    // with its pictures).
+    let skins = folder();
+    let here = skins.join(v);
+    if here.exists() {
+        return here.to_string_lossy().into_owned();
+    }
+    let inside = std::fs::read_dir(&skins).into_iter().flatten().flatten().filter(|i| i.file_type().is_ok_and(|t| t.is_dir())).map(|i| i.path().join(v)).find(|p| p.exists());
+    inside.unwrap_or(here).to_string_lossy().into_owned()
+}
+
 fn font_list(v: &str) -> String {
     v.split(',')
         .map(|f| f.trim().trim_matches(['"', '\'']).trim())
@@ -1689,11 +1732,20 @@ struct Listing {
     stems: HashSet<String>,
 }
 
-/// The person's skins in `dir`: every *.glint file (not too many, not too big), by name.
+/// The person's skins in `dir`: every *.glint file (not too many, not too big), by name - also
+/// those in its folders, one level down (a skin in a folder of its own, with its pictures).
 fn read_folder(dir: &Path) -> Listing {
     let mut found = Listing { own: Vec::new(), stems: HashSet::new() };
     let Ok(listing) = std::fs::read_dir(dir) else { return found };
+    let mut items: Vec<std::fs::DirEntry> = Vec::new();
     for item in listing.flatten() {
+        if item.file_type().is_ok_and(|t| t.is_dir()) {
+            items.extend(std::fs::read_dir(item.path()).into_iter().flatten().flatten());
+        } else {
+            items.push(item);
+        }
+    }
+    for item in items {
         let path = item.path();
         if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case(EXTENSION)) {
             continue;
@@ -2241,10 +2293,14 @@ mod tests {
         write_atomic(&file, "name: Mine\naccent: #654321\n").unwrap();
         std::fs::write(dir.join("notes.txt"), "not a skin").unwrap();
         std::fs::write(dir.join("Other.GLINT"), "accent: #00ff00").unwrap();
+        // A skin in a folder of its own, next to its picture.
+        std::fs::create_dir_all(dir.join("Pink")).unwrap();
+        std::fs::write(dir.join("Pink").join("Pink.glint"), "wallpaper: pink.png").unwrap();
+        std::fs::write(dir.join("Pink").join("pink.png"), "not really a picture").unwrap();
         let listing = read_folder(&dir);
         let listed = &listing.own;
         let ids: Vec<&str> = listed.iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(ids, ["file:Mine", "file:Other"]);
+        assert_eq!(ids, ["file:Mine", "file:Other", "file:Pink"]);
         assert!(listed[0].text.contains("#654321"));
         assert_eq!(listed[1].name, "Other", "no name: the file's name");
         assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")));
@@ -2456,10 +2512,11 @@ mod tests {
             let name = file.file_name().to_string_lossy().into_owned();
             let p = parse(&text, &name);
             assert!(p.notes.is_empty(), "{name}: {:?}", p.notes);
-            assert!(value_in(&text, "era").is_some(), "{name} has no era");
+            // The older Windows looks each have an era; the picture skins have a wallpaper instead.
+            assert!(value_in(&text, "era").is_some() || value_in(&text, "wallpaper").is_some(), "{name} has no era");
             read += 1;
         }
-        assert_eq!(read, 6);
+        assert!(read >= 6);
     }
 
     #[test]

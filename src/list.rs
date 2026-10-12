@@ -371,6 +371,9 @@ pub struct ListView {
     /// Home's page (home.rs) and whether it's on screen (at the last frame).
     home: home::Home,
     home_on: bool,
+    /// The skin's wallpaper as last loaded: its path, and the picture (None when it couldn't be
+    /// read, so it isn't tried again every frame).
+    wall: Option<(String, Option<std::sync::Arc<crate::thumbs::Picture>>)>,
 }
 
 impl Default for ListView {
@@ -429,6 +432,7 @@ impl ListView {
             list_hit: Vec::new(),
             home: home::Home::default(),
             home_on: false,
+            wall: None,
         }
     }
 
@@ -1624,6 +1628,36 @@ impl ListView {
     /// An item's picture, in the box `b`: its thumbnail (pictures, videos, PDFs: filling the box,
     /// with a thin frame) or Windows' big icon (at its own size at most) - made in the background
     /// (thumbs.rs), with the list's own icon meanwhile. Returns where it was drawn.
+    /// The skin's wallpaper, filling the list (cut to fit, keeping `wallpaper_at`'s side and its
+    /// top in view), faint enough for the names to read over it.
+    fn paint_wallpaper(&mut self, r: &mut Renderer, theme: &Theme) {
+        if theme.wallpaper.is_empty() || theme.wallpaper_opacity <= 0.0 {
+            return;
+        }
+        let stale = match &self.wall {
+            Some((path, pic)) => *path != theme.wallpaper || pic.as_ref().is_some_and(|p| p.is_lost()),
+            None => true,
+        };
+        if stale {
+            let pic = thumbs::wic_factory()
+                .and_then(|w| thumbs::decode(&w, &theme.wallpaper, 3840, 3840 * 2160, 0))
+                .and_then(|d| thumbs::Picture::new(d.width, d.height, d.pixels, false));
+            self.wall = Some((theme.wallpaper.clone(), pic));
+        }
+        let Some((_, Some(pic))) = &self.wall else { return };
+        let (w, h) = (pic.width() as f32, pic.height() as f32);
+        if theme.wallpaper_whole && w * self.rect.h / h <= self.rect.w {
+            let dw = w * self.rect.h / h;
+            let dest = Rect::new(self.rect.x + (self.rect.w - dw) * theme.wallpaper_at, self.rect.y, dw, self.rect.h);
+            r.picture(pic, dest, None, theme.wallpaper_opacity, true);
+            return;
+        }
+        let k = (self.rect.w / w).max(self.rect.h / h);
+        let (sw, sh) = (self.rect.w / k, self.rect.h / k);
+        let src = Rect::new((w - sw) * theme.wallpaper_at, 0.0, sw, sh);
+        r.picture(pic, self.rect, Some(src), theme.wallpaper_opacity, true);
+    }
+
     fn paint_picture(&self, r: &mut Renderer, theme: &Theme, app: &AppState, dir: &str, e: &Entry, b: Rect) -> Rect {
         picture(r, theme, app, dir, e, b, self.scale)
     }
@@ -2016,6 +2050,7 @@ impl Component for ListView {
         self.place_columns(app);
         r.fill_paint(self.rect, 0.0, &theme.panel_paint);
         r.push_clip(self.rect);
+        self.paint_wallpaper(r, theme);
         if self.home_on {
             let max = (self.home.layout.height - self.rect.h).max(0.0);
             let area = Rect::new(self.rect.x, self.rect.y, self.rect.w - SCROLL_GUTTER.min(12.0), self.rect.h);

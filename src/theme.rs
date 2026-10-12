@@ -573,6 +573,16 @@ pub struct Theme {
     /// How much of what is behind the window shows through 7's glass title bar, 0 (none) to 0.9
     /// (`see-through`; Windows 11 only, see frame.rs `set_glass`).
     pub see_through: f32,
+    /// A picture behind the file list and Home (`wallpaper`): its full path, or empty for none.
+    pub wallpaper: String,
+    /// How strongly it shows, 0 to 1 (`wallpaper-opacity`).
+    pub wallpaper_opacity: f32,
+    /// Which side of it stays in view when the list is narrower than the picture: 0 its left, 0.5
+    /// its middle, 1 its right (`wallpaper-position`).
+    pub wallpaper_at: f32,
+    /// Show the whole picture, as tall as the list, at `wallpaper_at`'s side, instead of filling
+    /// the list with it (`wallpaper-fit: whole`). Best for a picture on a plain background.
+    pub wallpaper_whole: bool,
 
     // ---- Older Windows. Each is off (or follows an older colour) unless the skin sets it.
     /// Which older Windows the skin dresses Glint as (`era`), and whose icons it shows (`icons`).

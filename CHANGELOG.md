@@ -12,6 +12,19 @@ Each new number counts as newer than the one before it (1.0.12-beta.1, 1.0.12-be
 1.0.13-beta.1, ...), so the updater offers them in that order. Versions up to 0.11.0 used
 MAJOR.MINOR.PATCH, where a new feature bumped the middle number.
 
+## 1.0.17-beta.1 (2026-10-12): wallpaper support for skins
+
+### New
+- Wallpaper support: a skin can now show a picture behind your files and Home.
+- Choose how strongly it shows, which side stays in view, and whether it fills the list or sits whole at one side.
+- A skin can live in a folder of its own, with its pictures next to it. Drop the folder into the skins folder and the skin shows up.
+
+### How to add a wallpaper
+- Open SETTINGS > Appearance > CUSTOMISE… and pick your skin (for a built-in one, click Duplicate first).
+- Click Open skins folder and put your picture in it.
+- Tick Show as text and add a line with the picture's name, like: wallpaper: my picture.png
+- Optional: wallpaper-opacity: 50 (0 to 100), wallpaper-position: left, middle or right, and wallpaper-fit: whole to show the whole picture at one side.
+
 ## 1.0.16-beta.1 (2026-10-12): new Home, video preview, and an easier sort window
 
 ### New
