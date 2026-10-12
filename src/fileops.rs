@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use windows::core::{implement, w, Interface, Ref, Result as WinResult, HRESULT, PCWSTR};
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
-use windows::Win32::Storage::FileSystem::{GetFileAttributesW, MoveFileExW, INVALID_FILE_ATTRIBUTES, MOVE_FILE_FLAGS};
+use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetFileAttributesW, MoveFileExW, INVALID_FILE_ATTRIBUTES, MOVE_FILE_FLAGS};
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, IPersistFile, CLSCTX_ALL, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
@@ -448,7 +448,7 @@ fn shortcuts(sources: &[String], dest: &str) -> Outcome {
 }
 
 /// Writes the shortcut file `lnk` pointing at `target` (Windows' own shortcut object).
-fn make_shortcut(target: &str, lnk: &str) -> Result<(), HRESULT> {
+pub(crate) fn make_shortcut(target: &str, lnk: &str) -> Result<(), HRESULT> {
     // SAFETY: COM calls in this job thread's apartment; the strings outlive the calls.
     unsafe {
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(|e| e.code())?;
@@ -956,6 +956,19 @@ pub fn dotted_extension(name: &str) -> String {
     }
 }
 
+/// Whether "to the Recycle Bin" really keeps `path` there. A USB stick, a network drive or a disc
+/// has no Recycle Bin, so deleting there is for good either way.
+pub fn has_recycle_bin(path: &str) -> bool {
+    let root: String = path.chars().take(3).collect();
+    if !(root.len() == 3 && root.ends_with(":\\")) {
+        return false; // (\\server\share)
+    }
+    let w = wide(&root);
+    // SAFETY: a NUL-terminated root path that outlives the call.
+    let kind = unsafe { GetDriveTypeW(PCWSTR(w.as_ptr())) };
+    !matches!(kind, 2 | 4 | 5) // DRIVE_REMOVABLE, DRIVE_REMOTE, DRIVE_CDROM
+}
+
 /// Whether `path` is a full path ("C:\..." or "\\server\share\...") of something inside a folder -
 /// not a drive or a share itself, and not a bare name.
 pub fn is_full_item_path(path: &str) -> bool {
@@ -1161,6 +1174,13 @@ pub fn parse_drop_files(bytes: &[u8]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A network share has no Recycle Bin, so deleting there is asked as deleting for good.
+    #[test]
+    fn network_shares_have_no_recycle_bin() {
+        assert!(!has_recycle_bin("\\\\server\\share\\notes.txt"));
+        assert!(has_recycle_bin("C:\\Users\\notes.txt"));
+    }
 
     #[test]
     fn unique_names() {

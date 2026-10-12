@@ -61,7 +61,7 @@ use windows::Win32::UI::WindowsAndMessaging::WM_CLIPBOARDUPDATE;
 use crate::app::{AppState, WM_APP_LOADED};
 use crate::ask::{Answer, AskBox};
 use crate::frame;
-use crate::list::{ListView, SLOW_CLICK_TIMER};
+use crate::list::{ListView, BAR_REPEAT_TIMER, SLOW_CLICK_TIMER};
 use crate::log;
 use crate::render::{FrameResult, Renderer};
 use crate::settings::{self, Backspace, Settings, ThemeMode, ViewMode};
@@ -531,6 +531,10 @@ fn mods() -> Mods {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // While a menu with Windows' items is open, the messages those items need go to their maker
     // (popup.rs). They come from inside the menu's own loop, so no state is touched here.
+    // The skin's own menus (oldmenu.rs) first: those items are Glint's.
+    if let Some(r) = crate::oldmenu::handle(hwnd, msg, wparam, lparam) {
+        return r;
+    }
     if let Some(r) = popup::forward(msg, wparam, lparam) {
         return r;
     }
@@ -953,6 +957,7 @@ fn show_menu(hwnd: HWND, menu: &Menu, scale: f32) -> u32 {
     // SAFETY: the menu is created, shown (modal) and destroyed here.
     unsafe {
         let Some(h) = build_menu(&menu.items) else { return 0 };
+        crate::oldmenu::dress(h, &[]);
         let mut pt = POINT { x: (menu.at.x * scale).round() as i32, y: (menu.at.y * scale).round() as i32 };
         let _ = ClientToScreen(hwnd, &mut pt);
         let side = if menu.right_aligned { TPM_RIGHTALIGN } else { TPM_LEFTALIGN };
@@ -1129,26 +1134,29 @@ impl Window {
 
     /// Where every part sits, from the window size.
     fn layout(&mut self) {
-        let (w, h) = self.size;
+        // 98 / 2000: everything sits inside the window's raised frame (frame.rs).
+        let b = frame::classic_border(&self.app.theme, self.maximized);
+        let (w, h) = ((self.size.0 - 2.0 * b).max(0.0), (self.size.1 - 2.0 * b).max(0.0));
         let ctx = self.ctx();
-        let body_y = size::TITLE_H + size::TOOLBAR_H + size::GAP;
+        let gap = self.app.theme.gap();
+        let body_y = b + size::TITLE_H + size::TOOLBAR_H + gap;
         // "Show the status bar" off: the list goes down to the bottom (notes then show over it).
-        let status_h = if self.app.settings.show_status_bar { size::STATUS_H } else { size::GAP };
-        let status = Rect::new(0.0, h - status_h, w, if self.app.settings.show_status_bar { status_h } else { 0.0 });
-        let body_h = (h - status_h - body_y).max(0.0);
+        let status_h = if self.app.settings.show_status_bar { size::STATUS_H } else { gap };
+        let status = Rect::new(b, b + h - status_h, w, if self.app.settings.show_status_bar { status_h } else { 0.0 });
+        let body_h = (b + h - status_h - body_y).max(0.0);
         // Ctrl+B hides the sidebar ("ShowSidebar"): the list then takes its room.
         let sidebar_w = if self.app.settings.show_sidebar { size::SIDEBAR_W } else { 0.0 };
         // The details panel or the Space preview takes its width from the list's room, with the
         // same gap before it as between the other panels (side.rs; 0 when neither shows).
-        let room = (w - sidebar_w - 2.0 * size::GAP).max(0.0);
+        let room = (w - sidebar_w - 2.0 * gap).max(0.0);
         let pane = self.side.pane_width(&self.app, room);
-        let list_w = if pane > 0.0 { room - pane - size::GAP } else { room };
-        let list = Rect::new(sidebar_w + size::GAP, body_y, list_w, body_h);
-        let side = if pane > 0.0 { Rect::new(list.right(), body_y, size::GAP + pane, body_h) } else { Rect::default() };
+        let list_w = if pane > 0.0 { room - pane - gap } else { room };
+        let list = Rect::new(b + sidebar_w + gap, body_y, list_w, body_h);
+        let side = if pane > 0.0 { Rect::new(list.right(), body_y, gap + pane, body_h) } else { Rect::default() };
         let rects = [
-            (Part::Title, Rect::new(0.0, 0.0, w, size::TITLE_H)),
-            (Part::Toolbar, Rect::new(0.0, size::TITLE_H, w, size::TOOLBAR_H)),
-            (Part::Sidebar, Rect::new(0.0, body_y, sidebar_w, body_h)),
+            (Part::Title, Rect::new(b, b, w, size::TITLE_H)),
+            (Part::Toolbar, Rect::new(b, b + size::TITLE_H, w, size::TOOLBAR_H)),
+            (Part::Sidebar, Rect::new(b, body_y, sidebar_w, body_h)),
             (Part::List, list),
             (Part::Status, status),
             (Part::Side, side),
@@ -1163,6 +1171,7 @@ impl Window {
     fn apply_theme(&mut self) {
         self.theme_generation = self.app.theme_generation;
         self.renderer.set_font(&self.app.theme.font, self.app.theme.font_size / size::FONT);
+        self.renderer.set_title_font(&self.app.theme.title_font);
         textbox::set_font_family(&self.renderer.font_family());
         self.layout();
         let theme = &self.app.theme;
@@ -1414,7 +1423,18 @@ impl Window {
         }
         // SAFETY: stops our own timers (fine if one isn't running).
         unsafe {
-            for timer in [SAVE_TIMER, NOTE_TIMER, LOADING_TIMER, RETRY_TIMER, SHELL_MENU_TIMER, SLOW_CLICK_TIMER, drag::DRAG_SCROLL_TIMER, drag::TAB_SWITCH_TIMER] {
+            for timer in [
+                SAVE_TIMER,
+                NOTE_TIMER,
+                LOADING_TIMER,
+                RETRY_TIMER,
+                SHELL_MENU_TIMER,
+                SLOW_CLICK_TIMER,
+                BAR_REPEAT_TIMER,
+                crate::sidebar::BAR_REPEAT_TIMER,
+                drag::DRAG_SCROLL_TIMER,
+                drag::TAB_SWITCH_TIMER,
+            ] {
                 let _ = KillTimer(Some(self.hwnd), timer);
             }
         }
@@ -1702,14 +1722,17 @@ impl Window {
             more |= self.with_part(part, |c, app| c.tick(ctx.now, app));
         }
         let shown = self.renderer.begin() && {
-            let Window { renderer, app, titlebar, toolbar, sidebar, list, status, side, ask, size: client, .. } = self;
-            renderer.clear(app.theme.window);
-            if app.theme.window_paint.gradient().is_some() {
+            let Window { renderer, app, titlebar, toolbar, sidebar, list, status, side, ask, size: client, maximized, .. } = self;
+            // (7's panes are parted by thin pale lines: all that shows of the window there.)
+            let seven = app.theme.era == crate::theme::Era::Win7;
+            renderer.clear(if seven { crate::theme::Color::hex(0xd5dfe5) } else { app.theme.window });
+            if app.theme.window_paint.gradient().is_some() && !seven {
                 // A shaded background (in the gaps between the panels).
                 renderer.fill_paint(Rect::new(0.0, 0.0, client.0, client.1), 0.0, &app.theme.window_paint);
             }
             titlebar.paint(renderer, &app.theme, app, &ctx);
             toolbar.paint(renderer, &app.theme, app, &ctx);
+            titlebar.join_toolbar(renderer, &app.theme, app);
             if app.settings.show_sidebar {
                 sidebar.paint(renderer, &app.theme, app, &ctx);
             }
@@ -1721,10 +1744,14 @@ impl Window {
                 // Without the status bar, its notes ("Path copied") show at the bottom of the list.
                 crate::status::paint_note(renderer, &app.theme, app, list.rect());
             }
+            let b = frame::classic_border(&app.theme, *maximized);
             if let Some(q) = &app.question {
                 // Over everything below the toolbar (see ask.rs for why not the toolbar too).
-                let top = size::TITLE_H + size::TOOLBAR_H;
-                ask.paint(renderer, &app.theme, q, Rect::new(0.0, top, client.0, (client.1 - top).max(0.0)));
+                let top = b + size::TITLE_H + size::TOOLBAR_H;
+                ask.paint(renderer, &app.theme, q, Rect::new(b, top, (client.0 - 2.0 * b).max(0.0), (client.1 - top - b).max(0.0)));
+            }
+            if b > 0.0 {
+                frame::paint_classic_border(renderer, &app.theme, Rect::new(0.0, 0.0, client.0, client.1));
             }
             renderer.end() == FrameResult::Shown
         };
@@ -2318,6 +2345,19 @@ impl Window {
                     let _ = KillTimer(Some(self.hwnd), wparam.0);
                 }
                 self.invalidate();
+                Some(LRESULT(0))
+            }
+            // A held scroll bar arrow or track repeats (an older Windows' bars).
+            WM_TIMER if wparam.0 == BAR_REPEAT_TIMER => {
+                let ctx = self.ctx();
+                let e = self.list.repeat_due(&ctx, &mut self.app);
+                self.apply(Part::List, e);
+                Some(LRESULT(0))
+            }
+            WM_TIMER if wparam.0 == crate::sidebar::BAR_REPEAT_TIMER => {
+                let ctx = self.ctx();
+                let e = self.sidebar.repeat_due(&ctx);
+                self.apply(Part::Sidebar, e);
                 Some(LRESULT(0))
             }
             WM_TIMER if wparam.0 == SLOW_CLICK_TIMER => {

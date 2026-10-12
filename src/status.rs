@@ -8,6 +8,7 @@ use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY
 use windows::Win32::System::Threading::GetCurrentProcess;
 
 use crate::app::AppState;
+use crate::eraicons::{DriveKind, Role};
 use crate::folder::{format_count, format_size};
 use crate::pathbar::{fill_box_paint, outline_box};
 use crate::render::{Align, Renderer, TextStyle};
@@ -15,6 +16,8 @@ use crate::theme::{size, Theme};
 use crate::ui::{Component, Ctx, Rect};
 
 const PAD: f32 = 12.0;
+/// 98 / 2000: the last pane, saying where the folder is (My Computer, or Local intranet).
+const ZONE_W: f32 = 130.0;
 
 #[derive(Default)]
 pub struct StatusBar {
@@ -145,6 +148,9 @@ impl StatusBar {
                 Some(label) => s.push_str(&format!("  \u{00b7}  Custom sort ({label})")),
                 None => s.push_str("  \u{00b7}  Custom sort"),
             }
+        } else if tab.column_now {
+            // A column picked here sorts it for now (the custom sort order comes back after).
+            s.push_str("  \u{00b7}  Column for now");
         }
         s
     }
@@ -203,8 +209,39 @@ impl Component for StatusBar {
     }
 
     fn paint(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState, _ctx: &Ctx) {
+        if theme.era.old() {
+            // An older Windows' status bar (retrolist.rs): its panes, the text in them.
+            let style = TextStyle::new(crate::retrolist::status_text(theme));
+            let right = Self::right_text(app);
+            let right_w = r.measure(&right, &style).min(self.rect.w * 0.6);
+            let grip = if theme.era == crate::theme::Era::Win7 { 0.0 } else { 14.0 };
+            let zone = if theme.era.classic() && self.rect.w > 3.0 * ZONE_W { ZONE_W } else { 0.0 };
+            let inner = Rect::new(self.rect.x + PAD, self.rect.y, self.rect.w - 2.0 * PAD - grip - zone, self.rect.h);
+            let split = inner.right() - right_w - PAD - 2.0;
+            crate::retrolist::status_bar(r, theme, self.rect, split, zone);
+            if zone > 0.0 {
+                // As their Explorer did: My Computer for the PC's own folders, Local intranet for
+                // a network place.
+                let network = app.tab().path.starts_with("\\\\");
+                let pane = Rect::new(self.rect.right() - 16.0 - zone, self.rect.y, zone, self.rect.h);
+                let icon = Rect::new(pane.x + 5.0, (pane.y + (pane.h - size::ICON) / 2.0).round() + 1.0, size::ICON, size::ICON);
+                let role = if network { Role::Drive(DriveKind::Network) } else { Role::Computer };
+                crate::eraicons::draw(r, theme.icons, role, icon);
+                let words = if network { "Local intranet" } else { "My Computer" };
+                r.text(words, Rect::new(icon.right() + 5.0, pane.y, (pane.right() - icon.right() - 8.0).max(0.0), pane.h), &style);
+            }
+            r.text(&right, Rect::new(inner.right() - right_w - 1.0, inner.y, right_w + 1.0, inner.h), &style.align(Align::Right));
+            r.text(&Self::left_text(app), Rect::new(inner.x, inner.y, (split - inner.x - 8.0).max(0.0), inner.h), &style);
+            return;
+        }
         r.fill_paint(self.rect, 0.0, &theme.statusbar_paint);
         r.fill_rect(Rect::new(self.rect.x, self.rect.y, self.rect.w, 1.0), theme.status_line);
+        if theme.bevels {
+            let well = self.rect.inset(2.0, 3.0);
+            r.stroke_rect(Rect::new(well.x, well.y, well.w, well.h), 1.0, theme.statusbar.darker(0.4));
+            r.fill_rect(Rect::new(well.x + 1.0, well.bottom() - 1.0, well.w - 1.0, 1.0), crate::theme::Color::hex(0xffffff));
+            r.fill_rect(Rect::new(well.right() - 1.0, well.y + 1.0, 1.0, well.h - 1.0), crate::theme::Color::hex(0xffffff));
+        }
         let style = TextStyle::new(theme.status_text);
         let right = Self::right_text(app);
         let right_w = r.measure(&right, &style).min(self.rect.w * 0.6);

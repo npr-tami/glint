@@ -6,7 +6,6 @@
 use super::AppState;
 use crate::fileops::same_path;
 use crate::folder;
-use crate::recycle;
 
 impl AppState {
     /// Whether this folder is pinned to the sidebar.
@@ -91,11 +90,51 @@ impl AppState {
             self.settings.hidden_places.push(id.to_string());
         }
     }
+
+    /// Whether a file or folder is in Home's Favorites.
+    pub fn is_favorite(&self, path: &str) -> bool {
+        self.settings.favorites.iter().any(|p| same_path(p, path))
+    }
+
+    /// Adds these paths to Favorites, or takes them out when they're all in already. Returns
+    /// whether they were added.
+    pub fn favorite(&mut self, paths: &[String]) -> bool {
+        let all_in = !paths.is_empty() && paths.iter().all(|p| self.is_favorite(p));
+        if all_in {
+            self.settings.favorites.retain(|f| !paths.iter().any(|p| same_path(p, f)));
+        } else {
+            for p in paths {
+                if !p.trim().is_empty() && !folder::is_place(p) && !self.is_favorite(p) {
+                    self.settings.favorites.push(p.clone());
+                }
+            }
+        }
+        !all_in
+    }
+
+    /// "Add to Favorites" / "Remove from Favorites" in the right-click menu: for the selected items.
+    /// Home on screen is read again so its Favorites list shows the change.
+    pub fn toggle_favorites(&mut self) {
+        let t = self.tab();
+        let paths: Vec<String> = t.selected_entries().iter().map(|&i| t.folder.entries[i].path_in(&t.folder.path)).collect();
+        if paths.is_empty() {
+            return;
+        }
+        let what = if paths.len() == 1 { self.display_name(&paths[0]) } else { format!("{} items", paths.len()) };
+        if self.favorite(&paths) {
+            self.say(format!("Added {what} to Favorites"));
+        } else {
+            self.say(format!("Removed {what} from Favorites"));
+        }
+        if crate::recent::is_recent(&self.tab().path) {
+            self.refresh();
+        }
+    }
 }
 
 /// Whether a path can be pinned: a folder or a drive - not This PC, not the Recycle Bin.
 pub fn can_pin(path: &str) -> bool {
-    !path.trim().is_empty() && !recycle::is_bin(path)
+    !path.trim().is_empty() && !crate::folder::is_place(path)
 }
 
 #[cfg(test)]
@@ -105,6 +144,22 @@ mod tests {
 
     fn app() -> AppState {
         AppState::for_tests(Settings::default())
+    }
+
+    #[test]
+    fn favorites_go_in_and_come_out() {
+        let mut a = app();
+        let s = |v: &[&str]| v.iter().map(|p| p.to_string()).collect::<Vec<String>>();
+        assert!(a.favorite(&s(&["C:\\a.txt"])));
+        assert!(a.favorite(&s(&["c:\\A.TXT", "D:\\Work"])), "not all in yet: added (once)");
+        assert_eq!(a.settings.favorites, vec!["C:\\a.txt", "D:\\Work"]);
+        assert!(a.is_favorite("c:\\a.txt"));
+        assert!(!a.favorite(&s(&["D:\\work"])), "in already: taken out");
+        assert_eq!(a.settings.favorites, vec!["C:\\a.txt"]);
+        assert!(a.favorite(&s(&[crate::recycle::LOCATION])) && a.settings.favorites.len() == 1, "places aren't favorites");
+        // Kept in settings.json under "Favorites".
+        let text = serde_json::to_string(&a.settings).unwrap();
+        assert!(text.contains("\"Favorites\":[\"C:\\\\a.txt\"]"), "{text}");
     }
 
     #[test]

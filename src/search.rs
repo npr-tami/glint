@@ -120,6 +120,7 @@ pub struct Ask {
 /// Starts a search on a new thread. `send` gets the batches on that thread; when it returns false
 /// (the window is gone) the search stops. `listing` (the folder's own) is kept in the search.
 /// Returns the search to keep - or, if no thread could be had, the listing back.
+#[allow(clippy::result_large_err)] // (the listing back, rarely: no thread could be had)
 pub fn start(ask: Ask, listing: Folder, mut send: impl FnMut(Batch) -> bool + Send + 'static) -> Result<Search, Folder> {
     let Ask { root, query, generation, show_hidden, show_system, pause } = ask;
     let cancel = Arc::new(AtomicBool::new(false));

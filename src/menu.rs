@@ -73,6 +73,7 @@ const PICK_BIN_EXPLORER: u32 = 47;
 // Added with the list options (search results, the Date created column).
 const PICK_LOCATION: u32 = 48;
 const PICK_SORT_CREATED: u32 = 49;
+const PICK_FAVORITE: u32 = 50;
 // Added with the views: View › (from PICK_VIEW, in `ViewMode::ALL`'s order).
 const PICK_VIEW: u32 = 60;
 
@@ -120,9 +121,14 @@ pub fn for_items(app: &AppState, at: Point, how: How) -> Effect {
     if single && !first.is_container() {
         items.push(MenuItem::new(PICK_OPEN_WITH, "Open with\u{2026}"));
     }
-    if single && t.is_searching() {
-        // A search result: go to the folder it's in, with it selected.
+    if single && (t.is_searching() || crate::recent::is_recent(&t.folder.path)) {
+        // A search result (or one of Home's): go to the folder it's in, with it selected.
         items.push(MenuItem::new(PICK_LOCATION, "Open file location"));
+    }
+    if files {
+        // Home's Favorites (app/places.rs): "Remove" when they're all in already.
+        let all_in = chosen.iter().all(|&i| app.is_favorite(&t.folder.entries[i].path_in(&t.folder.path)));
+        items.push(MenuItem::new(PICK_FAVORITE, if all_in { "Remove from Favorites" } else { "Add to Favorites" }));
     }
     items.push(MenuItem::separator());
     if files {
@@ -135,7 +141,7 @@ pub fn for_items(app: &AppState, at: Point, how: How) -> Effect {
     items.push(MenuItem::new(PICK_COPY_PATH, if single { "Copy path\tCtrl+Shift+C" } else { "Copy paths\tCtrl+Shift+C" }));
     if files {
         items.push(MenuItem::separator());
-        items.push(MenuItem::new(PICK_RENAME, "Rename\tF2").disabled(!single));
+        items.push(MenuItem::new(PICK_RENAME, "Rename\tF2").disabled(!single || crate::recent::is_recent(&t.folder.path)));
         items.push(MenuItem::new(PICK_DELETE, "Delete\tDel"));
         items.push(MenuItem::new(PICK_DELETE_FOREVER, "Delete permanently\tShift+Del"));
     }
@@ -346,6 +352,7 @@ pub fn pick(id: u32, app: &mut AppState) -> Effect {
         PICK_SORT_DATE => Command::SetSort(SortKey::Date, app.tab().descending),
         PICK_SORT_CREATED => Command::SetSort(SortKey::Created, app.tab().descending),
         PICK_LOCATION => Command::OpenFileLocation,
+        PICK_FAVORITE => Command::ToggleFavorites,
         PICK_SORT_TYPE => Command::SetSort(SortKey::Type, app.tab().descending),
         PICK_SORT_SIZE => Command::SetSort(SortKey::Size, app.tab().descending),
         PICK_ASCENDING => Command::SetSort(app.tab().sort, false),

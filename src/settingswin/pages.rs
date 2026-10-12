@@ -37,7 +37,7 @@ pub const LIVE: &[&str] = &[
     // General
     "Startup",
     "StartupFolder",
-    "NewTab",
+    "NewTab", "HomeOpens",
     "@Folders",
     "@WinE",
     "StayRunning",
@@ -405,6 +405,7 @@ fn general(f: &Facts) -> Vec<Item> {
             choice("Startup", "Open on startup", None, &[(S("restore"), "Tabs from last time"), (S("home"), "Home folder"), (S("thispc"), "This PC"), (S("folder"), "A specific folder")]),
             Row::new("StartupFolder", "", None, Ctl::Folder).only_if("Startup", S("folder")),
             choice("NewTab", "New tabs open", None, &[(S("same"), "Current folder"), (S("home"), "Home folder"), (S("thispc"), "This PC")]),
+            choice("HomeOpens", "Home opens", None, &[(S("page"), "Home, like File Explorer"), (S("folder"), "Your user folder")]),
         ]),
         Item::Heading("Default file explorer"),
         Item::Card(vec![toggle("@Folders", "Open folders and drives in Glint", None), toggle("@WinE", "Open with Win+E", None)]),

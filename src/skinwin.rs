@@ -82,7 +82,7 @@ use crate::shell;
 use crate::skin::{self, Entry};
 use crate::textbox::{self, TextBox, TextEvent, TextEventKind, WM_APP_TEXT};
 use crate::settings::LogoStyle;
-use crate::theme::{size, ButtonStyle, CaptionStyle, Color, Paint, Shape, SidebarStyle, Stop, TabStyle, Theme};
+use crate::theme::{size, ButtonStyle, CaptionStyle, Color, Era, IconSet, Paint, Shape, SidebarStyle, Stop, TabStyle, Theme};
 use crate::ui::{Command, Menu, MenuItem, Point, Rect};
 
 /// The window's title (Alt+Tab, the taskbar's thumbnails).
@@ -143,7 +143,7 @@ const MAX_TEXT: usize = 256 * 1024;
 
 /// Every colour a skin has (skin::COLOURS), by the skin's name for it, with its title here: the
 /// window from the top down, then text, selections and hovers, lines, and the rest.
-const COLOURS: [(&str, &str); 57] = [
+const COLOURS: [(&str, &str); 75] = [
     ("accent", "Accent"),
     ("background", "Background"),
     ("title-bar", "Title bar"),
@@ -186,6 +186,18 @@ const COLOURS: [(&str, &str); 57] = [
     ("scrollbar-track", "Scroll bar track"),
     ("scrollbar-border", "Scroll bar edges"),
     ("scrollbar-grip-lines", "Grip lines"),
+    ("back-button", "Back and forward"),
+    ("tool-border", "Toolbar button edges"),
+    ("selection-border", "Selected row edges"),
+    ("title-gloss", "Title bar shine"),
+    ("title-bar-inactive", "Title bar, inactive"),
+    ("title-text", "Window titles"),
+    ("title-text-inactive", "Window titles, inactive"),
+    ("title-text-shadow", "Window title shadow"),
+    ("bevel-highlight", "3D edge, lit outside"),
+    ("bevel-light", "3D edge, lit inside"),
+    ("bevel-shadow", "3D edge, shaded inside"),
+    ("bevel-dark", "3D edge, shaded outside"),
     ("usage-bar", "Usage bar"),
     ("usage-fill", "Usage bar fill"),
     ("status-bar", "Status bar"),
@@ -201,6 +213,12 @@ const COLOURS: [(&str, &str); 57] = [
     ("line", "Lines"),
     ("accent-text", "Text on accent"),
     ("disabled", "Disabled"),
+    ("sidebar-text", "Sidebar names"),
+    ("menu", "Menus"),
+    ("menu-text", "Menu words"),
+    ("menu-selection", "Menu item hover"),
+    ("menu-selection-text", "Menu item hover words"),
+    ("menu-border", "Menu edge"),
 ];
 
 /// The choices of the drop-downs.
@@ -210,9 +228,11 @@ const ROW_HEIGHTS: [f32; 7] = [24.0, 26.0, 28.0, 30.0, 32.0, 34.0, 36.0];
 const FONT_SIZES: [f32; 8] = [8.0, 8.5, 9.0, 9.5, 10.0, 10.5, 11.0, 12.0];
 const LINE_WIDTHS: [f32; 7] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
 const BUTTON_STYLES: [(ButtonStyle, &str, &str); 2] = [(ButtonStyle::Flat, "flat", "Flat"), (ButtonStyle::Liquid, "liquid", "Liquid")];
-const CAPTION_STYLES: [(CaptionStyle, &str, &str); 2] = [(CaptionStyle::Symbols, "symbols", "Symbols"), (CaptionStyle::Marbles, "marbles", "Marbles")];
+const CAPTION_STYLES: [(CaptionStyle, &str, &str); 3] = [(CaptionStyle::Symbols, "symbols", "Symbols"), (CaptionStyle::Marbles, "marbles", "Marbles"), (CaptionStyle::Tiles, "tiles", "Tiles")];
 const TAB_STYLES: [(TabStyle, &str, &str); 2] = [(TabStyle::Attached, "attached", "Attached"), (TabStyle::Pills, "pills", "Pills")];
 const SIDEBAR_STYLES: [(SidebarStyle, &str, &str); 2] = [(SidebarStyle::Plain, "plain", "Plain"), (SidebarStyle::Panels, "panels", "Panels")];
+const ERAS: [(Era, &str, &str); 5] = [(Era::None, "none", "None"), (Era::Win98, "98", "Windows 98"), (Era::Win2000, "2000", "Windows 2000"), (Era::Xp, "xp", "Windows XP"), (Era::Win7, "7", "Windows 7")];
+const ICON_SETS: [(IconSet, &str, &str); 4] = [(IconSet::Windows, "windows", "Windows"), (IconSet::Classic, "classic", "Classic"), (IconSet::Xp, "xp", "XP"), (IconSet::Aero, "aero", "Aero")];
 /// The Logo setting (as Settings > Appearance offers it).
 const LOGOS: [(LogoStyle, &str); 3] = [(LogoStyle::Box, "Box"), (LogoStyle::Chrome, "Chrome"), (LogoStyle::None, "None")];
 /// DIPs in a point (9 pt = 12 DIPs).
@@ -248,6 +268,9 @@ enum Ctl {
     Tabs,
     Sidebar,
     Grip,
+    /// The older Windows the skin looks like, and its icons.
+    Era,
+    Icons,
     /// The Logo setting (not part of the skin).
     Logo,
 }
@@ -440,8 +463,10 @@ pub struct SkinWindow {
     serial: u64,
     renderer: Renderer,
     dpi: u32,
-    /// Client size in DIPs.
+    /// Client size in DIPs (inside 98 / 2000's window frame, when the skin draws one).
     size: (f32, f32),
+    /// The skin is 98 / 2000's: the window has their raised frame (frame.rs).
+    classic: bool,
     started: Instant,
     active: bool,
     tracking: bool,
@@ -506,6 +531,9 @@ pub struct SkinWindow {
     flips: kit::Flips,
     /// How thick the scrollbars are in the skin.
     bar: kit::Bar,
+    /// An older Windows' scroll bar arrow or track held down, repeating (bar 0: the list, 1: the
+    /// page).
+    holding: kit::Holding,
     /// The skin's colours as shown (COLOURS's order), and the library, look and skin they were
     /// worked out for.
     colours: Vec<Shown>,
@@ -582,6 +610,7 @@ pub fn create(owner: HWND, theme: &Theme) -> Option<SkinWindow> {
             renderer,
             dpi,
             size: (0.0, 0.0),
+            classic: false,
             started: Instant::now(),
             active: true,
             tracking: false,
@@ -624,6 +653,7 @@ pub fn create(owner: HWND, theme: &Theme) -> Option<SkinWindow> {
             repaint_until: 0.0,
             flips: kit::Flips::default(),
             bar: kit::Bar::default(),
+            holding: kit::Holding::default(),
             colours: Vec::new(),
             colours_for: (0, 0, String::new()),
         };
@@ -769,6 +799,10 @@ unsafe extern "system" fn text_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
 /// The window procedure. Messages that need no state are answered here; the rest go to the state,
 /// which the main window keeps, through its guard (window::skin_message).
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // The skin's own menus (oldmenu.rs).
+    if let Some(r) = crate::oldmenu::handle(hwnd, msg, wparam, lparam) {
+        return r;
+    }
     match msg {
         // SAFETY: lparam is the NCCALCSIZE_PARAMS Windows passed with this message.
         WM_NCCALCSIZE if wparam.0 != 0 => return unsafe { frame::nc_calc_size(hwnd, wparam, lparam) },
@@ -995,6 +1029,21 @@ impl SkinWindow {
         self.started.elapsed().as_secs_f64()
     }
 
+    /// How wide 98 / 2000's window frame is round everything (0 for other skins or maximised).
+    fn border(&self) -> f32 {
+        if self.classic && !frame::zoomed(self.hwnd) {
+            4.0
+        } else {
+            0.0
+        }
+    }
+
+    /// The client area's size in DIPs, less the frame (from `w` x `h` pixels).
+    fn inner_size(&self, w: u32, h: u32) -> (f32, f32) {
+        let (s, b) = (self.scale(), self.border());
+        ((w as f32 / s - 2.0 * b).max(0.0), (h as f32 / s - 2.0 * b).max(0.0))
+    }
+
     fn invalidate(&self) {
         // SAFETY: plain invalidate of our own window.
         unsafe {
@@ -1005,9 +1054,19 @@ impl SkinWindow {
     /// The skin changed (or the window was just made): its colours and font here too.
     pub fn apply_theme(&mut self, theme: &Theme) {
         self.renderer.set_font(&theme.font, 1.0);
+        self.renderer.set_title_font(&theme.title_font);
         self.layout_dirty = true;
         self.bar = kit::Bar::of(theme);
         self.edit_at = None;
+        if self.classic != theme.era.classic() {
+            self.classic = theme.era.classic();
+            self.text_at = None;
+            let mut rc = RECT::default();
+            // SAFETY: our own window and a valid out-struct.
+            if unsafe { GetClientRect(self.hwnd, &mut rc) }.is_ok() && rc.right > rc.left {
+                self.size = self.inner_size((rc.right - rc.left) as u32, (rc.bottom - rc.top) as u32);
+            }
+        }
         let (bg, fg) = (theme.input.to_colorref(), theme.text.to_colorref());
         // SAFETY: a new brush replaces the old one, which is deleted (no control paints in between:
         // this is the UI thread). The text box's scroll bars follow light or dark.
@@ -1176,7 +1235,7 @@ impl SkinWindow {
             (Ctl::Colour(_), Part::Hex) => Some(Rect::new(right - HEX_W, mid(ksize::FIELD_H), HEX_W, ksize::FIELD_H)),
             (Ctl::Colour(_), Part::Main) => Some(Rect::new(right - HEX_W - 10.0 - SWATCH, mid(SWATCH), SWATCH, SWATCH)),
             (Ctl::Colour(_), Part::Clear) => Some(Rect::new(right - HEX_W - 10.0 - SWATCH - 8.0 - NONE_W, mid(ksize::FIELD_H), NONE_W, ksize::FIELD_H)),
-            (Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Logo, Part::Main) => {
+            (Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Era | Ctl::Icons | Ctl::Logo, Part::Main) => {
                 Some(Rect::new(right - DROPDOWN_W, mid(ksize::FIELD_H), DROPDOWN_W, ksize::FIELD_H))
             }
             (Ctl::LogoText, Part::Main) => Some(Rect::new(right - LOGO_FIELD_W, mid(ksize::FIELD_H), LOGO_FIELD_W, ksize::FIELD_H)),
@@ -1254,6 +1313,8 @@ impl SkinWindow {
             (Ctl::Tabs, "Tabs", ""),
             (Ctl::Sidebar, "Sidebar", ""),
             (Ctl::Grip, "Scrollbar grip", ""),
+            (Ctl::Era, "Older Windows", ""),
+            (Ctl::Icons, "Icons", ""),
         ];
         card("Style", &style, &mut y, &mut blocks, &mut rows);
         card("Colours", &colours, &mut y, &mut blocks, &mut rows);
@@ -1291,9 +1352,14 @@ impl SkinWindow {
         }
         let theme = app.theme.clone();
         self.renderer.clear(theme.window);
+        // 98 / 2000: everything inside the window's frame.
+        let b = self.border();
+        self.renderer.set_origin(b, b);
         // The list of skins on the sidebar's colour (a gradient running down the whole window).
         let below = Rect::new(0.0, size::TITLE_H, self.size.0, (self.size.1 - size::TITLE_H).max(0.0));
         self.renderer.fill_paint(below, 0.0, &theme.sidebar_paint);
+        let list = self.list_rect();
+        kit::page_list_well(&mut self.renderer, &theme, list);
         self.paint_caption(&theme);
         self.paint_list(&theme, app);
         self.paint_header(&theme, app);
@@ -1315,6 +1381,10 @@ impl SkinWindow {
                 area,
             );
         }
+        if b > 0.0 {
+            self.renderer.set_origin(0.0, 0.0);
+            frame::paint_classic_border(&mut self.renderer, &theme, Rect::new(0.0, 0.0, self.size.0 + 2.0 * b, self.size.1 + 2.0 * b));
+        }
         if self.renderer.end() == FrameResult::DeviceLost {
             more = true;
         }
@@ -1328,10 +1398,9 @@ impl SkinWindow {
         let close = self.close_rect();
         let r = &mut self.renderer;
         let bar = Rect::new(0.0, 0.0, self.size.0, size::TITLE_H);
-        kit::title_bar(r, theme, bar);
+        kit::title_bar(r, theme, bar, self.active);
         let x = kit::logo(r, theme, bar);
-        let color = if self.active { theme.text } else { theme.muted };
-        r.text("Skins", Rect::new(x + 10.0, 0.0, (self.size.0 - x - 10.0 - ksize::CLOSE_W).max(0.0), size::TITLE_H), &TextStyle::new(color).size(13.0).semibold());
+        crate::retro::title(r, theme, Rect::new(x + 10.0, 0.0, (self.size.0 - x - 10.0 - ksize::CLOSE_W).max(0.0), size::TITLE_H), "Skins", self.active);
         let hot = self.hover == Some(Hot::Close);
         kit::close_button(r, theme, close, hot, hot && self.pressed == Some(Hot::Close), self.active);
     }
@@ -1340,7 +1409,7 @@ impl SkinWindow {
         let list = self.list_rect();
         let dy = list.y - self.list.offset;
         self.renderer.push_clip(list);
-        let heading = TextStyle::new(theme.muted).size(ksize::NOTE_FONT).semibold();
+        let heading = TextStyle::new(if theme.era.old() { theme.sidebar_text } else { theme.muted }).size(ksize::NOTE_FONT).semibold();
         self.renderer.text("BUILT IN", Rect::new(18.0, 6.0 + dy, LIST_W - 26.0, GROUP_H), &heading);
         let own_heading_y = self.items.iter().filter(|i| !i.id.starts_with(skin::FILE_PREFIX)).map(|i| i.rect.bottom()).fold(6.0 + GROUP_H, f32::max) + 10.0;
         self.renderer.text("YOUR SKINS", Rect::new(18.0, own_heading_y + dy, LIST_W - 26.0, GROUP_H), &heading);
@@ -1370,7 +1439,7 @@ impl SkinWindow {
         self.renderer.pop_clip();
         let hover = matches!(self.hover, Some(Hot::ListThumb)) || matches!(self.drag, Some((Hot::ListThumb, _)));
         let track = self.list_track();
-        kit::scrollbar(&mut self.renderer, theme, track, &self.list, hover);
+        kit::scrollbar(&mut self.renderer, theme, track, &self.list, hover, self.holding.hold_of(0));
         // The buttons.
         let own = app.skins.find(&app.settings.skin).is_some_and(|e| !e.built_in());
         let exists = app.skins.find(&app.settings.skin).is_some();
@@ -1403,7 +1472,7 @@ impl SkinWindow {
         let now = self.now();
         let advanced = self.flips.at("text", self.advanced, now);
         let r = &mut self.renderer;
-        r.text(&name, Rect::new(x, h.y + 14.0, w, 30.0), &TextStyle::new(theme.text_strong).size(ksize::PAGE_TITLE_FONT).semibold());
+        kit::page_title(r, theme, Rect::new(x, h.y + 14.0, w, 30.0), &name);
         let note = match entry {
             Some(e) if e.built_in() => "Built in. Changes go into your own copy.",
             Some(_) => "",
@@ -1467,11 +1536,17 @@ impl SkinWindow {
         let grip = self.flips.at("grip", app.theme.scrollbar_grip, now);
         self.refresh_colours(app);
         self.renderer.push_clip(page);
-        for block in &self.blocks {
+        // 98 / 2000: a card's heading is drawn with it, on its top line.
+        let classic = theme.era.classic();
+        for (k, block) in self.blocks.iter().enumerate() {
             let r = &mut self.renderer;
             match block {
+                Block::Heading(..) if classic && matches!(self.blocks.get(k + 1), Some(Block::Card(_))) => {}
                 Block::Heading(rect, text) => kit::heading(r, theme, shift(*rect), text),
-                Block::Card(rect) => kit::card(r, theme, shift(*rect)),
+                Block::Card(rect) => match k.checked_sub(1).and_then(|j| self.blocks.get(j)) {
+                    Some(Block::Heading(h, text)) if classic => kit::titled_group(r, theme, shift(*rect), shift(*h), text),
+                    _ => kit::card(r, theme, shift(*rect)),
+                },
                 Block::Line(rect) => kit::separator(r, theme, rect.x, rect.y + dy, rect.w),
             }
         }
@@ -1522,7 +1597,7 @@ impl SkinWindow {
                         kit::field(r, theme, hx, (!editing).then_some(c.text.as_str()), editing, hex_look);
                     }
                 }
-                Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Logo => {
+                Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Era | Ctl::Icons | Ctl::Logo => {
                     if let Some(m) = main {
                         kit::dropdown(r, theme, m, &label, main_look);
                     }
@@ -1555,7 +1630,7 @@ impl SkinWindow {
         self.renderer.pop_clip();
         let hover = matches!(self.hover, Some(Hot::PageThumb)) || matches!(self.drag, Some((Hot::PageThumb, _)));
         let track = self.page_track();
-        kit::scrollbar(&mut self.renderer, theme, track, &self.page, hover);
+        kit::scrollbar(&mut self.renderer, theme, track, &self.page, hover, self.holding.hold_of(1));
     }
 
     /// The label of a drop-down's current choice.
@@ -1571,6 +1646,8 @@ impl SkinWindow {
             Ctl::Caption => label_of(&CAPTION_STYLES, t.caption_buttons),
             Ctl::Tabs => label_of(&TAB_STYLES, t.tabs),
             Ctl::Sidebar => label_of(&SIDEBAR_STYLES, t.sidebar_style),
+            Ctl::Era => label_of(&ERAS, t.era),
+            Ctl::Icons => label_of(&ICON_SETS, t.icons),
             Ctl::Logo => LOGOS.iter().find(|(l, _)| *l == t.logo_style).map_or("", |(_, l)| l).to_string(),
             _ => String::new(),
         }
@@ -1590,7 +1667,8 @@ impl SkinWindow {
         if want != self.edit_at {
             match want {
                 Some(rect) => {
-                    self.edit_box.place(rect.inset(1.0, 1.0), 7.0, self.scale());
+                    let b = self.border();
+                    self.edit_box.place(Rect::new(rect.x + b, rect.y + b, rect.w, rect.h).inset(1.0, 1.0), 7.0, self.scale());
                     if self.edit_at.is_none() {
                         self.edit_box.show();
                     }
@@ -1616,6 +1694,7 @@ impl SkinWindow {
         let text_want = (self.advanced && self.asking.is_none()).then(|| self.text_rect());
         if text_want != self.text_at && !self.text_box.is_invalid() {
             let s = self.scale();
+            let b = self.border();
             // SAFETY: moves, shows or hides our own child window.
             unsafe {
                 match text_want {
@@ -1623,7 +1702,7 @@ impl SkinWindow {
                         if self.text_font_dpi != self.dpi {
                             self.make_text_font();
                         }
-                        let _ = SetWindowPos(self.text_box, None, (r.x * s).round() as i32, (r.y * s).round() as i32, (r.w * s).round() as i32, (r.h * s).round() as i32, SWP_NOZORDER | SWP_NOACTIVATE);
+                        let _ = SetWindowPos(self.text_box, None, ((r.x + b) * s).round() as i32, ((r.y + b) * s).round() as i32, (r.w * s).round() as i32, (r.h * s).round() as i32, SWP_NOZORDER | SWP_NOACTIVATE);
                         let _ = ShowWindow(self.text_box, SW_SHOW);
                     }
                     None => {
@@ -1753,8 +1832,8 @@ impl SkinWindow {
     }
 
     fn client_point(&self, lparam: LPARAM) -> Point {
-        let s = self.scale();
-        Point::new((lparam.0 & 0xffff) as i16 as f32 / s, ((lparam.0 >> 16) & 0xffff) as i16 as f32 / s)
+        let (s, b) = (self.scale(), self.border());
+        Point::new((lparam.0 & 0xffff) as i16 as f32 / s - b, ((lparam.0 >> 16) & 0xffff) as i16 as f32 / s - b)
     }
 
     fn mouse_move(&mut self, p: Point) {
@@ -1767,6 +1846,10 @@ impl SkinWindow {
             if self.ask.mouse_move(p) == Answer::Redraw {
                 self.invalidate();
             }
+            return;
+        }
+        if self.holding.active() {
+            self.holding.at = p;
             return;
         }
         if let Some((which, grab)) = self.drag {
@@ -1791,6 +1874,15 @@ impl SkinWindow {
         if self.asking.is_some() {
             let a = self.ask.mouse_down(p);
             return self.answer(a, app);
+        }
+        // An older Windows' scroll bars: an arrow button moves a list or the page a line, the
+        // track a page, again and again while the button is held.
+        let (now, list, page) = (self.now(), self.bar.place(self.list_rect()), self.bar.place(self.page_rect()));
+        if self.holding.press(self.hwnd, list, &mut self.list, 0, p, now)
+            || (!self.advanced && self.holding.press(self.hwnd, page, &mut self.page, 1, p, now))
+        {
+            self.invalidate();
+            return Vec::new();
         }
         let target = self.target_at(p);
         // A click anywhere ends typing in the one-line box (what was typed is kept).
@@ -1837,6 +1929,14 @@ impl SkinWindow {
         if self.asking.is_some() {
             let a = self.ask.mouse_up(p);
             return self.answer(a, app);
+        }
+        if self.holding.release(self.hwnd) {
+            // SAFETY: releasing our own capture.
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+            self.invalidate();
+            return Vec::new();
         }
         let was = self.pressed.take();
         self.drag = None;
@@ -2143,8 +2243,10 @@ impl SkinWindow {
             return Vec::new();
         }
         let anchor = self.rows.iter().find(|r| r.ctl == ctl).and_then(|r| self.part_rect(r, part)).map(|r| self.on_page(r));
+        let border = self.border();
         let menu = |items: Vec<MenuItem>| {
             let at = anchor.map_or(Point::new(LIST_W + PAD_X, size::TITLE_H + HEADER_H), |a| Point::new(a.x, a.bottom() + 2.0));
+            let at = Point::new(at.x + border, at.y + border);
             vec![Ask::Job(Job::Menu(Menu { tag: 1, at, items, right_aligned: false }))]
         };
         let t = app.theme.clone();
@@ -2215,6 +2317,14 @@ impl SkinWindow {
                 self.menu_for = Some(ctl);
                 menu(styles(&SIDEBAR_STYLES.map(|(s, _, l)| (l, s == t.sidebar_style))))
             }
+            (Ctl::Era, _) => {
+                self.menu_for = Some(ctl);
+                menu(styles(&ERAS.map(|(s, _, l)| (l, s == t.era))))
+            }
+            (Ctl::Icons, _) => {
+                self.menu_for = Some(ctl);
+                menu(styles(&ICON_SETS.map(|(s, _, l)| (l, s == t.icons))))
+            }
             (Ctl::Logo, _) => {
                 self.menu_for = Some(ctl);
                 menu(styles(&LOGOS.map(|(s, l)| (l, s == app.settings.logo))))
@@ -2268,6 +2378,8 @@ impl SkinWindow {
             Ctl::Caption => word_at(&CAPTION_STYLES, n, "caption-buttons"),
             Ctl::Tabs => word_at(&TAB_STYLES, n, "tabs"),
             Ctl::Sidebar => word_at(&SIDEBAR_STYLES, n, "sidebar-style"),
+            Ctl::Era => word_at(&ERAS, n, "era"),
+            Ctl::Icons => word_at(&ICON_SETS, n, "icons"),
             Ctl::Logo => {
                 // The setting, as Settings changes it: every title bar follows.
                 let Some((logo, _)) = LOGOS.get(n) else { return Vec::new() };
@@ -2643,8 +2755,7 @@ impl SkinWindow {
                 let (w, h) = (lo_word(lparam.0 as usize), hi_word(lparam.0 as usize));
                 self.renderer.resize(w, h);
                 if w > 0 && h > 0 {
-                    let s = self.scale();
-                    self.size = (w as f32 / s, h as f32 / s);
+                    self.size = self.inner_size(w, h);
                     self.layout_dirty = true;
                     self.edit_at = None;
                     self.text_at = None;
@@ -2658,8 +2769,7 @@ impl SkinWindow {
                 let mut rc = RECT::default();
                 // SAFETY: our own window and a valid out-struct.
                 if unsafe { GetClientRect(self.hwnd, &mut rc) }.is_ok() && rc.right > rc.left {
-                    let s = self.scale();
-                    self.size = ((rc.right - rc.left) as f32 / s, (rc.bottom - rc.top) as f32 / s);
+                    self.size = self.inner_size((rc.right - rc.left) as u32, (rc.bottom - rc.top) as u32);
                 }
                 self.layout_dirty = true;
                 self.edit_at = None;
@@ -2695,6 +2805,7 @@ impl SkinWindow {
             WM_CAPTURECHANGED => {
                 self.pressed = None;
                 self.drag = None;
+                self.holding.release(self.hwnd);
                 self.invalidate();
                 Some(LRESULT(0))
             }
@@ -2706,7 +2817,7 @@ impl SkinWindow {
                     let _ = ScreenToClient(self.hwnd, &mut pt);
                 }
                 let s = self.scale();
-                self.wheel(Point::new(pt.x as f32 / s, pt.y as f32 / s), hi_word(wparam.0) as u16 as i16 as f32 / 120.0);
+                self.wheel(Point::new(pt.x as f32 / s - self.border(), pt.y as f32 / s - self.border()), hi_word(wparam.0) as u16 as i16 as f32 / 120.0);
                 Some(LRESULT(0))
             }
             WM_KEYDOWN | WM_SYSKEYDOWN => self.key(wparam.0 as u16, app, &mut asks).then_some(LRESULT(0)),
@@ -2737,6 +2848,20 @@ impl SkinWindow {
                     let _ = KillTimer(Some(self.hwnd), RETRY_TIMER);
                 }
                 self.invalidate();
+                Some(LRESULT(0))
+            }
+            WM_TIMER if wparam.0 == kit::REPEAT_TIMER => {
+                let now = self.now();
+                let moved = if self.holding.bar == 0 {
+                    let place = self.bar.place(self.list_rect());
+                    self.holding.fire(self.hwnd, place, &mut self.list, now)
+                } else {
+                    let place = self.bar.place(self.page_rect());
+                    self.holding.fire(self.hwnd, place, &mut self.page, now)
+                };
+                if moved {
+                    self.invalidate();
+                }
                 Some(LRESULT(0))
             }
             WM_APP_TEXT => {

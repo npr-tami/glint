@@ -37,12 +37,15 @@ use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETWHEE
 use crate::app::{can_pin, AppState};
 use crate::folder::Drive;
 use crate::icons::{self, IconId, Icons, LoadedIcon};
+use crate::recent;
+use crate::settings::HomePage;
 use crate::recycle;
 use crate::list::{paint_scrollbar, ThumbState};
 use crate::render::{Renderer, TextStyle};
 use crate::shell::{self, ComGuard, KnownFolder};
 use crate::textbox::{TextBox, TextEvent, TextEventKind};
-use crate::theme::{size, Color, SidebarStyle, Theme};
+use crate::eraicons::{self, Role};
+use crate::theme::{size, Color, IconSet, SidebarStyle, Theme};
 use crate::ui::{Anim, Command, Component, Ctx, DropTarget, Effect, Menu, MenuItem, MouseButton, MouseEvent, Point, Rect};
 
 /// A heading's height: the same as the file list's column titles, so "Quick access" and "Name"
@@ -61,8 +64,12 @@ const PAD_RIGHT: f32 = 12.0;
 /// The usage bar under a drive's name: its thickness and its distance from the row's bottom.
 const BAR_H: f32 = 3.0;
 const BAR_BOTTOM: f32 = 4.0;
+/// 98 / 2000: the usage bar is a sunken progress bar this tall.
+const CLASSIC_BAR_H: f32 = 9.0;
 /// How much of a drive row the name gets (the rest holds the bar).
 const DRIVE_TEXT_H: f32 = size::ROW_H - 8.0;
+/// The space between a drive's name and its 98 / 2000 progress bar.
+const CLASSIC_BAR_GAP: f32 = 1.0;
 /// `sidebar-style: panels`: the space around and between the panels, their header bars' height,
 /// the room inside a panel around its rows, where icons start in a row, and how much taller a
 /// drive's row is (for a thicker usage bar with an edge).
@@ -76,6 +83,9 @@ const PANEL_BAR_H: f32 = 7.0;
 const SCROLL_TIME: f64 = 0.12;
 /// How far into the glide the first frame starts, so a wheel notch answers at once.
 const FRAME_HEAD_START: f64 = 0.008;
+/// The window timer that repeats a held scroll bar arrow or track (an older Windows); window.rs
+/// hands it to [`Sidebar::repeat_due`].
+pub const BAR_REPEAT_TIMER: usize = 12;
 
 /// The pinned folders' name box (text boxes 500-599 belong to the sidebar).
 const PIN_NAME_BOX: u16 = 500;
@@ -184,6 +194,12 @@ pub struct Sidebar {
     panels: bool,
     bar_w: f32,
     bar_margin: f32,
+    /// How long the scroll bar's arrow buttons are (an older Windows; 0 otherwise), and the one
+    /// held down.
+    arrows: f32,
+    repeat: crate::retroctl::Repeat,
+    /// How tall a line is, from the skin (`sidebar-row-height`).
+    row_h: f32,
 }
 
 impl Default for Sidebar {
@@ -228,6 +244,9 @@ impl Sidebar {
             panels: false,
             bar_w: size::SCROLLBAR_W,
             bar_margin: size::SCROLLBAR_MARGIN,
+            arrows: 0.0,
+            repeat: crate::retroctl::Repeat::default(),
+            row_h: size::ROW_H,
         }
     }
 
@@ -244,13 +263,23 @@ impl Sidebar {
         self.panels = app.theme.sidebar_style == SidebarStyle::Panels;
         self.bar_w = app.theme.scrollbar_w;
         self.bar_margin = app.theme.scrollbar_margin();
+        self.arrows = crate::retroctl::arrows(&app.theme);
+        self.row_h = app.theme.sidebar_row_h;
         // Above the first heading, after a heading, between the groups, and after the last line.
         let (top, heading_h, first, between, end) = if self.panels {
             (PANEL_MARGIN, PANEL_HEADER_H, PANEL_PAD, PANEL_PAD + PANEL_MARGIN, PANEL_PAD + PANEL_MARGIN)
         } else {
             (0.0, HEADING_H, 0.0, GROUP_GAP, BOTTOM_PAD)
         };
-        let drive_h = if self.panels { size::ROW_H + PANEL_DRIVE_EXTRA } else { size::ROW_H };
+        // 98 / 2000: a little taller, for the progress bar under the name (`classic_usage`).
+        let drive_h = if self.panels {
+            self.row_h + PANEL_DRIVE_EXTRA
+        } else if app.theme.era.classic() {
+            self.drive_text_h() + CLASSIC_BAR_GAP + CLASSIC_BAR_H + BAR_BOTTOM
+        } else {
+            self.row_h.max(self.drive_text_h() + 1.0 + BAR_H + BAR_BOTTOM)
+        };
+        let row_h = self.row_h;
         self.items.clear();
         let mut y = 0.0;
         let mut push = |items: &mut Vec<Placed>, item: Item, gap: f32, h: f32| {
@@ -262,22 +291,22 @@ impl Sidebar {
         let mut gap = first;
         for (i, k) in self.known.iter().enumerate() {
             if !app.is_place_hidden(&k.name.to_lowercase()) {
-                push(&mut self.items, Item::Known(i), gap, size::ROW_H);
+                push(&mut self.items, Item::Known(i), gap, row_h);
                 gap = 0.0;
             }
         }
         if !app.is_place_hidden(BIN_ID) {
-            push(&mut self.items, Item::Bin, gap, size::ROW_H);
+            push(&mut self.items, Item::Bin, gap, row_h);
         }
         if self.items.len() == before {
-            push(&mut self.items, Item::QuickHint, first, size::ROW_H);
+            push(&mut self.items, Item::QuickHint, first, row_h);
         }
         push(&mut self.items, Item::PinnedHeading, between, heading_h);
         for i in 0..app.settings.pinned.len() {
-            push(&mut self.items, Item::Pin(i), if i == 0 { first } else { 0.0 }, size::ROW_H);
+            push(&mut self.items, Item::Pin(i), if i == 0 { first } else { 0.0 }, row_h);
         }
         if app.settings.pinned.is_empty() {
-            push(&mut self.items, Item::PinHint, first, size::ROW_H);
+            push(&mut self.items, Item::PinHint, first, row_h);
         }
         push(&mut self.items, Item::PcHeading, between, heading_h);
         for i in 0..app.drives.len() {
@@ -342,6 +371,7 @@ impl Sidebar {
     fn path_of<'a>(&'a self, item: Item, app: &'a AppState) -> Option<&'a str> {
         match item {
             Item::QuickHeading | Item::QuickHint | Item::PinnedHeading | Item::PinHint => None,
+            Item::Known(i) if app.settings.home == HomePage::Page && self.known.get(i).is_some_and(|k| k.name == "Home") => Some(recent::LOCATION),
             Item::Known(i) => self.known.get(i).map(|k| k.path.as_str()),
             Item::Bin => Some(recycle::LOCATION),
             Item::Pin(i) => app.settings.pinned.get(i).map(String::as_str),
@@ -352,6 +382,16 @@ impl Sidebar {
 
     fn max_scroll(&self) -> f32 {
         (self.content_h - self.rect.h).max(0.0)
+    }
+
+    /// How far a scroll bar arrow moves the sidebar: a line.
+    fn line_h(&self) -> f32 {
+        self.row_h
+    }
+
+    /// How tall a drive's name is, above its usage bar: a whole row in 98 / 2000's short rows.
+    fn drive_text_h(&self) -> f32 {
+        (self.row_h - 8.0).max(self.row_h.min(16.0)).min(DRIVE_TEXT_H)
     }
 
     /// The line under a point (an index into `items`), None over a gap, the scrollbar or outside.
@@ -365,13 +405,10 @@ impl Sidebar {
 
     /// The scrollbar's lane (only when the sidebar is longer than the window).
     fn track(&self) -> Option<Rect> {
+        // Clear of an older Windows' arrow buttons at the two ends.
+        let along = self.bar_margin + self.arrows;
         (self.max_scroll() > 0.0).then(|| {
-            Rect::new(
-                self.rect.right() - self.bar_w - self.bar_margin,
-                self.rect.y + self.bar_margin,
-                self.bar_w,
-                (self.rect.h - 2.0 * self.bar_margin).max(0.0),
-            )
+            Rect::new(self.rect.right() - self.bar_w - self.bar_margin, self.rect.y + along, self.bar_w, (self.rect.h - 2.0 * along).max(0.0))
         })
     }
 
@@ -399,6 +436,65 @@ impl Sidebar {
         let target = target.clamp(0.0, self.max_scroll());
         self.anim.go(self.scroll, target, now - FRAME_HEAD_START, SCROLL_TIME);
         Effect::Animate
+    }
+
+    /// Where the scroll position is heading (where it is, when not gliding).
+    fn scroll_target(&self) -> f32 {
+        if self.anim.running() {
+            self.anim.target()
+        } else {
+            self.scroll
+        }
+    }
+
+    /// The mouse went down on an older Windows' scroll bar arrow or track: the first step now, the
+    /// next ones on BAR_REPEAT_TIMER while the button is held.
+    fn press_bar(&mut self, hold: crate::retroctl::Hold, now: f64) -> Effect {
+        let wait = self.repeat.press(hold, now);
+        crate::retroctl::repeat_timer(self.hwnd, BAR_REPEAT_TIMER, Some(wait));
+        match self.bar_step(hold, now) {
+            Effect::None => Effect::Redraw,
+            e => e,
+        }
+    }
+
+    /// One step of a held scroll bar arrow (a line) or track (a page, while the thumb hasn't
+    /// reached the mouse).
+    fn bar_step(&mut self, hold: crate::retroctl::Hold, now: f64) -> Effect {
+        use crate::retroctl::Hold;
+        let from = self.scroll_target();
+        let line = self.line_h();
+        let amount = match hold {
+            Hold::Arrow(_) => line,
+            Hold::Page(way) => {
+                let thumb = self.track().map(|track| {
+                    let max = self.max_scroll().max(1.0);
+                    let h = (track.h * self.rect.h / self.content_h).clamp(24.0_f32.min(track.h), track.h);
+                    Rect::new(track.x, track.y + (track.h - h) * (from / max).clamp(0.0, 1.0), track.w, h)
+                });
+                if !self.mouse.zip(thumb).is_some_and(|(p, t)| crate::retroctl::page_on(self.lane(), t, way, p)) {
+                    return Effect::None;
+                }
+                (self.rect.h - line).max(line)
+            }
+            Hold::None => return Effect::None,
+        };
+        self.scroll_to(from + hold.way().sign() * amount, now)
+    }
+
+    /// BAR_REPEAT_TIMER fired: the held scroll bar arrow or track takes its next step; the timer
+    /// stops at the end.
+    pub fn repeat_due(&mut self, ctx: &Ctx) -> Effect {
+        let room = crate::retroctl::Room::of(self.scroll_target(), self.max_scroll()).toward(self.repeat.hold.way());
+        let (hold, steps, next) = self.repeat.fire(room, ctx.now);
+        crate::retroctl::repeat_timer(self.hwnd, BAR_REPEAT_TIMER, next);
+        let mut effect = Effect::Redraw;
+        for _ in 0..steps {
+            if let e @ Effect::Animate = self.bar_step(hold, ctx.now) {
+                effect = e;
+            }
+        }
+        effect
     }
 
     /// The place the current tab is in: the place itself, or else the deepest place that holds it
@@ -466,7 +562,18 @@ impl Sidebar {
     fn paint_place(&self, r: &mut Renderer, theme: &Theme, app: &AppState, item: Item, row: Rect, state: RowState) {
         // In a panel, rows have round ends (in a rounded skin).
         let radius = if self.panels { theme.corner(row.h) } else { 0.0 };
+        let seven = theme.era == crate::theme::Era::Win7;
+        // 98 / 2000: like their folder tree, only the name is marked (`mark`).
+        let label_only = theme.era.classic() && !self.panels;
+        // XP's task pane: its places are links, with no bars; the one under the mouse is
+        // underlined (`mark`), the one you're in bold.
+        let links = theme.era == crate::theme::Era::Xp && self.panels;
         match state {
+            _ if links => {}
+            // 7's navigation pane: the list's round box with its blue edge.
+            RowState::Selected if seven => crate::pathbar::fill_row(r, theme, row, &theme.sidebar_selection, false),
+            RowState::Hover if seven => crate::pathbar::fill_row(r, theme, row, &theme.hover_paint, true),
+            RowState::Selected if label_only => {}
             RowState::Selected => {
                 r.fill_paint(row, radius, &theme.sidebar_selection);
                 if radius <= 0.0 {
@@ -478,31 +585,66 @@ impl Sidebar {
         }
         let (top_h, bar_h, bar_bottom) = match item {
             Item::Drive(_) if self.panels => (row.h - PANEL_BAR_H - 8.0, PANEL_BAR_H, 6.0),
-            _ => (DRIVE_TEXT_H, BAR_H, BAR_BOTTOM),
+            _ => (self.drive_text_h(), BAR_H, BAR_BOTTOM),
         };
         // A drive's icon sits beside its name, above the bar.
         let icon_mid = if matches!(item, Item::Drive(_)) && self.panels { top_h / 2.0 + 1.0 } else { row.h / 2.0 };
         let icon = Rect::new(row.x + self.pad_left(), row.y + icon_mid - size::ICON / 2.0, size::ICON, size::ICON);
         let (text_x, text_w) = self.name_span(row);
         let selected = state == RowState::Selected;
-        let color = if selected { theme.sidebar_selection_text } else { theme.text };
+        let color = if links && state == RowState::Hover {
+            theme.sidebar_text.lighter(0.3)
+        } else if selected && !links {
+            theme.sidebar_selection_text
+        } else {
+            theme.sidebar_text
+        };
         // With panels, the place you're in is in bold.
         let style = if selected && self.panels { TextStyle::new(color).bold() } else { TextStyle::new(color) };
+        // The selection behind a name only (98 / 2000), in `line`'s middle.
+        let mark = |r: &mut Renderer, name: &str, line: Rect| {
+            if label_only && selected {
+                let w = r.measure(name, &style).min(line.w).ceil();
+                let h = 16.0;
+                let label = Rect::new(r.snap(line.x - 2.0), r.snap(line.y + (line.h - h) / 2.0), w + 4.0, h);
+                r.fill_paint(label, 0.0, &theme.sidebar_selection);
+            }
+            if links && state == RowState::Hover {
+                let w = r.measure(name, &style).min(line.w).ceil();
+                r.fill_rect(Rect::new(line.x, r.snap(line.y + line.h / 2.0 + 6.0), w, 1.0), color);
+            }
+        };
         let path = self.path_of(item, app).unwrap_or("");
+        // A skin with older Windows' icons draws its own in place of Windows'.
+        if theme.icons != IconSet::Windows {
+            let drive_role = |d: &Drive| Role::Drive(eraicons::drive_kind(d.kind_name, &d.root));
+            let role = match item {
+                Item::Bin => Role::Bin { full: recycle::seen_full() == Some(true) },
+                Item::Drive(i) => app.drives.get(i).map_or(Role::Drive(eraicons::DriveKind::Fixed), drive_role),
+                Item::Pin(_) => app.drives.iter().find(|d| same_path(&d.root, path)).map_or_else(|| eraicons::role_of_path(path), drive_role),
+                _ => eraicons::role_of_path(path),
+            };
+            eraicons::draw(r, theme.icons, role, icon);
+        }
+        let era_icons = theme.icons != IconSet::Windows;
         match item {
             Item::Known(i) => {
                 match self.icons.get(path) {
+                    _ if era_icons => {}
                     Some(id) => r.icon(&app.icons, id, icon),
                     None => r.icon(&app.icons, app.icons.folder(), icon),
                 }
                 let name = self.known.get(i).map_or("", |k| k.name);
+                mark(r, name, Rect::new(text_x, row.y, text_w, row.h));
                 r.text(name, Rect::new(text_x, row.y, text_w, row.h), &style);
             }
             Item::Bin => {
                 match self.icons.get(path) {
+                    _ if era_icons => {}
                     Some(id) => r.icon(&app.icons, id, icon),
                     None => draw_bin_glyph(r, icon, theme.muted),
                 }
+                mark(r, recycle::NAME, Rect::new(text_x, row.y, text_w, row.h));
                 r.text(recycle::NAME, Rect::new(text_x, row.y, text_w, row.h), &style);
             }
             Item::Pin(_) => {
@@ -510,10 +652,12 @@ impl Sidebar {
                 // the plain folder icon.
                 let drive = app.drives.iter().find(|d| same_path(&d.root, path));
                 match drive.and_then(|d| self.icons.get(&d.root).or_else(|| app.icons.stock_drive(d.kind_name))) {
+                    _ if era_icons => {}
                     Some(id) => r.icon(&app.icons, id, icon),
                     None => r.icon(&app.icons, app.icons.folder(), icon),
                 }
                 if self.renaming.as_ref().is_none_or(|rn| !same_path(&rn.path, path)) {
+                    mark(r, &app.pin_name(path), Rect::new(text_x, row.y, text_w, row.h));
                     r.text(&app.pin_name(path), Rect::new(text_x, row.y, text_w, row.h), &style);
                 }
             }
@@ -522,11 +666,19 @@ impl Sidebar {
                 // Its own icon once the background lookup brought it, Windows' standard drive icon
                 // until then, and a drawn one if Windows has neither.
                 match self.icons.get(path).or_else(|| app.icons.stock_drive(drive.kind_name)) {
+                    _ if era_icons => {}
                     Some(id) => r.icon(&app.icons, id, icon),
                     None => draw_drive_glyph(r, icon, theme.muted, theme.text),
                 }
                 match usage(drive) {
+                    Some(used) if theme.era.classic() && !self.panels => {
+                        mark(r, &drive.name, Rect::new(text_x, row.y, text_w, top_h));
+                        r.text(&drive.name, Rect::new(text_x, row.y, text_w, top_h), &style);
+                        let bar = Rect::new(text_x, row.bottom() - bar_bottom - CLASSIC_BAR_H, text_w, CLASSIC_BAR_H);
+                        classic_usage(r, theme, bar, used);
+                    }
                     Some(used) => {
+                        mark(r, &drive.name, Rect::new(text_x, row.y, text_w, top_h));
                         r.text(&drive.name, Rect::new(text_x, row.y, text_w, top_h), &style);
                         let bar = Rect::new(text_x, row.bottom() - bar_bottom - bar_h, text_w, bar_h);
                         // Round ends in a rounded skin, and the edge of the path box if it has one.
@@ -541,7 +693,10 @@ impl Sidebar {
                             r.stroke_round_rect(bar.inset(0.5, 0.5), (radius - 0.5).max(0.0), 1.0, theme.input_border);
                         }
                     }
-                    None => r.text(&drive.name, Rect::new(text_x, row.y, text_w, row.h), &style),
+                    None => {
+                        mark(r, &drive.name, Rect::new(text_x, row.y, text_w, row.h));
+                        r.text(&drive.name, Rect::new(text_x, row.y, text_w, row.h), &style);
+                    }
                 }
             }
             Item::QuickHeading | Item::QuickHint | Item::PinnedHeading | Item::PinHint | Item::PcHeading => {}
@@ -777,6 +932,9 @@ impl Component for Sidebar {
 
         // (A gradient runs down the whole sidebar, as on the bars.)
         r.fill_paint_down(self.rect, 0.0, &theme.sidebar_paint, self.rect.y, self.rect.bottom());
+        if theme.bevels {
+            crate::pathbar::bevel(r, theme, self.rect, false, theme.window);
+        }
         r.push_clip(self.rect);
         if self.panels {
             self.paint_panels(r, theme);
@@ -863,12 +1021,15 @@ impl Component for Sidebar {
         if let Some(thumb) = self.thumb() {
             let state = if self.drag.is_some() {
                 ThumbState::Dragged
+            } else if self.repeat.hold != crate::retroctl::Hold::None {
+                ThumbState::Held(self.repeat.hold)
             } else if self.over_track {
                 ThumbState::Hover
             } else {
                 ThumbState::Rest
             };
-            paint_scrollbar(r, theme, self.lane(), thumb, state);
+            let room = crate::retroctl::Room::of(self.scroll, self.max_scroll());
+            paint_scrollbar(r, theme, self.lane(), thumb, state, room);
         }
     }
 
@@ -894,6 +1055,12 @@ impl Component for Sidebar {
 
     fn mouse_down(&mut self, ctx: &Ctx, e: &MouseEvent, app: &mut AppState) -> Effect {
         self.rebuild(app);
+        // An older Windows' scroll bar arrow buttons: a line up or down.
+        if self.track().is_some() && e.button == MouseButton::Left {
+            if let Some(held) = crate::retroctl::arrow_at(self.lane(), self.arrows, e.pos) {
+                return self.press_bar(crate::retroctl::Hold::Arrow(held), ctx.now);
+            }
+        }
         // The scrollbar: grab the thumb, or page towards the click.
         if self.on_track(e.pos) {
             if e.button != MouseButton::Left {
@@ -905,8 +1072,13 @@ impl Component for Sidebar {
                 self.anim.stop();
                 return Effect::Redraw;
             }
+            // An older Windows' track pages on while held, until the thumb reaches the mouse.
+            if self.arrows > 0.0 {
+                let way = if e.pos.y < thumb.y { crate::retroctl::Held::Start } else { crate::retroctl::Held::End };
+                return self.press_bar(crate::retroctl::Hold::Page(way), ctx.now);
+            }
             let from = if self.anim.running() { self.anim.target() } else { self.scroll };
-            let page = (self.rect.h - size::ROW_H).max(size::ROW_H);
+            let page = (self.rect.h - self.row_h).max(self.row_h);
             return self.scroll_to(from + if e.pos.y < thumb.y { -page } else { page }, ctx.now);
         }
         let Some(item) = self.item_at(e.pos).map(|i| self.items[i].item) else { return Effect::None };
@@ -927,6 +1099,10 @@ impl Component for Sidebar {
     }
 
     fn mouse_up(&mut self, _ctx: &Ctx, _e: &MouseEvent, _app: &mut AppState) -> Effect {
+        if self.repeat.release() {
+            crate::retroctl::repeat_timer(self.hwnd, BAR_REPEAT_TIMER, None);
+            return Effect::Redraw;
+        }
         if self.drag.take().is_some() {
             self.hover = None;
             let _ = self.update_hover();
@@ -945,7 +1121,7 @@ impl Component for Sidebar {
             return Effect::Redraw;
         }
         let from = if self.anim.running() { self.anim.target() } else { self.scroll };
-        self.scroll_to(from - e.wheel * self.wheel_lines * size::ROW_H, ctx.now)
+        self.scroll_to(from - e.wheel * self.wheel_lines * self.row_h, ctx.now)
     }
 
     fn menu_pick(&mut self, ctx: &Ctx, tag: u32, item: u32, app: &mut AppState) -> Effect {
@@ -999,7 +1175,7 @@ impl Component for Sidebar {
                 Effect::Redraw
             }
             PICK_EXPLORER => {
-                let at = if recycle::is_bin(&path) { "shell:RecycleBinFolder" } else { path.as_str() };
+                let at = if recycle::is_bin(&path) { "shell:RecycleBinFolder" } else if recent::is_recent(&path) { "shell:::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}" } else { path.as_str() };
                 shell::show_in_explorer(at, false);
                 Effect::None
             }
@@ -1071,8 +1247,18 @@ fn paint_panel_header(r: &mut Renderer, theme: &Theme, row: Rect, title: &str, l
     let paint = if lit { theme.panel_header.lighter(if theme.dark { 0.1 } else { 0.3 }) } else { theme.panel_header };
     // The bar reaches on below its bottom, out of sight, so only its top corners are round.
     r.push_clip(row);
-    r.fill_paint_down(Rect::new(row.x, row.y, row.w, row.h + radius), radius, &paint, row.y, row.bottom());
+    if theme.era == crate::theme::Era::Xp {
+        // XP's task pane: white on the left fading to blue on the right.
+        let y = row.y + row.h / 2.0;
+        r.fill_rect_toward(Rect::new(row.x, row.y, row.w, row.h + radius), radius, &paint, Point::new(row.x, y), Point::new(row.right(), y));
+    } else {
+        r.fill_paint_down(Rect::new(row.x, row.y, row.w, row.h + radius), radius, &paint, row.y, row.bottom());
+    }
     r.pop_clip();
+    if theme.era == crate::theme::Era::Xp {
+        // And its round button with the two arrows at the right end.
+        crate::retrolist::fold(r, theme, Point::new(row.right() - 15.0, row.y + row.h / 2.0), true, lit);
+    }
     r.fill_rect(Rect::new(row.x + radius * 0.7, row.y + 1.0, (row.w - 1.4 * radius).max(0.0), 1.0), theme.highlight);
     if dropping {
         r.stroke_round_rect(row.inset(0.5, 0.5), (radius - 0.5).max(0.0), 1.0, theme.accent);
@@ -1100,6 +1286,31 @@ fn draw_drive_glyph(r: &mut Renderer, icon: Rect, outline: Color, light: Color) 
     let corners = [Point::new(x0, y0), Point::new(x1, y0), Point::new(x1, y1), Point::new(x0, y1), Point::new(x0, y0)];
     r.polyline(&corners, 1.2, outline);
     r.fill_rect(Rect::new(x1 - 4.0, (y0 + y1) / 2.0 - 0.75, 2.0, 1.5), light);
+}
+
+/// 98 / 2000's progress bar for a drive's use in `bar`: a thin sunken frame, the skin's
+/// `usage-bar` inside it and `usage-fill` blocks with gaps of the face between them, as far as
+/// `used` (0 to 1) reaches.
+fn classic_usage(r: &mut Renderer, theme: &Theme, bar: Rect, used: f32) {
+    let bar = Rect::new(r.snap(bar.x), r.snap(bar.y), r.snap(bar.w), r.snap(bar.h));
+    let (hl, _, sh, _) = crate::retro::bevel_colours(theme, theme.toolbar);
+    r.fill_paint(bar, 0.0, &theme.bar_track_paint);
+    r.fill_rect(Rect::new(bar.x, bar.y, bar.w - 1.0, 1.0), sh);
+    r.fill_rect(Rect::new(bar.x, bar.y, 1.0, bar.h - 1.0), sh);
+    r.fill_rect(Rect::new(bar.x, bar.bottom() - 1.0, bar.w, 1.0), hl);
+    r.fill_rect(Rect::new(bar.right() - 1.0, bar.y, 1.0, bar.h), hl);
+    let inner = bar.inset(2.0, 2.0);
+    if inner.w <= 0.0 || inner.h <= 0.0 || used <= 0.0 {
+        return;
+    }
+    let block = (inner.h * 2.0 / 3.0).round().max(2.0);
+    let reach = inner.x + (inner.w * used.min(1.0)).max(block);
+    let mut x = inner.x;
+    while x < reach && x < inner.right() {
+        let w = block.min(inner.right() - x);
+        r.fill_paint(Rect::new(x, inner.y, w, inner.h), 0.0, &theme.usage_fill);
+        x += block + 2.0;
+    }
 }
 
 /// A small bin drawn with lines, until Windows' Recycle Bin icon has arrived: a lid and a tapered can.

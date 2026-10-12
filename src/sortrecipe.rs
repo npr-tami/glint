@@ -99,8 +99,7 @@ struct Order {
     key: Key,
     descending: bool,
     grain: Option<Grain>,
-    /// How it reads ("newest first"), for the tests' group headings.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// How it reads ("newest first"), for saying what a line does.
     text: String,
 }
 
@@ -149,6 +148,41 @@ struct Rules {
     line: usize,
     /// The _first / _last line the next lines are stacked under (Normal: none, after a blank line).
     stack: Place,
+    /// -and_subfolders: the folders inside it get these rules too (unless they have their own). Its
+    /// line.
+    subfolders: Option<usize>,
+    /// The lines its blocks start on ("in … (", "in = ("), for the editor to mark.
+    starts: Vec<usize>,
+}
+
+impl Rules {
+    /// Whether these rules sort anything (not just a view).
+    fn sorts(&self) -> bool {
+        !self.groups.is_empty() || !self.orders.is_empty()
+    }
+}
+
+/// A folder's rules in the text: from its "in" line to its ")" (lines counted from 1), or for an
+/// "in …:" without brackets, to its last line before the next "in". The editor tints the one the
+/// cursor is in and marks the one the folder on screen uses.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Block {
+    pub start: usize,
+    pub end: usize,
+    /// Ended by a ")" on `end`.
+    pub closed: bool,
+}
+
+/// A folder as written in the rules (after "in", or on a line of an "in = ("): where it is, and
+/// its path. The editor checks it's there; a folder renamed in Glint is changed here too.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Written {
+    pub line: usize,
+    /// Byte offsets of the folder as written (without quotes or the "(" after it).
+    pub span: (usize, usize),
+    pub path: String,
+    /// A folder Glint knows by name (Downloads…): Windows says where it is.
+    pub named: bool,
 }
 
 /// The time now, and how far local time is from UTC, to tell which day something was changed.
@@ -407,6 +441,8 @@ const ALIASES: &[(&str, &str)] = &[
     ("size", "biggest"),
     ("bigger", "biggest"),
     ("smaller", "smallest"),
+    ("by_date", "newest"),
+    ("by_size", "biggest"),
     ("name", "a_to_z"),
     ("by_name", "a_to_z"),
     ("alphabetical", "a_to_z"),
@@ -443,6 +479,17 @@ const ORDER_WORDS: &[(&str, Key, bool)] = &[
 
 const SIMPLE_GROUPS: &[&str] = &["folder", "other", "hidden", "updated", "added", "today", "yesterday", "empty"];
 
+/// The ways to write -and_subfolders (the first is the one the guide and suggestions use).
+const SUBFOLDER_WORDS: &[&str] = &["and_subfolders", "subfolders", "with_subfolders", "include_subfolders", "and_subfolders_too", "subfolders_too", "and_its_subfolders"];
+
+/// Rules about the folders themselves: (rule, a few words about it).
+pub const FOLDER_RULES: &[(&str, &str)] = &[("-and_subfolders", "the folders inside it too")];
+
+/// Whether a rule as written is -and_subfolders (the editor colours it like the order rules).
+pub fn is_folder_word(raw: &str) -> bool {
+    SUBFOLDER_WORDS.contains(&normalize(raw).as_str())
+}
+
 fn alias(word: &str) -> &str {
     ALIASES.iter().find(|(a, _)| *a == word).map_or(word, |(_, r)| r)
 }
@@ -460,19 +507,91 @@ pub fn known_type(word: &str) -> bool {
     OTHER_TYPES.contains(&word) || KINDS.iter().any(|(_, list)| list.contains(&word))
 }
 
-/// Every rule word (without _first, _last or _by_…) and file type, for "Did you mean…".
+/// Every rule word (without _first, _last or _by_…), for "Did you mean…": the ones the guide
+/// teaches first, then the other ways to write them.
 fn rule_words() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = ORDER_WORDS.iter().map(|(w, ..)| *w).collect();
     v.extend(SIMPLE_GROUPS);
     v.extend(KINDS.iter().map(|(k, _)| *k));
-    v.extend(ALIASES.iter().map(|(a, _)| *a));
     v.extend(["updated_3_days", "added_3_days", "older_than_1_year", "bigger_than_100mb", "smaller_than_1mb"]);
-    v.extend(KINDS.iter().flat_map(|(_, list)| list.iter().copied()));
-    v.extend(OTHER_TYPES);
     v.extend(VIEW_WORDS.iter().map(|(w, _)| *w));
+    v.push(SUBFOLDER_WORDS[0]);
+    v.extend(ALIASES.iter().map(|(a, _)| *a));
     let mut seen = std::collections::HashSet::new();
     v.retain(|w| seen.insert(*w));
     v
+}
+
+/// The rule a misspelt word (normalised) most likely means, with its ending: "new" -> "newest",
+/// "vid_first" -> "video_first", "folder_fist" -> "folder_first". Rules first: a file type only
+/// when it's one letter off one (so "new" never becomes -nef).
+fn suggestion(word: &str) -> Option<String> {
+    let (rule, place, grain) = split(word);
+    // The ending misspelt: _fist, _lst.
+    if place == Place::Normal && grain.is_none() {
+        if let Some(cut) = rule.rfind('_').filter(|&c| c > 0) {
+            let (base, end) = (&rule[..cut], &rule[cut + 1..]);
+            if end.len() >= 2 {
+                if let Some(e) = closest_within(end, ["first", "last"], 2).filter(|e| *e != end) {
+                    let base = if is_rule(base) { Some(base.to_string()) } else { suggest_base(base) };
+                    if let Some(base) = base {
+                        return Some(format!("{base}_{e}"));
+                    }
+                }
+            }
+        }
+    }
+    suggest_base(&rule).map(|base| format!("{base}{}", ending(place, grain)))
+}
+
+/// The rule word (without an ending) a misspelt one most likely means.
+fn suggest_base(rule: &str) -> Option<String> {
+    if !rule.chars().any(char::is_alphanumeric) {
+        return None;
+    }
+    let n = rule.chars().count();
+    let words = rule_words();
+    // Close in spelling: one letter off a short word, two in a longer one.
+    let most = if n <= 4 { 1 } else if n <= 8 { 2 } else { n / 3 };
+    if let Some(w) = closest_within(rule, words.iter().copied(), most) {
+        return Some(w.to_string());
+    }
+    // Its start: "new" -> newest, "vid" -> video (the shortest; another way of writing one gives the
+    // rule it means).
+    if n >= 3 {
+        if let Some(w) = words.iter().filter(|w| w.starts_with(rule)).min_by_key(|w| (ALIASES.iter().any(|(a, _)| a == *w), w.len())) {
+            return Some(alias(w).to_string());
+        }
+    }
+    // A file type, one letter off.
+    let types = KINDS.iter().flat_map(|(_, list)| list.iter().copied()).chain(OTHER_TYPES.iter().copied());
+    (n >= 4).then(|| closest_within(rule, types, 1)).flatten().map(str::to_string)
+}
+
+/// The option closest to `word`, at most `most` changes away.
+fn closest_within<'a>(word: &str, options: impl IntoIterator<Item = &'a str>, most: usize) -> Option<&'a str> {
+    let w: Vec<char> = word.chars().collect();
+    let mut best: Option<(&str, usize)> = None;
+    for o in options {
+        let d = distance(&w, &o.chars().collect::<Vec<_>>());
+        if best.is_none_or(|(_, b)| d < b) {
+            best = Some((o, d));
+        }
+    }
+    best.filter(|&(_, d)| d <= most).map(|(o, _)| o)
+}
+
+/// Words that aren't rules on their own ("sort", "first"): what to write instead.
+fn filler(word: &str) -> Option<String> {
+    Some(match word {
+        "first" | "last" => format!("\"{word}\" goes at the end of a kind of thing, like folder_{word}."),
+        "top" => "To put a kind of thing at the top, write _first after it, like folder_first.".into(),
+        "bottom" => "To put a kind of thing at the bottom, write _last after it, like folder_last.".into(),
+        "sort" | "sorted" | "sort_by" | "order" | "order_by" | "by" | "then" | "and" | "put" | "show" | "group" | "groups" => {
+            format!("\"{word}\" isn't a rule. Write how to sort, like newest or a_to_z, or a kind of thing, like folder or image.")
+        }
+        _ => return None,
+    })
 }
 
 /// The option closest to a misspelt word, or None when none is close (at most
@@ -561,6 +680,8 @@ enum Meaning {
     Group(Group),
     /// How the folder is shown (-large_icons).
     View(ViewMode),
+    /// -and_subfolders: the folders inside get the rules too.
+    Subfolders,
     /// A word Glint recognises, written wrong (-updated_3_dys): what to write instead.
     Explained(String),
     /// _by_… on something that isn't a date order.
@@ -570,6 +691,9 @@ enum Meaning {
 
 /// What a rule word (normalised) means.
 fn meaning(word: &str, written: &str) -> Meaning {
+    if SUBFOLDER_WORDS.contains(&word) {
+        return Meaning::Subfolders;
+    }
     if let Some(v) = view_word(word) {
         return Meaning::View(v);
     }
@@ -821,6 +945,66 @@ fn same_path(a: &str, b: &str) -> bool {
     a.trim_end_matches('\\').eq_ignore_ascii_case(b.trim_end_matches('\\'))
 }
 
+/// Whether `path` is inside the folder `parent` (below it, not the folder itself).
+fn inside(path: &str, parent: &str) -> bool {
+    under(path, parent).is_some_and(|rest| !rest.is_empty())
+}
+
+/// What's left of `path` after the folder `parent` ("\2024" in "C:\Pictures\2024"; "" for the folder
+/// itself), when it's that folder or inside it. (Windows paths: case doesn't matter.)
+fn under<'a>(path: &'a str, parent: &str) -> Option<&'a str> {
+    let parent = parent.trim_end_matches('\\');
+    let path = path.trim_end_matches('\\');
+    let head = path.get(..parent.len())?;
+    let rest = &path[parent.len()..];
+    (!parent.is_empty() && head.eq_ignore_ascii_case(parent) && (rest.is_empty() || rest.starts_with('\\'))).then_some(rest)
+}
+
+/// Where the rules that sort a folder are.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Source<'a> {
+    /// A folder's "in …" rules: its name as written, the lines its blocks start on, and whether
+    /// they're the folder's own (else a folder's above it, with -and_subfolders).
+    Folder { label: &'a str, starts: &'a [usize], own: bool },
+    /// The rules for every folder.
+    Everywhere,
+    /// None: its column decides.
+    Nothing,
+}
+
+/// The rules with the folder `from` (and the folders in it) written as `to`, after it was renamed
+/// or moved in Glint; None when they don't name it. A folder written as a full path gets the new
+/// one; one written from ~ or %VARIABLE% keeps that start when just its name changed.
+pub fn moved(text: &str, from: &str, to: &str) -> Option<String> {
+    let r = Recipe::parse(text);
+    let renamed = folder::parent(from).zip(folder::parent(to)).is_some_and(|(a, b)| same_path(&a, &b));
+    let mut changes: Vec<((usize, usize), String)> = Vec::new();
+    for w in r.places.iter().filter(|w| !w.named) {
+        let Some(rest) = under(&w.path, from) else { continue };
+        let Some(written) = text.get(w.span.0..w.span.1) else { continue };
+        let plain = written.replace('/', "\\");
+        let plain = plain.trim_end_matches('\\');
+        // The written folder's own start ("~\Pictures\old"), when only the name changed.
+        let head = plain.get(..plain.len().saturating_sub(rest.len())).filter(|_| plain.len() >= rest.len() && plain.get(plain.len() - rest.len()..).is_some_and(|t| t.eq_ignore_ascii_case(rest)));
+        let old_name = folder::file_name(from);
+        let start = head.and_then(|h| h.get(..h.len().saturating_sub(old_name.len())).filter(|s| renamed && s.ends_with('\\') && h.get(s.len()..).is_some_and(|t| t.eq_ignore_ascii_case(old_name))));
+        let new = match start {
+            Some(start) => format!("{start}{}{rest}", folder::file_name(to)),
+            None => format!("{}{rest}", to.trim_end_matches('\\')),
+        };
+        changes.push((w.span, new));
+    }
+    if changes.is_empty() {
+        return None;
+    }
+    let mut out = text.to_string();
+    changes.sort_by_key(|((a, _), _)| std::cmp::Reverse(*a));
+    for ((a, b), new) in changes {
+        out.replace_range(a..b, &new);
+    }
+    Some(out)
+}
+
 // ---------------------------------------------------------------- reading
 
 /// One word of a line: where it is in the text, and how it was written.
@@ -837,6 +1021,54 @@ pub struct Recipe {
     pub messages: Vec<Message>,
     everywhere: Rules,
     folders: Vec<(String, String, Rules)>,
+    /// The folders (numbers in `folders`) written more than once: their rules add up, which the
+    /// tip about it explains (so the tips about the rules themselves are left out).
+    twice: Vec<usize>,
+    /// What lines do, in plain words, for the editor to show after the cursor's line: (line, words).
+    pub explained: Vec<(usize, String)>,
+    /// The folders' blocks, in the order written.
+    pub blocks: Vec<Block>,
+    /// The folders as written.
+    pub places: Vec<Written>,
+    /// The lines of a "(" whose ")" never came (Enter after one adds it).
+    pub unclosed: Vec<usize>,
+}
+
+/// Where a line's rules go, for reading them.
+#[derive(Clone, Copy, Debug, Default)]
+struct Ctx<'a> {
+    /// The folder they're for, as written (None: every folder).
+    folder: Option<&'a str>,
+    /// In an "in = (": a word on its own may be a folder's name.
+    multi: bool,
+}
+
+/// An "in Downloads" (or "in Downloads:") line without a bracket, whose rules run to the next
+/// "in": kept to say so when that's likely not what was meant (a "(" forgotten).
+struct Bare {
+    line: usize,
+    /// As written ("in Downloads"), and the folder's name.
+    words: String,
+    label: String,
+    /// Where its words end, and where its code does (a colon after the words goes with a fix).
+    words_end: usize,
+    code_end: usize,
+    colon: bool,
+    /// Its number in `blocks`.
+    block: usize,
+    /// Where its last rule line ends; where its rules first stop at a blank line; and whether
+    /// more rules come after that.
+    rules_end: usize,
+    first_end: Option<usize>,
+    more_after_blank: bool,
+}
+
+/// A "(" whose ")" hasn't come yet: the line it ends, as written ("in Downloads ("), its number,
+/// and its block.
+struct Open {
+    what: String,
+    line: usize,
+    block: usize,
 }
 
 impl Recipe {
@@ -847,19 +1079,25 @@ impl Recipe {
         // throwaway set under a folder Glint doesn't know.
         let mut current: Option<Option<usize>> = Some(None);
         let mut scratch = Rules::default();
-        // A "(" whose ")" hasn't come yet: the line it ends, as written ("in Downloads ("), and its
-        // number.
-        let mut open: Option<(String, usize)> = None;
+        let mut open: Option<Open> = None;
         // An open "in = (": the folders listed in it so far. Its rules are read into `scratch`, and
         // every folder gets them when it closes.
         let mut multi: Option<Multi> = None;
         // The line before (notes and blank lines aside), when it was an "in …" line without a
         // bracket: its words ("in Downloads"), its number, where its words end (a "(" on the next
         // line belongs there) and where the line does (its notes after that are kept).
-        let mut bare_in: Option<(String, usize, usize, usize)> = None;
+        let mut under: Option<(String, usize, usize, usize)> = None;
+        // The "in …" without a bracket whose lines are being read.
+        let mut bare: Option<Bare> = None;
+        // The "in" lines, to say what they do once their rules are all read: (line, folder, with a
+        // bracket).
+        let mut in_lines: Vec<(usize, usize, bool)> = Vec::new();
+        let lines: Vec<&str> = text.split('\n').collect();
         let mut offset = 0;
         let mut last_line = 0;
-        for (i, raw_line) in text.split('\n').enumerate() {
+        // The last line with something on it besides notes (where a block left open ends).
+        let mut last_code = 0;
+        for (i, &raw_line) in lines.iter().enumerate() {
             last_line = i + 1;
             let line_no = i + 1;
             let line_start = offset;
@@ -875,15 +1113,36 @@ impl Recipe {
                         Some(Some(i)) => r.folders[i].2.stack = Place::Normal,
                         None => scratch.stack = Place::Normal,
                     }
+                    // An "in …" without a bracket: where its rules first stop at a blank line.
+                    if let Some(b) = bare.as_mut().filter(|b| b.rules_end > 0 && b.first_end.is_none()) {
+                        b.first_end = Some(b.rules_end);
+                    }
                 }
                 continue;
             }
+            let prev_code = last_code;
+            last_code = line_no;
             let at = line_start + lead;
             let span = Some((at, at + line.len()));
             // The whole line with its line break, for a fix that takes the line away: a blank line
             // left in its place would end a stack. (With a note on it, just the words go.)
             let whole = if raw_line.trim() == line { Some((line_start, offset.min(text.len()))) } else { span };
-            let bare = bare_in.take();
+            let above = under.take();
+            // "))": one closes, and the others have nothing to.
+            if line.matches(')').count() > 1 && line.chars().all(|c| c == ')' || c.is_whitespace()) {
+                if open.is_some() {
+                    r.messages.push(Message {
+                        line: line_no,
+                        text: "One ) is enough here: there's just one ( to close.".into(),
+                        error: true,
+                        span: Some((at + 1, at + line.len())),
+                        fix: Some(String::new()),
+                        fix_label: Some("remove the extra )".into()),
+                    });
+                }
+                close_bracket(&mut r, &mut open, &mut current, &mut multi, &scratch, &mut bare, line_no, whole);
+                continue;
+            }
             // ")" ends a folder's rules: the lines after it are for every folder again. (A ")" with
             // a colon after it, as in "):", is read the same way, but marked.)
             if let Some(after) = line.strip_prefix(')').filter(|a| a.trim().chars().all(|c| matches!(c, ':' | ';' | ',' | '.'))) {
@@ -897,12 +1156,18 @@ impl Recipe {
                         fix_label: Some("just )".into()),
                     });
                 }
-                close_bracket(&mut r, &mut open, &mut current, &mut multi, &scratch, line_no, whole);
+                close_bracket(&mut r, &mut open, &mut current, &mut multi, &scratch, &mut bare, line_no, whole);
+                continue;
+            }
+            // "}" or "]" for a ")" (unless a ")" comes next: then it's just a stray word).
+            if matches!(line, "}" | "]") && open.is_some() && !next_closes(&lines[i + 1..]) {
+                r.messages.push(Message { line: line_no, text: format!("Close the folder's rules with ), not {line}."), error: true, span, fix: Some(")".into()), fix_label: None });
+                close_bracket(&mut r, &mut open, &mut current, &mut multi, &scratch, &mut bare, line_no, whole);
                 continue;
             }
             // "(" on a line of its own.
             if line == "(" {
-                match bare {
+                match above {
                     // Under "in Downloads": it goes at the end of that line (with any notes
                     // between them kept).
                     Some((words, in_line, words_end, line_end)) => {
@@ -915,10 +1180,18 @@ impl Recipe {
                             fix: Some(format!(" ({between}")),
                             fix_label: Some(format!("{words} (")),
                         });
-                        open = Some((format!("{words} ("), in_line));
+                        let block = match bare.take() {
+                            Some(b) => b.block,
+                            None => new_block(&mut r, in_line),
+                        };
+                        if let Some(k) = in_lines.iter().position(|&(l, ..)| l == in_line) {
+                            in_lines[k].2 = true;
+                        }
+                        open = Some(Open { what: format!("{words} ("), line: in_line, block });
                     }
                     None => {
-                        close_earlier(&mut r, &mut open, &mut multi, &scratch, line_no, span, line);
+                        close_earlier(&mut r, &mut open, &mut multi, &scratch, line_no, span, line, prev_code);
+                        finish_bare(&mut r, &mut bare, text);
                         r.messages.push(Message {
                             line: line_no,
                             text: "This ( has no folder: a folder's own rules start with a line like \"in Downloads (\".".into(),
@@ -927,7 +1200,8 @@ impl Recipe {
                             fix: None,
                             fix_label: None,
                         });
-                        open = Some(("(".into(), line_no));
+                        let block = new_block(&mut r, line_no);
+                        open = Some(Open { what: "(".into(), line: line_no, block });
                         r.everywhere.stack = Place::Normal;
                         current = None; // the lines in it are still checked, but not used
                         scratch = Rules::default();
@@ -937,9 +1211,51 @@ impl Recipe {
             }
             // A folder of an "in = (": a path on a line of its own (or a folder Glint knows by name).
             if let Some(m) = multi.as_mut() {
-                if let Some(written) = multi_folder(line) {
+                // Several on one line, with commas between them: each goes on a line of its own.
+                let parts: Vec<&str> = line.split([',', ';']).map(str::trim).filter(|p| !p.is_empty()).collect();
+                if parts.len() > 1 && parts.iter().all(|p| multi_folder(p).is_some()) {
+                    r.messages.push(Message {
+                        line: line_no,
+                        text: "Put each folder on a line of its own.".into(),
+                        error: true,
+                        span,
+                        fix: Some(parts.join("\n")),
+                        fix_label: Some("one folder per line".into()),
+                    });
+                    let mut from = 0;
+                    for p in parts {
+                        let written = multi_folder(p).unwrap_or(p);
+                        let found = line[from..].find(written).map_or(0, |k| from + k);
+                        from = found + written.len();
+                        if let Some(path) = place_path(written) {
+                            m.folders.push((path.clone(), written.to_string(), line_no));
+                            r.places.push(Written { line: line_no, span: (at + found, at + found + written.len()), path, named: is_named(written) });
+                        }
+                    }
+                    continue;
+                }
+                if let Some(mut written) = multi_folder(line) {
+                    // "C:\Pictures (": the "in = (" above is the bracket.
+                    if let Some(base) = written.strip_suffix('(') {
+                        let base = base.trim_end().trim_matches('"').trim_end();
+                        let cut = line.trim_end_matches('(').trim_end().len();
+                        r.messages.push(Message {
+                            line: line_no,
+                            text: "No ( after a folder here: the \"in = (\" above has the bracket.".into(),
+                            error: true,
+                            span: Some((at + cut, at + line.len())),
+                            fix: Some(String::new()),
+                            fix_label: Some("remove the (".into()),
+                        });
+                        written = base;
+                    }
+                    let found = line.find(written).unwrap_or(0);
                     match place_path(written) {
-                        Some(path) => m.folders.push((path, written.to_string(), line_no)),
+                        Some(path) => {
+                            m.folders.push((path.clone(), written.to_string(), line_no));
+                            r.places.push(Written { line: line_no, span: (at + found, at + found + written.len()), path, named: is_named(written) });
+                            explain(&mut r, line_no, format!("{} gets this block's rules", folder::file_name(written)));
+                        }
                         None => r.messages.push(Message {
                             line: line_no,
                             text: format!("\"{written}\" isn't a full path: write it like C:\\Users\\me\\Pictures or ~\\Pictures."),
@@ -955,9 +1271,11 @@ impl Recipe {
             // "in Downloads (" … ")", or "in Downloads:" to the next "in" - rules for one folder
             // (the colon may be left out).
             if let Some(rest) = strip_in(line) {
-                close_earlier(&mut r, &mut open, &mut multi, &scratch, line_no, span, line);
+                close_earlier(&mut r, &mut open, &mut multi, &scratch, line_no, span, line, prev_code);
+                finish_bare(&mut r, &mut bare, text);
                 // Lines after a folder's rules don't stack under the rules for every folder above.
                 r.everywhere.stack = Place::Normal;
+                let rest_at = at + line.len() - rest.len();
                 // "in = (": the same rules for several folders, listed on the lines under it.
                 if let Some(after) = rest.strip_prefix('=') {
                     let after = after.trim();
@@ -971,10 +1289,12 @@ impl Recipe {
                             fix_label: None,
                         });
                     }
-                    open = Some(("in = (".into(), line_no));
+                    let block = new_block(&mut r, line_no);
+                    open = Some(Open { what: "in = (".into(), line: line_no, block });
                     multi = Some(Multi { line: line_no, folders: Vec::new() });
                     current = None;
                     scratch = Rules { line: line_no, ..Rules::default() };
+                    explain(&mut r, line_no, "The same rules for each folder listed under it".into());
                     continue;
                 }
                 // All on one line ("in Downloads (-newest_first)"): read as meant, but marked.
@@ -987,17 +1307,78 @@ impl Recipe {
                         fix: Some(if rules.is_empty() { format!("in {label} (\n)") } else { format!("in {label} (\n{rules}\n)") }),
                         fix_label: Some("put them on lines of their own".into()),
                     });
-                    let i = folder_rules(&mut r, path, label, line_no);
+                    let i = folder_rules(&mut r, path.clone(), label.clone(), line_no);
+                    r.folders[i].2.starts.push(line_no);
+                    r.places.push(Written { line: line_no, span: label_span(rest, rest_at, &label), path, named: is_named(&label) });
+                    let block = new_block(&mut r, line_no);
+                    r.blocks[block].closed = true;
                     let mut messages = Vec::new();
-                    read_line(&tokenize(rules, at + line.len() - rest.len() + rules_at), line_no, &mut r.folders[i].2, &mut messages);
+                    let said = read_line(&tokenize(rules, rest_at + rules_at), line_no, &mut r.folders[i].2, &mut messages, Ctx { folder: Some(&label), multi: false });
                     r.messages.extend(messages);
+                    explain(&mut r, line_no, said);
                     current = Some(None);
                     continue;
                 }
-                let bracket = rest.trim_end_matches(|c: char| c == ':' || c.is_whitespace()).ends_with('(');
-                let label = folder_name(rest);
+                // "in Downloads ( newest_first": the rules go on the lines under it.
+                if let Some((path, label, cut)) = rules_after_bracket(rest) {
+                    let rules = rest[cut..].trim();
+                    r.messages.push(Message {
+                        line: line_no,
+                        text: format!("Put the rules on the lines under \"in {label} (\"."),
+                        error: true,
+                        span: Some((rest_at + cut, at + line.len())),
+                        fix: Some(format!("\n{rules}")),
+                        fix_label: Some("put them on the next line".into()),
+                    });
+                    let i = folder_rules(&mut r, path.clone(), label.clone(), line_no);
+                    r.folders[i].2.starts.push(line_no);
+                    r.places.push(Written { line: line_no, span: label_span(rest, rest_at, &label), path, named: is_named(&label) });
+                    in_lines.push((line_no, i, true));
+                    let block = new_block(&mut r, line_no);
+                    open = Some(Open { what: format!("in {label} ("), line: line_no, block });
+                    current = Some(Some(i));
+                    let mut messages = Vec::new();
+                    read_line(&tokenize(&rest[cut..], rest_at + cut), line_no, &mut r.folders[i].2, &mut messages, Ctx { folder: Some(&label), multi: false });
+                    r.messages.extend(messages);
+                    continue;
+                }
+                let code = rest.trim_end_matches(|c: char| c == ':' || c.is_whitespace());
+                // "in Downloads {": a ( is meant.
+                let curly = code.ends_with(['{', '[']);
+                let bracket = code.ends_with('(') || curly;
+                let mut label = folder_name(rest);
+                // "in C:\Pictures\* (": its subfolders too, which is -and_subfolders.
+                let mut star = false;
+                if let Some(base) = label.strip_suffix('*').map(|b| b.trim_end_matches(['\\', '/'])).filter(|b| !b.is_empty()) {
+                    let from = rest.rfind('*').map_or(rest.len(), |k| rest[..k].trim_end_matches(['\\', '/']).len());
+                    r.messages.push(Message {
+                        line: line_no,
+                        text: "For its subfolders too, write and_subfolders in its rules (a * isn't read).".into(),
+                        error: true,
+                        span: Some((rest_at + from, at + line.len())),
+                        fix: bracket.then(|| " (\nand_subfolders".to_string()),
+                        fix_label: bracket.then(|| "use and_subfolders".to_string()),
+                    });
+                    label = base.to_string();
+                    star = true;
+                }
                 if bracket {
-                    if !rest.ends_with('(') {
+                    // Its brackets: one "(" (the others do nothing), and nothing after it.
+                    let run = rest.trim_end_matches(|c: char| c == '(' || c == ':' || c.is_whitespace()).len();
+                    if curly {
+                        let k = rest_at + code.len() - 1;
+                        r.messages.push(Message { line: line_no, text: format!("Start a folder's rules with (, not {}.", &code[code.len() - 1..]), error: true, span: Some((k, k + 1)), fix: Some("(".into()), fix_label: None });
+                    } else if rest[run..].matches('(').count() > 1 && !star {
+                        let first = run + rest[run..].find('(').unwrap_or(0) + 1;
+                        r.messages.push(Message {
+                            line: line_no,
+                            text: "There's one ( too many here: one starts the folder's rules.".into(),
+                            error: true,
+                            span: Some((rest_at + first, at + line.len())),
+                            fix: Some(String::new()),
+                            fix_label: Some("remove the extra (".into()),
+                        });
+                    } else if !rest.ends_with('(') && !star {
                         // "in Downloads (:" - read as meant, but marked.
                         let keep = line.trim_end_matches(|c: char| c == ':' || c.is_whitespace()).len();
                         r.messages.push(Message {
@@ -1009,14 +1390,38 @@ impl Recipe {
                             fix_label: Some("remove the :".into()),
                         });
                     }
-                    open = Some((line.to_string(), line_no));
+                }
+                let block = new_block(&mut r, line_no);
+                if bracket {
+                    open = Some(Open { what: line.to_string(), line: line_no, block });
                 } else {
                     // (A drive keeps its colon: "in C:".)
                     let words = if label.ends_with(":\\") { line } else { line.trim_end_matches(':').trim_end() };
-                    bare_in = Some((words.to_string(), line_no, at + words.len(), at + line.len()));
+                    under = Some((words.to_string(), line_no, at + words.len(), at + line.len()));
+                    bare = Some(Bare {
+                        line: line_no,
+                        words: words.to_string(),
+                        label: label.clone(),
+                        words_end: at + words.len(),
+                        code_end: at + line.len(),
+                        colon: words.len() < line.len(),
+                        block,
+                        rules_end: 0,
+                        first_end: None,
+                        more_after_blank: false,
+                    });
                 }
                 match place_path(&label).filter(|_| !label.is_empty()) {
-                    Some(path) => current = Some(Some(folder_rules(&mut r, path, label, line_no))),
+                    Some(path) => {
+                        let i = folder_rules(&mut r, path.clone(), label.clone(), line_no);
+                        r.folders[i].2.starts.push(line_no);
+                        if star {
+                            r.folders[i].2.subfolders.get_or_insert(line_no);
+                        }
+                        r.places.push(Written { line: line_no, span: label_span(rest, rest_at, &label), path, named: is_named(&label) });
+                        in_lines.push((line_no, i, bracket));
+                        current = Some(Some(i));
+                    }
                     None => {
                         let suggestion = closest(&label, PLACE_NAMES.iter().copied());
                         let hint = suggestion.map_or(String::new(), |s| format!(" Did you mean \"{s}\"?"));
@@ -1068,8 +1473,10 @@ impl Recipe {
                     if mark == "(" {
                         // Its ")" closes it (rather than being marked too). The lines in it are
                         // still checked, but not used until it's put right.
-                        close_earlier(&mut r, &mut open, &mut multi, &scratch, line_no, span, line);
-                        open = Some((line.to_string(), line_no));
+                        close_earlier(&mut r, &mut open, &mut multi, &scratch, line_no, span, line, prev_code);
+                        finish_bare(&mut r, &mut bare, text);
+                        let block = new_block(&mut r, line_no);
+                        open = Some(Open { what: line.to_string(), line: line_no, block });
                         r.everywhere.stack = Place::Normal;
                         current = None;
                         scratch = Rules::default();
@@ -1098,7 +1505,7 @@ impl Recipe {
                         fix_label: Some("put the ) on its own line".into()),
                     });
                 }
-                close_bracket(&mut r, &mut open, &mut current, &mut multi, &scratch, line_no, Some(away));
+                close_bracket(&mut r, &mut open, &mut current, &mut multi, &scratch, &mut bare, line_no, Some(away));
             }
             let mut close_after = None;
             if let Some(t) = tokens.last().filter(|t| t.text.ends_with(')') && !t.text.contains('(') && !is_rule(t.text)).cloned() {
@@ -1113,13 +1520,25 @@ impl Recipe {
                 close_after = Some(away);
             }
             let mut messages = Vec::new();
+            let label = match current {
+                Some(None) => None,
+                Some(Some(i)) => Some(r.folders[i].1.clone()),
+                None => Some(String::new()),
+            };
             let rules = match current {
                 Some(None) => &mut r.everywhere,
                 Some(Some(i)) => &mut r.folders[i].2,
                 None => &mut scratch,
             };
-            read_line(&tokens, line_no, rules, &mut messages);
+            let said = read_line(&tokens, line_no, rules, &mut messages, Ctx { folder: label.as_deref(), multi: multi.is_some() });
             r.messages.extend(messages);
+            explain(&mut r, line_no, said);
+            // The lines of an "in …" without a bracket: where they end.
+            if let Some(b) = bare.as_mut() {
+                b.rules_end = line_start + raw_line.trim_end_matches('\r').len();
+                b.more_after_blank |= b.first_end.is_some();
+                r.blocks[b.block].end = line_no;
+            }
             if let Some(away) = close_after {
                 if open.is_some() {
                     r.messages.push(Message {
@@ -1131,29 +1550,57 @@ impl Recipe {
                         fix_label: Some("put the ) on its own line".into()),
                     });
                 }
-                close_bracket(&mut r, &mut open, &mut current, &mut multi, &scratch, line_no, Some(away));
+                close_bracket(&mut r, &mut open, &mut current, &mut multi, &scratch, &mut bare, line_no, Some(away));
             }
         }
         finish_multi(&mut r, &mut multi, &scratch);
-        if let Some((what, line)) = open {
+        finish_bare(&mut r, &mut bare, text);
+        if let Some(o) = open {
             // Closing it at the end is what was meant, most likely.
             let end = text.len();
             r.messages.push(Message {
                 line: last_line,
-                text: format!("\"{what}\" on line {line} isn't closed: put a ) on a line of its own after its rules."),
+                text: format!("\"{}\" on line {} isn't closed: put a ) on a line of its own after its rules.", o.what, o.line),
                 error: true,
                 span: Some((end, end)),
                 fix: Some(if text.ends_with('\n') || text.is_empty() { ")".into() } else { "\n)".into() }),
                 fix_label: Some("close it with )".into()),
             });
+            r.blocks[o.block].end = last_code.max(o.line);
+            r.unclosed.push(o.line);
         }
+        // What the "in" lines and the ")" lines do, now that each folder's rules are all read.
+        for (line, i, bracket) in in_lines {
+            let (_, label, rules) = &r.folders[i];
+            let name = folder::file_name(label).to_string();
+            let mut said = if !bracket {
+                format!("The lines under it, up to the next \"in\", are just for {name}")
+            } else if rules.sorts() {
+                format!("Rules just for {name}, in place of the ones for every folder")
+            } else if rules.view.is_some() {
+                format!("Just a view for {name}: its order stays as it was")
+            } else {
+                continue;
+            };
+            if rules.subfolders.is_some() {
+                said.push_str(", and the folders inside it");
+            }
+            explain(&mut r, line, said);
+        }
+        let ends: Vec<usize> = r.blocks.iter().filter(|b| b.closed && b.end > b.start).map(|b| b.end).collect();
+        for end in ends {
+            explain(&mut r, end, "The end of these rules: the lines after it are for every folder again".into());
+        }
+        r.explained.sort_by_key(|&(line, _)| line);
         let mut tips = Vec::new();
         check_useless(&r.everywhere, "", &mut tips);
-        for (_, label, rules) in &r.folders {
+        for (i, (_, label, rules)) in r.folders.iter().enumerate() {
             if rules.groups.is_empty() && rules.orders.is_empty() && rules.view.is_none() {
                 tips.push(Message { line: rules.line, text: format!("\"in {label}\" has no rules in it yet."), error: false, span: None, fix: None, fix_label: None });
             }
-            check_useless(rules, &format!(" (in {label})"), &mut tips);
+            if !r.twice.contains(&i) {
+                check_useless(rules, &format!(" (in {label})"), &mut tips);
+            }
         }
         r.messages.extend(tips);
         r
@@ -1164,29 +1611,59 @@ impl Recipe {
         self.messages.iter().any(|m| m.error)
     }
 
-    fn rules_for(&self, folder: &str) -> &Rules {
-        self.folders.iter().find(|(p, ..)| same_path(p, folder)).map_or(&self.everywhere, |(_, _, r)| r)
+    /// The folder's rules (a number in `folders`) that decide its order (`sorting`) or its view:
+    /// its own, when they say anything about that, else those of the nearest folder above it with
+    /// -and_subfolders that do. None: the rules for every folder decide. (So a folder's rules with
+    /// just a view keep the order it would have without them.)
+    fn block_for(&self, folder: &str, sorting: bool) -> Option<usize> {
+        let says = |r: &Rules| if sorting { r.sorts() } else { r.view.is_some() };
+        if let Some(i) = self.folders.iter().position(|(p, _, r)| same_path(p, folder) && says(r)) {
+            return Some(i);
+        }
+        self.folders
+            .iter()
+            .enumerate()
+            .filter(|(_, (p, _, r))| r.subfolders.is_some() && says(r) && inside(folder, p))
+            .max_by_key(|(_, (p, ..))| p.trim_end_matches('\\').len())
+            .map(|(i, _)| i)
     }
 
-    /// The name as written of the "in …" rules this folder gets, if any.
+    fn rules_for(&self, folder: &str) -> &Rules {
+        self.block_for(folder, true).map_or(&self.everywhere, |i| &self.folders[i].2)
+    }
+
+    /// The name as written of the "in …" rules that sort this folder, if any (its own, or a folder's
+    /// above it with -and_subfolders).
     pub fn folder_label(&self, folder: &str) -> Option<&str> {
-        self.folders.iter().find(|(p, ..)| same_path(p, folder)).map(|(_, l, _)| l.as_str())
+        self.block_for(folder, true).map(|i| self.folders[i].1.as_str())
+    }
+
+    /// Where the rules that sort this folder are (for the editor to say).
+    pub fn source(&self, folder: &str) -> Source<'_> {
+        match self.block_for(folder, true) {
+            Some(i) => {
+                let (path, label, rules) = &self.folders[i];
+                Source::Folder { label, starts: &rules.starts, own: same_path(path, folder) }
+            }
+            None if self.everywhere.sorts() => Source::Everywhere,
+            None => Source::Nothing,
+        }
     }
 
     /// Whether any rules are for this folder: its own "in …" rules, or rules for every folder.
     /// With none (only "in …" rules, for other folders), it sorts by its column as usual.
     pub fn applies(&self, folder: &str) -> bool {
-        let rules = self.rules_for(folder);
-        !rules.groups.is_empty() || !rules.orders.is_empty()
+        self.rules_for(folder).sorts()
     }
 
-    /// How this folder is shown, when the rules say: its own "in …" view, else the view for every
-    /// folder. None for This PC (no path) and for folders the rules give no view.
+    /// How this folder is shown, when the rules say: its own "in …" view (or that of a folder above
+    /// it with -and_subfolders), else the view for every folder. None for This PC (no path) and for
+    /// folders the rules give no view.
     pub fn view_for(&self, folder: &str) -> Option<ViewMode> {
         if folder.is_empty() {
             return None;
         }
-        let own = self.folders.iter().find(|(p, ..)| same_path(p, folder)).and_then(|(_, _, r)| r.view);
+        let own = self.block_for(folder, false).and_then(|i| self.folders[i].2.view);
         own.or(self.everywhere.view).map(|(v, _)| v)
     }
 
@@ -1249,13 +1726,24 @@ fn strip_in(line: &str) -> Option<&str> {
 }
 
 /// The folder of an "in" line, as written: "Downloads (" -> "Downloads", and a drive's colon kept
-/// ("C: (" -> "C:\").
+/// ("C: (" -> "C:\"). (A "{" or "[" is taken for the "(".)
 fn folder_name(rest: &str) -> String {
-    let name = rest.trim_end_matches(|c: char| c == ':' || c == '(' || c.is_whitespace());
+    let name = rest.trim_end_matches(|c: char| matches!(c, ':' | '(' | '{' | '[') || c.is_whitespace());
     if name.len() == 1 && name.as_bytes()[0].is_ascii_alphabetic() && rest[1..].trim_start().starts_with(':') {
         return format!("{name}:\\");
     }
     name.trim_matches('"').to_string()
+}
+
+/// Where the folder of an "in" line is written (`rest` starts at `rest_at`).
+fn label_span(rest: &str, rest_at: usize, label: &str) -> (usize, usize) {
+    let start = rest_at + rest.len() - rest.trim_start_matches('"').len();
+    (start, start + label.len().min(rest.len()))
+}
+
+/// A folder Glint knows by name (Downloads…).
+fn is_named(written: &str) -> bool {
+    PLACE_NAMES.iter().any(|n| n.eq_ignore_ascii_case(written.trim()))
 }
 
 /// An "in" line with the folder's rules on it too ("Downloads (-newest_first)", or "Downloads ()"):
@@ -1276,23 +1764,106 @@ fn one_line_block(rest: &str) -> Option<(String, String, usize, &str)> {
     })
 }
 
-/// The rules of a folder, ready for its lines (a folder written twice gets the lines of both).
+/// An "in" line with rules after its "(" and no ")" ("Downloads ( newest_first"): the folder's path
+/// and name, and where the rules start in `rest`. Only when all the words after the "(" are rules,
+/// as a path can have a bracket of its own.
+fn rules_after_bracket(rest: &str) -> Option<(String, String, usize)> {
+    rest.match_indices('(').find_map(|(p, _)| {
+        let label = rest[..p].trim().trim_matches('"');
+        let tokens = tokenize(&rest[p + 1..], 0);
+        if label.is_empty() || tokens.is_empty() {
+            return None;
+        }
+        let (mut rules, mut messages) = (Rules::default(), Vec::new());
+        read_line(&tokens, 0, &mut rules, &mut messages, Ctx { folder: Some(label), multi: false });
+        let read = rules.sorts() || rules.view.is_some() || rules.subfolders.is_some();
+        if !read || messages.iter().any(|m| m.error) {
+            return None;
+        }
+        Some((place_path(label)?, label.to_string(), p + 1))
+    })
+}
+
+/// Whether the next line with something on it (notes aside) starts with ")".
+fn next_closes(lines: &[&str]) -> bool {
+    lines.iter().map(|l| strip_note(l).trim()).find(|l| !l.is_empty()).is_some_and(|l| l.starts_with(')'))
+}
+
+/// A new block, starting on `line` (its end is set as its lines are read).
+fn new_block(r: &mut Recipe, line: usize) -> usize {
+    r.blocks.push(Block { start: line, end: line, closed: false });
+    r.blocks.len() - 1
+}
+
+/// Says what a line does (after anything it says already).
+fn explain(r: &mut Recipe, line: usize, said: String) {
+    if said.is_empty() {
+        return;
+    }
+    match r.explained.iter_mut().find(|(l, _)| *l == line) {
+        Some((_, before)) => {
+            before.push_str("; ");
+            let mut chars = said.chars();
+            before.extend(chars.next().map(|c| c.to_ascii_lowercase()));
+            before.push_str(chars.as_str());
+        }
+        None => r.explained.push((line, said)),
+    }
+}
+
+/// The rules of a folder, ready for its lines (a folder written twice gets the lines of both, with
+/// a tip saying so).
 fn folder_rules(r: &mut Recipe, path: String, label: String, line: usize) -> usize {
-    let i = r.folders.iter().position(|(p, ..)| same_path(p, &path)).unwrap_or_else(|| {
-        r.folders.push((path, label, Rules { line, ..Rules::default() }));
-        r.folders.len() - 1
-    });
+    let i = match r.folders.iter().position(|(p, ..)| same_path(p, &path)) {
+        Some(i) => {
+            let first = r.folders[i].2.line;
+            r.messages.push(Message {
+                line,
+                text: format!("\"{label}\" already has rules on line {first}, so it gets both. Keep it in one place."),
+                error: false,
+                span: None,
+                fix: None,
+                fix_label: None,
+            });
+            if !r.twice.contains(&i) {
+                r.twice.push(i);
+            }
+            i
+        }
+        None => {
+            r.folders.push((path, label, Rules { line, ..Rules::default() }));
+            r.folders.len() - 1
+        }
+    };
     r.folders[i].2.stack = Place::Normal;
     i
 }
 
 /// A ")": the folder's rules end, and the lines after it are for every folder again. With no "("
-/// to close, it's marked, with a fix that takes it away (`away`: what goes).
-fn close_bracket(r: &mut Recipe, open: &mut Option<(String, usize)>, current: &mut Option<Option<usize>>, multi: &mut Option<Multi>, scratch: &Rules, line: usize, away: Option<(usize, usize)>) {
-    if open.take().is_some() {
+/// to close, it's marked, with a fix that takes it away (`away`: what goes) - or, under an "in"
+/// line without a bracket, one that adds the "(" there.
+#[allow(clippy::too_many_arguments)]
+fn close_bracket(r: &mut Recipe, open: &mut Option<Open>, current: &mut Option<Option<usize>>, multi: &mut Option<Multi>, scratch: &Rules, bare: &mut Option<Bare>, line: usize, away: Option<(usize, usize)>) {
+    if let Some(o) = open.take() {
         finish_multi(r, multi, scratch);
         *current = Some(None);
         r.everywhere.stack = Place::Normal;
+        r.blocks[o.block].end = line;
+        r.blocks[o.block].closed = true;
+    } else if let Some(b) = bare.take() {
+        r.messages.push(Message {
+            line,
+            text: format!("\"{}\" on line {} has no (, so this ) has nothing to close.", b.words, b.line),
+            error: true,
+            span: Some((b.words_end, b.code_end)),
+            fix: Some(" (".into()),
+            fix_label: Some(format!("add the ( on line {}", b.line)),
+        });
+        // Read as meant: its rules end here.
+        *current = Some(None);
+        r.everywhere.stack = Place::Normal;
+        r.blocks[b.block].end = line;
+        r.blocks[b.block].closed = true;
     } else {
         r.messages.push(Message {
             line,
@@ -1305,20 +1876,41 @@ fn close_bracket(r: &mut Recipe, open: &mut Option<(String, usize)>, current: &m
     }
 }
 
-/// A new "(" while one is still open: the one above ends here, marked, with a fix that closes it
-/// (`written`: the new line, which the fix puts after the ")").
-fn close_earlier(r: &mut Recipe, open: &mut Option<(String, usize)>, multi: &mut Option<Multi>, scratch: &Rules, line: usize, span: Option<(usize, usize)>, written: &str) {
-    if let Some((before, _)) = open.take() {
+/// A new "(" while one is still open: the one above ends here (after `last`, its last line), marked,
+/// with a fix that closes it (`written`: the new line, which the fix puts after the ")").
+#[allow(clippy::too_many_arguments)]
+fn close_earlier(r: &mut Recipe, open: &mut Option<Open>, multi: &mut Option<Multi>, scratch: &Rules, line: usize, span: Option<(usize, usize)>, written: &str, last: usize) {
+    if let Some(o) = open.take() {
         finish_multi(r, multi, scratch);
         r.messages.push(Message {
             line,
-            text: format!("\"{before}\" isn't closed with ) before this line, so its rules end here."),
+            text: format!("\"{}\" isn't closed with ) before this line, so its rules end here.", o.what),
             error: true,
             span,
             fix: Some(format!(")\n{written}")),
             fix_label: Some("close the one above with )".into()),
         });
+        r.blocks[o.block].end = last.max(o.line);
+        r.unclosed.push(o.line);
     }
+}
+
+/// An "in …" without a bracket ends (at the next "in", or the end): when it's likely its "(" was
+/// forgotten - it has no colon, or its rules go on past a blank line - a tip says where its rules
+/// end, with a fix that puts them in brackets up to the blank line.
+fn finish_bare(r: &mut Recipe, bare: &mut Option<Bare>, text: &str) {
+    let Some(b) = bare.take() else { return };
+    if b.rules_end == 0 || (b.colon && !b.more_after_blank) {
+        return;
+    }
+    let cut = b.first_end.unwrap_or(b.rules_end);
+    let Some(inside) = text.get(b.code_end..cut) else { return };
+    let said = if b.colon {
+        format!("\"{}:\" runs to the next \"in\", so the lines after the blank line are just for {} too.", b.words, b.label)
+    } else {
+        format!("\"{}\" has no (, so every line under it, up to the next \"in\", is just for {}.", b.words, b.label)
+    };
+    r.messages.push(Message { line: b.line, text: said, error: false, span: Some((b.words_end, cut)), fix: Some(format!(" ({inside}\n)")), fix_label: Some("add ( and )".into()) });
 }
 
 /// An open "in = (": its line, and the folders listed in it so far (path, as written, line).
@@ -1337,8 +1929,7 @@ fn multi_folder(line: &str) -> Option<&str> {
         || written.starts_with("\\\\")
         || written.starts_with('%')
         || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b.len() == 2 || matches!(b[2], b'\\' | b'/')));
-    let named = PLACE_NAMES.iter().any(|n| n.eq_ignore_ascii_case(written));
-    (path || named).then_some(written)
+    (path || is_named(written)).then_some(written)
 }
 
 /// An "in = (" ends: each of its folders gets its rules (added to any it has from elsewhere).
@@ -1363,13 +1954,17 @@ fn finish_multi(r: &mut Recipe, multi: &mut Option<Multi>, scratch: &Rules) {
         if rules.view.is_none() {
             rules.view = scratch.view;
         }
+        if rules.subfolders.is_none() {
+            rules.subfolders = scratch.subfolders;
+        }
+        rules.starts.push(m.line);
     }
 }
 
 /// Whether a word as written is a rule (a group or an order).
 fn is_rule(raw: &str) -> bool {
     let word = normalize(raw);
-    matches!(meaning(&word, &word), Meaning::Order(_) | Meaning::Group(_) | Meaning::View(_))
+    matches!(meaning(&word, &word), Meaning::Order(_) | Meaning::Group(_) | Meaning::View(_) | Meaning::Subfolders)
 }
 
 /// Notes start with # (or //) and are left out.
@@ -1420,7 +2015,7 @@ fn joined_len(tokens: &[Token], i: usize) -> usize {
     }
     for n in (2..=most).rev() {
         let word = tokens[i..i + n].iter().map(|t| normalize(t.text)).collect::<Vec<_>>().join("_");
-        if let Meaning::Order(_) | Meaning::Group(_) | Meaning::View(_) = meaning(&word, &word) {
+        if let Meaning::Order(_) | Meaning::Group(_) | Meaning::View(_) | Meaning::Subfolders = meaning(&word, &word) {
             // "name has screenshot newest" is "name has screenshot", then "newest".
             let name_words = ["name_has_", "name_contains_", "name_starts_with_", "name_ends_with_"];
             if let Some(prefix) = name_words.iter().find(|p| word.starts_with(*p)) {
@@ -1444,9 +2039,17 @@ fn joined_len(tokens: &[Token], i: usize) -> usize {
 
 /// One line. An order rule written after a group on the same line is for that group only
 /// (-image -biggest); one written before any group, or on its own line, is for every group.
-fn read_line(tokens: &[Token], line: usize, into: &mut Rules, messages: &mut Vec<Message>) {
-    let mut line_groups: Vec<usize> = Vec::new();
+/// Returns what the line does, in plain words ("" when it does nothing).
+fn read_line(tokens: &[Token], line: usize, into: &mut Rules, messages: &mut Vec<Message>, ctx: Ctx) -> String {
+    // The groups of this line so far (None: one left out, which takes its order rules with it).
+    let mut line_groups: Vec<Option<usize>> = Vec::new();
     let mut last_was_order = false;
+    // For saying what the line does.
+    let (groups_before, orders_before) = (into.groups.len(), into.orders.len());
+    let mut left_out: Vec<String> = Vec::new();
+    let mut every: Vec<String> = Vec::new();
+    let mut view = None;
+    let mut subfolders = false;
     let mut i = 0;
     while i < tokens.len() {
         let n = joined_len(tokens, i);
@@ -1454,6 +2057,7 @@ fn read_line(tokens: &[Token], line: usize, into: &mut Rules, messages: &mut Vec
         let word = tokens[i..i + n].iter().map(|t| normalize(t.text)).collect::<Vec<_>>().join("_");
         let raw: String = tokens[i..i + n].iter().map(|t| t.text).collect::<Vec<_>>().join(" ");
         let dash = has_dash(tokens[i].text);
+        let first = i == 0;
         i += n;
         if word.is_empty() {
             continue;
@@ -1468,9 +2072,12 @@ fn read_line(tokens: &[Token], line: usize, into: &mut Rules, messages: &mut Vec
                     say(messages, format!("{written}: _by_{} only works on dates (-newest_by_{}), so it was left out.", g.name(), g.name()), false, None);
                 }
                 if line_groups.is_empty() {
-                    add_order(&mut into.orders, o, &written, "", line, span, messages);
+                    let text = o.text.clone();
+                    if add_order(&mut into.orders, o, &written, "", line, span, messages) {
+                        every.push(text);
+                    }
                 } else {
-                    for &g in &line_groups {
+                    for &g in line_groups.iter().flatten() {
                         let label = format!(" for {}", into.groups[g].label);
                         add_order(&mut into.groups[g].orders, o.clone(), &written, &label, line, span, messages);
                     }
@@ -1481,7 +2088,12 @@ fn read_line(tokens: &[Token], line: usize, into: &mut Rules, messages: &mut Vec
                 if last_was_order {
                     line_groups.clear(); // -folder -a_to_z -image -biggest: each group gets its own
                 }
-                line_groups.push(add_group(into, g, &written, line, span, messages));
+                let label = g.label.clone();
+                let added = add_group(into, g, &written, line, span, messages);
+                if added.is_none() {
+                    left_out.push(label);
+                }
+                line_groups.push(added);
                 last_was_order = false;
             }
             Meaning::View(v) => match into.view {
@@ -1495,14 +2107,36 @@ fn read_line(tokens: &[Token], line: usize, into: &mut Rules, messages: &mut Vec
                     };
                     say(messages, text, false, None);
                 }
-                None => into.view = Some((v, line)),
+                None => {
+                    into.view = Some((v, line));
+                    view = Some(v);
+                }
+            },
+            Meaning::Subfolders => match (ctx.folder, into.subfolders) {
+                (None, _) => say(messages, "\"and_subfolders\" goes in a folder's own rules, like in Pictures ( \u{2026} ): the rules out here are for every folder already.".into(), true, None),
+                (Some(_), Some(at)) => say(messages, format!("{written}: line {at} already says so."), false, None),
+                (Some(_), None) => {
+                    into.subfolders = Some(line);
+                    subfolders = true;
+                }
             },
             Meaning::Explained(text) | Meaning::BadGrain(text) => say(messages, text, true, None),
             Meaning::Unknown => {
-                let (rule, place, grain) = split(&word);
-                let words = rule_words();
-                // (Nothing is close to a word without a letter or a digit in it: "}".)
-                let close = closest(&rule, words.iter().copied()).filter(|_| rule.chars().any(char::is_alphanumeric));
+                let (rule, place, _) = split(&word);
+                if let Some(text) = filler(&word) {
+                    say(messages, text, true, None);
+                    continue;
+                }
+                let close = suggestion(&word);
+                // In "in = (", words on their own (no dash, nothing like a rule) are most likely a
+                // folder's name: folders go there as paths.
+                if ctx.multi && first && close.is_none() && !tokens.iter().any(|t| has_dash(t.text)) {
+                    let name = tokens.iter().map(|t| t.text).collect::<Vec<_>>().join(" ");
+                    let (a, b) = (tokens[0].start, tokens[tokens.len() - 1].end);
+                    let text = format!("\"{name}\" isn't a rule. For a folder, write its full path, like ~\\Pictures\\{name} (start typing its name for suggestions).");
+                    messages.push(Message { line, text, error: true, span: Some((a, b)), fix: None, fix_label: None });
+                    break;
+                }
                 let plain = !rule.is_empty() && rule.len() <= 8 && rule.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
                 if close.is_none() && plain && n == 1 {
                     // Not a rule: a file type (-blend).
@@ -1512,14 +2146,18 @@ fn read_line(tokens: &[Token], line: usize, into: &mut Rules, messages: &mut Vec
                     if last_was_order {
                         line_groups.clear();
                     }
-                    line_groups.push(add_group(into, g, &written, line, span, messages));
+                    let label = g.label.clone();
+                    let added = add_group(into, g, &written, line, span, messages);
+                    if added.is_none() {
+                        left_out.push(label);
+                    }
+                    line_groups.push(added);
                     last_was_order = false;
                     continue;
                 }
                 match close {
-                    Some(c) => {
-                        let fixed = format!("{c}{}", ending(place, grain));
-                        say(messages, format!("\"{}\" isn't a rule. Did you mean -{fixed}?", raw.trim_start_matches(['-', '–', '—'])), true, Some(if dash { format!("-{fixed}") } else { fixed }));
+                    Some(fixed) => {
+                        say(messages, format!("\"{}\" isn't a rule. Did you mean -{fixed}?", raw.trim_start_matches(['-', '\u{2013}', '\u{2014}'])), true, Some(if dash { format!("-{fixed}") } else { fixed }));
                     }
                     None if !rule.chars().any(char::is_alphanumeric) => say(messages, format!("\"{raw}\" isn't a rule."), true, None),
                     None => say(messages, format!("\"{written}\" isn't a rule. The guide lists them (for files ending in .{rule}, write -.{rule})."), true, None),
@@ -1527,12 +2165,54 @@ fn read_line(tokens: &[Token], line: usize, into: &mut Rules, messages: &mut Vec
             }
         }
     }
+    // What it does, in plain words.
+    let mut parts: Vec<String> = Vec::new();
+    for (k, g) in into.groups.iter().enumerate().skip(groups_before) {
+        let earlier = into.groups[..k].iter().any(|x| x.tier != Place::Last);
+        let mut s = match (g.place, g.tier) {
+            (Place::First, _) => format!("{} at the very top", g.label),
+            (Place::Last, _) => format!("{} at the very bottom", g.label),
+            (_, Place::First) => format!("{} next, near the top", g.label),
+            (_, Place::Last) => format!("{} next, near the bottom", g.label),
+            _ if earlier => format!("{} next", g.label),
+            _ => format!("{} first", g.label),
+        };
+        if !g.orders.is_empty() {
+            s.push_str(&format!(", {}", g.orders.iter().map(|o| o.text.as_str()).collect::<Vec<_>>().join(", then ")));
+        }
+        parts.push(s);
+    }
+    for label in left_out {
+        parts.push(format!("left out: {label} already have a line above"));
+    }
+    if !every.is_empty() {
+        let list = every.join(", then ");
+        parts.push(if orders_before > 0 { format!("then {list}, where the order above ties") } else { format!("everything {list}") });
+    }
+    if let Some(v) = view {
+        let name = v.name().to_lowercase();
+        parts.push(match ctx.folder {
+            None => format!("every folder shown as {name}, unless its own rules say"),
+            Some(_) => format!("shown as {name}"),
+        });
+    }
+    if subfolders {
+        parts.push("the folders inside get these rules too".into());
+    }
+    let mut said = parts.join("; ");
+    if let Some(c) = said.get(..1) {
+        let up = c.to_uppercase();
+        said.replace_range(..1, &up);
+    }
+    said
 }
 
-fn add_group(into: &mut Rules, mut g: Group, written: &str, line: usize, span: Option<(usize, usize)>, messages: &mut Vec<Message>) -> usize {
+/// Adds a group to the rules: its number there, or None when it's left out (its things have a
+/// line above).
+fn add_group(into: &mut Rules, mut g: Group, written: &str, line: usize, span: Option<(usize, usize)>, messages: &mut Vec<Message>) -> Option<usize> {
     if let Some(i) = into.groups.iter().position(|x| x.name == g.name) {
         messages.push(Message { line, text: format!("{written}: {} already have a line above, so this one is left out.", into.groups[i].label), error: false, span, fix: None, fix_label: None });
-        return i;
+        return None;
     }
     // A _first / _last line takes the lines stacked under it along to the top / bottom (one that's
     // left out doesn't start a stack).
@@ -1572,7 +2252,7 @@ fn add_group(into: &mut Rules, mut g: Group, written: &str, line: usize, span: O
     g.written = written.to_string();
     g.line = line;
     into.groups.push(g);
-    into.groups.len() - 1
+    Some(into.groups.len() - 1)
 }
 
 /// Whether a group takes everything another would (so the other, after it, gets nothing). Only
@@ -1608,13 +2288,15 @@ fn what_it_takes(g: &Group) -> String {
     }
 }
 
-fn add_order(into: &mut Vec<Order>, o: Order, written: &str, for_whom: &str, line: usize, span: Option<(usize, usize)>, messages: &mut Vec<Message>) {
+/// Adds an order rule (false when one for the same thing is already there, which a tip says).
+fn add_order(into: &mut Vec<Order>, o: Order, written: &str, for_whom: &str, line: usize, span: Option<(usize, usize)>, messages: &mut Vec<Message>) -> bool {
     if into.iter().any(|x| x.key == o.key) {
         let text = format!("{written}: there's already an order rule for the {}{for_whom} before it, so this one never decides anything.", key_name(o.key));
         messages.push(Message { line, text, error: false, span, fix: None, fix_label: None });
-        return;
+        return false;
     }
     into.push(o);
+    true
 }
 
 /// Tips for rules that can't make a difference.
@@ -2077,6 +2759,8 @@ mod tests {
         assert!(!x86.has_errors());
         assert_eq!(x86.folder_label("C:\\Program Files (x86)"), Some("C:\\Program Files (x86)"));
         assert_eq!(sorted_in("in C:\\t (\n-folder_first\n)\nin C:\\t (\n-image\n)", "C:\\t").join(","), order("-folder_first\n-image"));
+        let twice = Recipe::parse("in C:\\t (\n-folder_first\n)\nin C:\\t (\n-image\n)");
+        assert!(!twice.has_errors() && twice.messages.iter().any(|m| m.line == 4 && m.text.contains("already has rules on line 1")), "{:?}", twice.messages);
 
         // A drive, written with or without its backslash.
         for text in ["in C: (\n-newest_first\n)", "in C:\\ (\n-newest_first\n)"] {
@@ -2310,6 +2994,10 @@ mod tests {
         assert!(!r.has_errors(), "{:?}", r.messages);
         assert_eq!(r.view_for("C:\\pics"), Some(ViewMode::List), "the first view stays");
         assert_eq!(r.view_for("C:\\x"), Some(ViewMode::Large));
+        // Written twice: one tip, on the path's line, about that (not about the rules adding up).
+        let r = Recipe::parse("in C:\\pics (\n-newest_first\n)\nin = (\nC:\\pics\n-large_icons\n-newest\n)\n");
+        let tips: Vec<_> = r.messages.iter().map(|m| (m.line, m.text.as_str())).collect();
+        assert_eq!(tips, [(5, "\"C:\\pics\" already has rules on line 1, so it gets both. Keep it in one place.")]);
     }
 
     #[test]
@@ -2321,5 +3009,187 @@ mod tests {
         assert_eq!(r.view_for("C:\\x"), Some(ViewMode::Large), "closed at the end, as meant");
         // A path outside "in = (" is still a mistake.
         assert!(!errors("C:\\x\n").is_empty());
+    }
+
+    #[test]
+    fn bracket_mistakes_name_the_real_cause() {
+        let downloads = place_path("Downloads").unwrap();
+        let fixed = |text: &str| {
+            let all = errors(text);
+            assert_eq!(all.len(), 1, "{text:?}: {all:?}");
+            let m = all.into_iter().next().unwrap();
+            let (a, b) = m.span.unwrap();
+            let fix = m.fix.clone().unwrap_or_else(|| panic!("no fix in {text:?}"));
+            let after = format!("{}{fix}{}", &text[..a], &text[b..]);
+            assert!(!Recipe::parse(&after).has_errors(), "{after:?}: {:?}", errors(&after));
+            (m, after)
+        };
+        let both = |text: &str| (order(text), sorted_in(text, &downloads).join(","));
+        let same = |text: &str| {
+            let (m, after) = fixed(text);
+            assert_eq!(both(text), both(&after), "{text:?} -> {after:?}");
+            (m, after)
+        };
+        // One "(" too many, and one ")".
+        assert_eq!(same("in C:\\t ( (\n-newest_first\n)\n-a_to_z").1, "in C:\\t (\n-newest_first\n)\n-a_to_z");
+        assert_eq!(same("in Downloads (\n-newest_first\n))\n-a_to_z").1, "in Downloads (\n-newest_first\n)\n-a_to_z");
+        // Brackets of another kind.
+        assert_eq!(same("in Downloads {\n-newest_first\n)\n-a_to_z").1, "in Downloads (\n-newest_first\n)\n-a_to_z");
+        assert_eq!(same("in Downloads (\n-newest_first\n]\n-a_to_z").1, "in Downloads (\n-newest_first\n)\n-a_to_z");
+        // Rules after the "(".
+        assert_eq!(same("in Downloads ( newest_first\n)\n-a_to_z").1, "in Downloads (\nnewest_first\n)\n-a_to_z");
+        assert_eq!(same("in Downloads ( newest first\n)").1, "in Downloads (\nnewest first\n)");
+        // A ")" under an "in" line without a "(": the "(" goes there.
+        let (m, after) = same("in Downloads\n-newest_first\n)\n-a_to_z");
+        assert_eq!((m.line, m.fix_label.as_deref()), (3, Some("add the ( on line 1")));
+        assert_eq!(after, "in Downloads (\n-newest_first\n)\n-a_to_z");
+        assert_eq!(fixed("in Downloads:\n-newest_first\n)").1, "in Downloads (\n-newest_first\n)");
+        // In "in = (": no "(" after a folder, and one folder per line.
+        let (_, after) = fixed("in = (\nC:\\x (\n-large_icons\n)");
+        assert_eq!(after, "in = (\nC:\\x\n-large_icons\n)");
+        assert_eq!(Recipe::parse("in = (\nC:\\x (\n-large_icons\n)").view_for("C:\\x"), Some(ViewMode::Large), "read as meant");
+        let (_, after) = fixed("in = (\nC:\\x, D:\\y\n-large_icons\n)");
+        assert_eq!(after, "in = (\nC:\\x\nD:\\y\n-large_icons\n)");
+        let r = Recipe::parse("in = (\nC:\\x, D:\\y\n-large_icons\n)");
+        assert_eq!((r.view_for("C:\\x"), r.view_for("D:\\y")), (Some(ViewMode::Large), Some(ViewMode::Large)));
+        assert!(Recipe::parse("in = (\nC:\\Photos, 2024\n-large_icons\n)").view_for("C:\\Photos, 2024").is_some(), "a comma in a folder's name");
+        // A folder's name on its own in "in = (" is taken for a folder, not a file type.
+        let m = errors("in = (\nC:\\x\npfp\n-large_icons\n)");
+        assert!(m.len() == 1 && m[0].text.contains("full path"), "{m:?}");
+        // A "*" for the subfolders: and_subfolders.
+        let (_, after) = fixed("in C:\\t\\* (\n-newest_first\n)");
+        assert_eq!(after, "in C:\\t (\nand_subfolders\n-newest_first\n)");
+        assert_eq!(sorted_in("in C:\\t\\* (\n-newest_first\n)", "C:\\t\\a"), sorted_in("-newest_first", "C:\\t\\a"), "read as meant");
+    }
+
+    #[test]
+    fn an_in_line_without_a_bracket_says_where_its_rules_end() {
+        let tip = |text: &str| Recipe::parse(text).messages.into_iter().find(|m| m.fix_label.as_deref() == Some("add ( and )"));
+        // No colon and no "(": every line to the next "in" is the folder's.
+        let text = "-a_to_z\nin C:\\t\n-newest_first\n\n-folder_first";
+        let m = tip(text).expect("a tip");
+        assert!(!m.error && m.line == 2, "{m:?}");
+        let (a, b) = m.span.unwrap();
+        let after = format!("{}{}{}", &text[..a], m.fix.unwrap(), &text[b..]);
+        assert_eq!(after, "-a_to_z\nin C:\\t (\n-newest_first\n)\n\n-folder_first");
+        assert!(Recipe::parse(&after).messages.is_empty());
+        // "in C:\t:" is the old way of writing it: a tip only when its rules go on past a blank line.
+        assert!(tip("in C:\\t:\n-newest_first\n-image").is_none());
+        assert!(tip("in C:\\t:\n-newest_first\n\n-image").is_some());
+        assert!(tip("in C:\\t (\n-newest_first\n)").is_none());
+    }
+
+    #[test]
+    fn enter_after_an_open_bracket_knows_it_is_open() {
+        assert_eq!(Recipe::parse("-a_to_z\nin C:\\t (\n").unclosed, [2]);
+        assert_eq!(Recipe::parse("in C:\\t (\n-a\nin C:\\u (\n-b\n)").unclosed, [1]);
+        assert!(Recipe::parse("in C:\\t (\n)").unclosed.is_empty());
+        let r = Recipe::parse("-a_to_z\nin C:\\t (\n-newest_first\n)\nin = (\nC:\\x\n-list\n)\nin D:\\y:\n-image\n");
+        assert_eq!(r.blocks, [Block { start: 2, end: 4, closed: true }, Block { start: 5, end: 8, closed: true }, Block { start: 9, end: 10, closed: false }]);
+    }
+
+    #[test]
+    fn a_folder_with_just_a_view_keeps_the_order_for_every_folder() {
+        let text = "-newest_first\n-folder_last -a_to_z\nin C:\\pics (\n-large_icons\n)";
+        assert_eq!(sorted_in(text, "C:\\pics"), sorted_in("-newest_first\n-folder_last -a_to_z", "C:\\pics"));
+        let r = Recipe::parse(text);
+        assert_eq!(r.view_for("C:\\pics"), Some(ViewMode::Large));
+        assert_eq!((r.folder_label("C:\\pics"), r.source("C:\\pics")), (None, Source::Everywhere));
+        // With sort rules of its own, they're used instead.
+        assert_eq!(sorted_in("-newest_first\nin C:\\pics (\n-large_icons\n-a_to_z\n)", "C:\\pics"), sorted_in("-a_to_z", "C:\\pics"));
+    }
+
+    #[test]
+    fn rules_for_a_folder_and_its_subfolders() {
+        let text = "-a_to_z\nin C:\\pics (\nand_subfolders\n-newest_first\n-large_icons\n)\nin C:\\pics\\keep (\n-z_to_a\n)";
+        let r = Recipe::parse(text);
+        assert!(r.messages.is_empty(), "{:?}", r.messages);
+        for folder in ["C:\\pics", "C:\\pics\\2024", "c:\\PICS\\2024\\may"] {
+            assert_eq!(sorted_in(text, folder), sorted_in("-newest_first", folder), "{folder}");
+            assert_eq!(r.view_for(folder), Some(ViewMode::Large), "{folder}");
+            assert_eq!(r.folder_label(folder), Some("C:\\pics"), "{folder}");
+        }
+        assert!(matches!(r.source("C:\\pics\\2024"), Source::Folder { own: false, .. }));
+        // A subfolder with rules of its own: its own order, the view from above.
+        assert_eq!(sorted_in(text, "C:\\pics\\keep"), sorted_in("-z_to_a", "C:\\pics\\keep"));
+        assert_eq!(r.view_for("C:\\pics\\keep"), Some(ViewMode::Large));
+        // Not a folder whose name just starts the same.
+        assert_eq!(sorted_in(text, "C:\\pics2"), sorted_in("-a_to_z", "C:\\pics2"));
+        assert_eq!(r.view_for("C:\\pics2"), None);
+        // Without it, just the folder (as before).
+        assert_eq!(Recipe::parse("in C:\\pics (\n-large_icons\n)").view_for("C:\\pics\\2024"), None);
+        // For "in = (" folders too; written with spaces; and a mistake outside a folder's rules.
+        let r = Recipe::parse("in = (\nC:\\a\nD:\\b\nand subfolders\n-list\n)");
+        assert!(r.messages.is_empty(), "{:?}", r.messages);
+        assert_eq!((r.view_for("C:\\a\\x"), r.view_for("D:\\b\\y")), (Some(ViewMode::List), Some(ViewMode::List)));
+        assert!(errors("-a_to_z\nand_subfolders").iter().any(|m| m.text.contains("folder's own rules")));
+    }
+
+    #[test]
+    fn did_you_mean_offers_rules() {
+        let fix = |word: &str| {
+            let m = errors(&format!("-folder\n{word}"));
+            assert_eq!(m.len(), 1, "{word}: {m:?}");
+            m[0].fix.clone()
+        };
+        for (typed, meant) in [
+            ("new", "newest"),
+            ("old", "oldest"),
+            ("big", "biggest"),
+            ("vid_first", "video_first"),
+            ("folder_fist", "folder_first"),
+            ("-folder_fist", "-folder_first"),
+            ("image_lst", "image_last"),
+            ("newst", "newest"),
+            ("lagre_icons", "large_icons"),
+            ("jpgg", "jpg"),
+            ("and_subfolder", "and_subfolders"),
+        ] {
+            assert_eq!(fix(typed).as_deref(), Some(meant), "{typed}");
+        }
+        // Words that aren't rules on their own: what to write, and no file type.
+        for word in ["first", "sort", "by", "top"] {
+            assert_eq!(fix(word), None, "{word}");
+        }
+        // A short word near nothing is still a file type (with a tip).
+        assert!(errors("-folder\n-pfp").is_empty());
+        // A line left out takes its order rules with it.
+        assert!(order("-newest_first\n-folder_first\n-folder_last -a_to_z").starts_with("Zeta,Alpha"));
+        // "by date" and "by size" read as meant.
+        assert_eq!(order("by date"), order("-newest"));
+        assert_eq!(order("by size"), order("-biggest"));
+    }
+
+    #[test]
+    fn lines_say_what_they_do() {
+        let r = Recipe::parse("-newest_first\n-folder_first\n-image -biggest_first\n-a_to_z\nfolder_last newest\nin Downloads (\n-large_icons\n)\n-program_last\n-document");
+        let said = |line: usize| r.explained.iter().find(|(l, _)| *l == line).map(|(_, s)| s.as_str());
+        assert_eq!(said(1), Some("Everything newest first"));
+        assert_eq!(said(2), Some("Folders at the very top"));
+        assert_eq!(said(3), Some("Pictures next, near the top, biggest first"), "stacked under folder_first");
+        assert_eq!(said(4), Some("Then A to Z, where the order above ties"));
+        assert_eq!(said(5), Some("Left out: folders already have a line above"));
+        assert_eq!(said(6), Some("Just a view for Downloads: its order stays as it was"));
+        assert_eq!(said(7), Some("Shown as large icons"));
+        assert!(said(8).is_some_and(|s| s.starts_with("The end of these rules")));
+        assert_eq!(said(9), Some("Programs at the very bottom"));
+        assert_eq!(said(10), Some("Documents next, near the bottom"));
+        let r = Recipe::parse("folder_first newest\n-image");
+        assert_eq!(r.explained[0].1, "Folders at the very top, newest first");
+        assert_eq!(Recipe::parse("-image").explained[0].1, "Pictures first");
+    }
+
+    #[test]
+    fn a_folder_renamed_in_glint_keeps_its_rules() {
+        let text = "in C:\\p\\old (\n-a_to_z\n)\nin = (\nC:\\p\\old\\sub\nC:\\x\n)\nin C:/p/old/b (\n)\n";
+        assert_eq!(moved(text, "C:\\p\\old", "C:\\p\\new").as_deref(), Some("in C:\\p\\new (\n-a_to_z\n)\nin = (\nC:\\p\\new\\sub\nC:\\x\n)\nin C:\\p\\new\\b (\n)\n"));
+        // Moved somewhere else: the new full path.
+        assert_eq!(moved("in C:\\p\\old (\n)", "C:\\p\\old", "D:\\q\\old").as_deref(), Some("in D:\\q\\old (\n)"));
+        // Written from ~: kept that way.
+        let home = crate::shell::home();
+        assert_eq!(moved("in ~\\old (\n)", &format!("{home}\\old"), &format!("{home}\\new")).as_deref(), Some("in ~\\new (\n)"));
+        // Not about it.
+        assert_eq!(moved("in C:\\p\\older (\n)", "C:\\p\\old", "C:\\p\\new"), None);
+        assert_eq!(moved("in Downloads (\n)", &place_path("Downloads").unwrap(), "C:\\z"), None);
     }
 }

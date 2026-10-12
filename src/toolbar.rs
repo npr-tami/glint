@@ -33,7 +33,9 @@ use crate::pathbar::{box_contains, fill_box, fill_box_paint, fill_field, PathBar
 use crate::render::{Align, Renderer, TextStyle};
 use crate::shell;
 use crate::textbox::{TextBox, TextEvent, TextEventKind};
-use crate::theme::{size, ButtonStyle, Color, Theme};
+use crate::pathbar::Crumbs;
+use crate::retrotool::{self, Look, Tool};
+use crate::theme::{size, ButtonStyle, Color, Era, Theme};
 use crate::ui::{Command, Component, Ctx, CursorKind, DropTarget, Effect, Menu, MenuItem, MouseButton, MouseEvent, Point, Rect};
 
 /// Text box ids (100-199 belong to the toolbar).
@@ -50,6 +52,10 @@ const MENU_PATH: u32 = 4;
 /// VIEW's menu: the views (from VIEW_FIRST, in `ViewMode::ALL`'s order), the view rules and two
 /// switches.
 const MENU_VIEW: u32 = 5;
+/// XP's lists beside Back and Forward (`history_menu`), and how many places they show at most.
+const MENU_BACK: u32 = 6;
+const MENU_FORWARD: u32 = 7;
+const HISTORY_MAX: usize = 12;
 const VIEW_FIRST: u32 = 1;
 const VIEW_SIDEBAR: u32 = 20;
 const VIEW_STATUS_BAR: u32 = 21;
@@ -73,6 +79,18 @@ const FILTER_ICON_W: f32 = 28.0;
 const FILTER_CLEAR_W: f32 = 26.0;
 /// The Subfolders switch at the right end of the filter box.
 const SUBFOLDERS_W: f32 = 26.0;
+/// 2000 and XP: the word "Address" before the path, and the Go button after it.
+const ADDRESS_W: f32 = 54.0;
+const GO_W: f32 = 44.0;
+/// 7: Refresh, joined to the right end of the path box.
+const REFRESH7_W: f32 = 26.0;
+/// The era's text boxes are this tall (Glint's own are `size::INPUT_H`).
+const ERA_FIELD_H: f32 = 24.0;
+/// XP: the room the words "Back" and "Folders" take beside their pictures.
+const XP_BACK_WORD_W: f32 = 30.0;
+const XP_FOLDERS_WORD_W: f32 = 42.0;
+/// XP: the drop arrow at the end of Back and of Forward.
+const XP_DROP_W: f32 = 13.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Part {
@@ -90,9 +108,14 @@ enum Part {
     Sort,
     View,
     Settings,
+    /// The Address band's Go (2000 and XP skins).
+    Go,
+    /// XP's drop arrows beside Back and Forward: the places you've been.
+    BackMenu,
+    ForwardMenu,
 }
 
-const PARTS: [Part; 12] = [
+const PARTS: [Part; 15] = [
     Part::Sidebar,
     Part::Back,
     Part::Forward,
@@ -105,6 +128,9 @@ const PARTS: [Part; 12] = [
     Part::Sort,
     Part::View,
     Part::Settings,
+    Part::Go,
+    Part::BackMenu,
+    Part::ForwardMenu,
 ];
 
 pub struct Toolbar {
@@ -138,6 +164,8 @@ pub struct Toolbar {
     /// `layout`; the window lays everything out again when the skin changes).
     lean: f32,
     line_w: f32,
+    /// The skin's older Windows, if any (taken in `layout`): its own toolbar (retrotool.rs).
+    era: Era,
 }
 
 impl Toolbar {
@@ -167,6 +195,7 @@ impl Toolbar {
             repaint_until: 0.0,
             lean: WORD_LEAN,
             line_w: 2.0,
+            era: Era::None,
         }
     }
 
@@ -187,6 +216,8 @@ impl Toolbar {
             "This PC"
         } else if crate::recycle::is_bin(path) {
             crate::recycle::NAME // typing it goes there too
+        } else if crate::recent::is_recent(path) {
+            crate::recent::NAME
         } else {
             path
         });
@@ -227,7 +258,31 @@ impl Toolbar {
     fn nav_rect(&self, i: f32) -> Rect {
         let band = self.band();
         let y = band.y + (band.h - size::NAV_BUTTON) / 2.0;
+        if self.era == Era::Xp {
+            return self.xp_nav_rect(i, y);
+        }
         Rect::new(band.x + 8.0 + i * (size::NAV_BUTTON + 2.0), y, size::NAV_BUTTON, size::NAV_BUTTON)
+    }
+
+    /// XP's Standard Buttons in its order: Back (with its word), Forward, Up, a separator, Folders
+    /// (the sidebar switch, with its word), Refresh. `i` as in `nav_rect` (0 Folders ... 4 Refresh,
+    /// 5 the end).
+    fn xp_nav_rect(&self, i: f32, y: f32) -> Rect {
+        let n = size::NAV_BUTTON;
+        let x0 = self.band().x + 6.0;
+        let back = Rect::new(x0, y, n + XP_BACK_WORD_W + XP_DROP_W, n);
+        let forward = Rect::new(back.right() + 2.0, y, n + XP_DROP_W, n);
+        let up = Rect::new(forward.right() + 2.0, y, n, n);
+        let folders = Rect::new(up.right() + 8.0, y, n + XP_FOLDERS_WORD_W, n);
+        let refresh = Rect::new(folders.right() + 2.0, y, n, n);
+        match i as i32 {
+            0 => folders,
+            1 => back,
+            2 => forward,
+            3 => up,
+            4 => refresh,
+            _ => Rect::new(refresh.right() + 2.0, y, n, n),
+        }
     }
 
     /// The filter box gets narrower when the window does, so the path keeps some room.
@@ -250,16 +305,37 @@ impl Toolbar {
         let view = Rect::new(settings.x + self.lean - WORD_GAP - VIEW_W, iy, VIEW_W, size::INPUT_H);
         let sort = Rect::new(view.x + self.lean - WORD_GAP - SORT_W, iy, SORT_W, size::INPUT_H);
         let filter = Rect::new(sort.x - 8.0 - self.filter_w(), iy, self.filter_w(), size::INPUT_H);
+        // The address takes what is left between the buttons and the filter. 7 has Refresh at its
+        // right end instead of among the buttons; 2000 and XP put "Address" before it and Go after.
+        let seven = self.era == Era::Win7;
+        let band_era = matches!(self.era, Era::Win98 | Era::Win2000 | Era::Xp);
+        let left = self.nav_rect(if seven { 4.0 } else { 5.0 }).x + 6.0;
+        let area = Rect::new(left, iy, (filter.x - 8.0 - left).max(40.0), size::INPUT_H);
         match part {
             Part::Sidebar => self.nav_rect(0.0),
+            // XP: the drop arrow at the button's right end is a part of its own.
+            Part::Back | Part::Forward if self.era == Era::Xp => {
+                let b = self.nav_rect(if part == Part::Back { 1.0 } else { 2.0 });
+                Rect::new(b.x, b.y, b.w - XP_DROP_W, b.h)
+            }
+            Part::BackMenu | Part::ForwardMenu if self.era == Era::Xp => {
+                let b = self.nav_rect(if part == Part::BackMenu { 1.0 } else { 2.0 });
+                Rect::new(b.right() - XP_DROP_W, b.y, XP_DROP_W, b.h)
+            }
+            Part::BackMenu | Part::ForwardMenu => Rect::default(),
             Part::Back => self.nav_rect(1.0),
             Part::Forward => self.nav_rect(2.0),
             Part::Up => self.nav_rect(3.0),
+            Part::Refresh if seven => Rect::new(area.right() - REFRESH7_W, iy, REFRESH7_W, size::INPUT_H),
             Part::Refresh => self.nav_rect(4.0),
-            Part::Path => {
-                let left = self.nav_rect(5.0).x + 6.0;
-                Rect::new(left, iy, (filter.x - 8.0 - left).max(40.0), size::INPUT_H)
+            Part::Path if seven => Rect::new(area.x, iy, (area.w - REFRESH7_W).max(40.0), size::INPUT_H),
+            Part::Path if band_era => {
+                let x = area.x + ADDRESS_W;
+                Rect::new(x, iy, (area.right() - GO_W - 4.0 - x).max(40.0), size::INPUT_H)
             }
+            Part::Path => area,
+            Part::Go if band_era => Rect::new(area.right() - GO_W, iy + (size::INPUT_H - ERA_FIELD_H) / 2.0 - 1.0, GO_W, ERA_FIELD_H + 2.0),
+            Part::Go => Rect::default(),
             Part::Filter => filter,
             Part::FilterClear => Rect::new(filter.right() - SUBFOLDERS_W - FILTER_CLEAR_W, iy, FILTER_CLEAR_W, size::INPUT_H),
             Part::Subfolders => Rect::new(filter.right() - SUBFOLDERS_W, iy, SUBFOLDERS_W, size::INPUT_H),
@@ -298,8 +374,8 @@ impl Toolbar {
     fn enabled(&self, part: Part, app: &AppState) -> bool {
         let t = app.tab();
         match part {
-            Part::Back => !t.back.is_empty(),
-            Part::Forward => !t.forward.is_empty(),
+            Part::Back | Part::BackMenu => !t.back.is_empty(),
+            Part::Forward | Part::ForwardMenu => !t.forward.is_empty(),
             Part::Up => !t.path.is_empty(),
             _ => true,
         }
@@ -394,6 +470,26 @@ impl Toolbar {
         }
     }
 
+    /// Back or forward as a round glass button of its own (the skin's `back-button`: XP's green,
+    /// Windows 7's blue) with a white arrow; grey while it can't be used.
+    fn paint_back_button(r: &mut Renderer, theme: &Theme, part: Part, b: Rect, enabled: bool, hot: bool, pressed: bool) {
+        let c = Point::new(b.x + b.w / 2.0, b.y + b.h / 2.0);
+        let radius = (b.w.min(b.h) / 2.0 - 1.0).max(4.0);
+        let glass = if !enabled {
+            theme.back_button.map(|c| c.grey().lighter(0.25))
+        } else if pressed {
+            theme.back_button.darker(0.18)
+        } else if hot {
+            theme.back_button.lighter(0.2)
+        } else {
+            theme.back_button
+        };
+        r.marble(c, radius, &glass);
+        let below = Rect::new(b.x, b.y + 1.0, b.w, b.h);
+        Self::paint_glyph_w(r, part, below, glass.last().darker(0.45).with_alpha(0.7), 2.2);
+        Self::paint_glyph_w(r, part, b, Color::hex(0xffffff), 2.0);
+    }
+
     /// SORT, VIEW or SETTINGS as a glossy capsule (`buttons: liquid`): the skin's `button` glass
     /// (`button-hover` under the mouse), its word in bold `button-text` with a dark shadow under it.
     fn paint_capsule(r: &mut Renderer, theme: &Theme, b: Rect, label: &str, hot: bool) {
@@ -446,7 +542,8 @@ impl Toolbar {
                 MenuItem::new(5, "Ascending").checked(!t.descending && !here),
                 MenuItem::new(6, "Descending").checked(t.descending && !here),
                 MenuItem::separator(),
-                MenuItem::new(8, "Custom order").checked(custom),
+                // (Not checked while a column sorts this folder for now: picking it brings the rules back.)
+                MenuItem::new(8, "Custom order").checked(custom && !t.column_now),
                 MenuItem::new(9, "Edit custom order\u{2026}"),
             ],
             right_aligned: false,
@@ -497,6 +594,15 @@ impl Toolbar {
     }
 
     /// The popup of the steps hidden behind "…", nearest first, under it.
+    /// XP's list beside Back or Forward: the places you've been, the nearest first.
+    fn history_menu(&self, forward: bool, app: &AppState) -> Effect {
+        let t = app.tab();
+        let places = if forward { &t.forward } else { &t.back };
+        let items = places.iter().rev().take(HISTORY_MAX).enumerate().map(|(i, p)| MenuItem::new(i as u32 + 1, &app.display_name(p).replace('&', "&&"))).collect();
+        let b = self.rect_of(if forward { Part::Forward } else { Part::Back });
+        Effect::Menu(Menu { tag: if forward { MENU_FORWARD } else { MENU_BACK }, at: Point::new(b.x, b.bottom() + 2.0), items, right_aligned: false })
+    }
+
     fn hidden_menu(&mut self, at: Rect) -> Effect {
         let hidden = self.path.hidden_nearest_first();
         self.menu_paths = hidden.iter().map(|(_, p)| p.clone()).collect();
@@ -529,6 +635,123 @@ impl Toolbar {
 }
 
 /// The shadow under white words and signs on liquid buttons: the glass's darkest colour, darker.
+impl Toolbar {
+    /// The toolbar of a skin with an older Windows (retrotool.rs): the era's band, its buttons
+    /// and pictures, the Address band or 7's breadcrumb box, and its word buttons.
+    fn paint_era(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState, active: bool) {
+        let era = theme.era;
+        let seven = era == Era::Win7;
+        let glass = Rect::new(self.rect.x, self.rect.y - size::TITLE_H, self.rect.w, self.rect.h + size::TITLE_H);
+        retrotool::band(r, theme, self.rect, glass, active);
+
+        if seven {
+            let (back, forward) = (self.rect_of(Part::Back), self.rect_of(Part::Forward));
+            retrotool::seven_socket(r, Rect::new(back.x, back.y, forward.right() - back.x, back.h));
+        }
+        let xp = era == Era::Xp;
+        if xp {
+            // Back and Forward with their drop arrows: under the mouse, one frame round both
+            // parts with a line between them.
+            for (main, drop) in [(Part::Back, Part::BackMenu), (Part::Forward, Part::ForwardMenu)] {
+                let (m, d) = (self.rect_of(main), self.rect_of(drop));
+                let enabled = self.enabled(main, app);
+                if enabled && (self.hover == Some(main) || self.hover == Some(drop)) {
+                    let pressed = self.hover == Some(main) && self.pressed == Some(main);
+                    retrotool::xp_frame(r, theme, Rect::new(m.x, m.y, d.right() - m.x, m.h).inset(1.0, 1.0), Look { enabled, hot: true, pressed, checked: false });
+                    r.fill_rect(Rect::new(d.x, d.y + 4.0, 1.0, d.h - 8.0), Color::rgba(0, 0, 0, 0.2));
+                }
+                let ink = if enabled { theme.button_text } else { theme.disabled };
+                retrotool::triangle_down(r, Point::new(d.x + d.w / 2.0 - 1.0, d.y + d.h / 2.0), 5.0, ink);
+            }
+        }
+        for part in [Part::Sidebar, Part::Back, Part::Forward, Part::Up, Part::Refresh] {
+            if seven && part == Part::Refresh {
+                continue;
+            }
+            let enabled = self.enabled(part, app);
+            // (XP's Back and Forward have their frames drawn above, round their drop arrows too.)
+            let framed = !(xp && matches!(part, Part::Back | Part::Forward));
+            let hot = enabled && self.hover == Some(part) && framed;
+            let look = Look { enabled, hot, pressed: hot && self.pressed == Some(part), checked: part == Part::Sidebar && app.settings.show_sidebar };
+            let tool = match part {
+                Part::Sidebar => Tool::Folders,
+                Part::Back => Tool::Back,
+                Part::Forward => Tool::Forward,
+                Part::Up => Tool::Up,
+                _ => Tool::Refresh,
+            };
+            retrotool::nav_button(r, theme, self.rect_of(part), tool, look);
+        }
+        if !seven {
+            // A separator between the buttons and the address.
+            let last = self.rect_of(Part::Refresh);
+            let x = (last.right() + 3.0).round();
+            if era == Era::Xp {
+                // And one between Up and Folders, as XP had.
+                let up = self.rect_of(Part::Up);
+                for x in [x, (up.right() + 3.0).round()] {
+                    r.fill_rect(Rect::new(x, last.y + 3.0, 1.0, last.h - 6.0), Color::hex(0xc5c2b8));
+                    r.fill_rect(Rect::new(x + 1.0, last.y + 3.0, 1.0, last.h - 6.0), Color::hex(0xffffff));
+                }
+            } else {
+                crate::retro::etched_upright(r, theme, x, last.y + 2.0, last.h - 4.0, theme.toolbar);
+            }
+        }
+
+        // The address.
+        let path = self.rect_of(Part::Path);
+        let path_hot = self.hover == Some(Part::Path);
+        if seven {
+            let refresh = self.rect_of(Part::Refresh);
+            let both = Rect::new(path.x, path.y, refresh.right() - path.x, path.h).center(refresh.right() - path.x, ERA_FIELD_H);
+            retrotool::field(r, theme, both, path_hot || self.hover == Some(Part::Refresh) || self.path_box.is_visible());
+            let inner = Rect::new(path.x, both.y, path.w, both.h);
+            retrotool::drop_arrow(r, theme, inner, false);
+            r.fill_rect(Rect::new(refresh.x, both.y + 1.0, 1.0, both.h - 2.0), Color::hex(0x8e9baa));
+            let hot = self.hover == Some(Part::Refresh);
+            let look = Look { enabled: true, hot, pressed: hot && self.pressed == Some(Part::Refresh), checked: false };
+            retrotool::seven_refresh(r, Rect::new(refresh.x + 1.0, both.y + 1.0, refresh.w - 2.0, both.h - 2.0), look);
+        } else {
+            let label = Rect::new(path.x - ADDRESS_W, path.y, ADDRESS_W, path.h);
+            retrotool::address_label(r, theme, label);
+            let field = path.center(path.w, ERA_FIELD_H);
+            retrotool::field(r, theme, field, path_hot);
+            retrotool::drop_arrow(r, theme, field, false);
+            let go = self.rect_of(Part::Go);
+            let hot = self.hover == Some(Part::Go);
+            retrotool::go_button(r, theme, go, Look { enabled: true, hot, pressed: hot && self.pressed == Some(Part::Go), checked: false });
+        }
+        let mouse = self.mouse.filter(|_| path_hot);
+        self.path.paint(r, theme, app, self.path_box.is_visible(), mouse);
+
+        // The filter: the era's box, its magnifier, and × while filtering.
+        let f = self.rect_of(Part::Filter);
+        retrotool::field(r, theme, f.center(f.w, ERA_FIELD_H), self.hover == Some(Part::Filter));
+        let filtering = !app.tab().filter.is_empty();
+        retrotool::magnifier(r, theme, Point::new(f.x + FILTER_ICON_W / 2.0 + 1.0, f.y + f.h / 2.0), filtering);
+        if filtering {
+            let x = self.rect_of(Part::FilterClear);
+            let hot = self.hover == Some(Part::FilterClear);
+            Self::paint_cross(r, Point::new(x.x + x.w / 2.0, x.y + x.h / 2.0), 3.5, 1.2, if hot { theme.text } else { theme.muted });
+        }
+        let sub = self.rect_of(Part::Subfolders);
+        let color = if app.tab().path.is_empty() {
+            theme.disabled
+        } else if app.subfolders {
+            theme.accent
+        } else if self.hover == Some(Part::Subfolders) {
+            theme.text
+        } else {
+            theme.muted
+        };
+        Self::paint_subfolders(r, Point::new(sub.x + sub.w / 2.0, sub.y + sub.h / 2.0), color);
+
+        for (part, label, menu) in [(Part::Sort, "SORT", true), (Part::View, "VIEW", true), (Part::Settings, "SETTINGS", false)] {
+            retrotool::word_button(r, theme, self.rect_of(part), label, self.hover == Some(part), menu);
+        }
+    }
+}
+
 fn text_shadow(theme: &Theme) -> Color {
     theme.chip_paint.last().darker(0.5).with_alpha(0.8)
 }
@@ -536,11 +759,23 @@ fn text_shadow(theme: &Theme) -> Color {
 impl Component for Toolbar {
     fn layout(&mut self, rect: Rect, ctx: &Ctx, app: &AppState) {
         self.rect = rect;
+        self.era = app.theme.era;
         self.lean = app.theme.lean(WORD_LEAN);
         self.line_w = app.theme.toolbar_line_w;
         let path = self.rect_of(Part::Path);
         self.path.set_rect(path);
-        self.path_box.place(path, 9.0, ctx.scale);
+        self.path.set_style(match self.era {
+            Era::None => Crumbs::Modern,
+            Era::Win7 => Crumbs::Seven,
+            _ => Crumbs::Plain,
+        });
+        if self.era.old() {
+            // Typing goes after the place's icon, short of the drop arrow.
+            let (lead, trail) = if self.era == Era::Win7 { (24.0, 20.0) } else { (22.0, 20.0) };
+            self.path_box.place(Rect::new(path.x + lead, path.y, (path.w - lead - trail).max(10.0), path.h), 0.0, ctx.scale);
+        } else {
+            self.path_box.place(path, 9.0, ctx.scale);
+        }
         self.filter_box.place(self.filter_edit_rect(), 0.0, ctx.scale);
         self.filter_box.show();
     }
@@ -550,6 +785,9 @@ impl Component for Toolbar {
     }
 
     fn paint(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState, _ctx: &Ctx) {
+        if theme.era.old() {
+            return self.paint_era(r, theme, app, _ctx.active);
+        }
         r.fill_paint(self.rect, 0.0, &theme.toolbar_paint);
         r.fill_rect(Rect::new(self.rect.x, self.rect.bottom() - self.line_w, self.rect.w, self.line_w), theme.toolbar_line);
 
@@ -563,10 +801,25 @@ impl Component for Toolbar {
                 Self::paint_liquid_button(r, theme, part, b, enabled, hot, pressed, app.settings.show_sidebar);
                 continue;
             }
-            if pressed {
+            if matches!(part, Part::Back | Part::Forward) && !theme.back_button.is_clear() {
+                Self::paint_back_button(r, theme, part, b, enabled, hot, pressed);
+                continue;
+            }
+            if theme.tool_border.a > 0.0 && hot {
+                let face = b.inset(1.0, 1.0);
+                r.fill_paint(face, 3.0, &crate::theme::Paint::Flat(if pressed { theme.button_pressed } else { theme.button_hover }));
+                if !pressed {
+                    let shine = Rect::new(face.x, face.y, face.w, face.h / 2.0);
+                    r.fill_paint(shine, 3.0, &crate::theme::Paint::even(&[Color::rgba(255, 255, 255, 0.7), Color::rgba(255, 255, 255, 0.0)]));
+                }
+                r.stroke_round_rect(face.inset(0.5, 0.5), 2.5, 1.0, theme.tool_border);
+            } else if pressed {
                 r.fill_rect(b, theme.button_pressed);
             } else if hot {
                 r.fill_rect(b, theme.button_hover);
+            }
+            if theme.bevels && hot {
+                crate::pathbar::bevel(r, theme, b, !pressed, theme.toolbar);
             }
             let color = if !enabled {
                 theme.disabled
@@ -624,6 +877,11 @@ impl Component for Toolbar {
             if liquid {
                 Self::paint_capsule(r, theme, b, label, hot);
             } else {
+                if theme.bevels || crate::kit::old_windows(theme) {
+                    let look = crate::kit::Look { hover: hot, enabled: true, ..crate::kit::Look::default() };
+                    crate::kit::push_button(r, theme, b.inset(1.0, 1.0), label, look, false);
+                    continue;
+                }
                 fill_box_paint(r, theme, b, self.lean, if hot { &theme.chip_hover_paint } else { &theme.chip_paint });
                 r.text(label, b, &TextStyle::new(theme.button_text).semibold().align(Align::Center));
             }
@@ -702,6 +960,7 @@ impl Component for Toolbar {
             Some(Part::Filter) => self.focus_filter(ctx, app),
             Some(Part::Sort) => self.sort_menu(app),
             Some(Part::View) => self.view_menu(app),
+            Some(p @ (Part::BackMenu | Part::ForwardMenu)) if self.enabled(p, app) => self.history_menu(p == Part::ForwardMenu, app),
             Some(p) if self.enabled(p, app) => {
                 self.pressed = Some(p);
                 Effect::Redraw
@@ -746,6 +1005,13 @@ impl Component for Toolbar {
             return Effect::Redraw;
         }
         match pressed {
+            // Go: to what is typed, or the folder you're in again.
+            Some(Part::Go) if self.path_box.is_visible() => {
+                let text = self.path_box.text();
+                self.hide_path_box(_ctx, true);
+                Effect::Command(Command::Navigate(text))
+            }
+            Some(Part::Go) => Effect::Command(Command::Refresh),
             Some(Part::Back) => Effect::Command(Command::Back),
             Some(Part::Forward) => Effect::Command(Command::Forward),
             Some(Part::Up) => Effect::Command(Command::Up),
@@ -825,7 +1091,7 @@ impl Component for Toolbar {
             }
             (MENU_SORT, 5 | 6) => Effect::Command(Command::SetSort(app.tab().sort, item == 6)),
             (MENU_SORT, 7) => Effect::Command(Command::SetSort(SortKey::Created, app.tab().descending)),
-            (MENU_SORT, 8) => Effect::Command(Command::SetCustomSort(!app.settings.custom_sort)),
+            (MENU_SORT, 8) => Effect::Command(Command::SetCustomSort(!app.settings.custom_sort || app.tab().column_now)),
             (MENU_SORT, 9) => Effect::Command(Command::OpenSortEditor),
             (MENU_SETTINGS, _) => self.settings_pick(item),
             (MENU_VIEW, VIEW_RULES) => Effect::Command(Command::OpenSortEditor),
@@ -846,6 +1112,8 @@ impl Component for Toolbar {
                 Effect::Redraw
             }
             (MENU_PATH, 3) => self.begin_path_edit(ctx, app),
+            (MENU_BACK, n) => Effect::Command(Command::BackBy(n as usize)),
+            (MENU_FORWARD, n) => Effect::Command(Command::ForwardBy(n as usize)),
             _ => Effect::None,
         }
     }

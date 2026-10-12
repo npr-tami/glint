@@ -71,6 +71,7 @@ pub fn show(owner: HWND, at: POINT, menu: &Menu, default_item: u32, built: Optio
         if default_item != 0 {
             let _ = SetMenuDefaultItem(h, default_item, 0);
         }
+        crate::oldmenu::dress(h, &shared);
         SHOWING.with(|s| s.set(built.map_or(0, |b| b.session)));
         let picked = TrackPopupMenuEx(h, flags, at.x, at.y, owner, None);
         SHOWING.with(|s| s.set(0));

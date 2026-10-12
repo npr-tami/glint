@@ -651,7 +651,7 @@ fn fix_alpha(px: &mut [u8], has_alpha: bool) {
 }
 
 /// A smaller copy that fits a `px` square (WIC's Fant scaler, which averages: no shimmer).
-fn shrink(wic: &IWICImagingFactory, p: &Pixels, px: u32) -> Option<Pixels> {
+pub fn shrink(wic: &IWICImagingFactory, p: &Pixels, px: u32) -> Option<Pixels> {
     let (w, h) = fit_size(p.width, p.height, px, u64::MAX);
     // SAFETY: the WIC objects are owned wrappers; the source buffer outlives the calls.
     unsafe {

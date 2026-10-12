@@ -68,7 +68,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::fileops::{self, is_full_item_path, is_same_or_inside, same_path, DropHow};
 use crate::folder::{parent, wide};
 use crate::log;
-use crate::recycle;
 
 /// From [`Target`] to the window: one step of a drag over it (lparam: a `*mut DragMsg`, valid for
 /// the SendMessage). See window/drag.rs.
@@ -146,7 +145,7 @@ fn volume(path: &str) -> String {
 /// flags). None: they can't go there (a folder into itself, nothing but drives, moving items to
 /// where they are, or nothing the source allows).
 pub fn folder_effect(sources: &[String], dest: &str, keys: u32, allowed: u32) -> Option<DropHow> {
-    if dest.is_empty() || recycle::is_bin(dest) {
+    if dest.is_empty() || crate::folder::is_place(dest) {
         return None;
     }
     let items: Vec<&String> = sources.iter().filter(|p| is_full_item_path(p)).collect();
@@ -937,7 +936,8 @@ mod tests {
         assert_eq!(folder_effect(&paths(&["E:\\"]), "C:\\x", 0, ALL), None, "a whole drive");
         assert_eq!(folder_effect(&paths(&["notes.txt"]), "C:\\x", 0, ALL), None, "a bare name");
         assert_eq!(folder_effect(&paths(&["C:\\a.txt"]), "", 0, ALL), None, "This PC");
-        assert_eq!(folder_effect(&paths(&["C:\\a.txt"]), recycle::LOCATION, 0, ALL), None, "the bin isn't a folder");
+        assert_eq!(folder_effect(&paths(&["C:\\a.txt"]), crate::recycle::LOCATION, 0, ALL), None, "the bin isn't a folder");
+        assert_eq!(folder_effect(&paths(&["C:\\a.txt"]), crate::recent::LOCATION, 0, ALL), None, "nor is Recent");
         assert_eq!(bin_effect(&paths(&["C:\\a.txt"]), ALL), DROPEFFECT_MOVE.0);
         assert_eq!(bin_effect(&paths(&["E:\\"]), ALL), 0);
         assert_eq!(bin_effect(&paths(&["C:\\a.txt"]), DROPEFFECT_COPY.0), 0, "a source that can't let go");

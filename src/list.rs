@@ -50,7 +50,7 @@ use std::collections::BTreeMap;
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetDoubleClickTime, VK_A, VK_C, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F2, VK_HOME, VK_INSERT, VK_LEFT, VK_N, VK_NEXT, VK_PRIOR,
+    GetDoubleClickTime, GetFocus, VK_A, VK_C, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F2, VK_HOME, VK_INSERT, VK_LEFT, VK_N, VK_NEXT, VK_PRIOR,
     VK_RETURN, VK_RIGHT, VK_SPACE, VK_UP, VK_V, VK_X,
 };
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer, SystemParametersInfoW, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS};
@@ -60,6 +60,7 @@ use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXDRAG, SM_CY
 
 use crate::app::{AppState, SortKey, Tab, THIS_PC_NOTE};
 use crate::fileops;
+use crate::home;
 use crate::folder::{self, Entry, EntryKind};
 use crate::frame;
 use crate::icons;
@@ -70,7 +71,7 @@ use crate::settings::{DateFormat, ListSize, SizeFormat, ViewMode};
 use crate::thumbs;
 use crate::views::{Flow, Geometry, Step, Tile, LIST_COLUMN_W, NAME_LINE_H, SCROLL_GUTTER, TILE_PAD, TILE_TEXT_GAP};
 use crate::textbox::{TextBox, TextEvent, TextEventKind};
-use crate::theme::{size, ButtonStyle, Paint, Theme};
+use crate::theme::{size, ButtonStyle, Color, Paint, Theme};
 use crate::ui::{Anim, Command, Component, Ctx, CursorKind, Effect, Menu, MenuItem, MouseButton, MouseEvent, Point, Rect};
 // The right-click menus (menu.rs) and their keys.
 use crate::menu;
@@ -98,6 +99,9 @@ const RENAME_BOX: u16 = 300;
 /// The window timer that starts renaming after a slow second click; window.rs hands it to
 /// [`ListView::slow_click_due`].
 pub const SLOW_CLICK_TIMER: usize = 10;
+/// The window timer that repeats a held scroll bar arrow or track (an older Windows); window.rs
+/// hands it to [`ListView::repeat_due`].
+pub const BAR_REPEAT_TIMER: usize = 11;
 
 /// The column titles' right-click menu (its tag; the files menus are menu.rs's 1 and 2).
 const MENU_HEADER: u32 = 10;
@@ -158,11 +162,13 @@ impl Col {
         }
     }
 
-    /// Its title; `bin`: in the Recycle Bin, whose dates are when items were deleted.
-    fn title(self, this_pc: bool, bin: bool) -> &'static str {
+    /// Its title; `bin`: in the Recycle Bin, whose dates are when items were deleted; `recent`: in
+    /// Recent, whose dates are when files were opened.
+    fn title(self, this_pc: bool, bin: bool, recent: bool) -> &'static str {
         match self {
             Col::Name => "Name",
             Col::Modified if bin => "Date deleted",
+            Col::Modified if recent => "Date accessed",
             Col::Modified => "Date modified",
             Col::Created => "Date created",
             Col::Type => "Type",
@@ -270,6 +276,9 @@ enum Drag {
     /// Dragging the scrollbar thumb; `grab` is where on the thumb it was taken (from its top, or
     /// its left in the List view).
     Thumb { grab: f32 },
+    /// An older Windows' scroll bar arrow button or track held down (`ListView::repeat` says
+    /// which).
+    Bar,
     /// Resizing the column `col` by its left edge.
     Column { col: Col, start_x: f32, start_w: f32 },
 }
@@ -307,8 +316,14 @@ pub struct ListView {
     /// How thick the scrollbar's thumb is and the space beside it, from the skin.
     bar_w: f32,
     bar_margin: f32,
+    /// How long the scroll bar's arrow buttons are (an older Windows; 0 otherwise).
+    arrows: f32,
+    /// How far in the column titles sit (98 / 2000: inside the list's 2 DIP sunken edge).
+    edge_in: f32,
     mouse: Option<Point>,
     drag: Drag,
+    /// The scroll bar's held arrow or track, repeating (an older Windows).
+    repeat: crate::retroctl::Repeat,
     anim: Anim,
     /// The tab the running animation belongs to.
     anim_tab: u64,
@@ -330,6 +345,9 @@ pub struct ListView {
     /// Whether the window was active at the last mouse move (a click that brings the window to the
     /// front doesn't start renaming).
     was_active: bool,
+    /// The keyboard is in the list (the window is active and no text box has it): 98 / 2000 show
+    /// the selection in their colours only then, in grey otherwise.
+    has_focus: bool,
     /// Keep painting until this time: under Wine a hidden text box stays visible, and a new listing
     /// isn't on screen, until a later frame.
     repaint_until: f64,
@@ -350,6 +368,9 @@ pub struct ListView {
     /// The List view: where each name drawn at the last frame ends (row, right edge from its cell's
     /// left), so the empty space beside a short name isn't the item.
     list_hit: Vec<(usize, f32)>,
+    /// Home's page (home.rs) and whether it's on screen (at the last frame).
+    home: home::Home,
+    home_on: bool,
 }
 
 impl Default for ListView {
@@ -376,8 +397,11 @@ impl ListView {
             skin_text: 1.0,
             bar_w: size::SCROLLBAR_W,
             bar_margin: size::SCROLLBAR_MARGIN,
+            arrows: 0.0,
+            edge_in: 0.0,
             mouse: None,
             drag: Drag::None,
+            repeat: crate::retroctl::Repeat::default(),
             anim: Anim::default(),
             anim_tab: 0,
             // "One screen per notch" comes back as u32::MAX; treat it as a big step.
@@ -393,6 +417,7 @@ impl ListView {
             click_open: None,
             opened_at: None,
             was_active: false,
+            has_focus: true,
             repaint_until: 0.0,
             was_loading: false,
             press: None,
@@ -402,6 +427,8 @@ impl ListView {
             mode: ViewMode::Details,
             band: None,
             list_hit: Vec::new(),
+            home: home::Home::default(),
+            home_on: false,
         }
     }
 
@@ -431,7 +458,10 @@ impl ListView {
         self.skin_text = app.theme.font_size / size::FONT;
         self.bar_w = app.theme.scrollbar_w;
         self.bar_margin = app.theme.scrollbar_margin();
-        let mode = app.tab().view_mode;
+        self.arrows = crate::retroctl::arrows(&app.theme);
+        self.edge_in = if app.theme.era.classic() && app.theme.bevels { 2.0 } else { 0.0 };
+        self.home_on = Self::is_home(app.tab());
+        let mode = if self.home_on { ViewMode::Details } else { app.tab().view_mode };
         self.flow = Flow::of(mode);
         self.tile = Tile::of(mode);
         if mode != self.mode {
@@ -442,6 +472,16 @@ impl ListView {
             self.name_box_at = None;
             self.list_hit.clear();
         }
+    }
+
+    /// Whether the tab shows Home's page (home.rs) rather than rows: Home read and on screen.
+    fn is_home(tab: &Tab) -> bool {
+        crate::recent::is_recent(&tab.folder.path) && tab.folder.home.is_some() && tab.search.is_none() && !tab.waiting_long()
+    }
+
+    /// Home: the page under a point (in the page's own coordinates).
+    fn home_point(&self, tab: &Tab, p: Point) -> Point {
+        Point::new(p.x - self.rect.x, p.y - self.rect.y + tab.scroll.clamp(0.0, self.max_scroll(tab)))
     }
 
     /// Where the tab's items sit this frame (views.rs).
@@ -490,6 +530,9 @@ impl ListView {
         }
         if recycle::is_bin(&t.folder.path) {
             return vec![Col::Name, Col::Location, Col::Modified, Col::Size, Col::Type];
+        }
+        if crate::recent::is_recent(&t.folder.path) {
+            return vec![Col::Name, Col::Folder, Col::Modified, Col::Size, Col::Type];
         }
         let mut cols = vec![Col::Name];
         cols.extend(OPTIONAL.iter().copied().filter(|c| app.settings.shows_column(c.key())));
@@ -553,20 +596,25 @@ impl ListView {
 
     /// The column titles (Details and Tree only: the other views have none).
     fn header(&self) -> Rect {
-        let h = if self.flow == Flow::Rows { size::HEADER_H } else { 0.0 };
-        Rect::new(self.rect.x, self.rect.y, self.rect.w, h)
+        let h = if self.flow == Flow::Rows && !self.home_on { size::HEADER_H } else { 0.0 };
+        // 98 / 2000: inside the list's sunken edge, so its own raised edge shows all round.
+        let e = self.edge_in;
+        Rect::new(self.rect.x + e, self.rect.y + e, (self.rect.w - 2.0 * e).max(0.0), h)
     }
 
     /// The area the items scroll in (under the header and its 1-DIP line, where there is one).
     fn rows_area(&self) -> Rect {
-        if self.flow != Flow::Rows {
+        if self.flow != Flow::Rows || self.home_on {
             return self.rect;
         }
-        let top = self.rect.y + size::HEADER_H + 1.0;
+        let top = self.rect.y + self.edge_in + size::HEADER_H + 1.0;
         Rect::new(self.rect.x, top, self.rect.w, (self.rect.bottom() - top).max(0.0))
     }
 
     fn max_scroll(&self, tab: &Tab) -> f32 {
+        if self.home_on {
+            return (self.home.layout.height - self.rect.h).max(0.0);
+        }
         self.geo(tab).max_scroll()
     }
 
@@ -575,6 +623,15 @@ impl ListView {
     fn row_at(&self, tab: &Tab, p: Point) -> Option<usize> {
         if tab.waiting_long() || self.near_track(p) {
             return None;
+        }
+        if self.home_on {
+            if !self.rect.contains(p) {
+                return None;
+            }
+            return match self.home.layout.spot_at(self.home_point(tab, p)) {
+                Some(home::Spot::Item(i)) => tab.row_of(i),
+                _ => None,
+            };
         }
         let scroll = tab.scroll.clamp(0.0, self.max_scroll(tab));
         let geo = self.geo(tab);
@@ -595,17 +652,25 @@ impl ListView {
     fn track(&self) -> Rect {
         let area = self.rows_area();
         let (w, m) = (self.bar_w, self.bar_margin);
+        // Clear of an older Windows' arrow buttons at the two ends, and inside 98 / 2000's sunken
+        // edge round the list.
+        let along = m + self.arrows;
+        let e = if self.home_on { 0.0 } else { self.edge_in };
         if self.flow == Flow::Columns {
-            return Rect::new(area.x + m, self.rect.bottom() - w - m, (area.w - 2.0 * m).max(0.0), w);
+            return Rect::new(area.x + e + along, self.rect.bottom() - e - w - m, (area.w - 2.0 * (e + along)).max(0.0), w);
         }
-        Rect::new(self.rect.right() - w - m, area.y + m, w, (area.h - 2.0 * m).max(0.0))
+        Rect::new(self.rect.right() - e - w - m, area.y + along, w, (area.h - e - 2.0 * along).max(0.0))
     }
 
-    /// The scrollbar's whole lane: the track and the space beside it (where a skin paints a track).
+    /// The scrollbar's whole lane: the track and the space beside it (where a skin paints a track),
+    /// and an older Windows' arrow buttons.
     fn lane(&self) -> Rect {
         let t = self.track();
-        let m = self.bar_margin;
-        Rect::new(t.x - m, t.y - m, t.w + 2.0 * m, t.h + 2.0 * m)
+        let (m, a) = (self.bar_margin, self.arrows);
+        if self.flow == Flow::Columns {
+            return Rect::new(t.x - m - a, t.y - m, t.w + 2.0 * (m + a), t.h + 2.0 * m);
+        }
+        Rect::new(t.x - m, t.y - m - a, t.w + 2.0 * m, t.h + 2.0 * (m + a))
     }
 
     /// Whether `p` is on (or right next to) the scrollbar's track.
@@ -620,13 +685,26 @@ impl ListView {
 
     /// The scrollbar thumb, if the items don't all fit (and are showing).
     fn thumb(&self, tab: &Tab) -> Option<Rect> {
+        self.thumb_at(tab, tab.scroll)
+    }
+
+    /// Where the thumb is once the list is scrolled to `scroll`.
+    fn thumb_at(&self, tab: &Tab, scroll: f32) -> Option<Rect> {
+        if self.home_on {
+            let (max, track) = (self.max_scroll(tab), self.track());
+            if max <= 0.0 {
+                return None;
+            }
+            let h = (track.h * self.rect.h / self.home.layout.height).clamp(24.0_f32.min(track.h), track.h);
+            return Some(Rect::new(track.x, track.y + (track.h - h) * (scroll / max).clamp(0.0, 1.0), track.w, h));
+        }
         let geo = self.geo(tab);
         let max = geo.max_scroll();
         if max <= 0.0 || tab.waiting_long() {
             return None;
         }
         let track = self.track();
-        let along = (tab.scroll / max).clamp(0.0, 1.0);
+        let along = (scroll / max).clamp(0.0, 1.0);
         if geo.sideways() {
             let w = (track.w * geo.view() / geo.content()).clamp(24.0_f32.min(track.w), track.w);
             return Some(Rect::new(track.x + (track.w - w) * along, track.y, w, track.h));
@@ -653,6 +731,14 @@ impl ListView {
 
     /// Scrolls (without animation) so `row` is fully visible.
     fn reveal(&mut self, tab: &mut Tab, row: usize) {
+        if self.home_on {
+            if let Some(r) = tab.index_at(row).and_then(|i| self.home.layout.rect_of(i)) {
+                let top = tab.scroll.min(r.y - 8.0).max(r.bottom() + 8.0 - self.rect.h);
+                tab.scroll = top.clamp(0.0, self.max_scroll(tab));
+            }
+            self.anim.stop();
+            return;
+        }
         tab.scroll = self.geo(tab).reveal(row, tab.scroll);
         self.anim.stop();
     }
@@ -665,6 +751,68 @@ impl ListView {
         self.anim.go(tab.scroll, target, now - FRAME_HEAD_START, SCROLL_TIME);
         self.anim_tab = tab.id;
         Effect::Animate
+    }
+
+    /// Where the scroll position is heading (where it is, when not gliding).
+    fn scroll_target(&self, tab: &Tab) -> f32 {
+        if self.anim.running() {
+            self.anim.target()
+        } else {
+            tab.scroll
+        }
+    }
+
+    /// The mouse went down on an older Windows' scroll bar arrow or track: the first step now, the
+    /// next ones on BAR_REPEAT_TIMER while the button is held.
+    fn press_bar(&mut self, tab: &mut Tab, hold: crate::retroctl::Hold, now: f64) -> Effect {
+        self.drag = Drag::Bar;
+        let wait = self.repeat.press(hold, now);
+        crate::retroctl::repeat_timer(self.hwnd, BAR_REPEAT_TIMER, Some(wait));
+        match self.bar_step(tab, hold, now) {
+            Effect::None => Effect::Redraw,
+            e => e,
+        }
+    }
+
+    /// One step of a held scroll bar arrow (a line) or track (a page, while the thumb hasn't
+    /// reached the mouse).
+    fn bar_step(&mut self, tab: &mut Tab, hold: crate::retroctl::Hold, now: f64) -> Effect {
+        use crate::retroctl::Hold;
+        let geo = self.geo(tab);
+        let from = self.scroll_target(tab);
+        let amount = match hold {
+            Hold::Arrow(_) if self.home_on => crate::kit::ARROW_STEP,
+            Hold::Arrow(_) => geo.line(),
+            Hold::Page(way) => {
+                let on = self.mouse.zip(self.thumb_at(tab, from)).is_some_and(|(p, t)| crate::retroctl::page_on(self.lane(), t, way, p));
+                if !on {
+                    return Effect::None;
+                }
+                if self.home_on {
+                    (self.rect.h - crate::kit::ARROW_STEP).max(crate::kit::ARROW_STEP)
+                } else {
+                    geo.view() - geo.line()
+                }
+            }
+            Hold::None => return Effect::None,
+        };
+        self.scroll_to(tab, from + hold.way().sign() * amount, now)
+    }
+
+    /// BAR_REPEAT_TIMER fired: the held scroll bar arrow or track takes its next step; the timer
+    /// stops at the end.
+    pub fn repeat_due(&mut self, ctx: &Ctx, app: &mut AppState) -> Effect {
+        let tab = app.tab_mut();
+        let room = crate::retroctl::Room::of(self.scroll_target(tab), self.max_scroll(tab)).toward(self.repeat.hold.way());
+        let (hold, steps, next) = self.repeat.fire(room, ctx.now);
+        crate::retroctl::repeat_timer(self.hwnd, BAR_REPEAT_TIMER, next);
+        let mut effect = Effect::Redraw;
+        for _ in 0..steps {
+            if let e @ Effect::Animate = self.bar_step(tab, hold, ctx.now) {
+                effect = e;
+            }
+        }
+        effect
     }
 
     /// Moves the keyboard cursor to `row`, selecting like Explorer does.
@@ -710,15 +858,18 @@ impl ListView {
             Some(r) => r,
             None => 0,
         };
-        for k in 0..n {
-            let row = (start + k) % n;
-            if tab.entry_at(row).is_some_and(|e| e.lower.starts_with(&needle)) {
-                tab.select_only_row(row);
-                self.reveal(tab, row);
-                return true;
-            }
+        let find = |needle: &str, start: usize| (0..n).map(|k| (start + k) % n).find(|&row| tab.entry_at(row).is_some_and(|e| e.lower.starts_with(needle)));
+        let mut found = find(&needle, start);
+        if found.is_none() && self.typed.chars().count() > 1 {
+            // No name starts with the letters typed together: the last letter starts again on its
+            // own (File Explorer just stops here), going on from the item selected now.
+            self.typed = ch.to_lowercase().collect();
+            found = find(&self.typed, cur.map_or(0, |r| r + 1));
         }
-        false
+        let Some(row) = found else { return false };
+        tab.select_only_row(row);
+        self.reveal(tab, row);
+        true
     }
 
     // ------------------------------------------------------------ renaming
@@ -750,7 +901,7 @@ impl ListView {
     fn begin_rename(&mut self, now: f64, tab: &mut Tab, index: usize, text: Option<&str>, hide_ext: bool) -> Effect {
         let Some(e) = tab.folder.entries.get(index) else { return Effect::None };
         // Not drives, and not the Recycle Bin's deleted items.
-        if e.kind == EntryKind::Drive || tab.folder.path.is_empty() || recycle::is_bin(&tab.folder.path) || self.hwnd.is_invalid() {
+        if e.kind == EntryKind::Drive || tab.folder.path.is_empty() || folder::is_place(&tab.folder.path) || self.hwnd.is_invalid() {
             return Effect::None;
         }
         let Some(row) = tab.row_of(index) else { return Effect::None }; // hidden by the filter
@@ -1061,6 +1212,25 @@ impl ListView {
         let this_pc = Self::is_this_pc(tab);
         let bin = recycle::is_bin(&tab.folder.path);
         let end = self.rect.right() - SCROLL_GUTTER;
+        if theme.era.old() {
+            // An older Windows' column titles (retrolist.rs).
+            crate::retrolist::header_band(r, theme, header);
+            let end = end.min(header.right());
+            for (i, p) in self.cols.clone().iter().enumerate() {
+                let x = p.x.max(header.x);
+                let cell = Rect::new(x, header.y, (p.x + p.w).min(end) - x, header.h);
+                if cell.w <= 0.0 {
+                    continue;
+                }
+                let label = p.col.title(this_pc, bin, crate::recent::is_recent(&tab.folder.path));
+                let right = p.col.right_aligned();
+                let text_rect = if i == 0 { Rect::new(cell.x + ROW_PAD + 4.0, cell.y, cell.w - ROW_PAD - 16.0, cell.h) } else { cell.inset(10.0, 0.0) };
+                let sorted = p.col.sort_key() == Some(tab.sort) && tab.custom_here().is_none() && !(crate::recent::is_recent(&tab.folder.path) && !tab.column_now) && !(this_pc && p.col == Col::Free && tab.sort != SortKey::Date);
+                let hot = hover_col == Some(p.col) && p.col.sort_key().is_some();
+                crate::retrolist::header_item(r, theme, cell, text_rect, label, right, sorted.then_some(tab.descending), hot);
+            }
+            return;
+        }
         r.fill_paint(header, 0.0, &theme.list_header);
         for (i, p) in self.cols.clone().iter().enumerate() {
             let cell = Rect::new(p.x, header.y, (p.x + p.w).min(end) - p.x, header.h);
@@ -1070,19 +1240,22 @@ impl ListView {
             if hover_col == Some(p.col) && p.col.sort_key().is_some() {
                 r.fill_paint(cell, 0.0, &theme.hover_paint);
             }
+            if theme.bevels {
+                crate::pathbar::bevel(r, theme, cell, true, theme.list_header.base());
+            }
             if i > 0 {
                 // The line between two column titles (none in most skins).
                 r.fill_rect(Rect::new(cell.x, cell.y, 1.0, cell.h), theme.column_line);
             }
-            let label = p.col.title(this_pc, bin);
+            let label = p.col.title(this_pc, bin, crate::recent::is_recent(&tab.folder.path));
             let right = p.col.right_aligned();
             let text_rect = if i == 0 { Rect::new(cell.x + ROW_PAD + 4.0, cell.y, cell.w - ROW_PAD - 16.0, cell.h) } else { cell.inset(10.0, 0.0) };
             let style = TextStyle::new(theme.list_header_text).align(if right { Align::Right } else { Align::Left });
             // With liquid buttons the titles are bold, as the sidebar's panel headers are.
             let style = if theme.buttons == ButtonStyle::Liquid { style.bold() } else { style };
             r.text(label, text_rect, &style);
-            // (None while the custom sort order decides.)
-            if p.col.sort_key() == Some(tab.sort) && tab.custom_here().is_none() && !(this_pc && p.col == Col::Free && tab.sort != SortKey::Date) {
+            // (None while the custom sort order decides, or Recent keeps Windows' newest-first order.)
+            if p.col.sort_key() == Some(tab.sort) && tab.custom_here().is_none() && !(crate::recent::is_recent(&tab.folder.path) && !tab.column_now) && !(this_pc && p.col == Col::Free && tab.sort != SortKey::Date) {
                 // A small chevron beside the sorted column's title: up = A to Z / oldest first.
                 let w = r.measure(label, &style);
                 let cx = if right { text_rect.right() - w - 9.0 } else { (text_rect.x + w + 9.0).min(text_rect.right() - 4.0) };
@@ -1160,7 +1333,13 @@ impl ListView {
         } else if tab.folder.entries.is_empty() && tab.loading.is_some() {
             Some("Loading\u{2026}".to_string())
         } else if tab.folder.entries.is_empty() && tab.folder.path == tab.path {
-            Some(if recycle::is_bin(&tab.path) { "The Recycle Bin is empty." } else { "This folder is empty." }.to_string())
+            Some(if recycle::is_bin(&tab.path) {
+                "The Recycle Bin is empty."
+            } else if crate::recent::is_recent(&tab.path) {
+                "Files you open show up here."
+            } else {
+                "This folder is empty."
+            }.to_string())
         } else if tab.view.is_empty() && !tab.filter.is_empty() {
             Some(format!("No items match \u{201c}{}\u{201d}.", tab.filter))
         } else if tab.view.is_empty() && tab.folder.path == tab.path {
@@ -1177,10 +1356,12 @@ impl ListView {
         if let Some(thumb) = self.thumb(tab) {
             let state = match self.drag {
                 Drag::Thumb { .. } => ThumbState::Dragged,
+                Drag::Bar => ThumbState::Held(self.repeat.hold),
                 _ if self.mouse.is_some_and(|p| self.near_track(p)) => ThumbState::Hover,
                 _ => ThumbState::Rest,
             };
-            paint_scrollbar(r, theme, self.lane(), thumb, state);
+            let room = crate::retroctl::Room::of(tab.scroll, self.max_scroll(tab));
+            paint_scrollbar(r, theme, self.lane(), thumb, state, room);
         }
     }
 
@@ -1198,9 +1379,28 @@ impl ListView {
         cut.is_some_and(|c| c.contains(&e.lower)) && !(tab.tree.is_open() && e.target.is_some())
     }
 
+    /// 98 / 2000 mark a selected item by its name only, its icon blended half way into the
+    /// selection's colour, and in grey (the button face, black text) while the keyboard is
+    /// elsewhere. Whether a selected item shows in the selection's colours (`lit`), and the
+    /// paint behind its name.
+    fn classic_label(&self, theme: &Theme) -> (bool, Paint) {
+        if self.has_focus {
+            (true, theme.accent_tint_paint)
+        } else {
+            (false, Paint::Flat(theme.toolbar))
+        }
+    }
+
+    /// Draws an item's icon blended half way into the selection's colour (98 / 2000's selected
+    /// icon) when `tint`.
+    fn tint_icon(r: &mut Renderer, theme: &Theme, tint: bool) {
+        r.set_tint(tint.then(|| (Color { a: 1.0, ..theme.accent_tint_paint.base() }, 0.5)));
+    }
+
     /// The colour of an item's name.
     fn name_color(theme: &Theme, e: &Entry, selected: bool, is_cut: bool) -> crate::theme::Color {
-        if selected && !is_cut {
+        // (An older Windows' selection is dark: a cut item on it keeps the selection's colour.)
+        if selected && (!is_cut || theme.era.old()) {
             theme.selection_text
         } else if e.is_hidden() || is_cut {
             theme.muted
@@ -1230,11 +1430,16 @@ impl ListView {
             let selected = tab.is_selected(index);
             // The folder something dragged over the list would go into: outlined in red.
             let dropping = self.drop_row.as_deref().is_some_and(|d| e.is_container() && e.path_in(&tab.folder.path).to_lowercase() == d);
+            // 98 / 2000 mark only the name (below), as their Explorer did.
+            let label_only = theme.era.classic();
+            let (lit, label_paint) = self.classic_label(theme);
             if selected {
-                r.fill_paint(line, 0.0, &theme.accent_tint_paint);
-                r.fill_rect(Rect::new(line.x, line.y, size::SELECT_EDGE, line.h), theme.select_edge);
+                if !label_only {
+                    crate::pathbar::fill_row(r, theme, line, &theme.accent_tint_paint, false);
+                    r.fill_rect(Rect::new(line.x, line.y, size::SELECT_EDGE, line.h), theme.select_edge);
+                }
             } else if hover == Some(row) || dropping {
-                r.fill_paint(line, 0.0, &theme.hover_paint);
+                crate::pathbar::fill_row(r, theme, line, &theme.hover_paint, true);
             }
             if dropping {
                 r.stroke_rect(line, 1.0, theme.accent);
@@ -1246,6 +1451,9 @@ impl ListView {
                 // (Greyed while an opened folder is still being read.)
                 let color = if tab.tree.waiting(&e.path_in(&tab.folder.path)) {
                     theme.disabled
+                } else if selected && theme.era.old() {
+                    // On an older Windows' selection (navy, blue): its own text colour.
+                    theme.selection_text
                 } else if selected || hover == Some(row) {
                     theme.text
                 } else {
@@ -1258,9 +1466,13 @@ impl ListView {
                 };
                 r.polyline(&points, 1.3, color);
             }
-            let icon = if large { app.icons.for_entry_sized(&tab.folder.path, e, true) } else { app.icons.for_entry(&tab.folder.path, e) };
             let icon_rect = Rect::new(line.x + ROW_PAD + offset, y + (row_h - self.icon) / 2.0, self.icon, self.icon);
-            r.icon(&app.icons, icon, icon_rect);
+            Self::tint_icon(r, theme, label_only && selected && lit);
+            if !crate::eraicons::draw_entry(r, theme.icons, &tab.folder.path, e, icon_rect) {
+                let icon = if large { app.icons.for_entry_sized(&tab.folder.path, e, true) } else { app.icons.for_entry(&tab.folder.path, e) };
+                r.icon(&app.icons, icon, icon_rect);
+            }
+            Self::tint_icon(r, theme, false);
             let is_cut = Self::is_cut(tab, cut, e);
             if is_cut {
                 // The row's own background over the icon, half see-through, so it fades into its row.
@@ -1270,11 +1482,21 @@ impl ListView {
                     r.fill_rect(icon_rect, theme.accent_tint.with_alpha(theme.accent_tint.a * 0.55));
                 }
             }
-            let name_color = Self::name_color(theme, e, selected, is_cut);
+            let name_color = Self::name_color(theme, e, selected && (lit || !label_only), is_cut);
             let name_x = line.x + ROW_PAD + offset + self.icon + 8.0;
             let name_right = self.name_right();
-            r.text(shown_name(e, hide_ext), Rect::new(name_x, y, name_right - name_x - 8.0, row_h), &TextStyle::new(name_color).size(self.font));
-            let detail = TextStyle::new(if selected { theme.selection_details } else { theme.muted }).size(self.font);
+            let name_style = TextStyle::new(name_color).size(self.font);
+            if label_only && selected {
+                // The selection behind the name only, and the keyboard's dotted box round it.
+                let w = r.measure(shown_name(e, hide_ext), &name_style).min((name_right - name_x - 8.0).max(0.0)).ceil();
+                let label = Rect::new(r.snap(name_x - 2.0), r.snap(y + 1.0), w + 4.0, (row_h - 2.0).round());
+                r.fill_paint(label, 0.0, &label_paint);
+                if tab.focus == Some(index) && lit {
+                    crate::retroctl::dotted(r, label, theme.selection_text);
+                }
+            }
+            r.text(shown_name(e, hide_ext), Rect::new(name_x, y, name_right - name_x - 8.0, row_h), &name_style);
+            let detail = TextStyle::new(if selected && !label_only { theme.selection_details } else { theme.muted }).size(self.font);
             for p in cols.iter().skip(1) {
                 let w = (p.x + p.w).min(end) - p.x - 20.0;
                 if w <= 0.0 {
@@ -1305,7 +1527,10 @@ impl ListView {
             }
             let selected = tab.is_selected(index);
             let is_cut = Self::is_cut(tab, cut, e);
-            let style = TextStyle::new(Self::name_color(theme, e, selected, is_cut)).size(self.font);
+            // 98 / 2000: the name only (see `classic_label`).
+            let label_only = theme.era.classic();
+            let (lit, label_paint) = self.classic_label(theme);
+            let style = TextStyle::new(Self::name_color(theme, e, selected && (lit || !label_only), is_cut)).size(self.font);
             let name = shown_name(e, hide_ext);
             let name_x = cell.x + ROW_PAD + self.icon + 8.0;
             let room = (cell.right() - name_x - 10.0).max(0.0);
@@ -1313,7 +1538,13 @@ impl ListView {
             let item = Rect::new(cell.x + 4.0, cell.y + 1.0, name_x + w + 6.0 - (cell.x + 4.0), cell.h - 2.0);
             self.list_hit.push((row, item.right() - cell.x));
             let dropping = self.drop_row.as_deref().is_some_and(|d| e.is_container() && e.path_in(&tab.folder.path).to_lowercase() == d);
-            if selected {
+            if selected && label_only {
+                let label = Rect::new(r.snap(name_x - 2.0), r.snap(cell.y + 1.0), w.ceil() + 4.0, (cell.h - 2.0).round());
+                r.fill_paint(label, 0.0, &label_paint);
+                if tab.focus == Some(index) && lit {
+                    crate::retroctl::dotted(r, label, theme.selection_text);
+                }
+            } else if selected {
                 r.fill_paint(item, 0.0, &theme.accent_tint_paint);
                 r.fill_rect(Rect::new(item.x, item.y, size::SELECT_EDGE, item.h), theme.select_edge);
             } else if hover == Some(row) || dropping {
@@ -1322,9 +1553,13 @@ impl ListView {
             if dropping {
                 r.stroke_rect(item, 1.0, theme.accent);
             }
-            let icon = if large { app.icons.for_entry_sized(&tab.folder.path, e, true) } else { app.icons.for_entry(&tab.folder.path, e) };
             let icon_rect = Rect::new(cell.x + ROW_PAD, cell.y + (cell.h - self.icon) / 2.0, self.icon, self.icon);
-            r.icon(&app.icons, icon, icon_rect);
+            Self::tint_icon(r, theme, label_only && selected && lit);
+            if !crate::eraicons::draw_entry(r, theme.icons, &tab.folder.path, e, icon_rect) {
+                let icon = if large { app.icons.for_entry_sized(&tab.folder.path, e, true) } else { app.icons.for_entry(&tab.folder.path, e) };
+                r.icon(&app.icons, icon, icon_rect);
+            }
+            Self::tint_icon(r, theme, false);
             if is_cut {
                 r.fill_rect(icon_rect, theme.panel.with_alpha(0.55));
             }
@@ -1345,11 +1580,16 @@ impl ListView {
             let tile = Geometry::tile(cell);
             let selected = tab.is_selected(index);
             let dropping = self.drop_row.as_deref().is_some_and(|d| e.is_container() && e.path_in(&tab.folder.path).to_lowercase() == d);
+            // 98 / 2000: the name only (below, see `classic_label`).
+            let label_only = theme.era.classic();
+            let (lit, label_paint) = self.classic_label(theme);
             // In the skin's shape (round corners only in a rounded skin), with the skin's selection
             // edge along the bottom.
             if selected {
-                fill_box_paint(r, theme, tile, 0.0, &theme.accent_tint_paint);
-                r.fill_rect(Rect::new(tile.x + 8.0, tile.bottom() - 2.0, tile.w - 16.0, 2.0), theme.select_edge);
+                if !label_only {
+                    fill_box_paint(r, theme, tile, 0.0, &theme.accent_tint_paint);
+                    r.fill_rect(Rect::new(tile.x + 8.0, tile.bottom() - 2.0, tile.w - 16.0, 2.0), theme.select_edge);
+                }
             } else if hover == Some(row) || dropping {
                 fill_box_paint(r, theme, tile, 0.0, &theme.hover_paint);
             }
@@ -1357,14 +1597,26 @@ impl ListView {
                 outline_box(r, theme, tile.inset(0.5, 0.5), 0.0, 1.0, theme.accent);
             }
             let pic = Rect::new(cell.x + (cell.w - side) / 2.0, cell.y + TILE_PAD, side, side);
+            Self::tint_icon(r, theme, label_only && selected && lit);
             let drawn = self.paint_picture(r, theme, app, &tab.folder.path, e, pic);
+            Self::tint_icon(r, theme, false);
             let is_cut = Self::is_cut(tab, cut, e);
             if is_cut {
                 let under = if selected { theme.panel } else if hover == Some(row) { theme.hover } else { theme.panel };
                 r.fill_rect(drawn, under.with_alpha(0.55));
             }
             let name = Rect::new(tile.x + 4.0, pic.bottom() + TILE_TEXT_GAP, tile.w - 8.0, self.tile.lines as f32 * NAME_LINE_H + 1.0);
-            let style = TextStyle::new(Self::name_color(theme, e, selected, is_cut)).align(Align::Center);
+            let style = TextStyle::new(Self::name_color(theme, e, selected && (lit || !label_only), is_cut)).align(Align::Center);
+            if selected && label_only {
+                // Behind the name's lines: as wide as the name (or the box, when it wraps).
+                let full = r.measure(shown_name(e, hide_ext), &style).ceil();
+                let (w, lines) = if full <= name.w { (full, 1.0) } else { (name.w, self.tile.lines as f32) };
+                let label = Rect::new(r.snap(name.x + (name.w - w) / 2.0 - 2.0), r.snap(name.y), w + 4.0, (lines * NAME_LINE_H + 1.0).round());
+                r.fill_paint(label, 0.0, &label_paint);
+                if tab.focus == Some(index) && lit {
+                    crate::retroctl::dotted(r, label, theme.selection_text);
+                }
+            }
             r.text_wrapped(shown_name(e, hide_ext), name, &style);
         }
     }
@@ -1373,32 +1625,7 @@ impl ListView {
     /// with a thin frame) or Windows' big icon (at its own size at most) - made in the background
     /// (thumbs.rs), with the list's own icon meanwhile. Returns where it was drawn.
     fn paint_picture(&self, r: &mut Renderer, theme: &Theme, app: &AppState, dir: &str, e: &Entry, b: Rect) -> Rect {
-        let scale = self.scale.max(0.5);
-        // Pictures are asked for in screen pixels, so they're sharp at any scaling.
-        let px = (b.w * scale).round().max(16.0) as u32;
-        let path = e.path_in(dir);
-        let version = thumbs::version_of(e.modified, e.size);
-        if let Some(pic) = thumbs::request_versioned(&path, version, px) {
-            // In DIPs, fitted into the box; never blown up past its own size.
-            let (w, h) = (pic.width() as f32 / scale, pic.height() as f32 / scale);
-            let k = (b.w / w).min(b.h / h).min(1.0);
-            let (w, h) = (w * k, h * k);
-            // Thumbnails sit on the box's bottom edge, like photos on a shelf; icons in its middle.
-            let y = if pic.is_icon() { b.y + (b.h - h) / 2.0 } else { b.bottom() - h };
-            let at = Rect::new(b.x + (b.w - w) / 2.0, y, w, h);
-            if r.picture(&pic, at, None, 1.0, true) {
-                if !pic.is_icon() {
-                    r.stroke_rect(Rect::new(at.x - 1.0, at.y - 1.0, at.w + 2.0, at.h + 2.0), 1.0, theme.line);
-                }
-                return at;
-            }
-        }
-        // Not made yet (or Windows has none): the list's own big icon.
-        let icon = app.icons.for_entry_sized(dir, e, true);
-        let s = size::ICON_LARGE.min(b.w);
-        let at = Rect::new(b.x + (b.w - s) / 2.0, b.y + (b.h - s) / 2.0, s, s);
-        r.icon(&app.icons, icon, at);
-        at
+        picture(r, theme, app, dir, e, b, self.scale)
     }
 
     /// The right-click menu (menu.rs): for the selected items, or for the folder's empty space.
@@ -1488,6 +1715,44 @@ pub enum ThumbState {
     Rest,
     Hover,
     Dragged,
+    /// An older Windows' arrow button or track held down.
+    Held(crate::retroctl::Hold),
+}
+
+/// An item's picture in the box `b` (see `ListView::paint_picture`); `scale` is the screen's.
+pub(crate) fn picture(r: &mut Renderer, theme: &Theme, app: &AppState, dir: &str, e: &Entry, b: Rect, scale: f32) -> Rect {
+    let scale = scale.max(0.5);
+    // Pictures are asked for in screen pixels, so they're sharp at any scaling.
+    let px = (b.w * scale).round().max(16.0) as u32;
+    let path = e.path_in(dir);
+    let version = thumbs::version_of(e.modified, e.size);
+    // With older Windows' icons, folders and drives show theirs, and so does any file without a
+    // real picture of its own (Windows' icon for it would come back as its picture).
+    let era = theme.icons != crate::theme::IconSet::Windows;
+    let wanted = !(era && e.is_container());
+    if let Some(pic) = wanted.then(|| thumbs::request_versioned(&path, version, px)).flatten().filter(|pic| !(era && pic.is_icon())) {
+        // In DIPs, fitted into the box; never blown up past its own size.
+        let (w, h) = (pic.width() as f32 / scale, pic.height() as f32 / scale);
+        let k = (b.w / w).min(b.h / h).min(1.0);
+        let (w, h) = (w * k, h * k);
+        // Thumbnails sit on the box's bottom edge, like photos on a shelf; icons in its middle.
+        let y = if pic.is_icon() { b.y + (b.h - h) / 2.0 } else { b.bottom() - h };
+        let at = Rect::new(b.x + (b.w - w) / 2.0, y, w, h);
+        if r.picture(&pic, at, None, 1.0, true) {
+            if !pic.is_icon() {
+                r.stroke_rect(Rect::new(at.x - 1.0, at.y - 1.0, at.w + 2.0, at.h + 2.0), 1.0, theme.line);
+            }
+            return at;
+        }
+    }
+    // Not made yet (or Windows has none): the list's own big icon.
+    let s = size::ICON_LARGE.min(b.w);
+    let at = Rect::new(b.x + (b.w - s) / 2.0, b.y + (b.h - s) / 2.0, s, s);
+    if !crate::eraicons::draw_entry(r, theme.icons, dir, e, at) {
+        let icon = app.icons.for_entry_sized(dir, e, true);
+        r.icon(&app.icons, icon, at);
+    }
+    at
 }
 
 /// Draws a scrollbar (the file list's, the sidebar's): the skin's track along `lane` if it paints
@@ -1495,23 +1760,31 @@ pub enum ThumbState {
 /// in the skin's `scrollbar` paint (a gradient shades it across, like a rod), its edge and three
 /// grip lines across its middle if the skin has them. Being dragged, a flat thumb takes the accent
 /// colour and a shaded one gets a little darker.
-pub fn paint_scrollbar(r: &mut Renderer, theme: &Theme, lane: Rect, thumb: Rect, state: ThumbState) {
+pub fn paint_scrollbar(r: &mut Renderer, theme: &Theme, lane: Rect, thumb: Rect, state: ThumbState, room: crate::retroctl::Room) {
+    if theme.era.old() {
+        let hold = if let ThumbState::Held(h) = state { h } else { crate::retroctl::Hold::None };
+        let hot = matches!(state, ThumbState::Hover | ThumbState::Held(_));
+        let look = crate::retroctl::BarLook { hot, dragged: state == ThumbState::Dragged, hold, room };
+        return crate::retroctl::scrollbar(r, theme, lane, thumb, look);
+    }
     let upright = thumb.h >= thumb.w;
     if !theme.scrollbar_track.is_clear() {
         r.fill_paint(lane, 0.0, &theme.scrollbar_track);
         let edge = if upright { Rect::new(lane.x, lane.y, 1.0, lane.h) } else { Rect::new(lane.x, lane.y, lane.w, 1.0) };
         r.fill_rect(edge, theme.line);
     }
-    let radius = thumb.w.min(thumb.h) / 2.0;
+    let radius = if theme.bevels { 0.0 } else { thumb.w.min(thumb.h) / 2.0 };
     let shaded = theme.scroll_thumb_paint.gradient().is_some();
     let paint = match state {
         ThumbState::Dragged if shaded => theme.scroll_thumb_hover_paint.darker(0.1),
         ThumbState::Dragged => Paint::Flat(theme.accent),
         ThumbState::Hover => theme.scroll_thumb_hover_paint,
-        ThumbState::Rest => theme.scroll_thumb_paint,
+        ThumbState::Rest | ThumbState::Held(_) => theme.scroll_thumb_paint,
     };
     r.fill_paint(thumb, radius, &paint);
-    if theme.scrollbar_border.a > 0.0 {
+    if theme.bevels {
+        crate::pathbar::bevel(r, theme, thumb, true, paint.base());
+    } else if theme.scrollbar_border.a > 0.0 {
         r.stroke_round_rect(thumb.inset(0.5, 0.5), (radius - 0.5).max(0.0), 1.0, theme.scrollbar_border);
     }
     let long = if upright { thumb.h } else { thumb.w };
@@ -1529,7 +1802,7 @@ pub fn paint_scrollbar(r: &mut Renderer, theme: &Theme, lane: Rect, thumb: Rect,
 /// An item's name as the list shows it: without its extension when known extensions are left out
 /// ("HideKnownExtensions") and Windows knows the type - like File Explorer. A name that is only an
 /// extension (".gitignore") stays whole.
-fn shown_name(e: &Entry, hide_ext: bool) -> &str {
+pub(crate) fn shown_name(e: &Entry, hide_ext: bool) -> &str {
     if hide_ext && e.kind == EntryKind::File && !e.ext.is_empty() && icons::known_type(&e.ext) {
         if let Some(i) = e.name.rfind('.').filter(|&i| i > 0) {
             return &e.name[..i];
@@ -1650,6 +1923,20 @@ impl ListView {
     /// to the folder an item is in).
     fn cursor_key(&mut self, key: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY, app: &mut AppState) -> Option<usize> {
         let tab = app.tab();
+        if self.home_on {
+            // Home: among the tiles and rows as they're laid out.
+            let l = &self.home.layout;
+            let to = match key {
+                VK_UP => home::step(l, tab.focus, 0, -1),
+                VK_DOWN => home::step(l, tab.focus, 0, 1),
+                VK_LEFT => home::step(l, tab.focus, -1, 0),
+                VK_RIGHT => home::step(l, tab.focus, 1, 0),
+                VK_HOME | VK_PRIOR => l.items().next().map(|(i, _)| i),
+                VK_END | VK_NEXT => l.items().last().map(|(i, _)| i),
+                _ => return None,
+            };
+            return to.and_then(|i| tab.row_of(i)).or(tab.focus_row());
+        }
         let geo = self.geo(tab);
         let n = tab.view.len();
         let cur = tab.focus_row();
@@ -1721,17 +2008,40 @@ impl Component for ListView {
         self.rect
     }
 
-    fn paint(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState, _ctx: &Ctx) {
+    fn paint(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState, ctx: &Ctx) {
+        // SAFETY: a plain focus query.
+        self.has_focus = ctx.active && unsafe { GetFocus() } == self.hwnd;
         let tab = app.tab();
         self.take_size(app);
         self.place_columns(app);
         r.fill_paint(self.rect, 0.0, &theme.panel_paint);
         r.push_clip(self.rect);
+        if self.home_on {
+            let max = (self.home.layout.height - self.rect.h).max(0.0);
+            let area = Rect::new(self.rect.x, self.rect.y, self.rect.w - SCROLL_GUTTER.min(12.0), self.rect.h);
+            let mouse = if self.drag == Drag::None { self.mouse } else { None };
+            home::paint(r, theme, app, tab, &mut self.home, area, tab.scroll.clamp(0.0, max), mouse, self.scale);
+            if let Some(thumb) = self.thumb(tab) {
+                let state = match self.drag {
+                    Drag::Thumb { .. } => ThumbState::Dragged,
+                    Drag::Bar => ThumbState::Held(self.repeat.hold),
+                    _ if self.mouse.is_some_and(|p| self.near_track(p)) => ThumbState::Hover,
+                    _ => ThumbState::Rest,
+                };
+                let room = crate::retroctl::Room::of(tab.scroll, self.max_scroll(tab));
+                paint_scrollbar(r, theme, self.lane(), thumb, state, room);
+            }
+            r.pop_clip();
+            return;
+        }
         if self.flow == Flow::Rows {
             self.paint_header(r, theme, tab);
         }
         self.paint_rows(r, theme, app, tab);
         r.pop_clip();
+        if theme.bevels {
+            crate::pathbar::bevel(r, theme, self.rect, false, theme.window);
+        }
     }
 
     fn cursor(&self, p: Point, app: &AppState) -> CursorKind {
@@ -1780,9 +2090,10 @@ impl Component for ListView {
         let tab = app.tab_mut();
         match self.drag {
             Drag::Thumb { grab } => {
-                let (track, max) = (self.track(), geo.max_scroll());
+                // Home has its own height (`max_scroll`) and always scrolls downwards.
+                let (track, max) = (self.track(), self.max_scroll(tab));
                 if let Some(thumb) = self.thumb(tab) {
-                    let (pos, start, span) = if geo.sideways() { (e.pos.x, track.x, track.w - thumb.w) } else { (e.pos.y, track.y, track.h - thumb.h) };
+                    let (pos, start, span) = if geo.sideways() && !self.home_on { (e.pos.x, track.x, track.w - thumb.w) } else { (e.pos.y, track.y, track.h - thumb.h) };
                     tab.scroll = ((pos - grab - start) / span.max(1.0) * max).clamp(0.0, max);
                     self.anim.stop();
                 }
@@ -1796,7 +2107,7 @@ impl Component for ListView {
                 self.wanted.insert(col.key(), w.min(max_w) / self.text_growth());
                 self.place_columns(app);
             }
-            Drag::None => {}
+            Drag::Bar | Drag::None => {}
         }
         Effect::Redraw
     }
@@ -1822,16 +2133,55 @@ impl Component for ListView {
                 return Effect::Redraw;
             }
         }
+        // Home: its chevrons fold a section; its pills pick Recent or Favorites.
+        if self.home_on && e.button == MouseButton::Left && !self.near_track(e.pos) {
+            let at = self.home_point(app.tab(), e.pos);
+            let h = &mut self.home;
+            let changed = match h.layout.spot_at(at) {
+                Some(home::Spot::Quick) => {
+                    h.quick_open = !h.quick_open;
+                    true
+                }
+                Some(home::Spot::Lists) => {
+                    h.lists_open = !h.lists_open;
+                    true
+                }
+                Some(home::Spot::Recent) if h.favorites => {
+                    h.favorites = false;
+                    true
+                }
+                Some(home::Spot::Favorites) if !h.favorites => {
+                    h.favorites = true;
+                    true
+                }
+                Some(home::Spot::Recent | home::Spot::Favorites) => return Effect::None,
+                _ => false,
+            };
+            if changed {
+                // What was selected may be out of sight now.
+                app.tab_mut().clear_selection();
+                return Effect::Redraw;
+            }
+        }
         let geo = self.geo(app.tab());
         let tab = app.tab_mut();
         if e.button == MouseButton::Left {
             // Scrollbar: grab the thumb, or page towards the click.
             if self.near_track(e.pos) {
                 if let Some(thumb) = self.thumb(tab) {
-                    let (pos, start, end) = if geo.sideways() { (e.pos.x, thumb.x, thumb.right()) } else { (e.pos.y, thumb.y, thumb.bottom()) };
+                    // An older Windows' arrow buttons: a line up or down, again and again while held.
+                    if let Some(held) = crate::retroctl::arrow_at(self.lane(), self.arrows, e.pos) {
+                        return self.press_bar(tab, crate::retroctl::Hold::Arrow(held), ctx.now);
+                    }
+                    let (pos, start, end) = if geo.sideways() && !self.home_on { (e.pos.x, thumb.x, thumb.right()) } else { (e.pos.y, thumb.y, thumb.bottom()) };
                     if pos >= start && pos < end {
                         self.drag = Drag::Thumb { grab: pos - start };
                         return Effect::Redraw;
+                    }
+                    // Its track pages on while held, until the thumb reaches the mouse.
+                    if self.arrows > 0.0 {
+                        let way = if pos < start { crate::retroctl::Held::Start } else { crate::retroctl::Held::End };
+                        return self.press_bar(tab, crate::retroctl::Hold::Page(way), ctx.now);
                     }
                     let page = geo.view() - geo.line();
                     let from = if self.anim.running() { self.anim.target() } else { tab.scroll };
@@ -1910,8 +2260,8 @@ impl Component for ListView {
                 if !e.mods.ctrl {
                     tab.clear_selection();
                 }
-                // Dragging from here draws a rectangle that selects what it touches.
-                if !tab.waiting_long() {
+                // Dragging from here draws a rectangle that selects what it touches (not on Home).
+                if !tab.waiting_long() && !self.home_on {
                     let start = if self.flow == Flow::Columns { Point::new(e.pos.x + tab.scroll, e.pos.y) } else { Point::new(e.pos.x, e.pos.y + tab.scroll) };
                     let base = if e.mods.ctrl { tab.selected.clone() } else { vec![false; tab.folder.entries.len()] };
                     self.band = Some(Band { tab_id: tab.id, start, now: e.pos, base, active: false, at: ctx.now });
@@ -1930,6 +2280,9 @@ impl Component for ListView {
     fn mouse_up(&mut self, ctx: &Ctx, e: &MouseEvent, app: &mut AppState) -> Effect {
         if self.drag != Drag::None {
             self.drag = Drag::None;
+            if self.repeat.release() {
+                crate::retroctl::repeat_timer(self.hwnd, BAR_REPEAT_TIMER, None);
+            }
             return Effect::Redraw;
         }
         if self.band.take().is_some_and(|b| b.active) {
@@ -2014,7 +2367,7 @@ impl Component for ListView {
             Some(_) if app.settings.single_click => Effect::None,
             Some(index) => Effect::Command(Command::OpenEntry(index)),
             // The empty space below the items: up a folder, if the setting says so.
-            None if app.settings.double_click_up && !tab.waiting_long() && !e.mods.ctrl && !e.mods.shift => Effect::Command(Command::Up),
+            None if app.settings.double_click_up && !tab.waiting_long() && !self.home_on && !e.mods.ctrl && !e.mods.shift => Effect::Command(Command::Up),
             None => Effect::None,
         }
     }
@@ -2119,6 +2472,9 @@ impl Component for ListView {
         if recycle::is_bin(&tab.path) {
             return Some(DropTarget::RecycleBin);
         }
+        if crate::recent::is_recent(&tab.path) {
+            return None;
+        }
         // A folder that couldn't be read (gone, no permission) takes nothing.
         if tab.folder.error.is_some() {
             return None;
@@ -2175,13 +2531,13 @@ impl Component for ListView {
         if let Some(v) = self.anim.value(now) {
             tab.scroll = v;
         }
-        let max = geo.max_scroll();
+        let max = if self.home_on { (self.home.layout.height - self.rect.h).max(0.0) } else { geo.max_scroll() };
         tab.scroll = tab.scroll.clamp(0.0, max);
         // How a step of scrolling goes in this view, for a re-read that keeps the top item in place.
         tab.lines = Some((geo.line(), geo.per_line));
         if tab.reveal_focus {
             tab.reveal_focus = false;
-            if let Some(row) = tab.focus_row() {
+            if let Some(row) = tab.focus_row().filter(|_| !self.home_on) {
                 // Centre it if it's out of sight (e.g. going up to a folder with thousands of items).
                 if !geo.shows(row, tab.scroll) {
                     tab.scroll = geo.centre(row);
@@ -2264,6 +2620,37 @@ mod tests {
         assert_eq!(relative_folder(&e, "C:\\"), "");
         e.target = Some("C:\\x\\a.txt".into());
         assert_eq!(relative_folder(&e, "C:\\"), "x");
+    }
+
+    /// Letters typed together jump to a name starting with them; when none does, the last letter
+    /// starts again on its own instead of doing nothing (File Explorer stops there).
+    #[test]
+    fn a_letter_that_matches_nothing_together_starts_again() {
+        let entry = |name: &str| Entry {
+            name: name.into(),
+            lower: name.to_lowercase(),
+            kind: EntryKind::File,
+            size: 0,
+            modified: 0,
+            created: 0,
+            attributes: 0,
+            ext: String::new(),
+            type_name: Arc::from("File"),
+            target: None,
+            free: 0,
+        };
+        let mut tab = Tab::new(1, "C:\\x".into());
+        let folder = crate::folder::Folder { path: "C:\\x".into(), entries: ["apple.txt", "banana.txt", "berry.txt", "cherry.txt"].map(entry).to_vec(), ..Default::default() };
+        crate::app::apply_listing(&mut tab, folder);
+        let mut list = ListView::new();
+        let name = |t: &Tab| t.focus.map(|i| t.folder.entries[i].name.clone());
+        assert!(list.jump_to_typed(&mut tab, 'b', 0.0));
+        assert!(list.jump_to_typed(&mut tab, 'e', 0.2));
+        assert_eq!(name(&tab).as_deref(), Some("berry.txt"), "\"be\" together");
+        assert!(list.jump_to_typed(&mut tab, 'c', 0.4));
+        assert_eq!(name(&tab).as_deref(), Some("cherry.txt"), "no \"bec\": c on its own");
+        assert!(list.jump_to_typed(&mut tab, 'h', 0.6));
+        assert_eq!(name(&tab).as_deref(), Some("cherry.txt"), "and on from there: \"ch\"");
     }
 
     #[test]

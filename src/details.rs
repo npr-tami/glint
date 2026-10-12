@@ -20,7 +20,6 @@ use crate::app::{AppState, Tab};
 use crate::folder::{self, Entry, EntryKind};
 use crate::peek::{self, Answer, Ask, Facts, FactsCache, Peeker, TextLimits, What};
 use crate::pathbar::{fill_box, fill_box_paint, outline_box};
-use crate::recycle;
 use crate::render::{Align, Renderer, TextStyle};
 use crate::shell;
 use crate::theme::{ButtonStyle, Color, Theme};
@@ -229,7 +228,7 @@ pub fn info(sel: &Sel, facts: Option<&Facts>, app: &AppState) -> Info {
         Sel::Folder { path, items } => {
             out.name = app.display_name(path);
             out.chips.push(count(*items, "item", "items"));
-            if !path.is_empty() && !recycle::is_bin(path) {
+            if !path.is_empty() && !crate::folder::is_place(path) {
                 out.rows.push(Row { label: "Location", value: path.clone(), path: true });
             }
         }

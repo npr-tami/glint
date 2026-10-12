@@ -10,6 +10,13 @@
 //!   (the pane filled, cut where it must) are one click. The zoom mode stays while stepping
 //!   through pictures.
 //! - Text files show their first 200 KB as monospaced text with line numbers; the wheel scrolls.
+//! - Animated GIFs play by themselves, looping (anim.rs decodes their frames on peek.rs's thread).
+//! - Videos show their thumbnail with a big play button; they play only when the person clicks it
+//!   (or the picture), with play/pause, a seek bar with the time, mute and volume under them
+//!   (video.rs). Space still closes the pane.
+//! - The "i" button in the top bar shows a strip of facts under pictures, GIFs and videos: the
+//!   size in pixels, format, bit depth, DPI, camera and date taken, frames, frame rate, bitrate
+//!   ("PreviewInfo" in settings.json).
 //! - Anything else shows its big thumbnail (a video's frame, a PDF's first page, or its icon) and
 //!   its details, as the details panel says them (details.rs).
 //!
@@ -19,9 +26,13 @@
 //! full size; closing the pane or going to another file lets it go.
 
 use std::sync::Arc;
+use std::time::Instant;
+
+use windows::Win32::Foundation::HWND;
 
 use crate::app::AppState;
 use crate::details::{self, One, Sel};
+use crate::anim::{self, Frames};
 use crate::folder;
 use crate::pathbar::{chevron_right, fill_box, fill_box_paint};
 use crate::peek::{self, Answer, FactsCache, Peeker};
@@ -29,6 +40,7 @@ use crate::render::{Align, Renderer, TextStyle};
 use crate::theme::{Color, Theme};
 use crate::thumbs::{self, Picture};
 use crate::ui::{Command, Ctx, CursorKind, Effect, MouseButton, MouseEvent, Point, Rect};
+use crate::video::{self, Video};
 
 /// The top bar's height.
 pub const TOP_H: f32 = 40.0;
@@ -45,6 +57,9 @@ const MONO_FONT: f32 = 12.5;
 const MONO_LINE: f32 = 18.0;
 /// Text lines scrolled per wheel notch.
 const WHEEL_LINES: f32 = 3.0;
+/// The video controls' height, and one line of the info strip.
+const CONTROLS_H: f32 = 40.0;
+const INFO_LINE: f32 = 18.0;
 
 /// How a picture is sized.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -98,8 +113,54 @@ enum Hit {
     Fill,
     Prev,
     Next,
+    /// The "i" button: the info strip on or off.
+    Info,
+    /// The video's play / pause button.
+    Play,
+    Seek,
+    Mute,
+    Volume,
     /// The picture (or text, or thumbnail) area.
     View,
+}
+
+/// Dragging on a video's controls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Drag {
+    Seek,
+    Volume,
+}
+
+/// Where a video's controls are.
+#[derive(Clone, Copy, Debug)]
+struct Controls {
+    bar: Rect,
+    play: Rect,
+    time: Rect,
+    seek: Rect,
+    mute: Rect,
+    volume: Rect,
+}
+
+impl Controls {
+    fn new(bar: Rect) -> Controls {
+        let b = 32.0;
+        let y = bar.y + (bar.h - b) / 2.0;
+        let play = Rect::new(bar.x + 6.0, y, b, b);
+        let time = Rect::new(play.right() + 6.0, bar.y, 96.0, bar.h);
+        let volume = Rect::new(bar.right() - 10.0 - 72.0, bar.y, 72.0, bar.h);
+        let mute = Rect::new(volume.x - 4.0 - b, y, b, b);
+        let seek_x = time.right() + 6.0;
+        let seek = Rect::new(seek_x, bar.y, (mute.x - 10.0 - seek_x).max(0.0), bar.h);
+        Controls { bar, play, time, seek, mute, volume }
+    }
+}
+
+/// An animated GIF on screen.
+struct Anim {
+    key: String,
+    frames: Frames,
+    start: Instant,
 }
 
 /// The picture at full size, for one item.
@@ -118,6 +179,8 @@ struct Shown {
     picture: Option<((f32, f32), f32)>,
     /// Text: how many lines it has and how many fit.
     text: Option<(usize, usize)>,
+    /// A video: its controls.
+    controls: Option<Controls>,
 }
 
 /// Where the top bar's buttons are.
@@ -130,6 +193,7 @@ struct Bar {
     name: Rect,
     prev: Rect,
     next: Rect,
+    info: Rect,
 }
 
 pub struct PreviewPane {
@@ -152,6 +216,18 @@ pub struct PreviewPane {
     panning: Option<(Point, Point)>,
     scale: f32,
     shown: Option<Shown>,
+    /// The animated GIF on screen, its frames and when it started.
+    anim: Option<Anim>,
+    /// The video being played (only after play was pressed), and the item it's for.
+    video: Option<Video>,
+    video_key: String,
+    /// The video on screen couldn't be played.
+    video_failed: bool,
+    /// Videos' volume (0 to 1, read from the settings at first) and mute.
+    volume: Option<f32>,
+    muted: bool,
+    dragging: Option<Drag>,
+    hwnd: HWND,
 }
 
 impl Default for PreviewPane {
@@ -177,6 +253,14 @@ impl PreviewPane {
             panning: None,
             scale: 1.0,
             shown: None,
+            anim: None,
+            video: None,
+            video_key: String::new(),
+            video_failed: false,
+            volume: None,
+            muted: false,
+            dragging: None,
+            hwnd: HWND::default(),
         }
     }
 
@@ -195,6 +279,7 @@ impl PreviewPane {
         self.hover = Hit::None;
         self.pressed = Hit::None;
         self.shown = None;
+        self.stop_media();
         if !matches!(self.zoom, Zoom::Custom(_)) {
             return;
         }
@@ -212,9 +297,10 @@ impl PreviewPane {
         let zoom = Rect::new(fill.right() + 6.0, r.y, 52.0, TOP_H);
         let next = Rect::new(r.right() - 6.0 - b, y, b, b);
         let prev = Rect::new(next.x - 2.0 - b, y, b, b);
+        let info = Rect::new(prev.x - 8.0 - b, y, b, b);
         let name_x = zoom.right() + 8.0;
-        let name = Rect::new(name_x, r.y, (prev.x - 8.0 - name_x).max(0.0), TOP_H);
-        Bar { close, fit, actual, fill, zoom, name, prev, next }
+        let name = Rect::new(name_x, r.y, (info.x - 8.0 - name_x).max(0.0), TOP_H);
+        Bar { close, fit, actual, fill, zoom, name, prev, next, info }
     }
 
     fn view_rect(&self) -> Rect {
@@ -236,7 +322,21 @@ impl PreviewPane {
             Hit::Prev
         } else if b.next.contains(p) {
             Hit::Next
-        } else if self.view_rect().contains(p) {
+        } else if b.info.contains(p) {
+            Hit::Info
+        } else if let Some(c) = self.shown.and_then(|s| s.controls).filter(|c| c.bar.contains(p)) {
+            if c.play.contains(p) {
+                Hit::Play
+            } else if c.mute.contains(p) {
+                Hit::Mute
+            } else if c.seek.contains(p) {
+                Hit::Seek
+            } else if c.volume.contains(p) {
+                Hit::Volume
+            } else {
+                Hit::None
+            }
+        } else if self.shown.map_or(self.view_rect(), |s| s.view).contains(p) {
             Hit::View
         } else {
             Hit::None
@@ -249,7 +349,8 @@ impl PreviewPane {
                 Answer::Facts { key, facts } => self.facts.insert(key, facts),
                 // Only the item on screen keeps its picture at full size.
                 Answer::Picture { key, picture, original } if key == self.view_key => self.full = Some(Full { key, picture, original }),
-                Answer::Picture { .. } => {}
+                Answer::Frames { key, frames } if key == self.view_key => self.anim = Some(Anim { key, frames, start: Instant::now() }),
+                Answer::Picture { .. } | Answer::Frames { .. } => {}
             }
         }
     }
@@ -258,6 +359,7 @@ impl PreviewPane {
     fn new_item(&mut self, key: &str) {
         self.view_key = key.to_string();
         self.full = None;
+        self.stop_media();
         self.pan = Point::default();
         self.scroll = 0.0;
         self.panning = None;
@@ -272,6 +374,10 @@ impl PreviewPane {
             return;
         }
         self.scale = ctx.scale;
+        self.hwnd = ctx.hwnd;
+        if self.volume.is_none() {
+            self.volume = Some(app.settings.preview_volume);
+        }
         self.take_answers();
         r.fill_paint(rect, 0.0, &theme.panel_paint);
         r.push_clip(rect);
@@ -281,8 +387,10 @@ impl PreviewPane {
                 self.new_item(&o.key);
             }
             // The full picture was lost with the graphics device: decode it again.
-            if self.full.as_ref().is_some_and(|f| f.picture.as_ref().is_some_and(|p| p.is_lost())) {
+            let anim_lost = self.anim.as_ref().is_some_and(|a| a.frames.pictures.iter().any(|p| p.is_lost()));
+            if anim_lost || self.full.as_ref().is_some_and(|f| f.picture.as_ref().is_some_and(|p| p.is_lost())) {
                 self.full = None;
+                self.anim = None;
                 self.asked.clear();
             }
             let picture = o.is_file() && thumbs::is_picture(&o.entry.ext);
@@ -298,18 +406,37 @@ impl PreviewPane {
             self.full = None;
         }
         let view = self.view_rect();
-        self.shown = Some(Shown { view, picture: None, text: None });
+        self.shown = Some(Shown { view, picture: None, text: None, controls: None });
+        let mut wake: Option<u64> = None;
         match &one {
             None => {
                 r.text("Select a file to preview it", view, &TextStyle::new(theme.muted).align(Align::Center));
             }
-            Some(o) => self.paint_item(r, theme, app, o, view),
+            Some(o) => wake = self.paint_item(r, theme, app, o, view),
         }
         self.paint_bar(r, theme, app, one.as_ref());
         r.pop_clip();
+        // A GIF's next frame, or the video's: the window is repainted then.
+        match wake {
+            Some(ms) => video::wake_in(self.hwnd, ms.min(60_000) as u32),
+            None => video::stop_waking(self.hwnd),
+        }
     }
 
-    fn paint_item(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState, one: &One, view: Rect) {
+    /// The GIF and the video go (another item, or the pane closed): the video's sound fades out.
+    fn stop_media(&mut self) {
+        self.anim = None;
+        self.video = None;
+        self.video_key.clear();
+        self.video_failed = false;
+        self.dragging = None;
+        if self.hwnd != HWND::default() {
+            video::stop_waking(self.hwnd);
+        }
+    }
+
+    /// Draws the item; returns in how many milliseconds to draw again (a GIF or a video playing).
+    fn paint_item(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState, one: &One, view: Rect) -> Option<u64> {
         let s = self.scale;
         let facts = self.facts.get(&one.key).cloned();
         let is_picture = one.is_file() && thumbs::is_picture(&one.entry.ext);
@@ -320,17 +447,56 @@ impl PreviewPane {
         let waiting_for_text = by_name && facts.as_ref().is_none_or(|f| f.text.is_some());
         let thumb = if waiting_for_text { None } else { thumbs::request_versioned(&one.shell_path, one.version, thumb_px) };
         let real_thumb = thumb.as_ref().filter(|t| !t.is_icon()).cloned();
-        if is_picture && !(full_failed && real_thumb.is_none()) {
-            self.paint_picture(r, theme, view, facts.as_ref().and_then(|f| f.dims), real_thumb.or(thumb));
-            return;
+        let is_video = one.is_file() && video::is_video(&one.entry.ext);
+        if (is_picture && !(full_failed && real_thumb.is_none())) || is_video {
+            // The info strip and the video's controls go under the picture.
+            let gif = self.anim.as_ref().filter(|a| a.key == one.key).map(|a| (a.frames.count, a.frames.total_ms()));
+            let video_dims = self.video.as_ref().filter(|_| self.video_key == one.key).and_then(|v| v.size());
+            let decoded = self.full.as_ref().filter(|f| f.key == one.key && f.original.0 > 0).map(|f| f.original);
+            let dims = facts.as_ref().and_then(|f| f.dims).or(video_dims).or(decoded);
+            let lines = if app.settings.preview_info {
+                let taken = facts.as_ref().and_then(|f| f.media.taken).map(|t| folder::format_date_as(t, app.settings.date_format));
+                let duration = facts.as_ref().and_then(|f| f.duration).filter(|_| is_video);
+                media_lines(dims, duration, facts.as_ref().map(|f| &f.media), gif, taken)
+            } else {
+                Vec::new()
+            };
+            let info_h = if lines.is_empty() { 0.0 } else { lines.len() as f32 * INFO_LINE + 12.0 };
+            let controls_h = if is_video { CONTROLS_H } else { 0.0 };
+            let pic = Rect::new(view.x, view.y, view.w, (view.h - info_h - controls_h).max(0.0));
+            if let Some(sh) = self.shown.as_mut() {
+                sh.view = pic;
+            }
+            let thumb = real_thumb.or(thumb);
+            let wake = if is_video {
+                self.paint_video(r, theme, pic, one, thumb)
+            } else {
+                self.paint_picture(r, theme, pic, facts.as_ref().and_then(|f| f.dims), thumb)
+            };
+            if !lines.is_empty() {
+                let strip = Rect::new(view.x, pic.bottom(), view.w, info_h);
+                r.fill_rect(strip, theme.window.with_alpha(0.5));
+                r.fill_rect(Rect::new(strip.x, strip.y, strip.w, 1.0), theme.line);
+                let mut y = strip.y + 6.0;
+                for (i, line) in lines.iter().enumerate() {
+                    let color = if i == 0 { theme.text } else { theme.muted };
+                    r.text(line, Rect::new(strip.x + 12.0, y, (strip.w - 24.0).max(0.0), INFO_LINE), &TextStyle::new(color).size(12.0));
+                    y += INFO_LINE;
+                }
+            }
+            if is_video {
+                let duration = facts.as_ref().and_then(|f| f.duration).map_or(0.0, |t| t as f64 / 10_000_000.0);
+                self.paint_controls(r, theme, Rect::new(view.x, view.bottom() - CONTROLS_H, view.w, CONTROLS_H), duration);
+            }
+            return wake;
         }
         let text = facts.as_ref().and_then(|f| f.text.clone()).filter(|_| by_name || real_thumb.is_none());
         if let Some(text) = text {
             self.paint_text(r, theme, view, &text);
-            return;
+            return None;
         }
         if waiting_for_text {
-            return; // its lines are on their way
+            return None; // its lines are on their way
         }
         // Anything else: the big thumbnail, and the details under it.
         let pad = 18.0;
@@ -341,14 +507,24 @@ impl PreviewPane {
         let info = details::info(&Sel::One(Box::new(one.clone())), facts.as_ref(), app);
         let area = Rect::new(view.x + pad, img.bottom() + 16.0, (view.w - 2.0 * pad).max(0.0), (view.bottom() - img.bottom() - 16.0 - pad).max(0.0));
         details::draw_info(r, theme, area, &info);
+        None
     }
 
     /// A picture on the checkerboard, zoomed and panned.
-    fn paint_picture(&mut self, r: &mut Renderer, theme: &Theme, view: Rect, dims: Option<(u32, u32)>, thumb: Option<Arc<Picture>>) {
+    fn paint_picture(&mut self, r: &mut Renderer, theme: &Theme, view: Rect, dims: Option<(u32, u32)>, thumb: Option<Arc<Picture>>) -> Option<u64> {
         let s = self.scale;
         let (a, b) = if theme.dark { (Color::hex(0x1c1c1f), Color::hex(0x242428)) } else { (Color::hex(0xf4f4f6), Color::hex(0xe4e4e8)) };
         r.fill_checker(view, 8.0, a, b);
-        let full = self.full.as_ref().filter(|f| f.key == self.view_key).and_then(|f| f.picture.clone().map(|p| (p, f.original)));
+        let mut wake = None;
+        let mut full = self.full.as_ref().filter(|f| f.key == self.view_key).and_then(|f| f.picture.clone().map(|p| (p, f.original)));
+        // An animated GIF: the frame for now, and when the next one is due.
+        if let Some(a) = self.anim.as_ref().filter(|a| a.key == self.view_key) {
+            let (i, next) = anim::frame_at(&a.frames.delays, a.start.elapsed().as_millis() as u64);
+            if let Some(p) = a.frames.pictures.get(i) {
+                full = Some((p.clone(), a.frames.size));
+                wake = Some(next.max(10));
+            }
+        }
         // The picture's own size: from the full decode, the shell, or (for now) the thumbnail.
         let natural = match (&full, dims, &thumb) {
             (Some((_, (w, h))), _, _) if *w > 0 => (*w as f32, *h as f32),
@@ -358,7 +534,7 @@ impl PreviewPane {
                 if let Some(t) = &thumb {
                     details::draw_fitted(r, t, view.inset(24.0, 24.0), s, 256.0);
                 }
-                return;
+                return wake;
             }
         };
         let z = zoom_value(self.zoom, natural, (view.w * s, view.h * s));
@@ -381,6 +557,168 @@ impl PreviewPane {
         r.pop_clip();
         if let Some(sh) = self.shown.as_mut() {
             sh.picture = Some((natural, z));
+        }
+        wake
+    }
+
+    /// A video: its newest frame once it plays, before that its thumbnail with a big play button.
+    fn paint_video(&mut self, r: &mut Renderer, theme: &Theme, area: Rect, one: &One, thumb: Option<Arc<Picture>>) -> Option<u64> {
+        let s = self.scale;
+        r.fill_rect(area, theme.window);
+        let mut wake = None;
+        let mut playing = false;
+        let mut frame = None;
+        if let Some(v) = self.video.as_mut().filter(|_| self.video_key == one.key) {
+            let px = (area.w.max(area.h) * s) as u32;
+            if v.tick(px.clamp(64, r.max_bitmap_size().min(4096))) {
+                wake = Some(video::FRAME_MS as u64);
+            }
+            if v.failed() {
+                self.video_failed = true;
+            }
+            playing = v.is_playing();
+            frame = v.frame();
+        }
+        let shown = frame.or(thumb.filter(|t| !t.is_icon()));
+        r.push_clip(area);
+        match &shown {
+            Some(p) => {
+                let dest = fit_rect((p.width() as f32, p.height() as f32), area);
+                r.picture(p, dest, None, 1.0, true);
+            }
+            None => {
+                if let Some(t) = thumbs::request_versioned(&one.shell_path, one.version, 256) {
+                    details::draw_fitted(r, &t, area.inset(24.0, 24.0), s, 128.0);
+                }
+            }
+        }
+        if !playing {
+            // The big play button.
+            let c = Point::new(area.x + area.w / 2.0, area.y + area.h / 2.0);
+            let rad = 30.0f32.min(area.h / 3.0).max(0.0);
+            if rad > 8.0 {
+                let hover = self.hover == Hit::View;
+                r.fill_round_rect(Rect::new(c.x - rad, c.y - rad, rad * 2.0, rad * 2.0), rad, theme.accent.with_alpha(if hover { 1.0 } else { 0.85 }));
+                let t = rad * 0.45;
+                r.fill_polygon(&[Point::new(c.x - t * 0.7, c.y - t), Point::new(c.x + t, c.y), Point::new(c.x - t * 0.7, c.y + t)], theme.on_accent);
+            }
+            if self.video_failed && self.video_key == one.key {
+                let note = Rect::new(area.x, c.y + rad + 10.0, area.w, 22.0);
+                r.text("This video can't be played here", note, &TextStyle::new(theme.text_strong).align(Align::Center));
+            }
+        }
+        r.pop_clip();
+        wake
+    }
+
+    /// Play / pause, the time, the seek bar, mute and the volume.
+    fn paint_controls(&mut self, r: &mut Renderer, theme: &Theme, bar: Rect, known_duration: f64) {
+        let c = Controls::new(bar);
+        if let Some(sh) = self.shown.as_mut() {
+            sh.controls = Some(c);
+        }
+        r.fill_paint(bar, 0.0, &theme.list_header);
+        r.fill_rect(Rect::new(bar.x, bar.y, bar.w, 1.0), theme.line);
+        let v = self.video.as_ref().filter(|_| self.video_key == self.view_key);
+        let playing = v.is_some_and(|v| v.is_playing());
+        let (pos, dur) = match v {
+            Some(v) if v.duration() > 0.0 => (v.position(), v.duration()),
+            _ => (0.0, known_duration),
+        };
+        let (hover, pressed) = (self.hover, self.pressed);
+        let hover_bg = |r: &mut Renderer, rect: Rect, hit: Hit| {
+            if hover == hit {
+                fill_box(r, theme, rect, 0.0, if pressed == hit { theme.button_pressed } else { theme.button_hover });
+            }
+        };
+        // Play / pause.
+        hover_bg(r, c.play, Hit::Play);
+        let m = Point::new(c.play.x + c.play.w / 2.0, c.play.y + c.play.h / 2.0);
+        if playing {
+            r.fill_rect(Rect::new(m.x - 5.0, m.y - 6.0, 3.5, 12.0), theme.text);
+            r.fill_rect(Rect::new(m.x + 1.5, m.y - 6.0, 3.5, 12.0), theme.text);
+        } else {
+            r.fill_polygon(&[Point::new(m.x - 4.0, m.y - 7.0), Point::new(m.x + 7.0, m.y), Point::new(m.x - 4.0, m.y + 7.0)], theme.text);
+        }
+        // The time.
+        r.text(&format!("{} / {}", video::clock(pos), video::clock(dur)), c.time, &TextStyle::new(theme.muted).size(12.0));
+        // The seek bar.
+        let share = if dur > 0.0 { (pos / dur).clamp(0.0, 1.0) as f32 } else { 0.0 };
+        slider(r, theme, c.seek, share, hover == Hit::Seek || self.dragging == Some(Drag::Seek));
+        // Mute: a speaker, with waves or a cross.
+        hover_bg(r, c.mute, Hit::Mute);
+        let m = Point::new(c.mute.x + c.mute.w / 2.0 - 3.0, c.mute.y + c.mute.h / 2.0);
+        let color = theme.text;
+        r.fill_polygon(
+            &[
+                Point::new(m.x - 6.0, m.y - 3.0),
+                Point::new(m.x - 3.0, m.y - 3.0),
+                Point::new(m.x + 2.0, m.y - 7.0),
+                Point::new(m.x + 2.0, m.y + 7.0),
+                Point::new(m.x - 3.0, m.y + 3.0),
+                Point::new(m.x - 6.0, m.y + 3.0),
+            ],
+            color,
+        );
+        let volume = self.volume.unwrap_or(0.5);
+        if self.muted || volume <= 0.0 {
+            r.line(Point::new(m.x + 5.0, m.y - 3.5), Point::new(m.x + 12.0, m.y + 3.5), 1.4, color);
+            r.line(Point::new(m.x + 12.0, m.y - 3.5), Point::new(m.x + 5.0, m.y + 3.5), 1.4, color);
+        } else {
+            r.polyline(&[Point::new(m.x + 5.0, m.y - 3.0), Point::new(m.x + 6.5, m.y), Point::new(m.x + 5.0, m.y + 3.0)], 1.3, color);
+            if volume > 0.5 {
+                r.polyline(&[Point::new(m.x + 8.0, m.y - 6.0), Point::new(m.x + 10.5, m.y), Point::new(m.x + 8.0, m.y + 6.0)], 1.3, color);
+            }
+        }
+        // The volume.
+        slider(r, theme, c.volume, if self.muted { 0.0 } else { volume }, hover == Hit::Volume || self.dragging == Some(Drag::Volume));
+    }
+
+    /// Plays or pauses the video on screen (it's opened the first time).
+    fn toggle_video(&mut self, app: &mut AppState) -> Effect {
+        let Some(one) = details::focused(app).filter(|o| o.is_file() && video::is_video(&o.entry.ext)) else { return Effect::None };
+        if self.video_key != one.key || self.video.is_none() {
+            self.video = None;
+            self.video_key = one.key.clone();
+            self.video_failed = false;
+            match Video::open(&one.path, self.hwnd, self.volume.unwrap_or(app.settings.preview_volume), self.muted) {
+                Some(v) => self.video = Some(v),
+                None => {
+                    self.video_failed = true;
+                    return Effect::Redraw;
+                }
+            }
+        }
+        if let Some(v) = self.video.as_mut() {
+            v.toggle();
+        }
+        Effect::Redraw
+    }
+
+    /// The seek bar or the volume was clicked or dragged to `x`.
+    fn drag_to(&mut self, drag: Drag, x: f32) {
+        let Some(c) = self.shown.and_then(|s| s.controls) else { return };
+        let track = if drag == Drag::Seek { c.seek } else { c.volume };
+        let share = slider_share(track, x);
+        match drag {
+            Drag::Seek => {
+                if let Some(v) = self.video.as_mut().filter(|_| self.video_key == self.view_key) {
+                    let d = v.duration();
+                    v.seek(d * share as f64);
+                }
+            }
+            Drag::Volume => {
+                self.volume = Some(share);
+                if share > 0.0 && self.muted {
+                    self.muted = false;
+                    if let Some(v) = self.video.as_mut() {
+                        v.set_muted(false);
+                    }
+                }
+                if let Some(v) = self.video.as_mut() {
+                    v.set_volume(share);
+                }
+            }
         }
     }
 
@@ -441,7 +779,11 @@ impl PreviewPane {
         r.fill_rect(Rect::new(self.rect.x, self.rect.y + TOP_H, self.rect.w, 1.0), theme.line);
         let picture = self.shown.and_then(|s| s.picture);
         let button_bg = |r: &mut Renderer, rect: Rect, hit: Hit, on: bool, enabled: bool| {
-            if on {
+            if on && theme.era.old() {
+                // An older Windows' "on" toolbar button: pressed in (its selection is too dark here).
+                fill_box(r, theme, rect, 0.0, theme.button_pressed);
+                r.fill_rect(Rect::new(rect.x, rect.bottom() - 2.0, rect.w, 2.0), theme.accent);
+            } else if on {
                 fill_box_paint(r, theme, rect, 0.0, &theme.accent_tint_paint);
                 r.fill_rect(Rect::new(rect.x, rect.bottom() - 2.0, rect.w, 2.0), theme.accent);
             } else if enabled && self.hover == hit {
@@ -480,6 +822,11 @@ impl PreviewPane {
         if let Some((_, z)) = picture {
             r.text(&zoom_text(z), bar.zoom, &TextStyle::new(theme.muted).align(Align::Center));
         }
+        // The "i" button: the info strip under pictures and videos.
+        button_bg(r, bar.info, Hit::Info, app.settings.preview_info, true);
+        let c = Point::new(bar.info.x + bar.info.w / 2.0, bar.info.y + bar.info.h / 2.0);
+        r.fill_round_rect(Rect::new(c.x - 1.0, c.y - 7.0, 2.0, 2.0), 1.0, theme.text);
+        r.fill_rect(Rect::new(c.x - 0.8, c.y - 3.0, 1.6, 9.0), theme.text);
         // The name, then ‹ ›.
         if let Some(o) = one {
             r.text(&o.entry.name, bar.name, &TextStyle::new(theme.text).align(Align::Right));
@@ -567,7 +914,7 @@ impl PreviewPane {
     // ------------------------------------------------------------ the mouse
 
     pub fn cursor(&self, p: Point) -> CursorKind {
-        if self.hit(p) == Hit::View && self.can_pan() {
+        if self.hit(p) == Hit::View && (self.can_pan() || self.shown.is_some_and(|s| s.controls.is_some())) {
             CursorKind::Hand
         } else {
             CursorKind::Arrow
@@ -582,6 +929,10 @@ impl PreviewPane {
     }
 
     pub fn mouse_move(&mut self, e: &MouseEvent) -> Effect {
+        if let Some(d) = self.dragging {
+            self.drag_to(d, e.pos.x);
+            return Effect::Redraw;
+        }
         if let Some((start, pan0)) = self.panning {
             let Some(sh) = self.shown else { return Effect::None };
             let Some((natural, z)) = sh.picture else { return Effect::None };
@@ -598,7 +949,7 @@ impl PreviewPane {
     }
 
     pub fn mouse_leave(&mut self) -> Effect {
-        if self.hover != Hit::None && self.panning.is_none() {
+        if self.hover != Hit::None && self.panning.is_none() && self.dragging.is_none() {
             self.hover = Hit::None;
             return Effect::Redraw;
         }
@@ -611,6 +962,21 @@ impl PreviewPane {
         }
         let h = self.hit(e.pos);
         self.hover = h;
+        let drag = match h {
+            Hit::Seek => Some(Drag::Seek),
+            Hit::Volume => Some(Drag::Volume),
+            _ => None,
+        };
+        if let Some(d) = drag {
+            self.dragging = Some(d);
+            self.drag_to(d, e.pos.x);
+            return Effect::Redraw;
+        }
+        if h == Hit::View && self.shown.is_some_and(|s| s.controls.is_some()) {
+            // A click on the video plays or pauses it.
+            self.pressed = h;
+            return Effect::None;
+        }
         if h == Hit::View {
             if self.can_pan() {
                 self.panning = Some((e.pos, self.pan));
@@ -628,6 +994,12 @@ impl PreviewPane {
         if self.panning.take().is_some() {
             return Effect::Redraw;
         }
+        if let Some(d) = self.dragging.take() {
+            if d == Drag::Volume {
+                app.settings.preview_volume = self.volume.unwrap_or(0.5);
+            }
+            return Effect::Redraw;
+        }
         let was = std::mem::replace(&mut self.pressed, Hit::None);
         if was == Hit::None || self.hit(e.pos) != was {
             return Effect::Redraw;
@@ -639,6 +1011,26 @@ impl PreviewPane {
             Hit::Fill => self.set_zoom(Zoom::Fill),
             Hit::Prev => self.step(app, -1),
             Hit::Next => self.step(app, 1),
+            Hit::Info => {
+                app.settings.preview_info = !app.settings.preview_info;
+                Effect::Redraw
+            }
+            Hit::Play | Hit::View => self.toggle_video(app),
+            Hit::Mute => {
+                self.muted = !self.muted;
+                // Unmuting at no volume at all: back to the middle.
+                if !self.muted && self.volume.is_some_and(|v| v <= 0.0) {
+                    self.volume = Some(0.5);
+                    app.settings.preview_volume = 0.5;
+                    if let Some(v) = self.video.as_mut() {
+                        v.set_volume(0.5);
+                    }
+                }
+                if let Some(v) = self.video.as_mut() {
+                    v.set_muted(self.muted);
+                }
+                Effect::Redraw
+            }
             _ => Effect::Redraw,
         }
     }
@@ -681,6 +1073,109 @@ impl PreviewPane {
     }
 }
 
+/// The biggest rectangle of `natural`'s shape inside `area`, centred.
+fn fit_rect(natural: (f32, f32), area: Rect) -> Rect {
+    let k = (area.w / natural.0.max(1.0)).min(area.h / natural.1.max(1.0));
+    let (w, h) = (natural.0 * k, natural.1 * k);
+    Rect::new(area.x + (area.w - w) / 2.0, area.y + (area.h - h) / 2.0, w, h)
+}
+
+/// A seek bar or volume slider: a thin track, the part up to `share` in the accent colour, and a
+/// round knob.
+fn slider(r: &mut Renderer, theme: &Theme, area: Rect, share: f32, hot: bool) {
+    if area.w < 12.0 {
+        return;
+    }
+    let y = area.y + area.h / 2.0;
+    let track = Rect::new(area.x + 6.0, y - 2.0, area.w - 12.0, 4.0);
+    r.fill_round_rect(track, 2.0, theme.bar_track);
+    let x = track.x + track.w * share.clamp(0.0, 1.0);
+    r.fill_round_rect(Rect::new(track.x, track.y, x - track.x, track.h), 2.0, theme.accent);
+    let k = if hot { 7.0 } else { 5.5 };
+    r.fill_round_rect(Rect::new(x - k, y - k, k * 2.0, k * 2.0), k, theme.accent);
+}
+
+/// Where along a slider's track the point `x` is (0 to 1).
+fn slider_share(area: Rect, x: f32) -> f32 {
+    let w = (area.w - 12.0).max(1.0);
+    ((x - area.x - 6.0) / w).clamp(0.0, 1.0)
+}
+
+/// The info strip's lines for a picture, GIF or video: the size and format first, then the camera
+/// and when it was taken. `gif`: an animation's frame count and how long one loop plays (ms);
+/// `duration`: a video's length (100-nanosecond steps); `taken`: the date already written out.
+pub fn media_lines(dims: Option<(u32, u32)>, duration: Option<u64>, media: Option<&peek::Media>, gif: Option<(u32, u64)>, taken: Option<String>) -> Vec<String> {
+    let none = peek::Media::default();
+    let m = media.unwrap_or(&none);
+    let mut first = Vec::new();
+    if let Some((w, h)) = dims {
+        first.push(format!("{} \u{d7} {}", folder::format_count(w as usize), folder::format_count(h as usize)));
+    }
+    if let Some(f) = &m.format {
+        first.push(f.clone());
+    }
+    if let Some(b) = m.bits {
+        first.push(format!("{b}-bit"));
+    }
+    if let Some(d) = m.dpi {
+        first.push(format!("{} DPI", d.round() as u32));
+    }
+    if let Some((count, ms)) = gif {
+        first.push(format!("{} frames", folder::format_count(count as usize)));
+        first.push(seconds_text(ms));
+    } else if let Some(n) = m.frames.filter(|&n| n > 1) {
+        first.push(format!("{} frames", folder::format_count(n as usize)));
+    }
+    if let Some(t) = duration {
+        first.push(details::duration_text(t));
+    }
+    if let Some(fps) = m.fps {
+        first.push(fps_text(fps));
+    }
+    if let Some(b) = m.bitrate {
+        first.push(bitrate_text(b));
+    }
+    let mut second = Vec::new();
+    if let Some(c) = &m.camera {
+        second.push(c.clone());
+    }
+    if let Some(t) = taken.filter(|t| !t.is_empty()) {
+        second.push(format!("Taken {t}"));
+    }
+    [first, second].into_iter().filter(|l| !l.is_empty()).map(|l| l.join("  \u{b7}  ")).collect()
+}
+
+/// How long a GIF's loop plays: "3.2 s", or "1:05" from a minute on.
+pub fn seconds_text(ms: u64) -> String {
+    if ms >= 60_000 {
+        return details::duration_text(ms * 10_000);
+    }
+    let tenths = (ms + 50) / 100;
+    if tenths.is_multiple_of(10) {
+        format!("{} s", tenths / 10)
+    } else {
+        format!("{}.{} s", tenths / 10, tenths % 10)
+    }
+}
+
+/// "30 fps", "29.97 fps".
+pub fn fps_text(fps: f64) -> String {
+    if (fps - fps.round()).abs() < 0.005 {
+        format!("{} fps", fps.round() as u32)
+    } else {
+        format!("{:.2} fps", fps)
+    }
+}
+
+/// "4.2 Mb/s", "320 kb/s".
+pub fn bitrate_text(bps: u32) -> String {
+    if bps >= 1_000_000 {
+        format!("{:.1} Mb/s", bps as f64 / 1_000_000.0)
+    } else {
+        format!("{} kb/s", (bps + 500) / 1000)
+    }
+}
+
 /// How the zoom reads in the top bar ("93%").
 pub fn zoom_text(z: f32) -> String {
     format!("{}%", folder::format_count((z * 100.0).round().max(0.0) as usize))
@@ -719,6 +1214,42 @@ mod tests {
         assert_eq!(pan, Point::new(-180.0, 0.0));
         // Around the centre with nothing panned, nothing moves.
         assert_eq!(pan_for_zoom(Point::default(), Point::default(), 1.0, 3.0), Point::default());
+    }
+
+    #[test]
+    fn the_info_strip_says_what_is_known() {
+        let photo = peek::Media { format: Some("JPEG".into()), bits: Some(24), dpi: Some(72.0), camera: Some("Canon EOS 80D".into()), ..Default::default() };
+        let lines = media_lines(Some((6000, 4000)), None, Some(&photo), None, Some("08/10/2026 14:32".into()));
+        assert_eq!(lines, vec!["6,000 \u{d7} 4,000  \u{b7}  JPEG  \u{b7}  24-bit  \u{b7}  72 DPI", "Canon EOS 80D  \u{b7}  Taken 08/10/2026 14:32"]);
+        // A GIF: its frames and how long a loop plays.
+        let gif = peek::Media { format: Some("GIF".into()), frames: Some(48), ..Default::default() };
+        assert_eq!(media_lines(Some((320, 240)), None, Some(&gif), Some((48, 3200)), None), vec!["320 \u{d7} 240  \u{b7}  GIF  \u{b7}  48 frames  \u{b7}  3.2 s"]);
+        // A video.
+        let film = peek::Media { fps: Some(29.97), bitrate: Some(4_200_000), ..Default::default() };
+        assert_eq!(media_lines(Some((1920, 1080)), Some(650_000_000), Some(&film), None, None), vec!["1,920 \u{d7} 1,080  \u{b7}  1:05  \u{b7}  29.97 fps  \u{b7}  4.2 Mb/s"]);
+        // Nothing known yet: no strip.
+        assert!(media_lines(None, None, None, None, None).is_empty());
+    }
+
+    #[test]
+    fn small_numbers_read_well() {
+        assert_eq!(seconds_text(3200), "3.2 s");
+        assert_eq!(seconds_text(2000), "2 s");
+        assert_eq!(seconds_text(65_000), "1:05");
+        assert_eq!(fps_text(30.0), "30 fps");
+        assert_eq!(fps_text(23.976), "23.98 fps");
+        assert_eq!(bitrate_text(320_000), "320 kb/s");
+        assert_eq!(bitrate_text(12_345_678), "12.3 Mb/s");
+    }
+
+    #[test]
+    fn sliders_and_fitting() {
+        let track = Rect::new(100.0, 0.0, 112.0, 40.0);
+        assert_eq!(slider_share(track, 0.0), 0.0);
+        assert_eq!(slider_share(track, 156.0), 0.5);
+        assert_eq!(slider_share(track, 999.0), 1.0);
+        // A 16:9 picture in a square: as wide as it, centred up and down.
+        assert_eq!(fit_rect((1600.0, 900.0), Rect::new(0.0, 0.0, 160.0, 160.0)), Rect::new(0.0, 35.0, 160.0, 90.0));
     }
 
     #[test]

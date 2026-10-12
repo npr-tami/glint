@@ -17,19 +17,22 @@ use std::cell::Cell;
 use windows::core::{s, w, BOOL};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CLOAK, DWMWA_USE_IMMERSIVE_DARK_MODE,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DwmExtendFrameIntoClientArea, DwmGetWindowAttribute, DwmSetWindowAttribute, DWMSBT_AUTO, DWMSBT_TRANSIENTWINDOW,
+    DWMWA_BORDER_COLOR, DWMWA_CAPTION_BUTTON_BOUNDS, DWMWA_CLOAK,
+    DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
 };
-use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, GetClientRect, IsZoomed, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT, HTTOP,
+    DefWindowProcW, GetAncestor, GetClientRect, GetWindowRect, IsZoomed, GA_ROOT, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT, HTTOP,
     HTTOPLEFT, HTTOPRIGHT, NCCALCSIZE_PARAMS, SM_CXFRAME, SM_CXPADDEDBORDER, SM_CYFRAME, WM_NCCALCSIZE, WM_NCHITTEST,
 };
 
+use crate::render::Renderer;
 use crate::theme::Theme;
+use crate::ui::Rect;
 
 thread_local! {
     static WINE: Cell<Option<bool>> = const { Cell::new(None) };
@@ -147,15 +150,92 @@ pub fn init(hwnd: HWND) {
 }
 
 /// Matches the bits Windows still draws (the 1-pixel border, menus) to the skin: light or dark.
+/// Skins of 98 / 2000 get square corners, as those windows had; the skin's menu colours (if any)
+/// go to the menus Glint draws itself (oldmenu.rs).
 pub fn apply_theme(hwnd: HWND, theme: &Theme) {
     let dark = BOOL::from(theme.dark);
-    let border = theme.line.to_colorref();
+    // 98 / 2000 draw their own frame (`paint_classic_border`): no line of Windows 11's round it
+    // (DWMWA_COLOR_NONE).
+    let border = if theme.era.classic() { 0xFFFF_FFFE } else { theme.line.to_colorref() };
+    let corners = if theme.era.classic() { DWMWCP_DONOTROUND } else { DWMWCP_ROUND };
     // SAFETY: as in `init`.
     unsafe {
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as *const _, 4);
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border as *const _ as *const _, 4);
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corners as *const _ as *const _, 4);
     }
     dark_menus(theme.menus_dark);
+    crate::oldmenu::set_style(theme);
+    crate::render::set_text_aliased(theme.era.classic());
+}
+
+/// 7's see-through glass across the window's top, `height` pixels down (0: none): Windows 11's
+/// own blurred backdrop, the one its menus have (DWMWA_SYSTEMBACKDROP_TYPE, from build 22621),
+/// shows wherever Glint draws see-through there (render.rs `ask_glass`). Returns whether it is
+/// on: never on older Windows, under Wine (where see-through would show as black) or for a window
+/// inside another; the glass is then painted solid, as before. GLINT_GLASS=on tries it under Wine
+/// too, for testing.
+pub fn set_glass(hwnd: HWND, height: i32) -> bool {
+    let tried = std::env::var("GLINT_GLASS").is_ok_and(|v| v.eq_ignore_ascii_case("on"));
+    // SAFETY: a plain query on our own window.
+    let top_level = unsafe { GetAncestor(hwnd, GA_ROOT) } == hwnd;
+    let on = height > 0 && top_level && (tried || !is_wine());
+    let backdrop = if on { DWMSBT_TRANSIENTWINDOW } else { DWMSBT_AUTO };
+    // SAFETY: as in `init`. Windows before 22621 refuse the backdrop (an unknown attribute).
+    unsafe {
+        let on = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop as *const _ as *const _, 4).is_ok() && on;
+        let margins = MARGINS { cxLeftWidth: 0, cxRightWidth: 0, cyTopHeight: if on { height } else { 1 }, cyBottomHeight: 0 };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+        on
+    }
+}
+
+/// Where Windows keeps its own window buttons, in pixels from the top left of what Glint draws.
+/// They are never seen (Glint draws its own over them), but under see-through glass they would
+/// show, so the glass is kept solid there.
+pub fn caption_buttons(hwnd: HWND) -> Option<RECT> {
+    let (mut b, mut window, mut origin) = (RECT::default(), RECT::default(), POINT::default());
+    // SAFETY: plain queries on our own window, into valid out-structs of the sizes passed.
+    unsafe {
+        DwmGetWindowAttribute(hwnd, DWMWA_CAPTION_BUTTON_BOUNDS, &mut b as *mut _ as *mut _, std::mem::size_of::<RECT>() as u32).ok()?;
+        GetWindowRect(hwnd, &mut window).ok()?;
+        ClientToScreen(hwnd, &mut origin).ok().ok()?;
+    }
+    // The bounds count from the window's own top left, which is outside what we draw.
+    let (dx, dy) = (origin.x - window.left, origin.y - window.top);
+    (b.right > b.left && b.bottom > b.top).then(|| RECT { left: b.left - dx, top: b.top - dy, right: b.right - dx, bottom: b.bottom - dy })
+}
+
+/// How wide 98 / 2000's raised window frame is, in DIPs: 4 round a window of those skins (Glint
+/// draws it inside the window, and the window's parts sit inside it); none while maximised (its
+/// frame is then off the screen, as in Windows) or for any other skin.
+pub fn classic_border(theme: &Theme, maximized: bool) -> f32 {
+    if theme.era.classic() && !maximized {
+        CLASSIC_BORDER
+    } else {
+        0.0
+    }
+}
+
+pub const CLASSIC_BORDER: f32 = 4.0;
+
+/// 98 / 2000's window frame just inside `rect` (the whole window): from the outside, the light
+/// face and highlight along the top and left, the dark and shadow along the bottom and right,
+/// then two rows of face.
+pub fn paint_classic_border(r: &mut Renderer, theme: &Theme, rect: Rect) {
+    let face = theme.toolbar;
+    let b = CLASSIC_BORDER;
+    r.fill_rect(Rect::new(rect.x, rect.y, rect.w, b), face);
+    r.fill_rect(Rect::new(rect.x, rect.bottom() - b, rect.w, b), face);
+    r.fill_rect(Rect::new(rect.x, rect.y, b, rect.h), face);
+    r.fill_rect(Rect::new(rect.right() - b, rect.y, b, rect.h), face);
+    crate::retro::edge(r, theme, rect, crate::retro::Edge::RaisedWindow, face);
+}
+
+/// Whether `hwnd` is maximised.
+pub fn zoomed(hwnd: HWND) -> bool {
+    // SAFETY: a plain query on a window handle.
+    unsafe { IsZoomed(hwnd).as_bool() }
 }
 
 /// Hides the window from the screen until its first frame is ready (no white flash at start).

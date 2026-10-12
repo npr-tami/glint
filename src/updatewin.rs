@@ -26,7 +26,7 @@
 //! has the keyboard; the arrows, PgUp / PgDn, Home / End scroll what's new; Esc closes (remind me
 //! again later).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -243,6 +243,8 @@ struct Prompt {
     laid_out_for: f32,
     content_h: f32,
     scroller: Scroller,
+    /// An older Windows' scroll bar arrow or track held down, repeating.
+    holding: kit::Holding,
     skip: bool,
     focus: Ctl,
     /// Show the keyboard's outline (after a key was used, as in Windows).
@@ -263,6 +265,9 @@ struct Prompt {
 thread_local! {
     /// The prompt, while it's open (UI thread only).
     static PROMPT: RefCell<Option<Prompt>> = const { RefCell::new(None) };
+    /// The skin is 98 / 2000's: the window has their frame round it (for `hit_test`, which runs
+    /// without the prompt's state).
+    static CLASSIC: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Opens the prompt for `release` over `owner` (the main window), or brings it up to date if it's
@@ -290,6 +295,7 @@ pub fn open(owner: HWND, theme: &Theme, release: &Release, ours: &str) -> bool {
         Ok(mut r) => {
             // The skin's font, at the standard size (like the Settings window).
             r.set_font(&theme.font, 1.0);
+            r.set_title_font(&theme.title_font);
             r
         }
         Err(e) => {
@@ -316,6 +322,7 @@ pub fn open(owner: HWND, theme: &Theme, release: &Release, ours: &str) -> bool {
         laid_out_for: -1.0,
         content_h: 0.0,
         scroller: Scroller::default(),
+        holding: kit::Holding::default(),
         skip: false,
         focus: Ctl::Update,
         cues: false,
@@ -329,11 +336,11 @@ pub fn open(owner: HWND, theme: &Theme, release: &Release, ours: &str) -> bool {
         flips: kit::Flips::default(),
     };
     prompt.set_release(release, ours);
+    CLASSIC.with(|c| c.set(theme.era.classic()));
     let mut rc = RECT::default();
     // SAFETY: our own window and a valid out-struct.
     if unsafe { GetClientRect(hwnd, &mut rc) }.is_ok() {
-        let s = prompt.scale();
-        prompt.size = ((rc.right - rc.left) as f32 / s, (rc.bottom - rc.top) as f32 / s);
+        prompt.size = prompt.inner_size((rc.right - rc.left) as u32, (rc.bottom - rc.top) as u32);
     }
     PROMPT.with(|p| {
         if let Ok(mut guard) = p.try_borrow_mut() {
@@ -375,9 +382,18 @@ pub fn apply_theme(theme: &Theme) {
         let Ok(mut guard) = p.try_borrow_mut() else { return None };
         let prompt = guard.as_mut()?;
         prompt.theme = theme.clone();
+        CLASSIC.with(|c| c.set(theme.era.classic()));
+        // 98 / 2000's frame comes or goes: what's inside it changes size.
+        let mut rc = RECT::default();
+        // SAFETY: our own window and a valid out-struct.
+        if unsafe { GetClientRect(prompt.hwnd, &mut rc) }.is_ok() && rc.right > rc.left {
+            prompt.size = prompt.inner_size((rc.right - rc.left) as u32, (rc.bottom - rc.top) as u32);
+            prompt.laid_out_for = -1.0;
+        }
         // The skin's font: what's new is wrapped again with it.
         let generation = prompt.renderer.font_generation();
         prompt.renderer.set_font(&theme.font, 1.0);
+        prompt.renderer.set_title_font(&theme.title_font);
         if prompt.renderer.font_generation() != generation {
             prompt.laid_out_for = -1.0;
         }
@@ -539,7 +555,9 @@ fn hit_test(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         let _ = GetClientRect(hwnd, &mut rc);
         GetDpiForWindow(hwnd).max(96) as f32 / 96.0
     };
-    let (x, y, w) = (pt.x as f32 / scale, pt.y as f32 / scale, rc.right as f32 / scale);
+    // 98 / 2000: the title bar is inside the window's frame.
+    let b = if CLASSIC.with(Cell::get) && !frame::zoomed(hwnd) { frame::CLASSIC_BORDER } else { 0.0 };
+    let (x, y, w) = (pt.x as f32 / scale - b, pt.y as f32 / scale - b, rc.right as f32 / scale - 2.0 * b);
     let code = if (0.0..size::TITLE_H).contains(&y) && x < w - ksize::CLOSE_W { HTCAPTION } else { HTCLIENT };
     LRESULT(code as isize)
 }
@@ -651,7 +669,16 @@ impl Prompt {
     fn track(&mut self) -> Rect {
         let b = self.changelog_rect();
         let w = self.theme.scrollbar_w;
-        Rect::new(b.right() - 3.0 - w, b.y + 4.0, w, (b.h - 8.0).max(0.0))
+        // An older Windows' arrow buttons sit at the two ends (kit::scrollbar).
+        let a = crate::retroctl::arrows(&self.theme);
+        Rect::new(b.right() - 3.0 - w, b.y + 4.0 + a, w, (b.h - 8.0 - 2.0 * a).max(0.0))
+    }
+
+    /// The scroll bar: the track and an older Windows' arrow buttons round it.
+    fn bar_place(&mut self) -> kit::BarPlace {
+        let track = self.track();
+        let (m, a) = (self.theme.scrollbar_margin(), crate::retroctl::arrows(&self.theme));
+        kit::BarPlace { lane: track.inset(-m, -m - a), track, arrows: a }
     }
 
     /// Lays the changelog out for the box's width (again only when that changed).
@@ -703,11 +730,18 @@ impl Prompt {
         }
         let theme = self.theme.clone();
         self.renderer.clear(theme.toolbar);
+        // 98 / 2000: everything inside the window's frame.
+        let b = self.border();
+        self.renderer.set_origin(b, b);
         if theme.toolbar_paint.gradient().is_some() {
             self.renderer.fill_paint(Rect::new(0.0, 0.0, self.size.0, self.size.1), 0.0, &theme.toolbar_paint);
         }
         self.paint_caption(&theme);
         self.paint_body(&theme);
+        if b > 0.0 {
+            self.renderer.set_origin(0.0, 0.0);
+            frame::paint_classic_border(&mut self.renderer, &theme, Rect::new(0.0, 0.0, self.size.0 + 2.0 * b, self.size.1 + 2.0 * b));
+        }
         let lost = self.renderer.end() == FrameResult::DeviceLost;
         if more || lost {
             self.invalidate();
@@ -718,10 +752,9 @@ impl Prompt {
         let close = self.close_rect();
         let bar = Rect::new(0.0, 0.0, self.size.0, size::TITLE_H);
         let r = &mut self.renderer;
-        kit::title_bar(r, theme, bar);
+        kit::title_bar(r, theme, bar, self.active);
         let x = kit::logo(r, theme, bar);
-        let color = if self.active { theme.text } else { theme.muted };
-        r.text("Update", Rect::new(x + 10.0, 0.0, (self.size.0 - x - 10.0 - ksize::CLOSE_W).max(0.0), size::TITLE_H), &TextStyle::new(color).size(13.0).semibold());
+        crate::retro::title(r, theme, Rect::new(x + 10.0, 0.0, (self.size.0 - x - 10.0 - ksize::CLOSE_W).max(0.0), size::TITLE_H), "Update", self.active);
         let hot = self.hover == Some(Hot::Close);
         kit::close_button(r, theme, close, hot, hot && self.pressed == Some(Hot::Close), self.active);
         // The line under the title bar, like the toolbar's (as the skin draws it, or none; a skin
@@ -754,6 +787,7 @@ impl Prompt {
         let track = self.track();
         let (check_look, update_look, later_look, off_look) = (self.look(Ctl::Check), self.look(Ctl::Update), self.look(Ctl::Later), self.look(Ctl::Off));
         let thumb_hot = self.hover == Some(Hot::Thumb) || self.drag.is_some();
+        let hold = self.holding.hold_of(0);
         let now = self.now();
         let ticked = self.flips.at("skip", self.skip, now);
         let r = &mut self.renderer;
@@ -779,7 +813,7 @@ impl Prompt {
             r.text(&line.text, Rect::new(inner.x + line.x, y, (inner.w - line.x).max(0.0), h), &style);
         }
         r.pop_clip();
-        kit::scrollbar(r, theme, track, &self.scroller, thumb_hot);
+        kit::scrollbar(r, theme, track, &self.scroller, thumb_hot, hold);
 
         // Installing, or what went wrong.
         let mut y = b.bottom() + 10.0;
@@ -832,8 +866,19 @@ impl Prompt {
     }
 
     fn client_point(&self, lparam: LPARAM) -> Point {
-        let s = self.scale();
-        Point::new((lparam.0 & 0xffff) as i16 as f32 / s, ((lparam.0 >> 16) & 0xffff) as i16 as f32 / s)
+        let (s, b) = (self.scale(), self.border());
+        Point::new((lparam.0 & 0xffff) as i16 as f32 / s - b, ((lparam.0 >> 16) & 0xffff) as i16 as f32 / s - b)
+    }
+
+    /// How wide 98 / 2000's window frame is round everything (0 for other skins or maximised).
+    fn border(&self) -> f32 {
+        frame::classic_border(&self.theme, frame::zoomed(self.hwnd))
+    }
+
+    /// The client area's size in DIPs, less the frame (from `w` x `h` pixels).
+    fn inner_size(&self, w: u32, h: u32) -> (f32, f32) {
+        let (s, b) = (self.scale(), self.border());
+        ((w as f32 / s - 2.0 * b).max(0.0), (h as f32 / s - 2.0 * b).max(0.0))
     }
 
     fn mouse_move(&mut self, p: Point) {
@@ -841,6 +886,10 @@ impl Prompt {
             let mut tme = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: self.hwnd, dwHoverTime: 0 };
             // SAFETY: a valid struct for our own window.
             self.tracking = unsafe { TrackMouseEvent(&mut tme) }.is_ok();
+        }
+        if self.holding.active() {
+            self.holding.at = p;
+            return;
         }
         if let Some(grab) = self.drag {
             let track = self.track();
@@ -860,6 +909,13 @@ impl Prompt {
 
     fn mouse_down(&mut self, p: Point) {
         self.cues = false;
+        // An older Windows' scroll bar: an arrow button moves the notes a line, the track a page,
+        // again and again while the button is held.
+        let (place, now) = (self.bar_place(), self.now());
+        if self.holding.press(self.hwnd, place, &mut self.scroller, 0, p, now) {
+            self.invalidate();
+            return;
+        }
         let target = self.target_at(p);
         // SAFETY: focus and capture on our own window.
         unsafe {
@@ -881,6 +937,14 @@ impl Prompt {
     }
 
     fn mouse_up(&mut self, p: Point, acts: &mut Vec<Act>) {
+        if self.holding.release(self.hwnd) {
+            // SAFETY: releasing our own capture.
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+            self.invalidate();
+            return;
+        }
         let was = self.pressed.take();
         self.drag = None;
         // SAFETY: releasing our own capture.
@@ -1002,8 +1066,7 @@ impl Prompt {
                 let (w, h) = (lo_word(lparam.0 as usize), hi_word(lparam.0 as usize));
                 self.renderer.resize(w, h);
                 if w > 0 && h > 0 {
-                    let s = self.scale();
-                    self.size = (w as f32 / s, h as f32 / s);
+                    self.size = self.inner_size(w, h);
                 }
                 self.invalidate();
                 Some(LRESULT(0))
@@ -1014,8 +1077,7 @@ impl Prompt {
                 let mut rc = RECT::default();
                 // SAFETY: our own window and a valid out-struct.
                 if unsafe { GetClientRect(self.hwnd, &mut rc) }.is_ok() && rc.right > rc.left {
-                    let s = self.scale();
-                    self.size = ((rc.right - rc.left) as f32 / s, (rc.bottom - rc.top) as f32 / s);
+                    self.size = self.inner_size((rc.right - rc.left) as u32, (rc.bottom - rc.top) as u32);
                 }
                 self.laid_out_for = -1.0;
                 self.invalidate();
@@ -1048,6 +1110,7 @@ impl Prompt {
             WM_CAPTURECHANGED => {
                 self.pressed = None;
                 self.drag = None;
+                self.holding.release(self.hwnd);
                 self.invalidate();
                 Some(LRESULT(0))
             }
@@ -1077,6 +1140,13 @@ impl Prompt {
                     let _ = KillTimer(Some(self.hwnd), RETRY_TIMER);
                 }
                 self.invalidate();
+                Some(LRESULT(0))
+            }
+            WM_TIMER if wparam.0 == kit::REPEAT_TIMER => {
+                let (place, now) = (self.bar_place(), self.now());
+                if self.holding.fire(self.hwnd, place, &mut self.scroller, now) {
+                    self.invalidate();
+                }
                 Some(LRESULT(0))
             }
             WM_APP_PROMPT_SHOW => {

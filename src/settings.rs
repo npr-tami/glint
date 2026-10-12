@@ -426,6 +426,19 @@ pub enum NewTab {
     ThisPc,
 }
 
+/// What "Home" opens ("Home opens"): the sidebar's Home, and "Home folder" when Glint starts or a
+/// tab is opened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HomePage {
+    /// Glint's Home page, like File Explorer's: your folders, then the files you opened lately
+    /// (recent.rs).
+    #[default]
+    Page,
+    /// Your user folder (C:\Users\name).
+    Folder,
+}
+
 /// Light or dark.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -683,6 +696,9 @@ pub struct Settings {
     pub theme: ThemeMode,
     /// "New tabs open": same | home | thispc.
     pub new_tab: NewTab,
+    /// "Home opens": page | folder.
+    #[serde(rename = "HomeOpens")]
+    pub home: HomePage,
     /// Show hidden files and folders (greyed). Ctrl+H.
     pub show_hidden: bool,
     /// Also show protected operating-system files (hidden + system, like desktop.ini), when hidden
@@ -719,6 +735,9 @@ pub struct Settings {
     /// Quick access places removed from the sidebar (right-click > Remove from Quick access), by
     /// id: home, desktop, documents, downloads, pictures, music, videos, recycle.
     pub hidden_places: Vec<String>,
+    /// Files and folders marked with right-click > Add to Favorites (full paths, newest last):
+    /// Home's Favorites list (home.rs).
+    pub favorites: Vec<String>,
 
     // ----- the file list (list.rs)
     /// Row and text size: small | medium | large.
@@ -788,6 +807,9 @@ pub struct Settings {
     /// Column widths in DIPs (1/96 inch), by column: "modified", "type", "size". The name column
     /// takes the rest.
     pub column_width_map: BTreeMap<String, f32>,
+    /// The view picked with VIEW in each folder, by its path in lower case, so the folder shows
+    /// that way again (as in Explorer). Folders the view rules give a view aren't in it.
+    pub folder_views: BTreeMap<String, ViewMode>,
     /// How new tabs are sorted when Glint starts without its old tabs: 0 Name, 1 Date modified,
     /// 2 Type, 3 Size. Each saved tab has its own.
     pub sort_column: u32,
@@ -803,6 +825,10 @@ pub struct Settings {
     /// The sort order editor's guide is shown (GUIDE; hidden at first). (Older versions wrote
     /// "SortGuideHidden", shown at first: it's left out, so everyone starts with it hidden.)
     pub sort_guide_shown: bool,
+    /// The sort order editor is on its own (DETACH), not docked beside the main window.
+    pub sort_detached: bool,
+    /// Where the sort order editor was last on its own: left, top, width, height in screen pixels.
+    pub sort_bounds: Option<[i32; 4]>,
     /// The skin editor's guide is hidden.
     pub theme_guide_hidden: bool,
     /// The group Glint Minimal's icon rail shows: quick | pinned | pc.
@@ -815,6 +841,10 @@ pub struct Settings {
     pub details_width: f32,
     /// The Space preview's width in DIPs; 0 = half of the room next to the sidebar.
     pub preview_width: f32,
+    /// The Space preview shows a picture's or video's size and other facts under it (its "i" button).
+    pub preview_info: bool,
+    /// How loud the Space preview plays videos (0 to 1), as last set there.
+    pub preview_volume: f32,
 }
 
 impl Default for Settings {
@@ -824,6 +854,7 @@ impl Default for Settings {
             startup_folder: None,
             theme: ThemeMode::Dark,
             new_tab: NewTab::Same,
+            home: HomePage::Page,
             show_hidden: false,
             show_system: false,
             confirm_delete: ConfirmDelete::Permanent,
@@ -849,6 +880,7 @@ impl Default for Settings {
             pinned: Vec::new(),
             pin_names: BTreeMap::new(),
             hidden_places: Vec::new(),
+            favorites: Vec::new(),
             stay_running: true,
             tray_icon: true,
             start_with_windows: false,
@@ -862,18 +894,23 @@ impl Default for Settings {
             bounds_dpi: 0,
             maximized: false,
             column_width_map: BTreeMap::new(),
+            folder_views: BTreeMap::new(),
             sort_column: 0,
             sort_descending: false,
             sidebar_width: 0,
             column_widths: None,
             upgraded: 0,
             sort_guide_shown: false,
+            sort_detached: false,
+            sort_bounds: None,
             theme_guide_hidden: false,
             rail_group: RailGroup::Quick,
             logo: LogoStyle::Box,
             settings_size: None,
             details_width: 0.0,
             preview_width: 0.0,
+            preview_info: true,
+            preview_volume: 0.5,
         }
     }
 }
@@ -885,6 +922,7 @@ impl Default for Settings {
 const CHOICES: &[&str] = &[
     "Startup",
     "StartupFolder",
+    "HomeOpens",
     "Theme",
     "NewTab",
     "ShowHidden",
@@ -910,10 +948,13 @@ const CHOICES: &[&str] = &[
     "Backspace",
     "DoubleClickUp",
     "View",
+    "FolderViews",
     // The sidebar's (sidebar.rs, app/places.rs).
     "Pinned",
     "PinNames",
     "HiddenPlaces",
+    // Home's Favorites (home.rs).
+    "Favorites",
     // How Glint runs (life.rs).
     "StayRunning",
     "TrayIcon",
@@ -925,6 +966,9 @@ const CHOICES: &[&str] = &[
     "UpdateRepo",
     "SkippedUpdate",
     "RemindUpdateAfter",
+    // The Space preview (preview.rs).
+    "PreviewInfo",
+    "PreviewVolume",
 ];
 
 /// How many pinned folders a settings file may bring back.
@@ -945,6 +989,15 @@ pub fn is_extra_window() -> bool {
 }
 
 impl Settings {
+    /// Where Home goes: the Home page (like File Explorer's), or the user folder when "Home opens"
+    /// says so.
+    pub fn home_place(&self) -> String {
+        match self.home {
+            HomePage::Folder => crate::shell::home(),
+            HomePage::Page => crate::recent::LOCATION.to_string(),
+        }
+    }
+
     /// Whether deleting should ask first. `permanent`: the files would be gone for good (Shift+Delete,
     /// or no Recycle Bin on that drive) rather than go to the Recycle Bin.
     pub fn ask_before_deleting(&self, permanent: bool) -> bool {
@@ -1031,6 +1084,15 @@ impl Settings {
         }
         pinned.truncate(MAX_PINS);
         self.pinned = pinned;
+        // Favorites the same way.
+        let mut favorites: Vec<String> = Vec::new();
+        for p in self.favorites.drain(..).map(|p| p.trim().to_string()) {
+            if !p.is_empty() && !favorites.iter().any(|q| same_path(q, &p)) {
+                favorites.push(p);
+            }
+        }
+        favorites.truncate(MAX_PINS);
+        self.favorites = favorites;
         // A name only for a folder that is pinned, and only a name that says something.
         let pinned = &self.pinned;
         self.pin_names.retain(|path, name| !name.trim().is_empty() && pinned.iter().any(|p| same_path(p, path)));
@@ -1058,12 +1120,19 @@ impl Settings {
         if self.settings_size.is_some_and(|[w, h]| !(w.is_finite() && h.is_finite() && w >= 200.0 && h >= 150.0 && w <= 20000.0 && h <= 20000.0)) {
             self.settings_size = None;
         }
+        if self.sort_bounds.is_some_and(|[_, _, w, h]| !((200..=20000).contains(&w) && (150..=20000).contains(&h))) {
+            self.sort_bounds = None;
+        }
         // The side pane's widths: 0 (standard) or a sane width.
         for w in [&mut self.details_width, &mut self.preview_width] {
             if !w.is_finite() || *w < 0.0 || *w > 20000.0 {
                 *w = 0.0;
             }
         }
+        if !self.preview_volume.is_finite() {
+            self.preview_volume = 0.5;
+        }
+        self.preview_volume = self.preview_volume.clamp(0.0, 1.0);
     }
 }
 

@@ -300,6 +300,9 @@ pub enum CaptionStyle {
     Symbols,
     /// Three small glass marbles without signs; close in its own colour (`marble-close`).
     Marbles,
+    /// Windows XP and 7: small rounded glass tiles with white signs and a white edge, close in its
+    /// own colour (`marble` and `marble-close`).
+    Tiles,
 }
 
 /// How the tabs sit in the title bar: the skin's `tabs`.
@@ -337,6 +340,50 @@ pub enum Shape {
 
 /// How far SORT and SETTINGS lean in AMD Radeon; every other slant is in proportion to it.
 pub const STANDARD_SLANT: f32 = 8.0;
+
+/// Which older Windows a skin dresses Glint as: the skin's `era`. It picks how the parts that
+/// Windows drew its own way then are drawn (caption buttons, the Address bar, the toolbar's
+/// pictures, scroll bars, column titles, menus, the controls of Glint's own windows). None for a
+/// skin of today, which is drawn as Glint always was.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Era {
+    #[default]
+    None,
+    /// Windows 98 (Eggplant): Windows 2000's 3D edges, its toolbar pictures grey until the mouse
+    /// comes.
+    Win98,
+    /// Windows 2000: grey raised and sunken 3D edges.
+    Win2000,
+    /// Windows XP (Luna, Silver, Royale): rounded glossy controls.
+    Xp,
+    /// Windows 7: glass, soft blue highlights.
+    Win7,
+}
+
+impl Era {
+    /// Windows 98 and 2000: the grey 3D edges.
+    pub fn classic(self) -> bool {
+        matches!(self, Era::Win98 | Era::Win2000)
+    }
+    /// Any older Windows.
+    pub fn old(self) -> bool {
+        self != Era::None
+    }
+}
+
+/// Whose icons the places, drives, folders and files get: the skin's `icons`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IconSet {
+    /// Windows' own icons (as Explorer shows them today).
+    #[default]
+    Windows,
+    /// Windows 98 and 2000's: flat, hard-edged, a black shadow line.
+    Classic,
+    /// Windows XP's: soft and rounded, lit from the top left.
+    Xp,
+    /// Windows 7's: glossy and light.
+    Aero,
+}
 
 /// The active skin as plain values: every colour the window uses, by role, and the shapes and text.
 /// Pick the role, not the hex value, so every skin works. It is made from a skin's text once, when
@@ -409,6 +456,8 @@ pub struct Theme {
     pub radius: f32,
     /// The file list's rows at the "Small" size (Medium and Large add to it).
     pub row_h: f32,
+    /// The sidebar's rows (`sidebar-row-height`; Glint's own 28 unless the skin says).
+    pub sidebar_row_h: f32,
     /// How thick the active tab's line and the toolbar's line are (0: none).
     pub tab_line_w: f32,
     pub toolbar_line_w: f32,
@@ -505,6 +554,54 @@ pub struct Theme {
     pub scrollbar_grip: bool,
     /// How thick the scrollbars' thumbs are, in DIPs (6 = `size::SCROLLBAR_W`).
     pub scrollbar_w: f32,
+    /// Windows 2000's 3D edges (`bevels: true`): raised caption buttons, tabs and word buttons,
+    /// sunken path and filter boxes, toolbar buttons that rise under the mouse.
+    pub bevels: bool,
+    /// Back and forward as round glass buttons of their own (XP's green, Windows 7's blue); clear
+    /// for the usual signs.
+    pub back_button: Paint,
+    /// An edge round toolbar buttons under the mouse, which then have round corners (XP); clear
+    /// for none.
+    pub tool_border: Color,
+    /// An edge round selected rows (and, fainter, rows under the mouse), which then have round
+    /// corners (Windows 7); clear for none.
+    pub selection_border: Color,
+    /// A shine over the top half of the title bar (Windows 7's glass); clear for none.
+    pub title_gloss: Color,
+    /// The title bar's gradient runs left to right (`title-bar-across: true`), as in Windows 2000.
+    pub title_across: bool,
+    /// How much of what is behind the window shows through 7's glass title bar, 0 (none) to 0.9
+    /// (`see-through`; Windows 11 only, see frame.rs `set_glass`).
+    pub see_through: f32,
+
+    // ---- Older Windows. Each is off (or follows an older colour) unless the skin sets it.
+    /// Which older Windows the skin dresses Glint as (`era`), and whose icons it shows (`icons`).
+    pub era: Era,
+    pub icons: IconSet,
+    /// A window's title on its title bar (Settings, Sort order...), when the window is active and
+    /// when it isn't, and a shadow under it (clear: none).
+    pub title_text: Color,
+    pub title_text_inactive: Color,
+    pub title_shadow: Color,
+    /// The title bar while its window isn't the active one.
+    pub titlebar_inactive_paint: Paint,
+    /// The font of the windows' titles (empty: the skin's font).
+    pub title_font: String,
+    /// The four colours of a 3D edge (`bevels`): the lit outer and inner lines, the shaded inner and
+    /// outer ones. Clear: worked out from the face colour.
+    pub bevel_highlight: Color,
+    pub bevel_light: Color,
+    pub bevel_shadow: Color,
+    pub bevel_dark: Color,
+    /// Menus drawn by Glint in the skin's colours: their background, words, the item under the
+    /// mouse and its words, and their edge. A clear `menu` leaves menus to Windows.
+    pub menu: Color,
+    pub menu_text: Color,
+    pub menu_selection: Color,
+    pub menu_selection_text: Color,
+    pub menu_border: Color,
+    /// The names of the places in the sidebar.
+    pub sidebar_text: Color,
 }
 
 impl Theme {
@@ -523,6 +620,16 @@ impl Theme {
     /// The space between a scrollbar's thumb and the sides of its lane: `size::SCROLLBAR_MARGIN`,
     /// or less where the skin paints a track, so the thumb nearly fills it.
     pub fn scrollbar_margin(&self) -> f32 {
+        // An older Windows: the bar is as wide as that Windows had it (16, XP and 7 17) and its
+        // thumb fills it across (retroctl.rs).
+        let standard = match self.era {
+            Era::Win98 | Era::Win2000 => 16.0,
+            Era::Xp | Era::Win7 => 17.0,
+            Era::None => 0.0,
+        };
+        if standard > 0.0 {
+            return ((standard - self.scrollbar_w) / 2.0).max(0.0);
+        }
         if self.scrollbar_track.is_clear() {
             size::SCROLLBAR_MARGIN
         } else {
@@ -556,6 +663,16 @@ impl Theme {
     }
 
     /// The corner radius of a box `h` DIPs high (0 unless the shape is rounded).
+    /// The gap between the window's panels (and below the toolbar): Windows 7 parts its panes
+    /// with a thin pale line instead (window.rs draws 7's line colour where the gaps are).
+    pub fn gap(&self) -> f32 {
+        if self.era == Era::Win7 {
+            1.0
+        } else {
+            size::GAP
+        }
+    }
+
     pub fn corner(&self, h: f32) -> f32 {
         if self.shape == Shape::Rounded {
             self.radius.min(h / 2.0).max(0.0)

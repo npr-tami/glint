@@ -17,7 +17,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::folder;
-use crate::sortrecipe::{self, EXACT_RULES, GROUP_RULES, ORDER_RULES, PLACE_NAMES, VIEW_RULES};
+use crate::sortrecipe::{self, EXACT_RULES, FOLDER_RULES, GROUP_RULES, ORDER_RULES, PLACE_NAMES, VIEW_RULES};
 
 /// One suggestion: what replaces the word being typed, what the list shows, and a few words about it.
 #[derive(Clone, Debug, PartialEq)]
@@ -85,6 +85,30 @@ fn rank(items: Vec<(String, Suggestion)>, typed: &str) -> Vec<Suggestion> {
     }
     first.extend(then);
     first
+}
+
+/// Whether the line starting at `line_start` is inside an "in = (" (its folders and rules), going by
+/// the lines above it.
+fn in_multi(text: &str, line_start: usize) -> bool {
+    for line in text[..line_start].lines().rev() {
+        let code = sortrecipe::strip_note(line).trim();
+        if code.starts_with(')') {
+            return false;
+        }
+        if let Some(rest) = code.get(..3).filter(|h| h.eq_ignore_ascii_case("in ")).map(|_| code[3..].trim_start()) {
+            return rest.starts_with('=');
+        }
+    }
+    false
+}
+
+/// The places as folders of an "in = (": their full path goes in.
+fn place_paths(places: &[Place]) -> Vec<(String, Suggestion)> {
+    places
+        .iter()
+        .filter(|p| !p.path.is_empty())
+        .map(|p| (p.name.clone(), Suggestion { insert: p.path.clone(), label: p.name.clone(), hint: format!("{} \u{00b7} {}", p.hint, p.path) }))
+        .collect()
 }
 
 /// Whether what follows "in " is a path being typed rather than a place's name.
@@ -166,6 +190,16 @@ pub fn complete(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str
         return done;
     }
 
+    // A folder's name on a line of its own in "in = (": the folder, as its full path. (With a space,
+    // the whole line is the name; without, rules are suggested too, below.)
+    let multi = in_multi(text, line_start) && !trimmed.is_empty() && !trimmed.starts_with(['-', '\u{2013}', '\u{2014}', '#']);
+    if multi && trimmed.contains(' ') {
+        let items = rank(place_paths(places), trimmed);
+        if !items.is_empty() {
+            return Completion { start: caret - trimmed.len(), end: caret, items, ..Completion::default() };
+        }
+    }
+
     // The word being typed (from the last space to the cursor).
     let word_start = before.rfind(is_sep).map_or(0, |i| i + before[i..].chars().next().map_or(1, char::len_utf8));
     let word = &before[word_start..];
@@ -212,7 +246,7 @@ pub fn complete(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str
         }
     }
     // Rule words.
-    for (rule, hint) in GROUP_RULES.iter().chain(ORDER_RULES).chain(EXACT_RULES).chain(VIEW_RULES) {
+    for (rule, hint) in GROUP_RULES.iter().chain(ORDER_RULES).chain(EXACT_RULES).chain(VIEW_RULES).chain(FOLDER_RULES) {
         let w = &rule[1..];
         items.push((w.to_string(), Suggestion { insert: format!("{dash}{w}"), label: rule.to_string(), hint: hint.to_string() }));
     }
@@ -222,6 +256,10 @@ pub fn complete(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str
     // "in" at the start of a line: rules for one folder.
     if prev.is_empty() && dash.is_empty() {
         items.push(("in".into(), Suggestion { insert: "in ".into(), label: "in".into(), hint: "rules for one folder".into() }));
+    }
+    // In "in = (": the folders too, first (its lines name folders before their rules).
+    if multi && prev.is_empty() {
+        items.splice(0..0, place_paths(places));
     }
     done.items = rank(items, &norm);
     done
@@ -233,12 +271,43 @@ pub fn complete(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str
 pub struct Lister {
     done: Arc<Mutex<HashMap<String, Arc<Vec<String>>>>>,
     asked: HashSet<String>,
+    /// Whether folders are there (the folders the rules name), looked at the same way.
+    found: Arc<Mutex<HashMap<String, bool>>>,
+    looked: HashSet<String>,
 }
 
 impl Lister {
     /// The subfolders of `dir` (normalised) when they've been listed.
     pub fn get(&self, dir: &str) -> Option<Arc<Vec<String>>> {
         self.done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&dir.to_lowercase()).cloned()
+    }
+
+    /// Whether the folder `path` (normalised) is there, once it's been looked at.
+    pub fn exists(&self, path: &str) -> Option<bool> {
+        self.found.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&path.to_lowercase()).copied()
+    }
+
+    /// Looks whether the folder `path` is there in the background (once: a network folder can take
+    /// a while to answer), then posts `msg` to `hwnd`.
+    pub fn look(&mut self, path: &str, hwnd: HWND, msg: u32) {
+        let key = path.to_lowercase();
+        if path.is_empty() || !self.looked.insert(key.clone()) {
+            return;
+        }
+        let (found, path, target) = (self.found.clone(), path.to_string(), hwnd.0 as isize);
+        crate::shell::background("glint-sort-folder-there", move || {
+            let there = std::path::Path::new(&path).is_dir();
+            let mut map = found.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if map.len() > 500 {
+                map.clear();
+            }
+            map.insert(key, there);
+            drop(map);
+            // SAFETY: posting to a window by handle; if it's gone the message is dropped.
+            unsafe {
+                let _ = PostMessageW(Some(HWND(target as *mut _)), msg, WPARAM(0), LPARAM(0));
+            }
+        });
     }
 
     /// Lists `dir` in the background (once), then posts `msg` to `hwnd`.
@@ -330,6 +399,12 @@ mod tests {
         assert_eq!(c.items[0].insert, "C:\\Users\\");
         assert_eq!(at_end("in = (\n  D:\\Work\\").wants.as_deref(), Some("D:\\Work"));
         assert!(labels(&at_end("in = (\nC:\\x\n-new")).contains(&"-newest"), "rules after them as usual");
+        // A folder's name: its full path.
+        let c = at_end("in = (\nC:\\x\ndown");
+        assert_eq!(c.items[0].insert, "C:\\Users\\me\\Downloads");
+        assert_eq!(c.ghost("in = (\nC:\\x\ndown").as_deref(), None, "the line is replaced, not added to");
+        assert!(at_end("in = (\n-large_icons\n)\ndown").items.iter().all(|s| !s.insert.contains('\\')), "not after the )");
+        assert!(at_end("down").items.iter().all(|s| !s.insert.contains('\\')), "not outside \"in = (\"");
     }
 
     #[test]
@@ -347,6 +422,11 @@ mod tests {
         assert!(at_end("-folder ").items.is_empty(), "nothing after a space");
         assert!(at_end("-zzzz").items.is_empty(), "no list when nothing matches");
         assert!(at_end("i").items.iter().any(|s| s.insert == "in "));
+    }
+
+    #[test]
+    fn and_subfolders_is_suggested() {
+        assert!(labels(&at_end("in C:\\x (\nand_s")).contains(&"-and_subfolders"));
     }
 
     #[test]

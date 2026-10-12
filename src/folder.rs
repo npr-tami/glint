@@ -131,6 +131,8 @@ pub struct Folder {
     pub read_ms: f64,
     /// The Recycle Bin only: where each entry came from and where it is kept (recycle.rs).
     pub bin: Option<Arc<recycle::Listing>>,
+    /// Home only: where its parts start (recent.rs).
+    pub home: Option<Box<crate::recent::Parts>>,
 }
 
 /// A drive for This PC and the sidebar.
@@ -166,11 +168,19 @@ pub enum SortKey {
 /// opens it instead (app.rs, `navigate`).
 pub const NOT_A_FOLDER: &str = "This is a file, not a folder.";
 
+/// Whether `path` is one of Glint's places that aren't folders: the Recycle Bin or Recent. Nothing
+/// can be made, pasted or dropped there.
+pub fn is_place(path: &str) -> bool {
+    recycle::is_bin(path) || crate::recent::is_recent(path)
+}
+
 /// Reads one folder. Never panics; problems end up in `Folder::error`.
 pub fn read(path: &str) -> Folder {
     let start = Instant::now();
     let mut folder = if recycle::is_bin(path) {
         recycle::read()
+    } else if crate::recent::is_recent(path) {
+        crate::recent::read()
     } else if path.is_empty() {
         this_pc()
     } else if !is_absolute(path) {
@@ -824,7 +834,7 @@ fn is_absolute(path: &str) -> bool {
 pub fn resolve(input: &str, base: &str) -> String {
     let path = normalize(input);
     // Already complete, This PC, the Recycle Bin, or "D:something" (rare; left to Windows).
-    if path.is_empty() || base.is_empty() || is_absolute(&path) || recycle::is_bin(&path) || path.as_bytes().get(1) == Some(&b':') {
+    if path.is_empty() || base.is_empty() || is_absolute(&path) || is_place(&path) || path.as_bytes().get(1) == Some(&b':') {
         return path;
     }
     if path.starts_with('\\') {

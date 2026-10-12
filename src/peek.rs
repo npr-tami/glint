@@ -128,6 +128,29 @@ pub struct Facts {
     pub text_by_name: bool,
     /// EXIF orientation of a photo (1 = upright), when the shell knows it.
     pub orientation: u32,
+    /// What the preview's info strip says about a picture or a video (see `media_lines`).
+    pub media: Media,
+}
+
+/// Facts about a picture or a video for the preview's info strip. Anything unknown is None.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Media {
+    /// The picture's format by WIC ("PNG", "JPEG").
+    pub format: Option<String>,
+    /// Bits per pixel.
+    pub bits: Option<u32>,
+    /// Dots per inch (across).
+    pub dpi: Option<f64>,
+    /// How many frames (more than 1: an animation).
+    pub frames: Option<u32>,
+    /// The camera ("Canon EOS 80D").
+    pub camera: Option<String>,
+    /// When the photo was taken (a FILETIME).
+    pub taken: Option<u64>,
+    /// A video's frames per second.
+    pub fps: Option<f64>,
+    /// A video's bits per second.
+    pub bitrate: Option<u32>,
 }
 
 /// An answer from the thread.
@@ -135,6 +158,8 @@ pub enum Answer {
     Facts { key: String, facts: Facts },
     /// A picture decoded at full size (None: it couldn't be), and its size on disk.
     Picture { key: String, picture: Option<Arc<Picture>>, original: (u32, u32) },
+    /// An animated GIF's frames (asked with a picture; only sent when it has more than one).
+    Frames { key: String, frames: crate::anim::Frames },
 }
 
 /// Facts kept by key, the oldest forgotten first (a panel's memory of what it looked at).
@@ -277,10 +302,19 @@ fn work(shared: &Shared, tx: &Sender<Answer>) {
             Some(d) => (Picture::new(d.width, d.height, d.pixels, false), d.original),
             None => (None, (0, 0)),
         };
-        if tx.send(Answer::Picture { key: ask.key, picture, original }).is_err() {
+        if tx.send(Answer::Picture { key: ask.key.clone(), picture, original }).is_err() {
             return;
         }
         thumbs::repaint(&shared.hwnd);
+        // An animated GIF: its frames follow the first picture (which shows meanwhile).
+        if ask.ext == "gif" && here && shared.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).waiting.is_none() {
+            if let Some(frames) = wic.as_ref().and_then(|w| crate::anim::decode_gif(w, &ask.path, max_side.min(2048))) {
+                if tx.send(Answer::Frames { key: ask.key, frames }).is_err() {
+                    return;
+                }
+                thumbs::repaint(&shared.hwnd);
+            }
+        }
     }
 }
 
@@ -293,6 +327,11 @@ fn look(ask: &Ask, wic: Option<&windows::Win32::Graphics::Imaging::IWICImagingFa
             shell_facts(&ask.path, &mut facts);
             if facts.dims.is_none() && here && thumbs::is_picture(&ask.ext) {
                 facts.dims = wic.and_then(|w| thumbs::picture_size(w, &ask.path));
+            }
+            if here && thumbs::is_picture(&ask.ext) {
+                if let Some(w) = wic {
+                    picture_media(w, &ask.path, &mut facts.media);
+                }
             }
             facts.text_by_name = is_text_file(&ask.ext);
             let worth_sniffing = ask.size <= SNIFF_LIMIT && !NOT_TEXT.contains(&ask.ext.as_str()) && !thumbs::is_picture(&ask.ext) && facts.duration.is_none();
@@ -328,6 +367,14 @@ const VIDEO_HEIGHT: PROPERTYKEY = key(0x64440491_4c8b_11d1_8b70_080036b11a03, 4)
 const MEDIA_DURATION: PROPERTYKEY = key(0x64440490_4c8b_11d1_8b70_080036b11a03, 3);
 /// System.Photo.Orientation (EXIF's 1-8).
 const PHOTO_ORIENTATION: PROPERTYKEY = key(0x14b81da1_0135_4d31_96d9_6cbfc9671a99, 274);
+/// System.Photo.CameraManufacturer / CameraModel / DateTaken.
+const CAMERA_MAKER: PROPERTYKEY = key(0x14b81da1_0135_4d31_96d9_6cbfc9671a99, 271);
+const CAMERA_MODEL: PROPERTYKEY = key(0x14b81da1_0135_4d31_96d9_6cbfc9671a99, 272);
+const DATE_TAKEN: PROPERTYKEY = key(0x14b81da1_0135_4d31_96d9_6cbfc9671a99, 36867);
+/// System.Video.FrameRate (frames per 1,000 seconds), EncodingBitrate and TotalBitrate (bits per second).
+const VIDEO_FRAME_RATE: PROPERTYKEY = key(0x64440491_4c8b_11d1_8b70_080036b11a03, 6);
+const VIDEO_BITRATE: PROPERTYKEY = key(0x64440491_4c8b_11d1_8b70_080036b11a03, 8);
+const VIDEO_TOTAL_BITRATE: PROPERTYKEY = key(0x64440491_4c8b_11d1_8b70_080036b11a03, 43);
 
 /// What Windows' property handlers know: picture and video size, length, a photo's orientation.
 fn shell_facts(path: &str, facts: &mut Facts) {
@@ -358,7 +405,80 @@ fn shell_facts(path: &str, facts: &mut Facts) {
         if let Ok(o) = item.GetUInt32(&PHOTO_ORIENTATION) {
             facts.orientation = o;
         }
+        let m = &mut facts.media;
+        let text = |k: &PROPERTYKEY| -> Option<String> {
+            let p = item.GetString(k).ok()?;
+            if p.is_null() {
+                return None;
+            }
+            let s = p.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(p.0 as *const _));
+            let s = s.trim().to_string();
+            (!s.is_empty()).then_some(s)
+        };
+        m.camera = camera_name(text(&CAMERA_MAKER).as_deref(), text(&CAMERA_MODEL).as_deref());
+        if let Ok(ft) = item.GetFileTime(&DATE_TAKEN) {
+            let t = ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64;
+            m.taken = (t > 0).then_some(t);
+        }
+        if let Ok(r) = item.GetUInt32(&VIDEO_FRAME_RATE) {
+            m.fps = (r > 0).then_some(r as f64 / 1000.0);
+        }
+        m.bitrate = [VIDEO_TOTAL_BITRATE, VIDEO_BITRATE].iter().find_map(|k| item.GetUInt32(k).ok().filter(|&b| b > 0));
     }
+}
+
+/// "Canon EOS 80D" from the maker "Canon" and the model "Canon EOS 80D" (models often start with
+/// the maker's name already).
+pub fn camera_name(maker: Option<&str>, model: Option<&str>) -> Option<String> {
+    match (maker, model) {
+        (Some(a), Some(b)) if b.to_lowercase().starts_with(&a.to_lowercase().split_whitespace().next().unwrap_or("").to_string()) => Some(b.to_string()),
+        (Some(a), Some(b)) => Some(format!("{a} {b}")),
+        (None, Some(b)) => Some(b.to_string()),
+        (Some(a), None) => Some(a.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// A picture's format, bit depth, resolution and frame count, from WIC (headers only).
+fn picture_media(wic: &windows::Win32::Graphics::Imaging::IWICImagingFactory, path: &str, m: &mut Media) {
+    use windows::Win32::Graphics::Imaging::IWICPixelFormatInfo;
+    use windows::core::Interface;
+    let w = wide_path(path);
+    // SAFETY: the name buffer outlives the call; WIC objects are owned wrappers.
+    unsafe {
+        let Ok(decoder) = wic.CreateDecoderFromFilename(PCWSTR(w.as_ptr()), None, windows::Win32::Foundation::GENERIC_READ, windows::Win32::Graphics::Imaging::WICDecodeMetadataCacheOnDemand) else { return };
+        if let Ok(g) = decoder.GetContainerFormat() {
+            m.format = format_name(&g).map(str::to_string);
+        }
+        m.frames = decoder.GetFrameCount().ok();
+        let Ok(frame) = decoder.GetFrame(0) else { return };
+        if let Ok(pf) = frame.GetPixelFormat() {
+            m.bits = wic.CreateComponentInfo(&pf).ok().and_then(|i| i.cast::<IWICPixelFormatInfo>().ok()).and_then(|i| i.GetBitsPerPixel().ok()).filter(|&b| b > 0);
+        }
+        let (mut x, mut y) = (0.0f64, 0.0f64);
+        if frame.GetResolution(&mut x, &mut y).is_ok() && x > 0.0 {
+            m.dpi = Some(x);
+        }
+    }
+}
+
+/// The name of a WIC container format.
+fn format_name(g: &GUID) -> Option<&'static str> {
+    use windows::Win32::Graphics::Imaging::*;
+    let names: [(GUID, &str); 10] = [
+        (GUID_ContainerFormatPng, "PNG"),
+        (GUID_ContainerFormatJpeg, "JPEG"),
+        (GUID_ContainerFormatGif, "GIF"),
+        (GUID_ContainerFormatBmp, "BMP"),
+        (GUID_ContainerFormatTiff, "TIFF"),
+        (GUID_ContainerFormatIco, "ICO"),
+        (GUID_ContainerFormatWebp, "WebP"),
+        (GUID_ContainerFormatHeif, "HEIF"),
+        (GUID_ContainerFormatWmp, "JPEG XR"),
+        (GUID_ContainerFormatDds, "DDS"),
+    ];
+    names.iter().find(|(id, _)| id == g).map(|(_, n)| *n)
 }
 
 /// "1600 x 1000" (System.Image.Dimensions; the "x" may be a "×", with or without spaces).

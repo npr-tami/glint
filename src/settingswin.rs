@@ -277,8 +277,10 @@ pub struct SettingsWindow {
     serial: u64,
     renderer: Renderer,
     dpi: u32,
-    /// Client size in DIPs.
+    /// Client size in DIPs (inside 98 / 2000's window frame, when the skin draws one).
     size: (f32, f32),
+    /// The skin is 98 / 2000's: the window has their raised frame (frame.rs).
+    classic: bool,
     started: Instant,
     page: usize,
     blocks: Vec<Block>,
@@ -329,6 +331,8 @@ pub struct SettingsWindow {
     flips: kit::Flips,
     /// How thick the scrollbar is in the skin.
     bar: kit::Bar,
+    /// An older Windows' scroll bar arrow or track held down, repeating.
+    holding: kit::Holding,
 }
 
 /// The settings as written in settings.json.
@@ -473,6 +477,7 @@ pub fn create(owner: HWND, theme: &Theme, remembered: Option<[f32; 2]>, page: us
             renderer,
             dpi,
             size: (0.0, 0.0),
+            classic: false,
             started: Instant::now(),
             page: page.min(PAGES.len() - 1),
             blocks: Vec::new(),
@@ -506,6 +511,7 @@ pub fn create(owner: HWND, theme: &Theme, remembered: Option<[f32; 2]>, page: us
             skins_generation: 0,
             flips: kit::Flips::default(),
             bar: kit::Bar::default(),
+            holding: kit::Holding::default(),
         };
         window.apply_theme(theme);
         let mut rc = RECT::default();
@@ -607,6 +613,10 @@ unsafe extern "system" fn tab_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 /// The window procedure. Messages that need no state are answered here; the rest go to the state,
 /// which the main window keeps, through its guard (window::settings_message).
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // The skin's own menus (oldmenu.rs).
+    if let Some(r) = crate::oldmenu::handle(hwnd, msg, wparam, lparam) {
+        return r;
+    }
     match msg {
         // SAFETY: lparam is the NCCALCSIZE_PARAMS Windows passed with this message.
         WM_NCCALCSIZE if wparam.0 != 0 => return unsafe { frame::nc_calc_size(hwnd, wparam, lparam) },
@@ -735,6 +745,21 @@ impl SettingsWindow {
         self.started.elapsed().as_secs_f64()
     }
 
+    /// How wide 98 / 2000's window frame is round everything (0 for other skins or maximised).
+    fn border(&self) -> f32 {
+        if self.classic && !frame::zoomed(self.hwnd) {
+            4.0
+        } else {
+            0.0
+        }
+    }
+
+    /// The client area's size in DIPs, less the frame (from `w` x `h` pixels).
+    fn inner_size(&self, w: u32, h: u32) -> (f32, f32) {
+        let (s, b) = (self.scale(), self.border());
+        ((w as f32 / s - 2.0 * b).max(0.0), (h as f32 / s - 2.0 * b).max(0.0))
+    }
+
     fn poster(&self) -> Poster {
         Poster { hwnd: self.hwnd.0 as isize, serial: self.serial }
     }
@@ -750,9 +775,18 @@ impl SettingsWindow {
     /// size: the pages are laid out for it).
     pub fn apply_theme(&mut self, theme: &Theme) {
         self.renderer.set_font(&theme.font, 1.0);
+        self.renderer.set_title_font(&theme.title_font);
         self.layout_dirty = true;
         self.bar = kit::Bar::of(theme);
         self.box_at = None; // the text box is placed again, with the new font
+        if self.classic != theme.era.classic() {
+            self.classic = theme.era.classic();
+            let mut rc = RECT::default();
+            // SAFETY: our own window and a valid out-struct.
+            if unsafe { GetClientRect(self.hwnd, &mut rc) }.is_ok() && rc.right > rc.left {
+                self.size = self.inner_size((rc.right - rc.left) as u32, (rc.bottom - rc.top) as u32);
+            }
+        }
         let (bg, fg) = (theme.input.to_colorref(), theme.text.to_colorref());
         // SAFETY: a new brush replaces the old one, which is deleted (no control paints in between:
         // this is the UI thread).
@@ -928,12 +962,20 @@ impl SettingsWindow {
             return;
         }
         self.renderer.clear(theme.window);
+        // 98 / 2000: everything inside the window's frame.
+        let b = self.border();
+        self.renderer.set_origin(b, b);
         // The page list on the sidebar's colour (a gradient running down the whole window).
         let below = Rect::new(0.0, size::TITLE_H, self.size.0, (self.size.1 - size::TITLE_H).max(0.0));
         self.renderer.fill_paint(below, 0.0, &theme.sidebar_paint);
+        kit::page_list_well(&mut self.renderer, theme, Rect::new(0.0, size::TITLE_H, NAV_W, below.h));
         self.paint_caption(theme);
         self.paint_nav(theme);
         self.paint_page(theme);
+        if b > 0.0 {
+            self.renderer.set_origin(0.0, 0.0);
+            frame::paint_classic_border(&mut self.renderer, theme, Rect::new(0.0, 0.0, self.size.0 + 2.0 * b, self.size.1 + 2.0 * b));
+        }
         if self.renderer.end() == FrameResult::DeviceLost {
             more = true;
         }
@@ -947,10 +989,9 @@ impl SettingsWindow {
         let close = self.close_rect();
         let r = &mut self.renderer;
         let bar = Rect::new(0.0, 0.0, self.size.0, size::TITLE_H);
-        kit::title_bar(r, theme, bar);
+        kit::title_bar(r, theme, bar, self.active);
         let x = kit::logo(r, theme, bar);
-        let color = if self.active { theme.text } else { theme.muted };
-        r.text("Settings", Rect::new(x + 10.0, 0.0, (self.size.0 - x - 10.0 - ksize::CLOSE_W).max(0.0), size::TITLE_H), &TextStyle::new(color).size(13.0).semibold());
+        crate::retro::title(r, theme, Rect::new(x + 10.0, 0.0, (self.size.0 - x - 10.0 - ksize::CLOSE_W).max(0.0), size::TITLE_H), "Settings", self.active);
         let hot = self.hover == Some(Hot::Close);
         kit::close_button(r, theme, close, hot, hot && self.pressed == Some(Hot::Close), self.active);
     }
@@ -969,12 +1010,18 @@ impl SettingsWindow {
         self.renderer.push_clip(content);
         let dy = content.y - self.scroller.offset;
         let shift = |r: Rect| Rect::new(r.x, r.y + dy, r.w, r.h);
-        for block in &self.blocks {
+        // 98 / 2000: a card's heading is drawn with it, on its top line.
+        let classic = theme.era.classic();
+        for (k, block) in self.blocks.iter().enumerate() {
             let r = &mut self.renderer;
             match block {
-                Block::Title(rect, text) => r.text(text, shift(*rect), &TextStyle::new(theme.text_strong).size(ksize::PAGE_TITLE_FONT).semibold()),
+                Block::Title(rect, text) => kit::page_title(r, theme, shift(*rect), text),
+                Block::Heading(..) if classic && matches!(self.blocks.get(k + 1), Some(Block::Card(_))) => {}
                 Block::Heading(rect, text) => kit::heading(r, theme, shift(*rect), text),
-                Block::Card(rect) => kit::card(r, theme, shift(*rect)),
+                Block::Card(rect) => match k.checked_sub(1).and_then(|j| self.blocks.get(j)) {
+                    Some(Block::Heading(h, text)) if classic => kit::titled_group(r, theme, shift(*rect), shift(*h), text),
+                    _ => kit::card(r, theme, shift(*rect)),
+                },
                 Block::Line(rect) => kit::separator(r, theme, rect.x, rect.y + dy, rect.w),
             }
         }
@@ -988,7 +1035,7 @@ impl SettingsWindow {
         self.renderer.pop_clip();
         let hover = matches!(self.hover, Some(Hot::Thumb)) || self.drag.is_some();
         let track = self.track();
-        kit::scrollbar(&mut self.renderer, theme, track, &self.scroller, hover);
+        kit::scrollbar(&mut self.renderer, theme, track, &self.scroller, hover, self.holding.hold_of(0));
     }
 
     fn look_of(&self, i: usize, part: Part) -> Look {
@@ -1105,7 +1152,8 @@ impl SettingsWindow {
         }
         match want {
             Some(rect) => {
-                self.folder_box.place(rect.inset(1.0, 1.0), 7.0, self.scale());
+                let b = self.border();
+                self.folder_box.place(Rect::new(rect.x + b, rect.y + b, rect.w, rect.h).inset(1.0, 1.0), 7.0, self.scale());
                 if self.box_at.is_none() {
                     self.folder_box.show();
                 }
@@ -1165,8 +1213,8 @@ impl SettingsWindow {
     }
 
     fn client_point(&self, lparam: LPARAM) -> Point {
-        let s = self.scale();
-        Point::new((lparam.0 & 0xffff) as i16 as f32 / s, ((lparam.0 >> 16) & 0xffff) as i16 as f32 / s)
+        let (s, b) = (self.scale(), self.border());
+        Point::new((lparam.0 & 0xffff) as i16 as f32 / s - b, ((lparam.0 >> 16) & 0xffff) as i16 as f32 / s - b)
     }
 
     fn mouse_move(&mut self, p: Point) {
@@ -1174,6 +1222,10 @@ impl SettingsWindow {
             let mut tme = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: self.hwnd, dwHoverTime: 0 };
             // SAFETY: a valid struct for our own window.
             self.tracking = unsafe { TrackMouseEvent(&mut tme) }.is_ok();
+        }
+        if self.holding.active() {
+            self.holding.at = p;
+            return;
         }
         if let Some(grab) = self.drag {
             let track = self.track();
@@ -1194,6 +1246,13 @@ impl SettingsWindow {
     fn mouse_down(&mut self, p: Point) -> Vec<Ask> {
         self.cues = false;
         self.act_on_char = None;
+        // An older Windows' scroll bar: an arrow button moves the page a line, the track a page,
+        // again and again while the button is held.
+        let (place, now) = (self.bar.place(self.content_rect()), self.now());
+        if self.holding.press(self.hwnd, place, &mut self.scroller, 0, p, now) {
+            self.invalidate();
+            return Vec::new();
+        }
         let target = self.target_at(p);
         // SAFETY: focus and capture on our own window.
         unsafe {
@@ -1226,6 +1285,14 @@ impl SettingsWindow {
     }
 
     fn mouse_up(&mut self, p: Point, app: &mut AppState) -> Vec<Ask> {
+        if self.holding.release(self.hwnd) {
+            // SAFETY: releasing our own capture.
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+            self.invalidate();
+            return Vec::new();
+        }
         let was = self.pressed.take();
         self.drag = None;
         // SAFETY: releasing our own capture.
@@ -1440,7 +1507,8 @@ impl SettingsWindow {
                 let current = self.values.get(k).cloned();
                 let items = choices.iter().enumerate().map(|(n, (v, label))| MenuItem::new(n as u32 + 1, label).checked(Some(v.json()) == current)).collect();
                 self.menu_for = Some((k, choices.iter().map(|(v, _)| *v).collect()));
-                vec![Ask::Job(Job::Menu(Menu { tag: 1, at: Point::new(at.x, at.bottom() + 2.0), items, right_aligned: false }))]
+                let b = self.border();
+                vec![Ask::Job(Job::Menu(Menu { tag: 1, at: Point::new(at.x + b, at.bottom() + 2.0 + b), items, right_aligned: false }))]
             }
             (Ctl::Button(_, act), _) | (Ctl::ButtonToggle(_, act, _), Part::Main) => self.act(act),
             (Ctl::Folder, Part::Main) => {
@@ -1652,7 +1720,7 @@ impl SettingsWindow {
                 self.renderer.resize(w, h);
                 if w > 0 && h > 0 {
                     let s = self.scale();
-                    self.size = (w as f32 / s, h as f32 / s);
+                    self.size = self.inner_size(w, h);
                     self.layout_dirty = true;
                     // Remembered for next time (the window's outer size, in DIPs).
                     let mut r = RECT::default();
@@ -1674,8 +1742,7 @@ impl SettingsWindow {
                 let mut rc = RECT::default();
                 // SAFETY: our own window and a valid out-struct.
                 if unsafe { GetClientRect(self.hwnd, &mut rc) }.is_ok() && rc.right > rc.left {
-                    let s = self.scale();
-                    self.size = ((rc.right - rc.left) as f32 / s, (rc.bottom - rc.top) as f32 / s);
+                    self.size = self.inner_size((rc.right - rc.left) as u32, (rc.bottom - rc.top) as u32);
                 }
                 self.layout_dirty = true;
                 self.box_at = None;
@@ -1710,6 +1777,7 @@ impl SettingsWindow {
             WM_CAPTURECHANGED => {
                 self.pressed = None;
                 self.drag = None;
+                self.holding.release(self.hwnd);
                 self.invalidate();
                 Some(LRESULT(0))
             }
@@ -1753,6 +1821,13 @@ impl SettingsWindow {
                     let _ = KillTimer(Some(self.hwnd), RETRY_TIMER);
                 }
                 self.invalidate();
+                Some(LRESULT(0))
+            }
+            WM_TIMER if wparam.0 == kit::REPEAT_TIMER => {
+                let (place, now) = (self.bar.place(self.content_rect()), self.now());
+                if self.holding.fire(self.hwnd, place, &mut self.scroller, now) {
+                    self.invalidate();
+                }
                 Some(LRESULT(0))
             }
             WM_APP_TEXT => {

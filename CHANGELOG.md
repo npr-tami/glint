@@ -12,6 +12,38 @@ Each new number counts as newer than the one before it (1.0.12-beta.1, 1.0.12-be
 1.0.13-beta.1, ...), so the updater offers them in that order. Versions up to 0.11.0 used
 MAJOR.MINOR.PATCH, where a new feature bumped the middle number.
 
+## 1.0.16-beta.1 (2026-10-12): new Home, video preview, and an easier sort window
+
+### New
+- Home looks like File Explorer's: your folders at the top, then Recent files and Favorites.
+- Right-click any file or folder and pick Add to Favorites to put it on Home.
+- Prefer the old Home? SETTINGS > Home opens can switch it back to your user folder.
+- Space preview now plays GIFs, and videos too (press play).
+- Videos start with the sound fading in, and Glint remembers your volume.
+- The "i" button in the preview shows a picture's or video's details.
+- Each folder remembers its view, like File Explorer. Even after a restart.
+- Skins can now look like older Windows (98, 2000, XP or 7), with icons from that time.
+
+### Sort order window
+- DETACH lets it float as its own window. DOCK puts it back.
+- Line numbers, with a red dot on any line that has a mistake.
+- Every mistake is listed in full. Click one to jump to its line.
+- Clear tips for bracket mistakes, most with a one-click Fix.
+- Faint words after your line say what it does.
+- Add and_subfolders to a folder's rules so folders inside it follow them too.
+- Start typing a folder name and it suggests the full path.
+- Clicking a column sorts only that folder, until you leave it.
+- The window shows which rules sort the folder you're in.
+- Ctrl+Z / Ctrl+Y undo and redo, even after closing the window.
+- Right-click for cut, copy, paste and more. Ctrl+/ turns lines into notes.
+- Alt+Up and Alt+Down move lines.
+
+### Fixes
+- Deleting on a USB stick or network drive now asks first (there's no Recycle Bin there).
+- Typing letters to jump to a file keeps working when nothing matches.
+- Renaming or moving a folder in Glint updates its sort rules.
+- START FROM asks before replacing your own rules.
+
 ## 1.0.15-beta.1 (2026-10-11): the same rules for several folders
 
 - **One set of rules for several folders**: in the custom sort order (SORT > Edit custom

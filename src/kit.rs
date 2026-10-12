@@ -38,7 +38,10 @@ use crate::details::blend;
 use crate::pathbar::{fill_box, outline_box};
 use crate::render::{Align, Renderer, TextStyle};
 use crate::theme::{size as main_size, ButtonStyle, CaptionStyle, Color, Paint, SidebarStyle, Stop, Theme};
+use crate::retroctl::{Held, Hold, Repeat};
 use crate::ui::{Anim, Point, Rect};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::Input::KeyboardAndMouse::SetCapture;
 
 /// The kit's sizes, in DIPs.
 pub mod size {
@@ -191,8 +194,15 @@ fn knob(track: Rect, on: bool, lean: f32) -> (Rect, f32) {
 /// out; `1.0` / `0.0` draw it on or off.
 pub fn toggle(r: &mut Renderer, theme: &Theme, rect: Rect, on: f32, look: Look) {
     let t = on.clamp(0.0, 1.0);
+    if theme.era.old() {
+        // No Windows of the time had a switch: a check box at the switch's right end.
+        return crate::retroctl::checkbox(r, theme, Rect::new(rect.right() - 16.0, rect.y, 16.0, rect.h), t, look);
+    }
     if glass(theme) {
         return glass_toggle(r, theme, rect, t, look);
+    }
+    if theme.bevels {
+        return bevel_toggle(r, theme, rect, t, look);
     }
     let lit = look.enabled && (look.hover || look.pressed);
     let lean = theme.lean(size::TOGGLE_LEAN);
@@ -266,8 +276,14 @@ pub fn toggle_contains(rect: Rect, p: Point) -> bool {
 /// (0.0) to on (1.0): while it's flipping ([`Flips`]) the fill and the tick fade in or out.
 pub fn checkbox(r: &mut Renderer, theme: &Theme, rect: Rect, on: f32, look: Look) {
     let t = on.clamp(0.0, 1.0);
+    if theme.era.old() {
+        return crate::retroctl::checkbox(r, theme, rect, t, look);
+    }
     if glass(theme) {
         return glass_checkbox(r, theme, rect, t, look);
+    }
+    if theme.bevels || old_windows(theme) {
+        return box_checkbox(r, theme, rect, t, look);
     }
     let lit = look.enabled && (look.hover || look.pressed);
     let lean = theme.lean(size::CHECK_LEAN);
@@ -406,8 +422,14 @@ fn chevron_down(r: &mut Renderer, c: Point, half: f32, color: Color) {
 
 /// The closed box of a drop-down list showing `text` (the current choice), with an arrow.
 pub fn dropdown(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str, look: Look) {
+    if theme.era.old() {
+        return crate::retroctl::combo(r, theme, rect, text, look);
+    }
     if glass(theme) {
         return glass_dropdown(r, theme, rect, text, look);
+    }
+    if theme.bevels || old_windows(theme) {
+        return combo(r, theme, rect, text, look);
     }
     let fill = match (look.enabled, look.pressed, look.hover) {
         (true, true, _) => theme.button_pressed,
@@ -459,8 +481,14 @@ fn button_style(color: Color) -> TextStyle {
 
 /// A word button in the skin's shape (write the label in capitals, like SORT and CANCEL).
 pub fn button(r: &mut Renderer, theme: &Theme, rect: Rect, label: &str, look: Look) {
+    if theme.era.old() {
+        return crate::retroctl::push_button(r, theme, rect, &sentence_case(label), look, false);
+    }
     if glass(theme) {
         return glass_button(r, theme, rect, label, look, false);
+    }
+    if theme.bevels || old_windows(theme) {
+        return push_button(r, theme, rect, label, look, false);
     }
     let fill = match (look.enabled, look.pressed, look.hover) {
         (true, true, true) => theme.button_pressed,
@@ -479,8 +507,14 @@ pub fn button(r: &mut Renderer, theme: &Theme, rect: Rect, label: &str, look: Lo
 /// the colour that goes on it, in the skin's shape - in a glass skin a capsule in the selection's
 /// colour.
 pub fn primary_button(r: &mut Renderer, theme: &Theme, rect: Rect, label: &str, look: Look) {
+    if theme.era.old() {
+        return crate::retroctl::push_button(r, theme, rect, &sentence_case(label), look, true);
+    }
     if glass(theme) {
         return glass_button(r, theme, rect, label, look, true);
+    }
+    if theme.bevels || old_windows(theme) {
+        return push_button(r, theme, rect, label, look, true);
     }
     let fill = match (look.enabled, look.pressed, look.hover) {
         (false, _, _) => theme.accent.with_alpha(0.38),
@@ -546,7 +580,13 @@ pub fn button_contains(rect: Rect, p: Point) -> bool {
 /// scrolled partly out of view, say - the frame still shows what's in it.
 pub fn field(r: &mut Renderer, theme: &Theme, rect: Rect, text: Option<&str>, typing: bool, look: Look) {
     r.fill_paint(rect, theme.corner(rect.h), &faded_paint(theme.input_paint, look));
-    frame(r, theme, rect, faded(if typing { theme.accent } else { field_edge(theme) }, look));
+    if theme.era.old() {
+        crate::retrotool::field(r, theme, rect, typing);
+    } else if theme.bevels {
+        crate::pathbar::bevel(r, theme, rect, false, theme.window);
+    } else {
+        frame(r, theme, rect, faded(if typing { theme.accent } else { field_edge(theme) }, look));
+    }
     if let Some(t) = text {
         r.text(t, Rect::new(rect.x + 8.0, rect.y, (rect.w - 16.0).max(0.0), rect.h), &TextStyle::new(faded(theme.text, look)));
     }
@@ -560,11 +600,19 @@ pub fn field(r: &mut Renderer, theme: &Theme, rect: Rect, text: Option<&str>, ty
 /// A card: a panel with a hairline frame, holding rows of settings (with a soft shadow under it
 /// when the skin's sidebar is in panels).
 pub fn card(r: &mut Renderer, theme: &Theme, rect: Rect) {
+    if theme.era.old() {
+        return crate::retroctl::group_box(r, theme, rect);
+    }
     let radius = theme.corner(rect.h);
     if panels(theme) {
         fill_rounded(r, Rect::new(rect.x, rect.y + 1.0, rect.w, rect.h + 1.0), radius, Color::rgba(0, 0, 0, if theme.dark { 0.35 } else { 0.12 }));
     }
     r.fill_paint(rect, radius, &theme.panel_paint);
+    if theme.bevels {
+        r.stroke_rect(Rect::new(rect.x + 1.0, rect.y + 1.0, rect.w - 1.0, rect.h - 1.0), 1.0, Color::hex(0xffffff));
+        r.stroke_rect(Rect::new(rect.x, rect.y, rect.w - 1.0, rect.h - 1.0), 1.0, theme.window.darker(0.4));
+        return;
+    }
     frame(r, theme, rect, theme.line);
 }
 
@@ -581,13 +629,35 @@ fn frame(r: &mut Renderer, theme: &Theme, rect: Rect, color: Color) {
 /// The thin line between two rows of a card: the skin's lighter line between column titles where
 /// it has one, its thin lines otherwise.
 pub fn separator(r: &mut Renderer, theme: &Theme, x: f32, y: f32, w: f32) {
+    if theme.era.old() {
+        // (A group box of the time had no lines between its rows.)
+        return;
+    }
     let color = if theme.column_line.a > 0.0 { theme.column_line } else { theme.line };
     r.fill_rect(Rect::new(x, y, w, 1.0), color);
 }
 
+/// 98 / 2000: a group box with its title sitting on its top line, the line broken behind the words
+/// (`heading` is the title's row above the box `card`, as laid out for the other skins).
+pub fn titled_group(r: &mut Renderer, theme: &Theme, card: Rect, heading: Rect, text: &str) {
+    let top = r.snap(heading.y + heading.h / 2.0);
+    let group = Rect::new(card.x, top, card.w, (card.bottom() - top).max(0.0));
+    crate::retroctl::group_box(r, theme, group);
+    let style = TextStyle::new(theme.text);
+    let w = r.measure(text, &style).ceil();
+    let x = r.snap(group.x + 8.0);
+    r.fill_rect(Rect::new(x - 2.0, top - 7.0, w + 4.0, 14.0), theme.toolbar);
+    r.text(text, Rect::new(x, top - 10.0, w + 2.0, 20.0), &style);
+}
+
 /// A small heading above a card ("Starting", "Layout"), in the colour of the sidebar's headings
-/// when the sidebar is in panels.
+/// when the sidebar is in panels (98 / 2000 put theirs on the box's line: `titled_group`).
 pub fn heading(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str) {
+    if theme.era.old() {
+        let style = TextStyle::new(crate::retroctl::group_title(theme)).size(12.0);
+        let style = if theme.era == crate::theme::Era::Win7 { style } else { style.bold() };
+        return r.text(text, rect, &style);
+    }
     let color = if panels(theme) { theme.panel_header_text } else { theme.text };
     r.text(text, rect, &TextStyle::new(color).size(size::HEADING_FONT).semibold());
 }
@@ -596,6 +666,8 @@ pub fn heading(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str) {
 /// list (the skin's edge and tint) - or, when the skin's sidebar is in panels, like the place
 /// you're in there (a rounded selection inside the list).
 pub fn nav_item(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str, selected: bool, look: Look) {
+    // 98 and 2000: a list box's line, inside the sunken well (`page_list_well`).
+    let rect = if theme.era.classic() { Rect::new(rect.x + 9.0, rect.y, (rect.w - 18.0).max(0.0), rect.h) } else { rect };
     if panels(theme) {
         let pill = Rect::new(rect.x + 8.0, rect.y + 2.0, (rect.w - 16.0).max(0.0), (rect.h - 4.0).max(0.0));
         let radius = theme.corner(pill.h);
@@ -604,7 +676,7 @@ pub fn nav_item(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str, selecte
         } else if look.hover {
             r.fill_paint(pill, radius, &theme.hover_paint);
         }
-        let color = if selected { theme.sidebar_selection_text } else { theme.text };
+        let color = if selected { theme.sidebar_selection_text } else { theme.sidebar_text };
         let style = TextStyle::new(color).size(size::NAV_FONT);
         let style = if selected { style.semibold() } else { style };
         r.text(text, Rect::new(rect.x + 18.0, rect.y, (rect.w - 26.0).max(0.0), rect.h), &style);
@@ -614,18 +686,60 @@ pub fn nav_item(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str, selecte
         return;
     }
     if selected {
-        r.fill_rect(rect, theme.accent_tint);
+        crate::pathbar::fill_row(r, theme, rect, &theme.accent_tint_paint, false);
         r.fill_rect(Rect::new(rect.x, rect.y, main_size::SELECT_EDGE, rect.h), theme.select_edge);
     } else if look.hover {
-        r.fill_rect(rect, theme.hover);
+        crate::pathbar::fill_row(r, theme, rect, &theme.hover_paint, true);
     }
-    let color = if selected { theme.text_strong } else { theme.text };
+    let color = if selected { theme.selection_text } else { theme.sidebar_text };
     let style = TextStyle::new(color).size(size::NAV_FONT);
     let style = if selected { style.semibold() } else { style };
     r.text(text, Rect::new(rect.x + 18.0, rect.y, (rect.w - 26.0).max(0.0), rect.h), &style);
     if look.focused {
         focus_ring(r, theme, rect.inset(2.0, 2.0), 0.0);
     }
+}
+
+/// A page's title ("Appearance") at the top of a window's page: big and light in Glint's own
+/// skins; an older Windows' bold heading in the dialog font, or 7's dark blue Control Panel title.
+pub fn page_title(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str) {
+    let style = match theme.era {
+        crate::theme::Era::None => TextStyle::new(theme.text_strong).size(size::PAGE_TITLE_FONT).semibold(),
+        crate::theme::Era::Win7 => TextStyle::new(Color::hex(0x1e395b)).size(17.0),
+        _ => TextStyle::new(theme.text_strong).size(14.0).bold(),
+    };
+    r.text(text, rect, &style);
+}
+
+/// Behind a window's page list (the column `column`, already in the sidebar's paint): an older
+/// Windows' list box (2000: a sunken white well on the grey) or task pane panel (XP: the pale panel
+/// on the blue, so its blue words read).
+pub fn page_list_well(r: &mut Renderer, theme: &Theme, column: Rect) {
+    match theme.era {
+        crate::theme::Era::Win98 | crate::theme::Era::Win2000 => {
+            r.fill_rect(column, theme.toolbar);
+            let well = column.inset(7.0, 7.0);
+            r.fill_rect(well, theme.panel);
+            crate::retro::edge(r, theme, well, crate::retro::Edge::Sunken, theme.toolbar);
+        }
+        crate::theme::Era::Xp if !theme.sidebar_panel.is_clear() => {
+            let panel = column.inset(6.0, 8.0);
+            r.fill_paint(panel, 3.0, &theme.sidebar_panel);
+            r.stroke_round_rect(panel.inset(0.5, 0.5), 3.0, 1.0, Color::hex(0xffffff));
+        }
+        _ => {}
+    }
+}
+
+/// "CANCEL" -> "Cancel" (an older Windows never wrote its buttons in capitals); a label already in
+/// mixed case stays as it is.
+pub fn sentence_case(label: &str) -> String {
+    if label.chars().any(|ch| ch.is_lowercase()) {
+        return label.to_string();
+    }
+    let lower = label.to_lowercase();
+    let mut chars = lower.chars();
+    chars.next().map_or_else(String::new, |f| f.to_uppercase().chain(chars).collect())
 }
 
 /// The thin outline round the control that has the keyboard, in the control's shape (`lean`: how
@@ -693,6 +807,9 @@ fn longest_fitting(r: &mut Renderer, word: &str, style: &TextStyle, width: f32) 
 
 /// How long a wheel scroll glides, in seconds (like the file list).
 const SCROLL_TIME: f64 = 0.14;
+
+/// How far a click on a scroll bar's arrow button moves a page: one line.
+pub const ARROW_STEP: f32 = 24.0;
 
 /// A page that scrolls: where it is, where it's gliding to, and how long it is.
 #[derive(Clone, Copy, Debug, Default)]
@@ -773,13 +890,29 @@ impl Scroller {
 
     /// The scrollbar's thumb in `track`, if the page is longer than the view.
     pub fn thumb(&self, track: Rect) -> Option<Rect> {
+        self.thumb_at(track, self.offset)
+    }
+
+    /// Where the thumb is once the page is at `offset`.
+    pub fn thumb_at(&self, track: Rect, offset: f32) -> Option<Rect> {
         let max = self.max();
         if max <= 0.0 || self.content <= 0.0 || track.h <= 0.0 {
             return None;
         }
         let h = (track.h * self.view / self.content).clamp(24.0_f32.min(track.h), track.h);
-        let y = track.y + (track.h - h) * (self.offset / max).clamp(0.0, 1.0);
+        let y = track.y + (track.h - h) * (offset / max).clamp(0.0, 1.0);
         Some(Rect::new(track.x, y, track.w, h))
+    }
+
+    /// How far a click on the track moves the page: what shows, less a line.
+    pub fn page(&self) -> f32 {
+        (self.view - ARROW_STEP).max(ARROW_STEP)
+    }
+
+    /// Which ways it can still scroll (from where it is: the scroll bar's arrows grey out at the
+    /// ends).
+    pub fn room(&self) -> crate::retroctl::Room {
+        crate::retroctl::Room::of(self.offset, self.max())
     }
 
     /// The offset that puts the thumb's top at `thumb_top` (dragging it).
@@ -796,37 +929,166 @@ impl Scroller {
 pub struct Bar {
     pub w: f32,
     pub margin: f32,
+    /// How long the arrow buttons at each end are (an older Windows' scroll bars; 0 otherwise).
+    pub arrows: f32,
 }
 
 impl Default for Bar {
     fn default() -> Bar {
-        Bar { w: main_size::SCROLLBAR_W, margin: main_size::SCROLLBAR_MARGIN }
+        Bar { w: main_size::SCROLLBAR_W, margin: main_size::SCROLLBAR_MARGIN, arrows: 0.0 }
     }
 }
 
 impl Bar {
     pub fn of(theme: &Theme) -> Bar {
-        Bar { w: theme.scrollbar_w, margin: theme.scrollbar_margin() }
+        Bar { w: theme.scrollbar_w, margin: theme.scrollbar_margin(), arrows: crate::retroctl::arrows(theme) }
     }
 
-    /// Where the thumb runs: along the right edge of `area`, inside the margin.
+    /// Where the thumb runs: along the right edge of `area`, inside the margin (and between the
+    /// arrow buttons).
     pub fn track(self, area: Rect) -> Rect {
-        Rect::new(area.right() - self.w - self.margin, area.y + self.margin, self.w, (area.h - 2.0 * self.margin).max(0.0))
+        let along = self.margin + self.arrows;
+        Rect::new(area.right() - self.w - self.margin, area.y + along, self.w, (area.h - 2.0 * along).max(0.0))
+    }
+
+    /// The scroll bar along `area`'s right edge.
+    pub fn place(self, area: Rect) -> BarPlace {
+        let lane_w = self.w + 2.0 * self.margin;
+        BarPlace { lane: Rect::new(area.right() - lane_w, area.y, lane_w, area.h), track: self.track(area), arrows: self.arrows }
+    }
+}
+
+/// Where a scroll bar is: its whole lane (an older Windows' arrow buttons at the two ends), the
+/// track its thumb runs in, and how long the arrow buttons are.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BarPlace {
+    pub lane: Rect,
+    pub track: Rect,
+    pub arrows: f32,
+}
+
+impl BarPlace {
+    /// What a press at `p` holds on an older Windows' bar (while `s` scrolls): an arrow button, or
+    /// the track before or after the thumb.
+    pub fn hold_at(self, s: &Scroller, p: Point) -> Hold {
+        if self.arrows <= 0.0 || s.max() <= 0.0 || !self.lane.contains(p) {
+            return Hold::None;
+        }
+        if let Some(held) = crate::retroctl::arrow_at(self.lane, self.arrows, p) {
+            return Hold::Arrow(held);
+        }
+        match s.thumb(self.track) {
+            Some(t) if p.y < t.y => Hold::Page(Held::Start),
+            Some(t) if p.y >= t.bottom() => Hold::Page(Held::End),
+            _ => Hold::None,
+        }
+    }
+
+    /// One step of `hold` on `s`: a line for an arrow; a page for the track, while the thumb hasn't
+    /// reached the mouse (`at`). Whether it moved.
+    pub fn step(self, s: &mut Scroller, hold: Hold, at: Point, now: f64) -> bool {
+        match hold {
+            Hold::Arrow(way) => s.scroll_by(way.sign() * ARROW_STEP, now),
+            Hold::Page(way) => {
+                let on = s.thumb_at(self.track, s.target()).is_some_and(|t| crate::retroctl::page_on(self.lane, t, way, at));
+                on && s.scroll_by(way.sign() * s.page(), now)
+            }
+            Hold::None => false,
+        }
+    }
+}
+
+/// The timer that repeats a held scroll bar arrow or track in the Settings, skin and update
+/// windows (none of them uses 9 for anything else).
+pub const REPEAT_TIMER: usize = 9;
+
+/// A window's held scroll bar arrow or track (an older Windows' bars), repeating on REPEAT_TIMER.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Holding {
+    pub repeat: Repeat,
+    /// Which of the window's bars (the skin window has two).
+    pub bar: usize,
+    /// Where the mouse is: a held track pages until the thumb gets there.
+    pub at: Point,
+}
+
+impl Holding {
+    /// A press at `p`: when it is on bar `which` (at `place`, scrolling `s`), the first step is
+    /// taken, the mouse captured and the timer set. Whether it was.
+    #[allow(clippy::too_many_arguments)]
+    pub fn press(&mut self, hwnd: HWND, place: BarPlace, s: &mut Scroller, which: usize, p: Point, now: f64) -> bool {
+        let hold = place.hold_at(s, p);
+        if hold == Hold::None {
+            return false;
+        }
+        self.bar = which;
+        self.at = p;
+        crate::retroctl::repeat_timer(hwnd, REPEAT_TIMER, Some(self.repeat.press(hold, now)));
+        place.step(s, hold, p, now);
+        // SAFETY: capture on our own window, so the button coming up anywhere ends the hold.
+        unsafe {
+            SetCapture(hwnd);
+        }
+        true
+    }
+
+    /// The timer fired: the next step on the held bar (at `place`, scrolling `s`). Whether it moved.
+    pub fn fire(&mut self, hwnd: HWND, place: BarPlace, s: &mut Scroller, now: f64) -> bool {
+        let room = crate::retroctl::Room::of(s.target(), s.max()).toward(self.repeat.hold.way());
+        let (hold, steps, next) = self.repeat.fire(room, now);
+        crate::retroctl::repeat_timer(hwnd, REPEAT_TIMER, next);
+        let mut moved = false;
+        for _ in 0..steps {
+            moved |= place.step(s, hold, self.at, now);
+        }
+        moved
+    }
+
+    /// The button came up: whether something was held (it shows released; the timer stops).
+    pub fn release(&mut self, hwnd: HWND) -> bool {
+        let was = self.repeat.release();
+        if was {
+            crate::retroctl::repeat_timer(hwnd, REPEAT_TIMER, None);
+        }
+        was
+    }
+
+    /// Whether something is held.
+    pub fn active(&self) -> bool {
+        self.repeat.hold != Hold::None
+    }
+
+    /// What bar `which` holds.
+    pub fn hold_of(&self, which: usize) -> Hold {
+        if self.bar == which {
+            self.repeat.hold
+        } else {
+            Hold::None
+        }
     }
 }
 
 /// The thin scrollbar thumb in `track` (nothing when the page fits), in the skin's paint: with its
-/// track behind it, an edge and grip lines where the skin has them.
-pub fn scrollbar(r: &mut Renderer, theme: &Theme, track: Rect, s: &Scroller, hover: bool) {
+/// track behind it, an edge and grip lines where the skin has them. An older Windows' bar shows
+/// what is held (`hold`) pressed.
+pub fn scrollbar(r: &mut Renderer, theme: &Theme, track: Rect, s: &Scroller, hover: bool, hold: Hold) {
     let Some(thumb) = s.thumb(track) else { return };
+    if theme.era.old() {
+        let (m, a) = (theme.scrollbar_margin(), crate::retroctl::arrows(theme));
+        let lane = track.inset(-m, -m - a);
+        let look = crate::retroctl::BarLook { hot: hover || hold != Hold::None, dragged: false, hold, room: s.room() };
+        return crate::retroctl::scrollbar(r, theme, lane, thumb, look);
+    }
     if !theme.scrollbar_track.is_clear() {
         let m = theme.scrollbar_margin();
         let lane = track.inset(-m, -m);
         r.fill_paint(lane, lane.w / 2.0, &theme.scrollbar_track);
     }
-    let radius = thumb.w.min(thumb.h) / 2.0;
+    let radius = if theme.bevels { 0.0 } else { thumb.w.min(thumb.h) / 2.0 };
     r.fill_paint(thumb, radius, if hover { &theme.scroll_thumb_hover_paint } else { &theme.scroll_thumb_paint });
-    if theme.scrollbar_border.a > 0.0 {
+    if theme.bevels {
+        crate::pathbar::bevel(r, theme, thumb, true, theme.scroll_thumb);
+    } else if theme.scrollbar_border.a > 0.0 {
         edge(r, thumb, radius, theme.scrollbar_border);
     }
     if theme.scrollbar_grip && thumb.h >= 24.0 {
@@ -839,12 +1101,248 @@ pub fn scrollbar(r: &mut Renderer, theme: &Theme, track: Rect, s: &Scroller, hov
     }
 }
 
+// ---------------------------------------------------------------- old Windows looks
+
+/// Whether the skin is one of the XP / Windows 7 looks: flat buttons with an edge round them under
+/// the mouse (`tool-border`). Their controls are drawn as Windows drew them then.
+pub fn old_windows(theme: &Theme) -> bool {
+    theme.tool_border.a > 0.0 && !glass(theme)
+}
+
+/// A push button as Windows drew it: in Windows 2000 (`bevels`) a grey raised box that sinks
+/// while pressed, the main one with a black frame; in XP and 7 a rounded box of the skin's
+/// `button` paint with a dark edge, an orange (or blue) glow inside it under the mouse.
+pub fn push_button(r: &mut Renderer, theme: &Theme, rect: Rect, label: &str, look: Look, primary: bool) {
+    let down = look.enabled && look.pressed && look.hover;
+    let ink = faded(theme.button_text, look);
+    let text_rect = if down { Rect::new(rect.x + 1.0, rect.y + 1.0, rect.w, rect.h) } else { rect };
+    let style = TextStyle::new(ink).align(Align::Center);
+    if theme.bevels {
+        r.fill_paint(rect, 0.0, &theme.chip_paint);
+        let face = if primary {
+            r.stroke_rect(rect, 1.0, Color::hex(0x000000));
+            rect.inset(1.0, 1.0)
+        } else {
+            rect
+        };
+        crate::pathbar::bevel(r, theme, face, !down, theme.chip);
+        r.text(label, text_rect, &style);
+        if look.focused {
+            dotted_focus(r, rect.inset(4.0, 4.0), theme.button_text);
+        }
+        return;
+    }
+    let paint = if down {
+        theme.chip_paint.darker(0.08)
+    } else if look.hover && look.enabled {
+        theme.chip_hover_paint
+    } else {
+        theme.chip_paint
+    };
+    r.fill_paint(rect, 3.0, &faded_paint(paint, look));
+    if look.enabled && (look.hover || primary) {
+        let glow = if look.hover && theme.tab_line.a > 0.0 { theme.tab_line } else { theme.accent.with_alpha(0.6) };
+        r.stroke_round_rect(rect.inset(1.5, 1.5), 2.0, 2.0, glow);
+    }
+    r.stroke_round_rect(rect.inset(0.5, 0.5), 3.0, 1.0, faded(theme.input_border.darker(0.35), look));
+    r.text(label, text_rect, &style);
+    if look.focused {
+        dotted_focus(r, rect.inset(4.0, 4.0), theme.button_text);
+    }
+}
+
+/// The keyboard's dotted outline inside a classic button.
+fn dotted_focus(r: &mut Renderer, rect: Rect, color: Color) {
+    let c = color.with_alpha(0.6);
+    let mut x = rect.x;
+    while x < rect.right() {
+        r.fill_rect(Rect::new(x, rect.y, 1.0, 1.0), c);
+        r.fill_rect(Rect::new(x, rect.bottom() - 1.0, 1.0, 1.0), c);
+        x += 2.0;
+    }
+    let mut y = rect.y;
+    while y < rect.bottom() {
+        r.fill_rect(Rect::new(rect.x, y, 1.0, 1.0), c);
+        r.fill_rect(Rect::new(rect.right() - 1.0, y, 1.0, 1.0), c);
+        y += 2.0;
+    }
+}
+
+/// A drop-down as Windows drew it: a white box (sunken in Windows 2000, a thin edge in XP and 7)
+/// with a button for its arrow on the right - raised grey, or the skin's glossy button.
+fn combo(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str, look: Look) {
+    let down = look.enabled && look.pressed;
+    r.fill_paint(rect, 0.0, &faded_paint(theme.input_paint, look));
+    let arrow_w = 17.0;
+    let (inner, btn) = if theme.bevels {
+        crate::pathbar::bevel(r, theme, rect, false, theme.window);
+        (rect.inset(2.0, 2.0), Rect::new(rect.right() - 2.0 - arrow_w, rect.y + 2.0, arrow_w, rect.h - 4.0))
+    } else {
+        r.stroke_rect(rect, 1.0, faded(field_edge(theme), look));
+        (rect.inset(1.0, 1.0), Rect::new(rect.right() - 1.0 - arrow_w, rect.y + 1.0, arrow_w, rect.h - 2.0))
+    };
+    let text_rect = Rect::new(inner.x + 5.0, inner.y, (btn.x - inner.x - 6.0).max(0.0), inner.h);
+    r.text(text, text_rect, &TextStyle::new(faded(theme.text, look)));
+    if theme.bevels {
+        r.fill_paint(btn, 0.0, &theme.chip_paint);
+        crate::pathbar::bevel(r, theme, btn, !down, theme.chip);
+    } else {
+        let paint = if look.hover && look.enabled { theme.chip_hover_paint } else { theme.chip_paint };
+        let face = btn.inset(1.0, 1.0);
+        r.fill_paint(face, 2.0, &paint);
+        r.stroke_round_rect(face.inset(0.5, 0.5), 2.0, 1.0, theme.input_border);
+    }
+    let d = if down { 1.0 } else { 0.0 };
+    let c = Point::new(r.snap(btn.x + btn.w / 2.0) + d, r.snap(btn.y + btn.h / 2.0) + d);
+    let arrow = [Point::new(c.x - 4.0, c.y - 2.0), Point::new(c.x + 4.0, c.y - 2.0), Point::new(c.x, c.y + 2.0)];
+    r.fill_polygon(&arrow, faded(theme.button_text, look));
+    if look.focused {
+        dotted_focus(r, text_rect.inset(-2.0, 3.0), theme.text);
+    }
+}
+
+/// A checkbox as Windows drew it: a white box, sunken (Windows 2000) or with a thin edge (XP and
+/// 7), and a tick in the text colour (green in XP, the accent in 7).
+fn box_checkbox(r: &mut Renderer, theme: &Theme, rect: Rect, t: f32, look: Look) {
+    let b = Rect::new(r.snap(rect.x + (rect.w - 13.0) / 2.0), r.snap(rect.y + (rect.h - 13.0) / 2.0), 13.0, 13.0);
+    let lit_now = look.enabled && look.hover;
+    r.fill_paint(b, 0.0, &faded_paint(theme.input_paint, look));
+    let ink = if theme.bevels {
+        crate::pathbar::bevel(r, theme, b, false, theme.window);
+        theme.text
+    } else {
+        if lit_now {
+            r.stroke_rect(b.inset(1.0, 1.0), 1.0, theme.tab_line.with_alpha(0.8));
+        }
+        r.stroke_rect(b, 1.0, faded(theme.input_border.darker(0.3), look));
+        theme.accent
+    };
+    if t > 0.0 {
+        let p = [Point::new(b.x + 3.0, b.y + 6.5), Point::new(b.x + 5.5, b.y + 9.0), Point::new(b.x + 10.0, b.y + 4.0)];
+        r.polyline(&p, 2.0, faded(ink.with_alpha(ink.a * t), look));
+    }
+    if look.focused {
+        dotted_focus(r, b.inset(-2.0, -2.0), theme.text);
+    }
+}
+
+/// An on/off switch in Windows 2000: a sunken slot (white when off, the accent when on) with a
+/// raised grey knob sliding across.
+fn bevel_toggle(r: &mut Renderer, theme: &Theme, rect: Rect, t: f32, look: Look) {
+    let slot = Rect::new(r.snap(rect.x), r.snap(rect.y), r.snap(rect.w), r.snap(rect.h));
+    r.fill_rect(slot, faded(blend(theme.input, theme.accent, t), look));
+    crate::pathbar::bevel(r, theme, slot, false, theme.window);
+    let kw = (slot.h - 2.0).round();
+    let x = slot.x + 2.0 + (slot.w - 4.0 - kw) * t;
+    let knob = Rect::new(r.snap(x), slot.y + 2.0, kw - 2.0, slot.h - 4.0);
+    r.fill_paint(knob, 0.0, &theme.chip_paint);
+    crate::pathbar::bevel(r, theme, knob, true, theme.chip);
+    if look.focused {
+        dotted_focus(r, slot.inset(-3.0, -3.0), theme.text);
+    }
+}
+
+/// The sign on a caption button.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Sign {
+    Close,
+    Maximize,
+    Minimize,
+}
+
+/// Minimise, maximise or close in the old Windows looks, drawn in `b` (the button's whole spot):
+/// XP and 7's rounded glass tiles (`caption-buttons: tiles`) or Windows 2000's raised grey boxes
+/// (`bevels`). Returns false, drawing nothing, for the other skins.
+pub fn caption_face(r: &mut Renderer, theme: &Theme, b: Rect, sign: Sign, hot: bool, down: bool, active: bool) -> bool {
+    if theme.era.old() {
+        // As the era drew it, where it put it (a window's lone close button here).
+        let state = crate::retro::State { hot, down, active };
+        let (slot, sign) = match sign {
+            Sign::Close => (crate::retro::close_slot(theme.era, b), crate::retro::Sign::Close),
+            Sign::Maximize => (b.center(25.0, 22.0), crate::retro::Sign::Maximize),
+            Sign::Minimize => (b.center(25.0, 22.0), crate::retro::Sign::Minimize),
+        };
+        crate::retro::caption_button(r, theme, slot, sign, state);
+        return true;
+    }
+    if theme.caption_buttons == CaptionStyle::Tiles {
+        let (w, h): (f32, f32) = if sign == Sign::Close { (25.0, 21.0) } else { (21.0, 21.0) };
+        let (w, h) = (w.min(b.w - 2.0), h.min(b.h - 4.0));
+        let face = Rect::new(r.snap(b.x + (b.w - w) / 2.0), r.snap(b.y + (b.h - h) / 2.0), w, h);
+        let glass = if sign == Sign::Close { theme.marble_close } else { theme.marble };
+        let glass = if down {
+            glass.darker(0.15)
+        } else if hot {
+            glass.lighter(0.22)
+        } else if active {
+            glass
+        } else {
+            glass.map(|c| c.mix(c.grey(), 0.4))
+        };
+        r.fill_paint(face, 3.0, &glass);
+        let shine = Rect::new(face.x + 1.0, face.y + 1.0, face.w - 2.0, (face.h * 0.45).round());
+        r.fill_paint(shine, 2.5, &Paint::even(&[Color::rgba(255, 255, 255, 0.55), Color::rgba(255, 255, 255, 0.12)]));
+        r.stroke_round_rect(face.inset(0.5, 0.5), 2.5, 1.0, Color::rgba(255, 255, 255, 0.9));
+        let ink = Color::hex(0xffffff);
+        let c = Point::new(face.x + face.w / 2.0, face.y + face.h / 2.0);
+        match sign {
+            Sign::Close => cross(r, c, 4.0, 2.0, ink),
+            Sign::Maximize => {
+                let g = Rect::new(c.x - 5.0, c.y - 5.0, 10.0, 10.0);
+                r.stroke_rect(g.inset(0.5, 0.5), 1.0, ink);
+                r.fill_rect(Rect::new(g.x, g.y, g.w, 3.0), ink);
+            }
+            Sign::Minimize => r.fill_rect(Rect::new(c.x - 5.0, c.y + 2.0, 7.0, 3.0), ink),
+        }
+        return true;
+    }
+    if theme.bevels {
+        let face = Rect::new(b.x + (b.w - 16.0) / 2.0, b.y + (b.h - 14.0) / 2.0, 16.0, 14.0);
+        let face = if sign == Sign::Minimize { Rect::new(face.x + 2.0, face.y, face.w, face.h) } else { face };
+        r.fill_paint(face, 0.0, &theme.chip_paint);
+        crate::pathbar::bevel(r, theme, face, !down, theme.chip);
+        let glyph = if active { theme.button_text } else { theme.button_text.with_alpha(0.6) };
+        let d = if down { 1.0 } else { 0.0 };
+        let c = Point::new(r.snap(face.x + face.w / 2.0) + d, r.snap(face.y + face.h / 2.0) + d);
+        match sign {
+            Sign::Close => cross(r, c, 3.0, 1.5, glyph),
+            Sign::Maximize => {
+                let g = Rect::new(c.x - 4.0, c.y - 4.0, 8.0, 7.0);
+                r.stroke_rect(g, 1.0, glyph);
+                r.fill_rect(Rect::new(g.x, g.y, g.w, 2.0), glyph);
+            }
+            Sign::Minimize => r.fill_rect(Rect::new(c.x - 3.0, c.y + 2.0, 6.0, 2.0), glyph),
+        }
+        return true;
+    }
+    false
+}
+
+/// An "×" centred on `c`.
+fn cross(r: &mut Renderer, c: Point, half: f32, width: f32, color: Color) {
+    r.line(Point::new(c.x - half, c.y - half), Point::new(c.x + half, c.y + half), width, color);
+    r.line(Point::new(c.x + half, c.y - half), Point::new(c.x - half, c.y + half), width, color);
+}
+
 // ---------------------------------------------------------------- a window's own title bar
 
 /// The band of a window's own title bar `bar`: the skin's title bar paint - and where the skin
-/// has a shine along the top of its bars, that thin light line and an edge along the bottom.
-pub fn title_bar(r: &mut Renderer, theme: &Theme, bar: Rect) {
-    r.fill_paint(bar, 0.0, &theme.titlebar_paint);
+/// has a shine along the top of its bars, that thin light line and an edge along the bottom. With
+/// an era, as that Windows drew it (`active`: whether the window is the active one).
+pub fn title_bar(r: &mut Renderer, theme: &Theme, bar: Rect, active: bool) {
+    if theme.era.old() {
+        crate::retro::title_band(r, theme, bar, active);
+        return;
+    }
+    if theme.title_across {
+        r.fill_paint_across(bar, &theme.titlebar_paint);
+    } else {
+        r.fill_paint(bar, 0.0, &theme.titlebar_paint);
+    }
+    if theme.title_gloss.a > 0.0 {
+        let top = Rect::new(bar.x, bar.y, bar.w, (bar.h * 0.48).round());
+        r.fill_paint(top, 0.0, &Paint::even(&[theme.title_gloss, theme.title_gloss.with_alpha(theme.title_gloss.a * 0.45)]));
+    }
     if theme.highlight.a > 0.0 {
         r.fill_rect(Rect::new(bar.x, bar.y, bar.w, 1.0), theme.highlight);
         r.fill_rect(Rect::new(bar.x, bar.bottom() - 1.0, bar.w, 1.0), theme.toolbar_line);
@@ -870,6 +1368,9 @@ pub fn logo(r: &mut Renderer, theme: &Theme, rect: Rect) -> f32 {
 /// of the same spot: lighter under the mouse with a small "×" on it, darker while pressed, grey
 /// while the window isn't the active one.
 pub fn close_button(r: &mut Renderer, theme: &Theme, rect: Rect, hover: bool, pressed: bool, active: bool) {
+    if caption_face(r, theme, rect, Sign::Close, hover, pressed, active) {
+        return;
+    }
     if theme.caption_buttons == CaptionStyle::Marbles {
         let c = Point::new(r.snap(rect.x + rect.w / 2.0), r.snap(rect.y + rect.h / 2.0));
         let paint = match (hover, pressed, active) {

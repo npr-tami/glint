@@ -52,6 +52,8 @@ pub struct Side {
     down_on_pane: bool,
     /// What the pane showed at the last layout (to tell the panels when they're hidden).
     showing: Showing,
+    /// How wide the gap is (the skin's, `Theme::gap`).
+    gap: f32,
 }
 
 impl Default for Side {
@@ -62,7 +64,16 @@ impl Default for Side {
 
 impl Side {
     pub fn new() -> Side {
-        Side { rect: Rect::default(), preview_open: false, details: DetailsPanel::new(), preview: PreviewPane::new(), split: None, down_on_pane: false, showing: Showing::Nothing }
+        Side {
+            rect: Rect::default(),
+            preview_open: false,
+            details: DetailsPanel::new(),
+            preview: PreviewPane::new(),
+            split: None,
+            down_on_pane: false,
+            showing: Showing::Nothing,
+            gap: size::GAP,
+        }
     }
 
     pub fn showing(&self, app: &AppState) -> Showing {
@@ -112,11 +123,11 @@ impl Side {
 
     /// The pane itself, right of the gap.
     fn pane(&self) -> Rect {
-        Rect::new(self.rect.x + size::GAP, self.rect.y, (self.rect.w - size::GAP).max(0.0), self.rect.h)
+        Rect::new(self.rect.x + self.gap, self.rect.y, (self.rect.w - self.gap).max(0.0), self.rect.h)
     }
 
     fn on_splitter(&self, p: Point) -> bool {
-        !self.rect.is_empty() && p.x >= self.rect.x && p.x < self.rect.x + size::GAP + GRAB && p.y >= self.rect.y && p.y < self.rect.bottom()
+        !self.rect.is_empty() && p.x >= self.rect.x && p.x < self.rect.x + self.gap + GRAB && p.y >= self.rect.y && p.y < self.rect.bottom()
     }
 
     /// Keys while the preview is open, asked before the file list's (Esc, Left, Right).
@@ -148,6 +159,7 @@ fn pane_width(wanted: f32, min: f32, room: f32) -> f32 {
 impl Component for Side {
     fn layout(&mut self, rect: Rect, _ctx: &Ctx, app: &AppState) {
         self.rect = rect;
+        self.gap = app.theme.gap();
         let pane = self.pane();
         let showing = if rect.is_empty() { Showing::Nothing } else { self.showing(app) };
         if showing != self.showing && self.showing == Showing::Details {
@@ -168,7 +180,7 @@ impl Component for Side {
         }
         // The gap is the window's own colour (the renderer cleared it); while dragging it shows red.
         if self.split.is_some() {
-            r.fill_rect(Rect::new(self.rect.x + size::GAP / 2.0 - 1.0, self.rect.y, 2.0, self.rect.h), theme.accent);
+            r.fill_rect(Rect::new(self.rect.x + self.gap / 2.0 - 1.0, self.rect.y, 2.0, self.rect.h), theme.accent);
         }
         match self.showing {
             Showing::Details => self.details.paint(r, theme, app, ctx),

@@ -16,7 +16,6 @@ use windows::Win32::Foundation::HWND;
 use super::{wake, AppState, Loaded, Tab};
 use crate::fileops::{self, check_name, dotted_extension, items_text, same_path, Job, NameCheck, Outcome};
 use crate::folder::{file_name, join, parent, EntryKind};
-use crate::recycle;
 use crate::ui::MenuAbout;
 
 /// The status-bar note for file commands in This PC.
@@ -123,7 +122,7 @@ impl AppState {
             self.say(THIS_PC_NOTE);
             return false;
         }
-        if recycle::is_bin(&self.tab().path) || recycle::is_bin(&self.tab().folder.path) {
+        if crate::folder::is_place(&self.tab().path) || crate::folder::is_place(&self.tab().folder.path) {
             return false;
         }
         !self.tab().waiting_long()
@@ -182,14 +181,24 @@ impl AppState {
         if paths.is_empty() {
             return;
         }
-        let what = items_text(&paths);
         let after = AfterJob { select_next: self.next_after_selection(), ..AfterJob::new(self.tab().id) };
-        let job = Job::Delete { paths, recycle: !permanent };
-        let ask = self.settings.ask_before_deleting(permanent);
-        if !ask {
+        self.delete_asking(paths, permanent, after);
+    }
+
+    /// Deletes `paths` (to the Recycle Bin, or for good with `permanent`), asking first as the "Ask
+    /// before deleting" setting says. On a drive without a Recycle Bin (a USB stick, a network
+    /// drive) a delete is for good either way, so it's asked as one.
+    pub(super) fn delete_asking(&mut self, paths: Vec<String>, permanent: bool, after: AfterJob) {
+        let what = items_text(&paths);
+        let no_bin = !permanent && paths.iter().any(|p| !fileops::has_recycle_bin(p));
+        // (Some on this PC's drive, some not: the ones that can still go to the Recycle Bin.)
+        let recycle = !permanent && !paths.iter().all(|p| !fileops::has_recycle_bin(p));
+        let job = Job::Delete { paths, recycle };
+        if !self.settings.ask_before_deleting(permanent || no_bin) {
             self.start_job(job, after);
-        } else if permanent {
-            self.ask(format!("Delete {what} permanently?"), "This can't be undone.".into(), "DELETE", job, after);
+        } else if permanent || no_bin {
+            let why = if no_bin { "This drive has no Recycle Bin, so it can't be undone." } else { "This can't be undone." };
+            self.ask(format!("Delete {what} permanently?"), why.into(), "DELETE", job, after);
         } else {
             self.ask(format!("Move {what} to the Recycle Bin?"), String::new(), "DELETE", job, after);
         }

@@ -222,6 +222,9 @@ pub enum Command {
     Navigate(String),
     Back,
     Forward,
+    /// Back or Forward that many places at once (XP's lists beside its Back and Forward).
+    BackBy(usize),
+    ForwardBy(usize),
     Up,
     Refresh,
     /// Open a new tab (Ctrl+T, "+") where the "New tabs open" setting says: the current folder,
@@ -282,6 +285,9 @@ pub enum Command {
     NewTextFile,
     /// Pin this folder to the sidebar, or unpin it if it's pinned (Ctrl+D, "Pin to sidebar").
     TogglePin(String),
+    /// Add the selected items to Home's Favorites, or take them out when they all are in
+    /// ("Add to Favorites" / "Remove from Favorites").
+    ToggleFavorites,
     /// Sort by this column; asking for the column that is already sorted reverses it.
     SortBy(SortKey),
     /// Sort by this column in this direction.

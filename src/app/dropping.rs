@@ -6,7 +6,7 @@
 use super::files::AfterJob;
 use super::{wake, AppState, Loaded};
 use crate::dragdrop::{Action, Dest, Plan, Signal};
-use crate::fileops::{self, is_full_item_path, items_text, Job};
+use crate::fileops::{self, is_full_item_path, Job};
 
 impl AppState {
     /// Carries out a drop the window decided on. Returns true when a file job was started; its end
@@ -56,16 +56,7 @@ impl AppState {
         if paths.is_empty() {
             return;
         }
-        let what = items_text(&paths);
-        let after = AfterJob::new(self.tab().id);
-        let job = Job::Delete { paths, recycle: !permanent };
-        if !self.settings.ask_before_deleting(permanent) {
-            self.start_job(job, after);
-        } else if permanent {
-            self.ask(format!("Delete {what} permanently?"), "This can't be undone.".into(), "DELETE", job, after);
-        } else {
-            self.ask(format!("Move {what} to the Recycle Bin?"), String::new(), "DELETE", job, after);
-        }
+        self.delete_asking(paths, permanent, AfterJob::new(self.tab().id));
     }
 
     /// Folders dropped on the sidebar's "Pinned" group are pinned there (files are left out; a

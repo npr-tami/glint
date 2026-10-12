@@ -39,10 +39,13 @@
 
 #![windows_subsystem = "windows"]
 
+mod anim;
 mod app;
 mod complete;
 mod ask;
 mod details;
+mod eraicons;
+mod oldmenu;
 mod dragdrop;
 mod fileops;
 mod folder;
@@ -50,6 +53,7 @@ mod frame;
 mod icons;
 mod life;
 mod kit;
+mod home;
 mod list;
 mod log;
 // The chrome logo in the title bars (its pictures are baked in from res/logo).
@@ -59,7 +63,12 @@ mod pathbar;
 mod peek;
 mod popup;
 mod preview;
+mod recent;
 mod recycle;
+mod retro;
+mod retrotool;
+mod retrolist;
+mod retroctl;
 mod registry;
 mod render;
 mod search;
@@ -84,6 +93,7 @@ mod ui;
 mod update;
 mod updatewin;
 // Where the file list puts its items in each view (details, list, icons, tree).
+mod video;
 mod views;
 mod watch;
 mod window;
@@ -191,7 +201,7 @@ fn main() {
     let (tabs, active) = match &target {
         // An extra window (Ctrl+N) opens just its folder.
         Some(t) if !main => (vec![settings::SavedTab { path: t.folder.clone(), sort_column: loaded.sort_column, sort_descending: loaded.sort_descending, view: None }], 0),
-        _ => settings::initial_tabs(same_tabs.as_ref().unwrap_or(&loaded), target.as_ref().map(|t| t.folder.as_str()), &shell::home()),
+        _ => settings::initial_tabs(same_tabs.as_ref().unwrap_or(&loaded), target.as_ref().map(|t| t.folder.as_str()), &loaded.home_place()),
     };
     log::line(&format!(
         "start: {:?} (tab {} of {}); settings {}; {}",

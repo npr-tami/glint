@@ -32,7 +32,7 @@ pub(super) fn open_sort(hwnd: HWND, ptr: *mut Window) {
             let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(s.hwnd()), WM_CLOSE, WPARAM(0), LPARAM(0));
         }
         BUSY.with(|b| b.set(true));
-        let made = sortwin::create(hwnd, &(*ptr).app);
+        let made = sortwin::create(hwnd, &mut (*ptr).app);
         BUSY.with(|b| b.set(false));
         let Some(win) = made else {
             BUSY.with(|b| b.set(true));
@@ -55,6 +55,18 @@ pub(super) fn open_sort(hwnd: HWND, ptr: *mut Window) {
 pub(super) fn run_sort_job(hwnd: HWND, ptr: *mut Window, job: sortwin::Job) {
     // SAFETY: as above, a short borrow to read where the editor is.
     let Some((swin, scale)) = (unsafe { (*ptr).sort_win.as_ref().map(|s| (s.hwnd(), s.scale())) }) else { return };
+    if matches!(job, sortwin::Job::Reopen) {
+        // DETACH / DOCK: the editor is made again with its new frame (its state goes with the old
+        // window, after using what was typed; the settings say where the new one goes).
+        // SAFETY: our own window, with no borrow of the state held.
+        unsafe {
+            let _ = DestroyWindow(swin);
+        }
+        if still_alive(hwnd, ptr) {
+            open_sort(hwnd, ptr);
+        }
+        return;
+    }
     let done = sortwin::run_job(swin, scale, job, show_menu);
     if done != sortwin::JobDone::Nothing && still_alive(hwnd, ptr) {
         BUSY.with(|b| b.set(true));

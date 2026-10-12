@@ -48,9 +48,24 @@ pub struct Crumb {
 }
 
 /// What a layout of the steps was made for: the steps (name, path), where the bar sits, how far the
-/// folder-you're-in box leans, the font and whether the folder you're in is bold (the last three
-/// are the skin's).
-type LaidOut = (Vec<(String, String)>, Rect, f32, u32, bool);
+/// folder-you're-in box leans, the font, whether the folder you're in is bold and how the steps
+/// look (the last four are the skin's).
+type LaidOut = (Vec<(String, String)>, Rect, f32, u32, bool, Crumbs);
+
+/// How the steps look.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Crumbs {
+    /// Glint's own: muted steps with chevrons between, the folder you're in in a box.
+    #[default]
+    Modern,
+    /// 2000 and XP's Address box: the path as plain text ("C:\Users\Me"), each folder in it still
+    /// a step to click (underlined under the mouse), the place's icon before it, a drop arrow
+    /// after it.
+    Plain,
+    /// 7's breadcrumbs: the place's icon, then the steps as words with solid black arrows between,
+    /// a box only round the one under the mouse.
+    Seven,
+}
 
 /// What is under a point of the path bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,11 +90,32 @@ pub struct PathBar {
     laid_out: Option<LaidOut>,
     /// Something dragged would be dropped into this step's folder (toolbar.rs): a red line marks it.
     pub drop_path: Option<String>,
+    style: Crumbs,
 }
 
 impl PathBar {
     pub fn set_rect(&mut self, rect: Rect) {
         self.rect = rect;
+    }
+
+    pub fn set_style(&mut self, style: Crumbs) {
+        self.style = style;
+    }
+
+    /// Room kept before the steps (for the place's icon) and after them (the drop arrow and some
+    /// room to click to type).
+    fn margins(&self) -> (f32, f32) {
+        match self.style {
+            Crumbs::Modern => (4.0, EDIT_ROOM),
+            Crumbs::Plain => (24.0, 18.0 + EDIT_ROOM),
+            Crumbs::Seven => (37.0, 17.0 + EDIT_ROOM),
+        }
+    }
+
+    /// Where the place's icon goes (Plain and Seven).
+    pub fn icon_rect(&self) -> Rect {
+        let x = if self.style == Crumbs::Seven { 4.0 } else { 5.0 };
+        Rect::new(self.rect.x + x, (self.rect.y + (self.rect.h - 16.0) / 2.0).round(), 16.0, 16.0)
     }
 
     /// The steps hidden behind "…", nearest first (for its popup): (name, path).
@@ -110,23 +146,44 @@ impl PathBar {
     /// When they don't fit, the earliest go behind "…" (the folder you're in always stays); when
     /// even that one doesn't fit, its name is shortened.
     fn layout(&mut self, r: &mut Renderer, app: &AppState) {
-        let steps = app.path_steps(&app.tab().path);
-        let lean = app.theme.path_lean();
+        let mut steps = app.path_steps(&app.tab().path);
+        let style_now = self.style;
+        if style_now == Crumbs::Plain {
+            // The path as Windows wrote it: no "This PC" in front, a drive as its letter ("C:").
+            if steps.len() > 1 && steps[0].1.is_empty() {
+                steps.remove(0);
+            }
+            for (name, path) in &mut steps {
+                let root = path.trim_end_matches('\\');
+                if root.len() == 2 && root.ends_with(':') {
+                    *name = root.to_string();
+                }
+            }
+        }
+        let modern = style_now == Crumbs::Modern;
+        let lean = if modern { app.theme.path_lean() } else { 0.0 };
         let font = r.font_generation();
-        let bold = app.theme.buttons == ButtonStyle::Liquid;
-        if let Some((s, at, l, f, b)) = &self.laid_out {
-            if *s == steps && *at == self.rect && *l == lean && *f == font && *b == bold {
+        let bold = app.theme.buttons == ButtonStyle::Liquid && modern;
+        if let Some((s, at, l, f, b, st)) = &self.laid_out {
+            if *s == steps && *at == self.rect && *l == lean && *f == font && *b == bold && *st == style_now {
                 return;
             }
         }
+        let (pad, sep_w) = match style_now {
+            Crumbs::Modern => (PAD, SEP_W),
+            Crumbs::Plain => (0.0, r.measure("\\", &TextStyle::new(Color::hex(0))).ceil() + 1.0),
+            Crumbs::Seven => (6.0, 15.0),
+        };
         self.crumbs.clear();
         self.hidden.clear();
 
         let style = TextStyle::new(Color::hex(0));
-        let box_h = (self.rect.h - 2.0 * BOX_INSET).max(size::FONT + 4.0);
+        let inset = if style_now == Crumbs::Seven { 2.0 } else { BOX_INSET };
+        let box_h = (self.rect.h - 2.0 * inset).max(size::FONT + 4.0);
         let top = self.rect.y + (self.rect.h - box_h) / 2.0;
-        let left = self.rect.x + 4.0;
-        let room = self.rect.right() - EDIT_ROOM - left;
+        let (lead, trail) = self.margins();
+        let left = self.rect.x + lead;
+        let room = self.rect.right() - trail - left;
 
         let last = steps.len().saturating_sub(1);
         let mut widths: Vec<f32> = steps
@@ -134,13 +191,14 @@ impl PathBar {
             .enumerate()
             .map(|(i, (name, _))| {
                 let style = if i == last && bold { style.bold() } else { style };
-                r.measure(name, &style).min(MAX_NAME).ceil() + 2.0 * PAD + if i == last { 2.0 * lean } else { 0.0 }
+                r.measure(name, &style).min(MAX_NAME).ceil() + 2.0 * pad + if i == last { 2.0 * lean } else { 0.0 }
             })
             .collect();
+        let more_w = if modern { MORE_W } else { r.measure("...", &style).ceil() + 2.0 * pad + 2.0 };
         let total = |from: usize, widths: &[f32]| -> f32 {
-            let mut t = if from > 0 { MORE_W + SEP_W } else { 0.0 };
+            let mut t = if from > 0 { more_w + sep_w } else { 0.0 };
             for (i, w) in widths.iter().enumerate().skip(from) {
-                t += w + if i < last { SEP_W } else { 0.0 };
+                t += w + if i < last { sep_w } else { 0.0 };
             }
             t
         };
@@ -149,27 +207,40 @@ impl PathBar {
             first += 1;
         }
         if !widths.is_empty() && total(first, &widths) > room {
-            let rest = room - if first > 0 { MORE_W + SEP_W } else { 0.0 };
-            widths[last] = rest.max(2.0 * PAD + 2.0 * lean + 20.0).min(widths[last]);
+            let rest = room - if first > 0 { more_w + sep_w } else { 0.0 };
+            widths[last] = rest.max(2.0 * pad + 2.0 * lean + 20.0).min(widths[last]);
         }
 
         let mut x = left;
         if first > 0 {
             self.hidden.extend(steps[..first].iter().cloned());
-            self.crumbs.push(Crumb { path: String::new(), name: "\u{2026}".into(), rect: Rect::new(x, top, MORE_W, box_h), current: false, more: true });
-            x += MORE_W + SEP_W;
+            self.crumbs.push(Crumb { path: String::new(), name: "\u{2026}".into(), rect: Rect::new(x, top, more_w, box_h), current: false, more: true });
+            x += more_w + sep_w;
         }
         for (i, (name, path)) in steps.iter().enumerate().skip(first) {
             self.crumbs.push(Crumb { path: path.clone(), name: name.clone(), rect: Rect::new(x, top, widths[i], box_h), current: i == last, more: false });
-            x += widths[i] + if i < last { SEP_W } else { 0.0 };
+            x += widths[i] + if i < last { sep_w } else { 0.0 };
         }
         self.end = x;
-        self.laid_out = Some((steps, self.rect, lean, font, bold));
+        self.laid_out = Some((steps, self.rect, lean, font, bold, style_now));
     }
 
     /// Draws the box and (unless `editing`, when a text box sits on top) the steps.
     /// `mouse` is where the mouse is, if it is over the bar.
     pub fn paint(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState, editing: bool, mouse: Option<Point>) {
+        if self.style != Crumbs::Modern {
+            // (The toolbar drew the era's box.)
+            crate::retrotool::place_icon(r, theme, &app.tab().path, self.icon_rect());
+            if self.style == Crumbs::Seven {
+                let at = self.icon_rect();
+                crate::retrotool::triangle_right(r, Point::new(at.right() + 9.0, at.y + at.h / 2.0), 7.0, Color::hex(0));
+            }
+            if editing {
+                return;
+            }
+            self.layout(r, app);
+            return self.paint_era(r, theme, mouse);
+        }
         fill_field(r, theme, self.rect);
         if editing {
             return;
@@ -231,6 +302,56 @@ impl PathBar {
     }
 }
 
+impl PathBar {
+    /// The steps as 2000 / XP's plain path or 7's breadcrumbs.
+    fn paint_era(&mut self, r: &mut Renderer, theme: &Theme, mouse: Option<Point>) {
+        let hover = match mouse.map(|p| self.hit(p)) {
+            Some(PathHit::Step(i)) => Some(i),
+            _ => None,
+        };
+        let seven = self.style == Crumbs::Seven;
+        // The colour a step under the mouse takes (Windows' "hot" link colour).
+        let hot_color = match theme.era {
+            crate::theme::Era::Xp => Color::hex(0x000080),
+            _ => theme.accent,
+        };
+        let style = TextStyle::new(theme.text);
+        r.push_clip(self.rect);
+        let count = self.crumbs.len();
+        for (i, c) in self.crumbs.iter().enumerate() {
+            let dropping = !c.more && self.drop_path.as_deref() == Some(c.path.as_str());
+            let hot = hover == Some(i) || dropping;
+            let name = if c.more { "..." } else { c.name.as_str() };
+            if seven {
+                if hot {
+                    // The step and the arrow after it light up as one split button.
+                    let w = c.rect.w + if i + 1 < count { 15.0 } else { 0.0 };
+                    crate::retrotool::seven_crumb_box(r, Rect::new(c.rect.x, c.rect.y, w, c.rect.h), false);
+                    if i + 1 < count {
+                        r.fill_rect(Rect::new(c.rect.right(), c.rect.y + 1.0, 1.0, c.rect.h - 2.0), Color::hex(0x3c7fb1));
+                    }
+                }
+                r.text(name, Rect::new(c.rect.x + 6.0, c.rect.y, (c.rect.w - 12.0).max(0.0), c.rect.h), &style);
+                if i + 1 < count {
+                    crate::retrotool::triangle_right(r, Point::new(c.rect.right() + 8.0, c.rect.y + c.rect.h / 2.0), 7.0, Color::hex(0));
+                }
+            } else {
+                let color = if hot { hot_color } else { theme.text };
+                r.text(name, c.rect, &style.color(color));
+                if hot {
+                    let w = r.measure(name, &style).min(c.rect.w);
+                    let base = (c.rect.y + c.rect.h / 2.0 + size::FONT * 0.55).round();
+                    r.fill_rect(Rect::new(c.rect.x, base, w, 1.0), color);
+                }
+                if i + 1 < count {
+                    r.text("\\", Rect::new(c.rect.right(), c.rect.y, 12.0, c.rect.h), &style);
+                }
+            }
+        }
+        r.pop_clip();
+    }
+}
+
 /// The four corners of `rect` slanted like "/": the top edge shifted `lean` to the right of the
 /// bottom edge (both side edges lean the same way - a parallelogram).
 pub fn slanted_points(rect: Rect, lean: f32) -> [Point; 4] {
@@ -274,6 +395,29 @@ pub fn fill_box_paint(r: &mut Renderer, theme: &Theme, rect: Rect, lean: f32, pa
     }
 }
 
+/// Windows 2000's 3D edge just inside `rect` (`bevels: true`), two DIPs deep: light on the top and
+/// left and dark on the bottom and right when `raised`, the other way round when sunken. `face` is
+/// the surface it sits on, which the shades are made from.
+pub fn bevel(r: &mut Renderer, theme: &Theme, rect: Rect, raised: bool, face: Color) {
+    if rect.w < 4.0 || rect.h < 4.0 {
+        return;
+    }
+    let kind = if raised { crate::retro::Edge::RaisedWindow } else { crate::retro::Edge::Sunken };
+    crate::retro::edge(r, theme, rect, kind, face);
+}
+
+/// A selected row (or one under the mouse, `hover`) in `paint`: with the skin's `selection-border`
+/// it has round corners and that edge (fainter under the mouse), else it is a plain band.
+pub fn fill_row(r: &mut Renderer, theme: &Theme, rect: Rect, paint: &Paint, hover: bool) {
+    if theme.selection_border.a <= 0.0 {
+        return r.fill_paint(rect, 0.0, paint);
+    }
+    let rect = rect.inset(1.0, 0.5);
+    r.fill_paint(rect, 3.0, paint);
+    let edge = if hover { theme.selection_border.with_alpha(theme.selection_border.a * 0.55) } else { theme.selection_border };
+    r.stroke_round_rect(rect.inset(0.5, 0.5), 2.5, 1.0, edge);
+}
+
 /// A text field of the main window (the path, the filter box): the skin's `input` paint, round
 /// corners in a rounded skin, and its `input-border` edge if it has one.
 pub fn fill_field(r: &mut Renderer, theme: &Theme, rect: Rect) {
@@ -283,6 +427,9 @@ pub fn fill_field(r: &mut Renderer, theme: &Theme, rect: Rect) {
         // A faint shade along the inside of the top edge: the field sits below the surface.
         r.fill_rect(Rect::new(rect.x + radius * 0.7, rect.y + 1.0, (rect.w - 1.4 * radius).max(0.0), 1.0), Color::rgba(0, 0, 0, 0.07));
         r.stroke_round_rect(rect.inset(0.5, 0.5), (radius - 0.5).max(0.0), 1.0, theme.input_border);
+    }
+    if theme.bevels {
+        bevel(r, theme, rect, false, theme.toolbar);
     }
 }
 

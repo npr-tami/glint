@@ -19,11 +19,12 @@ use windows::Win32::Graphics::Direct2D::Common::{
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1PathGeometry, ID2D1SolidColorBrush,
-    ID2D1StrokeStyle, D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_CAP_STYLE_ROUND,
+    ID2D1StrokeStyle, D2D1_ANTIALIAS_MODE_ALIASED, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_CAP_STYLE_ROUND,
     D2D1_DASH_STYLE_SOLID, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_FEATURE_LEVEL_DEFAULT, D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_LINE_JOIN_ROUND, D2D1_PRESENT_OPTIONS_NONE,
     D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE,
-    D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES, D2D1_BITMAP_PROPERTIES,
+    D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES, D2D1_BITMAP_PROPERTIES, D2D1_TEXT_ANTIALIAS_MODE_ALIASED, D2D1_TEXT_ANTIALIAS_MODE_DEFAULT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+    D2D1_OPACITY_MASK_CONTENT_GRAPHICS,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteFontCollection, IDWriteTextFormat, IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED,
@@ -35,6 +36,7 @@ use windows::Win32::Graphics::DirectWrite::{
 // Names of several lines under the icon views' pictures (`text_wrapped`).
 use windows::Win32::Graphics::DirectWrite::{DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_WORD_WRAPPING_EMERGENCY_BREAK, DWRITE_WORD_WRAPPING_WRAP};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows_numerics::Vector2;
 
@@ -86,6 +88,8 @@ struct LayoutKey {
     h: i32,
     /// Broken into lines that fit the width (`text_wrapped`).
     wrap: bool,
+    /// In the windows' title font (`TextStyle::title_font`).
+    title: bool,
 }
 
 /// Horizontal text alignment.
@@ -106,11 +110,18 @@ pub struct TextStyle {
     pub weight: u16,
     pub align: Align,
     pub color: Color,
+    /// In the font of the windows' titles (`Renderer::set_title_font`) rather than the skin's.
+    pub title: bool,
 }
 
 impl TextStyle {
     pub fn new(color: Color) -> TextStyle {
-        TextStyle { size: size::FONT, weight: 400, align: Align::Left, color }
+        TextStyle { size: size::FONT, weight: 400, align: Align::Left, color, title: false }
+    }
+    /// In the skin's font for window titles (the skin's font when it has none).
+    pub fn title_font(mut self) -> TextStyle {
+        self.title = true;
+        self
     }
     pub fn size(mut self, size: f32) -> TextStyle {
         self.size = size;
@@ -213,18 +224,23 @@ pub struct Renderer {
     /// Round-capped lines for glyphs (arrows, chevrons, the caption-button signs).
     round: ID2D1StrokeStyle,
     family: HSTRING,
-    formats: HashMap<(u32, u16, Align), IDWriteTextFormat>,
+    /// The font of the windows' titles, when the skin has one of its own (`set_title_font`).
+    title_family: Option<HSTRING>,
+    formats: HashMap<(u32, u16, Align, bool), IDWriteTextFormat>,
     /// Texts laid out once and drawn every frame after that: shaping and line-breaking a text is the
     /// expensive part of drawing it (see `text`). The current generation and the one before.
     layouts: HashMap<LayoutKey, IDWriteTextLayout>,
     old_layouts: HashMap<LayoutKey, IDWriteTextLayout>,
-    /// Measured widths, by (text, size, weight).
-    widths: HashMap<(String, u32, u16), f32>,
+    /// Measured widths, by (text, size, weight, title font).
+    widths: HashMap<(String, u32, u16, bool), f32>,
     dpi: f32,
     /// Reused buffer for converting text to UTF-16, so drawing text doesn't allocate.
     wide: Vec<u16>,
     clip_depth: u32,
     in_frame: bool,
+    /// While set (`set_tint`), every colour drawn goes this far toward this colour, and a
+    /// picture gets a veil of it over its shape: 98 / 2000's selected icon.
+    tint: Option<(Color, f32)>,
     /// The skin's text size as a part of the standard one (1.0 = 9 pt): every text is drawn that
     /// much bigger or smaller (`set_font`).
     text_scale: f32,
@@ -234,6 +250,30 @@ pub struct Renderer {
     font_generation: u32,
     /// Monospaced text (the Space preview's text files), see `mono_text`.
     mono: Mono,
+    /// 7's see-through glass at the window's top (`ask_glass`).
+    glass: Glass,
+}
+
+/// How far down the window's top is see-through: as asked for while drawing this frame (DIPs), as
+/// it is now (pixels; 0: not at all), and whether this window can't be (older Windows, Wine).
+#[derive(Default)]
+struct Glass {
+    asked: f32,
+    on: i32,
+    cannot: bool,
+    /// Where Windows keeps its own window buttons (DIPs), which the glass mustn't show.
+    solid: Option<Rect>,
+}
+
+thread_local! {
+    /// Whether text is drawn without smoothing (`set_text_aliased`).
+    static TEXT_ALIASED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Draws every window's words without smoothing from the next frame on (98 / 2000's skins: their
+/// Windows drew crisp, aliased text), or smoothed as usual.
+pub fn set_text_aliased(on: bool) {
+    TEXT_ALIASED.with(|t| t.set(on));
 }
 
 /// The key of a monospaced text's layout: the words, the size and the box (as in `LayoutKey`).
@@ -275,6 +315,7 @@ impl Renderer {
             target: None,
             round,
             family,
+            title_family: None,
             formats: HashMap::new(),
             layouts: HashMap::new(),
             old_layouts: HashMap::new(),
@@ -283,10 +324,12 @@ impl Renderer {
             wide: Vec::with_capacity(256),
             clip_depth: 0,
             in_frame: false,
+            tint: None,
             text_scale: 1.0,
             font_asked: (String::new(), 1.0),
             font_generation: 0,
             mono: Mono::default(),
+            glass: Glass::default(),
         })
     }
 
@@ -314,6 +357,20 @@ impl Renderer {
             self.old_layouts.clear();
             self.widths.clear();
             self.font_generation = self.font_generation.wrapping_add(1);
+        }
+    }
+
+    /// The skin's font for window titles: the first of `families` that is installed, or the
+    /// skin's own font when none is (or `families` is empty).
+    pub fn set_title_font(&mut self, families: &str) {
+        let wanted = families.split(',').map(str::trim).filter(|f| !f.is_empty()).find(|f| font_installed(&self.dwrite, f));
+        let family = wanted.map(HSTRING::from);
+        if family != self.title_family {
+            self.title_family = family;
+            self.formats.retain(|k, _| !k.3);
+            self.layouts.retain(|k, _| !k.title);
+            self.old_layouts.retain(|k, _| !k.title);
+            self.widths.retain(|k, _| !k.3);
         }
     }
 
@@ -353,7 +410,11 @@ impl Renderer {
         unsafe { GetClientRect(self.hwnd, &mut rc)? };
         let props = D2D1_RENDER_TARGET_PROPERTIES {
             r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_IGNORE },
+            // See-through pixels only matter (and only cost) while the glass is on.
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: if self.glass.on > 0 { D2D1_ALPHA_MODE_PREMULTIPLIED } else { D2D1_ALPHA_MODE_IGNORE },
+            },
             dpiX: self.dpi,
             dpiY: self.dpi,
             usage: D2D1_RENDER_TARGET_USAGE_NONE,
@@ -398,6 +459,22 @@ impl Renderer {
         unsafe {
             t.rt.BeginDraw();
             t.rt.SetTransform(&windows_numerics::Matrix3x2::identity());
+            // 98 / 2000 drew their words crisp, without smoothing (`set_text_aliased`). On a
+            // see-through window, plain smoothing: ClearType's coloured edges need a solid
+            // background behind them.
+            let crisp = TEXT_ALIASED.with(std::cell::Cell::get);
+            t.rt.SetTextAntialiasMode(if crisp {
+                D2D1_TEXT_ANTIALIAS_MODE_ALIASED
+            } else if self.glass.on > 0 {
+                D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE
+            } else {
+                D2D1_TEXT_ANTIALIAS_MODE_DEFAULT
+            });
+        }
+        if self.glass.on > 0 {
+            let s = self.scale();
+            self.glass.solid = crate::frame::caption_buttons(self.hwnd)
+                .map(|b| Rect::new(b.left as f32 / s, b.top as f32 / s, (b.right - b.left) as f32 / s, (b.bottom - b.top) as f32 / s));
         }
         // Pictures nobody has any more (thumbs.rs dropped them) let go of their copies.
         self.drop_unused_pictures();
@@ -426,7 +503,10 @@ impl Renderer {
         let Some(t) = &self.target else { return FrameResult::DeviceLost };
         // SAFETY: matches the BeginDraw in `begin`.
         match unsafe { t.rt.EndDraw(None, None) } {
-            Ok(()) => FrameResult::Shown,
+            Ok(()) => {
+                self.settle_glass();
+                FrameResult::Shown
+            }
             Err(e) if e.code() == D2DERR_RECREATE_TARGET => {
                 self.target = None;
                 FrameResult::DeviceLost
@@ -436,6 +516,74 @@ impl Renderer {
                 self.target = None;
                 FrameResult::DeviceLost
             }
+        }
+    }
+
+    /// Asks for the window's top, down to `bottom` (DIPs), to be see-through: 7's glass, with the
+    /// skin's `see-through`. Asked for in every frame it should stay so; from the next frame on it
+    /// is (Windows 11 only, see frame.rs `set_glass`), and `glass_bottom` says how far.
+    pub fn ask_glass(&mut self, bottom: f32) {
+        self.glass.asked = self.glass.asked.max(bottom);
+    }
+
+    /// How far down from the window's top it is see-through now, in DIPs (0: not at all). There,
+    /// whatever is drawn see-through lets what is behind the window show.
+    pub fn glass_bottom(&self) -> f32 {
+        self.glass.on as f32 / self.scale()
+    }
+
+    /// Where the see-through top must be painted solid (Windows' own window buttons are there,
+    /// unseen: see frame.rs `caption_buttons`), if anywhere.
+    pub fn glass_solid(&self) -> Option<Rect> {
+        self.glass.solid.filter(|_| self.glass.on > 0)
+    }
+
+    /// Makes `r` fully see-through, to be painted over (only within `glass_bottom`).
+    pub fn clear_glass(&mut self, r: Rect) {
+        let bottom = self.glass_bottom();
+        if r.y >= bottom {
+            return;
+        }
+        self.push_clip(Rect::new(r.x, r.y, r.w, r.h.min(bottom - r.y)));
+        if let Some(t) = self.target.as_ref().filter(|_| self.in_frame) {
+            // SAFETY: the colour lives across the call; Clear keeps to the clip just pushed.
+            unsafe { t.rt.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 })) };
+        }
+        self.pop_clip();
+    }
+
+    /// After a frame: turns the glass on, off, or to a new height when the frame asked for other
+    /// than what is on, and draws again (a target with see-through pixels is made for it).
+    fn settle_glass(&mut self) {
+        let asked = std::mem::take(&mut self.glass.asked);
+        let want = if self.glass.cannot { 0 } else { (asked * self.scale()).floor() as i32 };
+        if want == self.glass.on {
+            return;
+        }
+        let now = if crate::frame::set_glass(self.hwnd, want) { want } else { 0 };
+        if want > 0 && now == 0 {
+            // This Windows (or this window) can't: drawn solid from now on, without asking again.
+            self.glass.cannot = true;
+        }
+        if now == self.glass.on {
+            return;
+        }
+        if (now > 0) != (self.glass.on > 0) {
+            self.target = None;
+        }
+        self.glass.on = now;
+        // SAFETY: our own window; it draws again with the glass as it now is.
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+    }
+
+    /// Moves everything drawn from now on by (`x`, `y`) DIPs, until the next call or frame (a
+    /// window drawing its parts inside a frame of its own: frame.rs `paint_classic_border`).
+    pub fn set_origin(&mut self, x: f32, y: f32) {
+        if let Some(t) = self.target.as_ref().filter(|_| self.in_frame) {
+            // SAFETY: a plain setter on a live render target.
+            unsafe { t.rt.SetTransform(&windows_numerics::Matrix3x2::translation(x, y)) };
         }
     }
 
@@ -453,8 +601,35 @@ impl Renderer {
     fn paint_with(&self, color: Color) -> Option<&Target> {
         let t = self.target.as_ref().filter(|_| self.in_frame)?;
         // SAFETY: plain setter; `color_f` returns a value that lives across the call.
-        unsafe { t.brush.SetColor(&color_f(color)) };
+        unsafe { t.brush.SetColor(&color_f(self.tinted(color))) };
         Some(t)
+    }
+
+    /// Until `set_tint(None)`, everything drawn goes `amount` of the way toward `color` (its
+    /// opacity kept): 98 / 2000 blend a selected icon half way into the selection's colour.
+    pub fn set_tint(&mut self, tint: Option<(Color, f32)>) {
+        self.tint = tint;
+    }
+
+    /// `c` as drawn now (see `set_tint`).
+    fn tinted(&self, c: Color) -> Color {
+        match self.tint {
+            Some((to, amount)) => c.mix(Color { a: c.a, ..to }, amount),
+            None => c,
+        }
+    }
+
+    /// `g` as drawn now (see `set_tint`).
+    fn tinted_gradient(&self, g: &Gradient) -> Gradient {
+        if self.tint.is_none() {
+            return *g;
+        }
+        let mut stops = [Stop { at: 0.0, color: Color::rgba(0, 0, 0, 0.0) }; MAX_STOPS];
+        let n = g.stops().len();
+        for (d, s) in stops.iter_mut().zip(g.stops()) {
+            *d = Stop { at: s.at, color: self.tinted(s.color) };
+        }
+        Gradient::new(&stops[..n]).unwrap_or(*g)
     }
 
     /// Fills the whole window.
@@ -557,16 +732,20 @@ impl Renderer {
     }
 
     fn format(&mut self, style: &TextStyle) -> Option<IDWriteTextFormat> {
-        let key = ((style.size * 100.0) as u32, style.weight, style.align);
+        let key = ((style.size * 100.0) as u32, style.weight, style.align, style.title);
         if let Some(f) = self.formats.get(&key) {
             return Some(f.clone());
         }
+        let family = match (&self.title_family, style.title) {
+            (Some(t), true) => t.clone(),
+            _ => self.family.clone(),
+        };
         // SAFETY: plain DirectWrite calls; the family string and locale outlive them.
         let format = unsafe {
             let f = self
                 .dwrite
                 .CreateTextFormat(
-                    &self.family,
+                    &family,
                     None::<&IDWriteFontCollection>,
                     DWRITE_FONT_WEIGHT(style.weight as i32),
                     DWRITE_FONT_STYLE_NORMAL,
@@ -633,6 +812,7 @@ impl Renderer {
             w: (w * 4.0).round() as i32,
             h: (h * 4.0).round() as i32,
             wrap,
+            title: style.title,
         };
         if let Some(layout) = self.layouts.get(&key) {
             return Some(layout.clone());
@@ -670,7 +850,7 @@ impl Renderer {
         if text.is_empty() {
             return 0.0;
         }
-        let key = (text.to_string(), (style.size * 100.0) as u32, style.weight);
+        let key = (text.to_string(), (style.size * 100.0) as u32, style.weight, style.title);
         if let Some(&w) = self.widths.get(&key) {
             return w;
         }
@@ -713,6 +893,18 @@ impl Renderer {
         if let Some(bmp) = &t.bitmaps[i] {
             // SAFETY: bitmap and rect live across the call.
             unsafe { t.rt.DrawBitmap(bmp, Some(&rect), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None) };
+            if let Some((to, amount)) = self.tint {
+                // The veil (see `set_tint`): the colour over the icon's own shape. Direct2D draws
+                // an opacity mask only without antialiasing.
+                // SAFETY: plain calls on our own target; the brush, bitmap and rect live across them.
+                unsafe {
+                    let mode = t.rt.GetAntialiasMode();
+                    t.rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+                    t.brush.SetColor(&color_f(to.with_alpha(amount)));
+                    t.rt.FillOpacityMask(bmp, &t.brush, D2D1_OPACITY_MASK_CONTENT_GRAPHICS, Some(&rect), None);
+                    t.rt.SetAntialiasMode(mode);
+                }
+            }
         }
     }
 
@@ -874,8 +1066,27 @@ impl Renderer {
         }
     }
 
+    /// Fills `r` with `paint` running left to right, whatever the shape (a title bar's
+    /// `title-bar-across`).
+    pub fn fill_paint_across(&mut self, r: Rect, paint: &Paint) {
+        let g = match paint {
+            Paint::Flat(c) => return self.fill_rect(r, *c),
+            Paint::Gradient(g) => g,
+        };
+        if r.is_empty() || paint.is_clear() || !self.in_frame {
+            return;
+        }
+        let rect = self.snapped(r);
+        let (a, b) = (Vector2 { X: rect.left, Y: rect.top }, Vector2 { X: rect.right, Y: rect.top });
+        let Some(brush) = self.linear_brush(g, a, b) else { return };
+        let Some(t) = &self.target else { return };
+        // SAFETY: the rectangle lives across the calls; the brush belongs to this target.
+        unsafe { t.rt.FillRectangle(&rect, &brush) };
+    }
+
     /// The linear brush of `g`, made the first time, set to run from `a` to `b`.
     fn linear_brush(&mut self, g: &Gradient, a: Vector2, b: Vector2) -> Option<ID2D1LinearGradientBrush> {
+        let g = &self.tinted_gradient(g);
         let t = self.target.as_mut().filter(|_| self.in_frame)?;
         let kept = gradient_brushes(&t.rt, &mut t.gradients, g)?;
         if kept.linear.is_none() {
@@ -895,6 +1106,7 @@ impl Renderer {
     /// Fills the circle of `radius` round `c` with `g` as a round gradient: its first colour at
     /// `light`, its last `reach` DIPs away (and beyond).
     fn fill_ellipse_radial(&mut self, c: Point, radius: f32, g: &Gradient, light: Point, reach: f32) {
+        let g = &self.tinted_gradient(g);
         let Some(t) = self.target.as_mut().filter(|_| self.in_frame) else { return };
         let Some(kept) = gradient_brushes(&t.rt, &mut t.gradients, g) else { return };
         if kept.radial.is_none() {
@@ -922,6 +1134,110 @@ impl Renderer {
         let ellipse = D2D1_ELLIPSE { point: vec2(Point::new(r.x + r.w / 2.0, r.y + r.h / 2.0)), radiusX: r.w / 2.0, radiusY: r.h / 2.0 };
         // SAFETY: the ellipse lives across the call; the brush belongs to this target.
         unsafe { t.rt.FillEllipse(&ellipse, &brush) };
+    }
+}
+
+impl Renderer {
+    /// Shapes drawn from here on get hard edges (`true`: every pixel all or nothing, as the icons
+    /// of Windows 2000 were) or smooth ones again (`false`, the normal).
+    pub fn set_aliased(&mut self, on: bool) {
+        if let Some(t) = self.target.as_ref().filter(|_| self.in_frame) {
+            let mode = if on { D2D1_ANTIALIAS_MODE_ALIASED } else { D2D1_ANTIALIAS_MODE_PER_PRIMITIVE };
+            // SAFETY: a plain setter on a live render target.
+            unsafe { t.rt.SetAntialiasMode(mode) };
+        }
+    }
+
+    /// A filled ellipse with radii `rx` and `ry` round `c`.
+    pub fn fill_ellipse(&mut self, c: Point, rx: f32, ry: f32, color: Color) {
+        if rx <= 0.0 || ry <= 0.0 || color.a <= 0.0 {
+            return;
+        }
+        let e = D2D1_ELLIPSE { point: vec2(c), radiusX: rx, radiusY: ry };
+        if let Some(t) = self.paint_with(color) {
+            // SAFETY: the ellipse lives across the call; the brush belongs to this target.
+            unsafe { t.rt.FillEllipse(&e, &t.brush) };
+        }
+    }
+
+    /// An ellipse's outline, `width` DIPs thick, centred on its edge.
+    pub fn stroke_ellipse(&mut self, c: Point, rx: f32, ry: f32, width: f32, color: Color) {
+        if rx <= 0.0 || ry <= 0.0 || color.a <= 0.0 {
+            return;
+        }
+        let e = D2D1_ELLIPSE { point: vec2(c), radiusX: rx, radiusY: ry };
+        if let Some(t) = self.paint_with(color) {
+            // SAFETY: the ellipse lives across the call; brush and stroke style are live.
+            unsafe { t.rt.DrawEllipse(&e, &t.brush, width, &self.round) };
+        }
+    }
+
+    /// A filled ellipse in a paint whose gradient runs from `a` to `b`.
+    pub fn fill_ellipse_toward(&mut self, c: Point, rx: f32, ry: f32, paint: &Paint, a: Point, b: Point) {
+        let g = match paint {
+            Paint::Flat(col) => return self.fill_ellipse(c, rx, ry, *col),
+            Paint::Gradient(g) => g,
+        };
+        if rx <= 0.0 || ry <= 0.0 || !self.in_frame {
+            return;
+        }
+        let Some(brush) = self.linear_brush(g, vec2(a), vec2(b)) else { return };
+        let Some(t) = &self.target else { return };
+        let e = D2D1_ELLIPSE { point: vec2(c), radiusX: rx, radiusY: ry };
+        // SAFETY: the ellipse lives across the call; the brush belongs to this target.
+        unsafe { t.rt.FillEllipse(&e, &brush) };
+    }
+
+    /// A filled shape through `points` in a paint whose gradient runs from `a` to `b` (any
+    /// direction: an icon lit from the top left).
+    pub fn fill_polygon_toward(&mut self, points: &[Point], paint: &Paint, a: Point, b: Point) {
+        let g = match paint {
+            Paint::Flat(c) => return self.fill_polygon(points, *c),
+            Paint::Gradient(g) => g,
+        };
+        if points.len() < 3 || paint.is_clear() || !self.in_frame {
+            return;
+        }
+        let Some(geo) = self.path(points, true) else { return };
+        let Some(brush) = self.linear_brush(g, vec2(a), vec2(b)) else { return };
+        let Some(t) = &self.target else { return };
+        // SAFETY: the geometry and brush are live; no opacity brush.
+        unsafe { t.rt.FillGeometry(&geo, &brush, None) };
+    }
+
+    /// A rectangle (corners `radius` round) in a paint whose gradient runs from `a` to `b`.
+    pub fn fill_rect_toward(&mut self, r: Rect, radius: f32, paint: &Paint, a: Point, b: Point) {
+        let g = match paint {
+            Paint::Flat(c) if radius > 0.0 => return self.fill_round_rect(r, radius, *c),
+            Paint::Flat(c) => return self.fill_rect(r, *c),
+            Paint::Gradient(g) => g,
+        };
+        if r.is_empty() || paint.is_clear() || !self.in_frame {
+            return;
+        }
+        let rect = self.snapped(r);
+        let Some(brush) = self.linear_brush(g, vec2(a), vec2(b)) else { return };
+        let Some(t) = &self.target else { return };
+        // SAFETY: the rectangle lives across the calls; the brush belongs to this target.
+        unsafe {
+            if radius > 0.0 {
+                t.rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect, radiusX: radius, radiusY: radius }, &brush);
+            } else {
+                t.rt.FillRectangle(&rect, &brush);
+            }
+        }
+    }
+
+    /// The outline of the closed shape through `points`, `width` DIPs thick (joins round).
+    pub fn stroke_polygon(&mut self, points: &[Point], width: f32, color: Color) {
+        if points.len() < 2 || color.a <= 0.0 {
+            return;
+        }
+        let Some(geo) = self.path(points, true) else { return };
+        if let Some(t) = self.paint_with(color) {
+            // SAFETY: the geometry, brush and stroke style are live.
+            unsafe { t.rt.DrawGeometry(&geo, &t.brush, width, &self.round) };
+        }
     }
 }
 

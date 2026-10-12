@@ -36,8 +36,11 @@
 //! **Where skins are.** The built-in ones (AMD Radeon, NVIDIA and their "(Light)" versions, Chrome
 //! and Gunmetal) are compiled into glint.exe from `skins/*.glint`, in the same format. A person's
 //! own skins are `*.glint` files in the `skins` folder of the config folder (settings.rs), made by
-//! the customiser (skinwin.rs) or by hand. Ids in settings.json: `amd-radeon`, `amd-radeon-light`,
-//! `nvidia`, `nvidia-light`, `chrome`, `gunmetal`, and `file:<file name without .glint>`.
+//! the customiser (skinwin.rs), imported with its IMPORT… or put there by hand. Newer looks (the
+//! Windows 2000, 98, XP and 7 skins) are such files, shared on their own rather than built in; the
+//! drawing they switch on (`era`, `icons` and the rest) is Glint's. Ids in settings.json:
+//! `amd-radeon`, `amd-radeon-light`, `nvidia`, `nvidia-light`, `chrome`, `gunmetal`, and
+//! `file:<file name without .glint>`.
 //!
 //! **Light and dark.** A skin's light version is the skin with the same name and " (Light)" after
 //! it (and `dark: false`); the light/dark choice picks between the two (`Library::twin`). Two skins
@@ -75,7 +78,7 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 use crate::log;
 use crate::settings;
 use crate::shell;
-use crate::theme::{size, ButtonStyle, CaptionStyle, Color, Paint, Shape, SidebarStyle, Stop, TabStyle, Theme, MAX_STOPS};
+use crate::theme::{size, ButtonStyle, CaptionStyle, Color, Era, IconSet, Paint, Shape, SidebarStyle, Stop, TabStyle, Theme, MAX_STOPS};
 
 /// The skin Glint starts with, and its light version.
 pub const DEFAULT: &str = "amd-radeon";
@@ -170,6 +173,24 @@ pub const COLOURS: &[(&str, &str)] = &[
     ("scrollbar-track", "Behind the scroll bars"),
     ("scrollbar-border", "Edge of the scroll bars"),
     ("scrollbar-grip-lines", "Lines on the scroll bars (scrollbar-grip)"),
+    ("back-button", "Back and forward as round glass buttons"),
+    ("tool-border", "Edge of toolbar buttons under the mouse"),
+    ("selection-border", "Edge of selected rows"),
+    ("title-gloss", "Shine over the top half of the title bar"),
+    ("title-text", "Window titles (Settings, Sort order)"),
+    ("title-text-inactive", "Window titles while the window isn't active"),
+    ("title-text-shadow", "Shadow under window titles"),
+    ("title-bar-inactive", "The title bar while the window isn't active"),
+    ("bevel-highlight", "3D edges: the lit outer line (bevels)"),
+    ("bevel-light", "3D edges: the lit inner line"),
+    ("bevel-shadow", "3D edges: the shaded inner line"),
+    ("bevel-dark", "3D edges: the shaded outer line"),
+    ("menu", "Menus drawn in the skin (none: Windows' own)"),
+    ("menu-text", "Words in menus"),
+    ("menu-selection", "The menu item under the mouse"),
+    ("menu-selection-text", "Its words"),
+    ("menu-border", "Edge of menus"),
+    ("sidebar-text", "Names of the places in the sidebar"),
 ];
 
 /// Colours that came later than AMD Radeon and NVIDIA: each follows an older colour when a skin
@@ -200,6 +221,24 @@ pub const DERIVED: &[(&str, &str)] = &[
     ("scrollbar-track", "none"),
     ("scrollbar-border", "none"),
     ("scrollbar-grip-lines", "muted"),
+    ("back-button", "none"),
+    ("tool-border", "none"),
+    ("selection-border", "none"),
+    ("title-gloss", "none"),
+    ("title-text", "text"),
+    ("title-text-inactive", "muted"),
+    ("title-text-shadow", "none"),
+    ("title-bar-inactive", "title-bar"),
+    ("bevel-highlight", "none"),
+    ("bevel-light", "none"),
+    ("bevel-shadow", "none"),
+    ("bevel-dark", "none"),
+    ("menu", "none"),
+    ("menu-text", "text"),
+    ("menu-selection", "accent"),
+    ("menu-selection-text", "accent-text"),
+    ("menu-border", "line"),
+    ("sidebar-text", "text"),
 ];
 
 /// Everything else a skin can set, with what it does.
@@ -215,17 +254,24 @@ pub const OTHERS: &[(&str, &str)] = &[
     ("path-slant", "How far the current folder's box leans, 0 to 20"),
     ("radius", "Corner roundness, 0 to 16"),
     ("row-height", "File list row height, 20 to 48"),
+    ("sidebar-row-height", "Sidebar row height, 16 to 48"),
     ("tab-line-width", "Current tab's line, 0 to 6"),
     ("toolbar-line-width", "Toolbar's line, 0 to 6"),
     ("font", "Fonts to try, best first"),
     ("font-size", "8pt to 14pt (or pixels: 12px)"),
     ("logo-text", "The word in the logo's box, at most 12 letters"),
     ("buttons", "flat, or liquid (glossy glass marbles and capsules)"),
-    ("caption-buttons", "symbols, or marbles (minimise, maximise, close)"),
+    ("caption-buttons", "symbols, marbles or tiles (minimise, maximise, close)"),
     ("tabs", "attached (the current one joins the toolbar), or pills"),
     ("sidebar-style", "plain, or panels (each group in a rounded panel)"),
     ("scrollbar-grip", "Lines across the scroll bars: true or false"),
-    ("scrollbar-width", "How thick the scroll bars are, 4 to 14"),
+    ("scrollbar-width", "How thick the scroll bars are, 4 to 18"),
+    ("bevels", "Raised and sunken 3D edges, as in Windows 2000: true or false"),
+    ("title-bar-across", "The title bar's gradient runs left to right: true or false"),
+    ("see-through", "How much shows through the glass title bar (era 7, Windows 11): 0 to 90"),
+    ("era", "Older Windows to look like: none, 98, 2000, xp or 7"),
+    ("icons", "Icons: windows (today's), classic, xp or aero (follows the era)"),
+    ("title-font", "Font of window titles (empty: the skin's font)"),
 ];
 
 /// Other names people may write for a setting (CSS habits, the code's names).
@@ -406,7 +452,7 @@ fn parse_number(v: &str, pt: Option<f32>) -> Option<f32> {
     let v = v.trim().to_lowercase();
     let (num, factor) = if let Some(n) = v.strip_suffix("pt") {
         (n, pt?)
-    } else if let Some(n) = v.strip_suffix("px") {
+    } else if let Some(n) = v.strip_suffix("px").or_else(|| v.strip_suffix('%')) {
         (n, 1.0)
     } else {
         (v.as_str(), 1.0)
@@ -724,6 +770,7 @@ pub fn parse(text: &str, fallback_name: &str) -> Parsed {
         path_slant: 6.0,
         radius: 6.0,
         row_h: size::ROW_H,
+        sidebar_row_h: size::ROW_H,
         tab_line_w: 3.0,
         toolbar_line_w: 2.0,
         font: String::new(),
@@ -780,6 +827,30 @@ pub fn parse(text: &str, fallback_name: &str) -> Parsed {
         sidebar_style: SidebarStyle::Plain,
         scrollbar_grip: false,
         scrollbar_w: size::SCROLLBAR_W,
+        bevels: false,
+        back_button: p("back-button"),
+        tool_border: p("tool-border").base(),
+        selection_border: p("selection-border").base(),
+        title_gloss: p("title-gloss").base(),
+        title_across: false,
+        see_through: 0.0,
+        era: Era::None,
+        icons: IconSet::Windows,
+        title_text: p("title-text").base(),
+        title_text_inactive: p("title-text-inactive").base(),
+        title_shadow: p("title-text-shadow").base(),
+        titlebar_inactive_paint: p("title-bar-inactive"),
+        title_font: String::new(),
+        bevel_highlight: p("bevel-highlight").base(),
+        bevel_light: p("bevel-light").base(),
+        bevel_shadow: p("bevel-shadow").base(),
+        bevel_dark: p("bevel-dark").base(),
+        menu: p("menu").base(),
+        menu_text: p("menu-text").base(),
+        menu_selection: p("menu-selection").base(),
+        menu_selection_text: p("menu-selection-text").base(),
+        menu_border: p("menu-border").base(),
+        sidebar_text: p("sidebar-text").base(),
     };
 
     // The rest: as the skin says, else as the base says.
@@ -816,6 +887,9 @@ pub fn parse(text: &str, fallback_name: &str) -> Parsed {
     }
     if let Some(x) = number("row-height", 20.0, 48.0, None, &mut notes) {
         theme.row_h = x.round();
+    }
+    if let Some(x) = number("sidebar-row-height", 16.0, 48.0, None, &mut notes) {
+        theme.sidebar_row_h = x.round();
     }
     if let Some(x) = number("tab-line-width", 0.0, 6.0, None, &mut notes) {
         theme.tab_line_w = x;
@@ -872,7 +946,10 @@ pub fn parse(text: &str, fallback_name: &str) -> Parsed {
     if style("buttons", &[("flat", false), ("plain", false), ("liquid", true), ("glass", true)], "flat or liquid") {
         theme.buttons = ButtonStyle::Liquid;
     }
-    if style("caption-buttons", &[("symbols", false), ("signs", false), ("marbles", true), ("marble", true)], "symbols or marbles") {
+    let tiles = |v: &str| v.trim().eq_ignore_ascii_case("tiles");
+    if own.get("caption-buttons").map_or_else(|| base.get("caption-buttons").is_some_and(|v| tiles(v)), |(v, _)| tiles(v)) {
+        theme.caption_buttons = CaptionStyle::Tiles;
+    } else if style("caption-buttons", &[("symbols", false), ("signs", false), ("marbles", true), ("marble", true)], "symbols, marbles or tiles") {
         theme.caption_buttons = CaptionStyle::Marbles;
     }
     if style("tabs", &[("attached", false), ("pills", true), ("pill", true)], "attached or pills") {
@@ -888,9 +965,61 @@ pub fn parse(text: &str, fallback_name: &str) -> Parsed {
         }),
         None => base.get("scrollbar-grip").and_then(|v| yes_no(v)).unwrap_or(false),
     };
-    if let Some(x) = number("scrollbar-width", 4.0, 14.0, None, &mut notes) {
+    let mut flag = |key: &str| match own.get(key) {
+        Some((v, line)) => yes_no(v).unwrap_or_else(|| {
+            notes.push(Note { line: *line, text: format!("{key} is true or false (not \u{201c}{v}\u{201d}).") });
+            false
+        }),
+        None => base.get(key).and_then(|v| yes_no(v)).unwrap_or(false),
+    };
+    theme.bevels = flag("bevels");
+    theme.title_across = flag("title-bar-across");
+    if let Some(x) = number("see-through", 0.0, 90.0, None, &mut notes) {
+        theme.see_through = x / 100.0;
+    }
+    if let Some(x) = number("scrollbar-width", 4.0, 18.0, None, &mut notes) {
         theme.scrollbar_w = x;
     }
+    // The older Windows the skin looks like, and its icons (the era's unless it says).
+    let era_of = |v: &str| match normalize_key(v).trim_start_matches("windows-").trim_start_matches("win") {
+        "none" | "" => Some(Era::None),
+        "98" | "95" | "me" => Some(Era::Win98),
+        "2000" | "2k" | "classic" => Some(Era::Win2000),
+        "xp" => Some(Era::Xp),
+        "7" | "vista" | "aero" => Some(Era::Win7),
+        _ => None,
+    };
+    let (mine, theirs) = value("era");
+    theme.era = match mine {
+        Some((v, line)) => era_of(&v).unwrap_or_else(|| {
+            notes.push(Note { line, text: format!("era is none, 98, 2000, xp or 7 (not \u{201c}{v}\u{201d}).") });
+            Era::None
+        }),
+        None => theirs.as_deref().and_then(era_of).unwrap_or_default(),
+    };
+    let icons_of = |v: &str| match normalize_key(v).as_str() {
+        "windows" | "shell" | "today" | "modern" | "none" => Some(IconSet::Windows),
+        "classic" | "98" | "2000" => Some(IconSet::Classic),
+        "xp" | "luna" => Some(IconSet::Xp),
+        "aero" | "7" | "vista" => Some(IconSet::Aero),
+        _ => None,
+    };
+    let by_era = match theme.era {
+        Era::None => IconSet::Windows,
+        Era::Win98 | Era::Win2000 => IconSet::Classic,
+        Era::Xp => IconSet::Xp,
+        Era::Win7 => IconSet::Aero,
+    };
+    let (mine, theirs) = value("icons");
+    theme.icons = match mine {
+        Some((v, line)) => icons_of(&v).unwrap_or_else(|| {
+            notes.push(Note { line, text: format!("icons is windows, classic, xp or aero (not \u{201c}{v}\u{201d}).") });
+            by_era
+        }),
+        None => theirs.as_deref().and_then(icons_of).unwrap_or(by_era),
+    };
+    let (mine, theirs) = value("title-font");
+    theme.title_font = font_list(&mine.map(|(v, _)| v).or(theirs).unwrap_or_default());
 
     let text_of = |key: &str, max: usize| own.get(key).map(|(v, _)| v.trim().chars().take(max).collect::<String>().trim().to_string()).filter(|v| !v.is_empty());
     let name = text_of("name", MAX_NAME).unwrap_or_else(|| fallback_name.chars().take(MAX_NAME).collect());
@@ -2148,7 +2277,7 @@ mod tests {
             let t = parse(&text, "fuzz").theme;
             assert!((0.0..=20.0).contains(&t.slant) && (0.0..=16.0).contains(&t.radius) && (20.0..=48.0).contains(&t.row_h), "{text:?}");
             assert!(t.font_size.is_finite() && t.accent.a.is_finite() && t.hover.a.is_finite() && t.accent_tint.a.is_finite(), "{text:?}");
-            assert!(t.titlebar.r.is_finite() && (4.0..=14.0).contains(&t.scrollbar_w), "{text:?}");
+            assert!(t.titlebar.r.is_finite() && (4.0..=18.0).contains(&t.scrollbar_w), "{text:?}");
             if let Some(g) = t.titlebar_paint.gradient() {
                 assert!(g.stops().windows(2).all(|s| s[0].at <= s[1].at) && g.stops().len() <= MAX_STOPS, "{text:?}");
             }
@@ -2222,6 +2351,11 @@ mod tests {
             // And the styles are the ones Glint always had.
             assert_eq!((t.buttons, t.caption_buttons, t.tabs, t.sidebar_style), (ButtonStyle::Flat, CaptionStyle::Symbols, TabStyle::Attached, SidebarStyle::Plain), "{id}");
             assert_eq!((t.scrollbar_grip, t.scrollbar_w, t.scrollbar_margin()), (false, size::SCROLLBAR_W, size::SCROLLBAR_MARGIN), "{id}");
+            // No older Windows: today's icons, titles and menus as they were drawn before.
+            assert_eq!((t.era, t.icons, t.title_font.as_str()), (Era::None, IconSet::Windows, ""), "{id}");
+            assert_eq!((t.title_text, t.title_text_inactive, t.title_shadow.a, t.titlebar_inactive_paint), (t.text, t.muted, 0.0, t.titlebar_paint), "{id}");
+            assert!(t.bevel_highlight.a == 0.0 && t.bevel_light.a == 0.0 && t.bevel_shadow.a == 0.0 && t.bevel_dark.a == 0.0, "{id}");
+            assert_eq!((t.menu.a, t.sidebar_text), (0.0, t.text), "{id}");
         }
         assert_eq!(Theme::dark(), built_in_theme(DEFAULT));
         assert_eq!(Theme::light(), built_in_theme(DEFAULT_LIGHT));
@@ -2302,7 +2436,30 @@ mod tests {
         let lines: Vec<usize> = p.notes.iter().map(|n| n.line).collect();
         assert_eq!(lines, [1, 4, 5, 6], "{:?}", p.notes);
         assert_eq!((p.theme.buttons, p.theme.tabs, p.theme.sidebar_style, p.theme.caption_buttons), (ButtonStyle::Flat, TabStyle::Pills, SidebarStyle::Panels, CaptionStyle::Symbols));
-        assert_eq!((p.theme.scrollbar_grip, p.theme.scrollbar_w), (false, 14.0));
+        assert_eq!((p.theme.scrollbar_grip, p.theme.scrollbar_w), (false, 18.0));
+        // How see-through 7's glass is: a number or a percentage, at most 90.
+        assert_eq!(parse("see-through: 35%\n", "x").theme.see_through, 0.35);
+        let p = parse("see-through: 120\n", "x");
+        assert_eq!((p.theme.see_through, p.notes.len()), (0.9, 1));
+        assert_eq!(parse("era: 7\n", "x").theme.see_through, 0.0, "solid unless the skin says");
+    }
+
+    /// The skins shared as files (next to the source, not built in) read cleanly too, each with its
+    /// era. Skipped where the folder isn't there.
+    #[test]
+    fn the_shared_skin_files_read_cleanly() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("glint-test").join("skins");
+        let Ok(listing) = std::fs::read_dir(&dir) else { return };
+        let mut read = 0;
+        for file in listing.flatten() {
+            let text = std::fs::read_to_string(file.path()).unwrap();
+            let name = file.file_name().to_string_lossy().into_owned();
+            let p = parse(&text, &name);
+            assert!(p.notes.is_empty(), "{name}: {:?}", p.notes);
+            assert!(value_in(&text, "era").is_some(), "{name} has no era");
+            read += 1;
+        }
+        assert_eq!(read, 6);
     }
 
     #[test]

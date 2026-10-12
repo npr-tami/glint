@@ -21,10 +21,13 @@ Direct2D, so it opens instantly, stays out of your way and needs nothing install
   **skin customiser** or in Notepad (skins are small `.glint` text files).
 - **Custom sort order**: write your own order, like `-folder_first -newest_first -image`, or rules for
   one folder between `in Downloads (` and `)` (the lines after the `)` are for every folder), the same
-  rules for several folders with `in = (` and their paths, one per line, with
-  **suggestions as you type** and a live preview. A folder with no rules sorts by its column.
+  rules for several folders with `in = (` and their paths, one per line, and `and_subfolders` to give
+  a folder's rules to every folder inside it. The editor has **suggestions as you type**, line
+  numbers, tips in plain words with one-click fixes, says which rules sort the folder you're in,
+  and can stay beside Glint or go anywhere (DETACH). A folder with no rules sorts by its column.
 - **A view for each folder**: put `-large_icons` (or `-details`, `-list`, `-tree`…) in a folder's rules and it
-  always opens that way; the other folders keep the view you picked.
+  always opens that way, keeping the order every other folder uses; the other folders keep the view
+  you picked.
 - **Your default file explorer**, if you like: folders, drives and Win+E open in Glint.
 - **Background mode**: closing the window keeps Glint ready in the tray, so the next window opens
   instantly. It can start with Windows too.

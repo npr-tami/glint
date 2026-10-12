@@ -218,7 +218,7 @@ impl Tab {
             && !self.path.is_empty()
             && self.folder.path == self.path
             && !self.is_searching()
-            && !recycle::is_bin(&self.path)
+            && !folder::is_place(&self.path)
             && self.folder.error.is_none()
     }
 
@@ -241,9 +241,10 @@ impl Tab {
         self.views.as_ref().filter(|_| !recycle::is_bin(folder)).and_then(|r| r.view_for(folder))
     }
 
-    /// The view for a folder shown in this tab: the one the view rules give it, else the tab's own.
+    /// The view for a folder shown in this tab: the one the view rules give it, else the one picked
+    /// there with VIEW, else the tab's own.
     pub fn view_for(&self, folder: &str) -> ViewMode {
-        self.ruled_view(folder).unwrap_or(self.own_view)
+        self.ruled_view(folder).or_else(|| self.folder_views.lock().ok()?.get(&key(folder)).copied()).unwrap_or(self.own_view)
     }
 
     /// Whether the view rules give the folder on screen a view of its own.
@@ -300,8 +301,8 @@ impl AppState {
     /// this way (new tabs opened from it too). Leaving the tree view closes its open folders.
     ///
     /// In a folder the view rules give a view (-large_icons in its "in … (" rules), the pick is just
-    /// for now: the rules' view comes back when the folder is opened again. Elsewhere it's the
-    /// tab's own view, for every folder the rules say nothing about.
+    /// for now: the rules' view comes back when the folder is opened again. Elsewhere the folder
+    /// keeps it, as in Explorer: it shows that way whenever it's opened, after a restart too.
     pub fn set_view(&mut self, mode: ViewMode) {
         let t = self.tab_mut();
         if t.view_mode == mode {
@@ -310,13 +311,21 @@ impl AppState {
         change_view(t, mode);
         let ruled = t.view_ruled();
         if !ruled {
-            t.own_view = mode;
+            let folder = key(&t.folder.path);
+            if let Ok(mut views) = t.folder_views.lock() {
+                // (The tab's own view needs no remembering.)
+                if mode == t.own_view {
+                    views.remove(&folder);
+                } else {
+                    views.insert(folder, mode);
+                }
+            }
         }
         let n = ViewMode::ALL.iter().position(|(v, _)| *v == mode).unwrap_or(0) + 1;
         if ruled {
             self.say(format!("{} (Ctrl+Shift+{n}) for now: the view rules give this folder its own view", mode.name()));
         } else {
-            self.say(format!("{} (Ctrl+Shift+{n})", mode.name()));
+            self.say(format!("{} (Ctrl+Shift+{n}) for this folder", mode.name()));
         }
     }
 

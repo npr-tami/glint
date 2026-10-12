@@ -9,7 +9,6 @@ use super::{AppState, ClosedTab, CLOSED_TABS_KEPT};
 use crate::folder;
 use crate::life::Target;
 use crate::settings::{self, Startup};
-use crate::shell;
 
 impl AppState {
     /// The window hides in the background: the folder watch stops, and so does a subfolder search
@@ -42,7 +41,7 @@ impl AppState {
     pub fn back_from_background(&mut self, open: Option<&Target>, seen: bool) {
         self.hidden = false;
         if self.settings.startup != Startup::Restore && (seen || open.is_some()) {
-            let (fresh, active) = settings::initial_tabs(&self.settings, open.map(|t| t.folder.as_str()), &shell::home());
+            let (fresh, active) = settings::initial_tabs(&self.settings, open.map(|t| t.folder.as_str()), &self.settings.home_place());
             let old = std::mem::take(&mut self.tabs);
             for saved in &fresh {
                 let mut tab = self.make_tab(saved.path.clone());
@@ -52,7 +51,7 @@ impl AppState {
             }
             if self.tabs.is_empty() {
                 // (initial_tabs always gives one; a window without tabs must never happen.)
-                let tab = self.make_tab(shell::home());
+                let tab = self.make_tab(self.settings.home_place());
                 self.tabs.push(tab);
             }
             // From the right, so the first Ctrl+Shift+T brings back the leftmost.
