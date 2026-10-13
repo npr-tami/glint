@@ -1646,16 +1646,20 @@ impl ListView {
         }
         let Some((_, Some(pic))) = &self.wall else { return };
         let (w, h) = (pic.width() as f32, pic.height() as f32);
-        if theme.wallpaper_whole && w * self.rect.h / h <= self.rect.w {
-            let dw = w * self.rect.h / h;
-            let dest = Rect::new(self.rect.x + (self.rect.w - dw) * theme.wallpaper_at, self.rect.y, dw, self.rect.h);
-            r.picture(pic, dest, None, theme.wallpaper_opacity, true);
+        let b = self.rect;
+        // Filling covers the list (its top in view); whole fits all of it in (at the bottom).
+        // Then the zoom, then whatever spills over the list is cut off.
+        let fit = if theme.wallpaper_whole { (b.w / w).min(b.h / h) } else { (b.w / w).max(b.h / h) };
+        let k = fit * theme.wallpaper_zoom;
+        let (dw, dh) = (w * k, h * k);
+        let at_y = theme.wallpaper_at_y.unwrap_or(if theme.wallpaper_whole { 1.0 } else { 0.0 });
+        let (x, y) = (b.x + (b.w - dw) * theme.wallpaper_at, b.y + (b.h - dh) * at_y);
+        let (x0, y0, x1, y1) = (x.max(b.x), y.max(b.y), (x + dw).min(b.right()), (y + dh).min(b.bottom()));
+        if x1 <= x0 || y1 <= y0 {
             return;
         }
-        let k = (self.rect.w / w).max(self.rect.h / h);
-        let (sw, sh) = (self.rect.w / k, self.rect.h / k);
-        let src = Rect::new((w - sw) * theme.wallpaper_at, 0.0, sw, sh);
-        r.picture(pic, self.rect, Some(src), theme.wallpaper_opacity, true);
+        let src = Rect::new((x0 - x) / k, (y0 - y) / k, (x1 - x0) / k, (y1 - y0) / k);
+        r.picture(pic, Rect::new(x0, y0, x1 - x0, y1 - y0), Some(src), theme.wallpaper_opacity, true);
     }
 
     fn paint_picture(&self, r: &mut Renderer, theme: &Theme, app: &AppState, dir: &str, e: &Entry, b: Rect) -> Rect {

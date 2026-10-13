@@ -71,7 +71,8 @@ use crate::log;
 // Settings > About > Updates (update.rs).
 use crate::{life, update};
 use crate::render::{FrameResult, Renderer, TextStyle};
-use crate::settings::{self, Settings, Terminal};
+use crate::settings::{self, Settings, SettingsOpens, Terminal};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use crate::shell;
 use crate::textbox::{self, TextBox, TextEvent, TextEventKind, WM_APP_TEXT};
 use crate::theme::{size, Color, Theme};
@@ -115,8 +116,22 @@ const DROPDOWN_MAX: f32 = 320.0;
 /// The window's size when nothing is remembered, and the smallest it gets (DIPs).
 const DEFAULT_W: f32 = 900.0;
 const DEFAULT_H: f32 = 660.0;
-const MIN_W: f32 = 620.0;
+const MIN_W: f32 = 360.0;
 const MIN_H: f32 = 420.0;
+/// Docked beside the main window: this wide at first.
+const DOCK_W: f32 = 480.0;
+/// "Small, in the middle".
+const SMALL_W: f32 = 560.0;
+const SMALL_H: f32 = 540.0;
+/// Narrower than this, the pages are buttons along the top instead of a list down the left.
+const NARROW_W: f32 = 620.0;
+/// The page buttons along the top: their margins.
+const PILL_PAD: f32 = 8.0;
+
+thread_local! {
+    /// Where Settings opens ("Settings opens"), for the window's own messages (`hit_test`, `follow`).
+    static OPENS: Cell<SettingsOpens> = const { Cell::new(SettingsOpens::Docked) };
+}
 /// One notch of the mouse wheel scrolls this far.
 const WHEEL_STEP: f32 = 96.0;
 /// The text box's id (textbox.rs: 400-499 belong to the Settings window).
@@ -153,6 +168,8 @@ pub enum Job {
     PickFolder(String),
     /// Put the window here (after a DPI change).
     Place(RECT),
+    /// To its place for "Settings opens", at that choice's first size (it just changed).
+    Follow,
     Close,
 }
 
@@ -327,6 +344,12 @@ pub struct SettingsWindow {
     /// generation (skin.rs): a skin added or renamed in the customiser shows at once.
     skins: Vec<(String, String, String)>,
     skins_generation: u64,
+    /// Where the window opens and stays ("Settings opens").
+    opens: SettingsOpens,
+    /// The page buttons along the top, when the window is narrow (`narrow`); empty otherwise.
+    pills: Vec<Rect>,
+    /// The skin in use has no light or dark other half, so "Light or dark" is greyed.
+    no_twin: bool,
     /// The switches the person just flipped, gliding to their new place (kit.rs).
     flips: kit::Flips,
     /// How thick the scrollbar is in the skin.
@@ -426,19 +449,28 @@ fn register_class() {
 }
 
 /// Makes the Settings window (hidden: show it with [`Job::Show`] once its state is kept), owned by
-/// `owner`, centred over it, at the size it had last time (`remembered`, DIPs). None if Windows
-/// can't make it.
-pub fn create(owner: HWND, theme: &Theme, remembered: Option<[f32; 2]>, page: usize) -> Option<SettingsWindow> {
+/// `owner`, where `opens` says: beside it, small in its middle, over its files, or where it was
+/// left (`bounds`, screen pixels; else at the size it had last time, `remembered`, DIPs, in the
+/// middle). None if Windows can't make it.
+pub fn create(owner: HWND, theme: &Theme, remembered: Option<[f32; 2]>, bounds: Option<[i32; 4]>, opens: SettingsOpens, page: usize) -> Option<SettingsWindow> {
+    OPENS.with(|o| o.set(opens));
     register_class();
     let title: Vec<u16> = TITLE.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: window creation and plain queries on our own windows; all structs are valid.
     unsafe {
         let dpi = GetDpiForWindow(owner).max(96);
         let scale = dpi as f32 / 96.0;
-        let [w, h] = remembered.unwrap_or([DEFAULT_W, DEFAULT_H]);
-        let (mut w, mut h) = ((w.max(MIN_W) * scale) as i32, (h.max(MIN_H) * scale) as i32);
-        let (x, y);
-        (x, y, w, h) = centred_on(owner, w, h);
+        let px = |v: f32| (v * scale) as i32;
+        let (x, y, w, h) = match (opens, bounds) {
+            (SettingsOpens::Docked, _) => beside(owner, px(DOCK_W)),
+            (SettingsOpens::Small, _) => centred_on(owner, px(SMALL_W), px(SMALL_H)),
+            (SettingsOpens::Tab, _) => over_files(owner, scale),
+            (SettingsOpens::Free, Some([x, y, w, h])) => (x, y, w, h),
+            (SettingsOpens::Free, None) => {
+                let [w, h] = remembered.unwrap_or([DEFAULT_W, DEFAULT_H]);
+                centred_on(owner, px(w.max(MIN_W)), px(h.max(MIN_H)))
+            }
+        };
         let instance = GetModuleHandleW(None).ok()?;
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -509,6 +541,9 @@ pub fn create(owner: HWND, theme: &Theme, remembered: Option<[f32; 2]>, page: us
             act_on_char: None,
             skins: Vec::new(),
             skins_generation: 0,
+            no_twin: false,
+            opens,
+            pills: Vec::new(),
             flips: kit::Flips::default(),
             bar: kit::Bar::default(),
             holding: kit::Holding::default(),
@@ -533,6 +568,8 @@ pub fn run_job(hwnd: HWND, scale: f32, job: Job, show_menu: fn(HWND, &Menu, f32)
             Job::Show => {
                 frame::cloak(hwnd, true);
                 let _ = ShowWindow(hwnd, SW_SHOW);
+                // Flush against the main window now that Windows knows its borders.
+                follow(hwnd, false);
                 let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
                 frame::cloak(hwnd, false);
                 let _ = SetForegroundWindow(hwnd);
@@ -545,6 +582,7 @@ pub fn run_job(hwnd: HWND, scale: f32, job: Job, show_menu: fn(HWND, &Menu, f32)
             }
             Job::Menu(menu) => return JobDone::Picked(show_menu(hwnd, &menu, scale)),
             Job::PickFolder(start) => return pick_folder(hwnd, &start).map_or(JobDone::Nothing, JobDone::Folder),
+            Job::Follow => follow(hwnd, true),
             Job::Place(r) => {
                 let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
             }
@@ -675,11 +713,105 @@ fn centred_on(owner: HWND, w: i32, h: i32) -> (i32, i32, i32, i32) {
     (x, y, w, h)
 }
 
+/// The part of `hwnd` you can see (screen pixels): Windows 10 / 11 add invisible borders round a
+/// window's rectangle.
+fn visible_rect(hwnd: HWND) -> RECT {
+    let mut r = RECT::default();
+    // SAFETY: plain queries on our own windows with valid out-structs.
+    unsafe {
+        if DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &mut r as *mut _ as *mut _, std::mem::size_of::<RECT>() as u32).is_err() || r.right <= r.left {
+            let _ = GetWindowRect(hwnd, &mut r);
+        }
+    }
+    r
+}
+
+/// The screen's work area round `owner` (or `fallback`).
+fn work_area(owner: HWND, fallback: RECT) -> RECT {
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    // SAFETY: a plain query with a valid out-struct.
+    unsafe {
+        if GetMonitorInfoW(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() {
+            info.rcWork
+        } else {
+            fallback
+        }
+    }
+}
+
+/// Docked: `w` wide beside `owner`, on its right if there's room, else on its left, else at the
+/// screen's right edge; as tall as the main window (the visible parts, screen pixels).
+fn beside(owner: HWND, w: i32) -> (i32, i32, i32, i32) {
+    let main = visible_rect(owner);
+    let work = work_area(owner, main);
+    let w = w.min((work.right - work.left).max(200));
+    let x = if main.right + w <= work.right {
+        main.right
+    } else if main.left - w >= work.left {
+        main.left - w
+    } else {
+        (work.right - w).max(work.left)
+    };
+    let top = main.top.max(work.top);
+    let bottom = main.bottom.min(work.bottom).max(top + 300);
+    (x, top, w, bottom - top)
+}
+
+/// As a tab: over the main window's files, below its tabs and toolbar.
+fn over_files(owner: HWND, scale: f32) -> (i32, i32, i32, i32) {
+    let main = visible_rect(owner);
+    let top = main.top + ((size::TITLE_H + size::TOOLBAR_H) * scale) as i32;
+    (main.left, top, main.right - main.left, (main.bottom - top).max(100))
+}
+
+/// Places `hwnd` so the part of it you can see is `x, y, w, h`, its invisible borders outside it.
+fn place_visible(hwnd: HWND, (x, y, w, h): (i32, i32, i32, i32)) {
+    let mut whole = RECT::default();
+    // SAFETY: a plain query and a move of our own window.
+    unsafe {
+        let _ = GetWindowRect(hwnd, &mut whole);
+        let seen = visible_rect(hwnd);
+        let (l, t) = (seen.left - whole.left, seen.top - whole.top);
+        let (r, b) = (whole.right - seen.right, whole.bottom - seen.bottom);
+        let _ = SetWindowPos(hwnd, None, x - l, y - t, w + l + r, h + t + b, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+/// Back in its place by the main window (it moved or changed size, or Settings did); `fresh`:
+/// "Settings opens" just changed, so at that choice's first size too. Where you left it stays put.
+fn follow(hwnd: HWND, fresh: bool) {
+    // SAFETY: plain queries on our own windows.
+    let owner = unsafe {
+        let Ok(owner) = GetWindow(hwnd, GW_OWNER) else { return };
+        if IsIconic(owner).as_bool() || IsZoomed(hwnd).as_bool() {
+            return;
+        }
+        owner
+    };
+    // SAFETY: a plain query on our own window.
+    let scale = unsafe { GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0;
+    let now = visible_rect(hwnd);
+    let (w, h) = (now.right - now.left, now.bottom - now.top);
+    let px = |v: f32| (v * scale) as i32;
+    let to = match OPENS.with(Cell::get) {
+        SettingsOpens::Docked => beside(owner, if fresh { px(DOCK_W) } else { w }),
+        SettingsOpens::Small if fresh => centred_on(owner, px(SMALL_W), px(SMALL_H)),
+        SettingsOpens::Small => centred_on(owner, w, h),
+        SettingsOpens::Tab => over_files(owner, scale),
+        SettingsOpens::Free => return,
+    };
+    place_visible(hwnd, to);
+}
+
 /// The title bar isn't a caption: Settings stays where Glint put it, in the middle of the main
 /// window (it follows that window, `follow_owner`). Its edges still resize it.
 fn hit_test(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if let Some(edge) = frame::resize_edge(hwnd, wparam, lparam) {
-        return LRESULT(edge as isize);
+    let opens = OPENS.with(Cell::get);
+    // As a tab it's part of the main window: no edges to drag.
+    if opens != SettingsOpens::Tab {
+        if let Some(edge) = frame::resize_edge(hwnd, wparam, lparam) {
+            return LRESULT(edge as isize);
+        }
     }
     let mut pt = POINT { x: (lparam.0 & 0xffff) as i16 as i32, y: ((lparam.0 >> 16) & 0xffff) as i16 as i32 };
     let mut rc = RECT::default();
@@ -690,7 +822,10 @@ fn hit_test(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         GetDpiForWindow(hwnd).max(96) as f32 / 96.0
     };
     let (x, y, w) = (pt.x as f32 / scale, pt.y as f32 / scale, rc.right as f32 / scale);
-    let _ = (x, y, w);
+    // Where you left it: the title bar moves it (all but the ×).
+    if opens == SettingsOpens::Free && y < size::TITLE_H && x < w - ksize::CLOSE_W {
+        return LRESULT(windows::Win32::UI::WindowsAndMessaging::HTCAPTION as isize);
+    }
     LRESULT(HTCLIENT as isize)
 }
 
@@ -717,19 +852,37 @@ fn hi_word(v: usize) -> u32 {
 }
 
 impl SettingsWindow {
-    /// Back in the middle of the main window (it moved or changed size, or Settings did).
+    /// Back in its place by the main window (it moved or changed size, or Settings did).
     pub fn follow_owner(&self) {
-        // SAFETY: plain queries and a move of our own window.
-        unsafe {
-            let Ok(owner) = GetWindow(self.hwnd, GW_OWNER) else { return };
-            if IsIconic(owner).as_bool() || IsZoomed(self.hwnd).as_bool() {
-                return;
-            }
-            let mut r = RECT::default();
-            let _ = GetWindowRect(self.hwnd, &mut r);
-            let (x, y, _, _) = centred_on(owner, r.right - r.left, r.bottom - r.top);
-            let _ = SetWindowPos(self.hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        follow(self.hwnd, false);
+    }
+
+    /// Too narrow for the page list down the left: the pages are buttons along the top.
+    fn narrow(&self) -> bool {
+        self.size.0 < NARROW_W
+    }
+
+    /// The title bar's height (none as a tab: the tab is its title).
+    fn title_h(&self) -> f32 {
+        if self.opens == SettingsOpens::Tab {
+            0.0
+        } else {
+            size::TITLE_H
         }
+    }
+
+    /// The page list's width (none when the pages are along the top).
+    fn nav_w(&self) -> f32 {
+        if self.narrow() {
+            0.0
+        } else {
+            NAV_W
+        }
+    }
+
+    /// Where the page buttons along the top end.
+    fn pills_bottom(&self) -> f32 {
+        self.pills.iter().map(|p| p.bottom()).fold(self.title_h(), f32::max) + if self.pills.is_empty() { 0.0 } else { PILL_PAD - 2.0 }
     }
 
     pub fn hwnd(&self) -> HWND {
@@ -847,15 +1000,22 @@ impl SettingsWindow {
 
     /// The scrolling part on the right.
     fn content_rect(&self) -> Rect {
-        Rect::new(NAV_W, size::TITLE_H, (self.size.0 - NAV_W).max(0.0), (self.size.1 - size::TITLE_H).max(0.0))
+        let (x, y) = (self.nav_w(), self.pills_bottom());
+        Rect::new(x, y, (self.size.0 - x).max(0.0), (self.size.1 - y).max(0.0))
     }
 
     fn close_rect(&self) -> Rect {
+        if self.opens == SettingsOpens::Tab {
+            return Rect::default();
+        }
         Rect::new(self.size.0 - ksize::CLOSE_W, 0.0, ksize::CLOSE_W, size::TITLE_H)
     }
 
     fn nav_rect(&self, i: usize) -> Rect {
-        Rect::new(0.0, size::TITLE_H + NAV_TOP + i as f32 * ksize::NAV_ITEM_H, NAV_W, ksize::NAV_ITEM_H)
+        if self.narrow() {
+            return self.pills.get(i).copied().unwrap_or_default();
+        }
+        Rect::new(0.0, self.title_h() + NAV_TOP + i as f32 * ksize::NAV_ITEM_H, NAV_W, ksize::NAV_ITEM_H)
     }
 
     fn track(&self) -> Rect {
@@ -870,9 +1030,23 @@ impl SettingsWindow {
     /// Lays the page out: where each heading, card, row and control goes, with the text wrapped.
     fn layout(&mut self) {
         self.layout_dirty = false;
+        // Narrow: the pages along the top, as many to a line as fit.
+        self.pills.clear();
+        if self.narrow() {
+            let (mut x, mut y) = (PILL_PAD, self.title_h() + PILL_PAD);
+            for name in PAGES {
+                let w = self.renderer.measure(name, &TextStyle::new(Color::hex(0)).size(ksize::NAV_FONT).semibold()).ceil() + 36.0;
+                if x > PILL_PAD && x + w > self.size.0 - PILL_PAD {
+                    (x, y) = (PILL_PAD, y + ksize::NAV_ITEM_H);
+                }
+                self.pills.push(Rect::new(x, y, w, ksize::NAV_ITEM_H));
+                x += w;
+            }
+        }
         let content = self.content_rect();
-        let card_w = (content.w - 2.0 * PAD_X - GUTTER).clamp(260.0, MAX_CARD_W);
-        let x0 = content.x + PAD_X;
+        let pad_x = if self.narrow() { PAD_X / 2.0 } else { PAD_X };
+        let card_w = (content.w - 2.0 * pad_x - GUTTER).clamp(260.0, MAX_CARD_W);
+        let x0 = content.x + pad_x;
         let facts = Facts {
             values: &self.values,
             terminals: self.terminals,
@@ -911,7 +1085,7 @@ impl SettingsWindow {
                             blocks.push(Block::Line(Rect::new(x0 + 1.0, y, card_w - 2.0, 1.0)));
                         }
                         any = true;
-                        let enabled = usable(&self.values, &row, self.portable_busy);
+                        let enabled = usable(&self.values, &row, self.portable_busy) && !(row.key == "Theme" && self.no_twin);
                         let placed = place_row(r, row, x0, y, card_w, enabled);
                         y += placed.rect.h;
                         rows.push(placed);
@@ -947,6 +1121,13 @@ impl SettingsWindow {
             self.skins = app.skins.entries().iter().map(|e| (e.id.clone(), e.name.clone(), e.description.clone())).collect();
             self.layout_dirty = true;
         }
+        let skin = self.values.get("Skin").and_then(Value::as_str).unwrap_or_default();
+        let dark = self.values.get("Theme").and_then(Value::as_str) != Some("light");
+        let no_twin = app.skins.twin(skin, !dark) == app.skins.twin(skin, dark);
+        if no_twin != self.no_twin {
+            self.no_twin = no_twin;
+            self.layout_dirty = true;
+        }
         if self.layout_dirty {
             self.layout();
         }
@@ -966,10 +1147,15 @@ impl SettingsWindow {
         let b = self.border();
         self.renderer.set_origin(b, b);
         // The page list on the sidebar's colour (a gradient running down the whole window).
-        let below = Rect::new(0.0, size::TITLE_H, self.size.0, (self.size.1 - size::TITLE_H).max(0.0));
+        let top = self.title_h();
+        let below = Rect::new(0.0, top, self.size.0, (self.size.1 - top).max(0.0));
         self.renderer.fill_paint(below, 0.0, &theme.sidebar_paint);
-        kit::page_list_well(&mut self.renderer, theme, Rect::new(0.0, size::TITLE_H, NAV_W, below.h));
-        self.paint_caption(theme);
+        if !self.narrow() {
+            kit::page_list_well(&mut self.renderer, theme, Rect::new(0.0, top, NAV_W, below.h));
+        }
+        if top > 0.0 {
+            self.paint_caption(theme);
+        }
         self.paint_nav(theme);
         self.paint_page(theme);
         if b > 0.0 {
@@ -1181,11 +1367,14 @@ impl SettingsWindow {
     // ------------------------------------------------------------ the mouse
 
     fn target_at(&self, p: Point) -> Option<Hot> {
-        if p.y < size::TITLE_H {
+        if p.y < self.title_h() {
             return self.close_rect().contains(p).then_some(Hot::Close);
         }
-        if p.x < NAV_W {
-            return (0..PAGES.len()).find(|&i| self.nav_rect(i).contains(p)).map(Hot::Nav);
+        if let Some(i) = (0..PAGES.len()).find(|&i| self.nav_rect(i).contains(p)) {
+            return Some(Hot::Nav(i));
+        }
+        if p.x < self.nav_w() || p.y < self.content_rect().y {
+            return None;
         }
         if let Some(thumb) = self.scroller.thumb(self.track()) {
             if thumb.inset(-4.0, 0.0).contains(p) {
@@ -1457,6 +1646,12 @@ impl SettingsWindow {
         self.invalidate();
         let mut asks = vec![Ask::RedrawMain];
         asks.extend(pages::after_change(key, &before, app).map(Ask::Command));
+        if app.settings.settings_opens != self.opens {
+            // "Settings opens" changed: to its new place now (a job: moving sends messages).
+            self.opens = app.settings.settings_opens;
+            OPENS.with(|o| o.set(self.opens));
+            asks.push(Ask::Job(Job::Follow));
+        }
         asks
     }
 
@@ -1713,6 +1908,12 @@ impl SettingsWindow {
             // Resized from an edge: back to the middle of the main window.
             WM_EXITSIZEMOVE => {
                 self.follow_owner();
+                // Where you left it: remembered for next time.
+                let mut r = RECT::default();
+                // SAFETY: plain queries on our own window.
+                if self.opens == SettingsOpens::Free && unsafe { !IsZoomed(self.hwnd).as_bool() && GetWindowRect(self.hwnd, &mut r).is_ok() } {
+                    app.settings.settings_bounds = Some([r.left, r.top, r.right - r.left, r.bottom - r.top]);
+                }
                 Some(LRESULT(0))
             }
             WM_SIZE => {
@@ -1725,7 +1926,7 @@ impl SettingsWindow {
                     // Remembered for next time (the window's outer size, in DIPs).
                     let mut r = RECT::default();
                     // SAFETY: plain queries on our own window.
-                    if wparam.0 != SIZE_MAXIMIZED as usize && unsafe { !IsZoomed(self.hwnd).as_bool() && GetWindowRect(self.hwnd, &mut r).is_ok() } {
+                    if self.opens == SettingsOpens::Free && wparam.0 != SIZE_MAXIMIZED as usize && unsafe { !IsZoomed(self.hwnd).as_bool() && GetWindowRect(self.hwnd, &mut r).is_ok() } {
                         let size = [((r.right - r.left) as f32 / s).round(), ((r.bottom - r.top) as f32 / s).round()];
                         if app.settings.settings_size != Some(size) {
                             app.settings.settings_size = Some(size);

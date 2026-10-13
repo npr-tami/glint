@@ -12,6 +12,25 @@ Each new number counts as newer than the one before it (1.0.12-beta.1, 1.0.12-be
 1.0.13-beta.1, ...), so the updater offers them in that order. Versions up to 0.11.0 used
 MAJOR.MINOR.PATCH, where a new feature bumped the middle number.
 
+## 1.0.18-beta.1 (2026-10-13): Settings beside Glint
+
+### New
+- Settings now opens beside Glint, docked like the sort window, so your files stay in view.
+- Pick how it opens: Settings > Appearance > Settings opens (Docked, Small in the middle, Tab or Last position).
+- The skin editor's text view now works like a code editor: line numbers, coloured settings and a colour square by each colour.
+- Start typing a setting and a list shows what fits, then what it can be. Tab or Enter takes one.
+- The line you're on says what it does, or what's wrong with it. Click a problem to jump to its line.
+- GUIDE under the text shows a short how-to with an example.
+- Skin colours are now grouped: Main colours, Title bar, Tabs, Toolbar, Sidebar, File list and more.
+- Wallpaper zoom: wallpaper-zoom: 100 zooms in, -100 zooms out (-500 to 500, 0 is normal).
+- wallpaper-position can now also say top, middle or bottom, like: right bottom.
+
+### Fixes
+- wallpaper-fit: whole now always shows the entire picture, whatever its size, instead of cutting off wide pictures.
+- The skins window now sits right against Glint, with no gap.
+- "Light or dark" is greyed out for skins that have no light or dark version.
+- Moving with the arrow keys in the sort and skin editors no longer pops up suggestions.
+
 ## 1.0.17-beta.1 (2026-10-12): wallpaper support for skins
 
 ### New

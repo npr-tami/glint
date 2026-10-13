@@ -334,6 +334,8 @@ pub enum Command {
     /// Open the skin customiser (Settings > Appearance > CUSTOMISE…), or bring it to the front.
     /// Handled by the window.
     OpenSkinEditor,
+    /// Close the Settings window (the × on its tab, when it opens as a tab).
+    CloseSettings,
     /// Switch the path bar to typing (Ctrl+L, F4). Handled by the toolbar's `begin_path_edit`.
     EditPath,
     /// Put the cursor in the filter box (Ctrl+F). Handled by the toolbar's `focus_filter`.

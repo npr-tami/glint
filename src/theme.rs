@@ -580,9 +580,14 @@ pub struct Theme {
     /// Which side of it stays in view when the list is narrower than the picture: 0 its left, 0.5
     /// its middle, 1 its right (`wallpaper-position`).
     pub wallpaper_at: f32,
-    /// Show the whole picture, as tall as the list, at `wallpaper_at`'s side, instead of filling
-    /// the list with it (`wallpaper-fit: whole`). Best for a picture on a plain background.
+    /// Show the whole picture, as big as fits, at `wallpaper_at`'s side, instead of filling the
+    /// list with it (`wallpaper-fit: whole`). Best for a picture on a plain background.
     pub wallpaper_whole: bool,
+    /// Which edge stays in view up and down: 0 its top, 0.5 its middle, 1 its bottom (the second
+    /// word of `wallpaper-position`); None: the top when filling, the bottom when whole.
+    pub wallpaper_at_y: Option<f32>,
+    /// How big it is next to its fitted size, 1/6 to 6 (`wallpaper-zoom`: -500 to 500, 0 for 1).
+    pub wallpaper_zoom: f32,
 
     // ---- Older Windows. Each is off (or follows an older colour) unless the skin sets it.
     /// Which older Windows the skin dresses Glint as (`era`), and whose icons it shows (`icons`).

@@ -432,6 +432,9 @@ pub struct AppState {
     /// (see `snapshot` and window.rs). Its remembered state (tabs, window position) is only
     /// up to date in `snapshot`.
     pub settings: Settings,
+    /// Settings is open as a tab ("Settings opens": As a tab): the tab strip shows its tab, the
+    /// current (window.rs keeps it up to date).
+    pub settings_tab: bool,
     /// Recently closed tabs, the last one at the end.
     closed: Vec<ClosedTab>,
     /// All drives (for This PC, the sidebar and drive names in paths). Filled shortly after start.
@@ -511,6 +514,7 @@ impl AppState {
             sort_history: None,
             folder_views: Arc::new(Mutex::new(std::mem::take(&mut loaded.folder_views))),
             settings: loaded,
+            settings_tab: false,
             closed: Vec::new(),
             drives: Vec::new(),
             icons: Icons::new(),
@@ -568,6 +572,7 @@ impl AppState {
             sort_history: None,
             folder_views: FolderViews::default(),
             settings,
+            settings_tab: false,
             closed: Vec::new(),
             drives: Vec::new(),
             icons: Icons::new(),

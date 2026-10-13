@@ -38,6 +38,7 @@ pub const LIVE: &[&str] = &[
     "Startup",
     "StartupFolder",
     "NewTab", "HomeOpens",
+    "SettingsOpens",
     "@Folders",
     "@WinE",
     "StayRunning",
@@ -455,6 +456,12 @@ fn appearance(f: &Facts) -> Vec<Item> {
             toggle("ShowSidebar", "Show sidebar", None),
             toggle("ShowDetails", "Show details panel", None),
             toggle("ShowStatusBar", "Show status bar", None),
+            choice(
+                "SettingsOpens",
+                "Settings opens",
+                None,
+                &[(S("docked"), "Docked"), (S("small"), "Small, in the middle"), (S("tab"), "Tab"), (S("free"), "Last position")],
+            ),
         ]),
     ]
 }

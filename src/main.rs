@@ -41,6 +41,7 @@
 
 mod anim;
 mod app;
+mod codebox;
 mod complete;
 mod ask;
 mod details;
@@ -77,6 +78,7 @@ mod settingswin;
 mod shell;
 mod shellmenu;
 mod skin;
+mod skincode;
 mod skinwin;
 mod sortrecipe;
 mod sortwin;

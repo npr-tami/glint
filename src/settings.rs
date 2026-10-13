@@ -439,6 +439,21 @@ pub enum HomePage {
     Folder,
 }
 
+/// Where the Settings window opens.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SettingsOpens {
+    /// Beside the main window, on the side with room, like the sort editor.
+    #[default]
+    Docked,
+    /// A small window in the middle of the main window.
+    Small,
+    /// Over the main window's files, with a Settings tab of its own.
+    Tab,
+    /// Where it was left, at the size it was left.
+    Free,
+}
+
 /// Light or dark.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -699,6 +714,8 @@ pub struct Settings {
     /// "Home opens": page | folder.
     #[serde(rename = "HomeOpens")]
     pub home: HomePage,
+    /// "Settings opens": docked | small | tab | free.
+    pub settings_opens: SettingsOpens,
     /// Show hidden files and folders (greyed). Ctrl+H.
     pub show_hidden: bool,
     /// Also show protected operating-system files (hidden + system, like desktop.ini), when hidden
@@ -837,6 +854,8 @@ pub struct Settings {
     pub logo: LogoStyle,
     /// The Settings window's size in DIPs (width, height), when it was last resized.
     pub settings_size: Option<[f32; 2]>,
+    /// Where Settings was (screen pixels: x, y, width, height) when it opens where it was left.
+    pub settings_bounds: Option<[i32; 4]>,
     /// The details panel's width in DIPs (dragged at its left edge); 0 = the standard width (side.rs).
     pub details_width: f32,
     /// The Space preview's width in DIPs; 0 = half of the room next to the sidebar.
@@ -855,6 +874,7 @@ impl Default for Settings {
             theme: ThemeMode::Dark,
             new_tab: NewTab::Same,
             home: HomePage::Page,
+            settings_opens: SettingsOpens::Docked,
             show_hidden: false,
             show_system: false,
             confirm_delete: ConfirmDelete::Permanent,
@@ -907,6 +927,7 @@ impl Default for Settings {
             rail_group: RailGroup::Quick,
             logo: LogoStyle::Box,
             settings_size: None,
+            settings_bounds: None,
             details_width: 0.0,
             preview_width: 0.0,
             preview_info: true,
@@ -923,6 +944,7 @@ const CHOICES: &[&str] = &[
     "Startup",
     "StartupFolder",
     "HomeOpens",
+    "SettingsOpens",
     "Theme",
     "NewTab",
     "ShowHidden",
@@ -1119,6 +1141,9 @@ impl Settings {
         }
         if self.settings_size.is_some_and(|[w, h]| !(w.is_finite() && h.is_finite() && w >= 200.0 && h >= 150.0 && w <= 20000.0 && h <= 20000.0)) {
             self.settings_size = None;
+        }
+        if self.settings_bounds.is_some_and(|[_, _, w, h]| !((200..=20000).contains(&w) && (150..=20000).contains(&h))) {
+            self.settings_bounds = None;
         }
         if self.sort_bounds.is_some_and(|[_, _, w, h]| !((200..=20000).contains(&w) && (150..=20000).contains(&h))) {
             self.sort_bounds = None;

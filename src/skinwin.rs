@@ -14,8 +14,9 @@
 //!   "#fdfdfd, #c3cddb 45%, #dfe6f0", whose first colour the picker changes. A colour that follows
 //!   another ("tab-line: accent") shows that colour, says which it follows, and keeps following it
 //!   until it's changed here. The Logo choice is the same as Settings' (not part of the skin).
-//!   "Show as text" swaps the controls for the skin's text itself (a Windows EDIT), with what
-//!   Glint couldn't understand under it.
+//!   "Show as text" swaps the controls for the skin's text itself, typed like code (codebox.rs,
+//!   skincode.rs: line numbers, suggestions, what each line does, colour squares), with what
+//!   Glint couldn't understand under it (clicking a problem goes to its line) and GUIDE.
 //! - **Live, and saved by itself.** Every change goes into the skin's text (`skin::with_value`, so
 //!   the rest of the text stays as it was), the main window shows it at once (`AppState::apply_skin`),
 //!   and the file is written a moment later (SAVE_TIMER) by the skin file worker - never on this
@@ -40,16 +41,16 @@ use std::time::Instant;
 
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, CreateSolidBrush, DeleteObject, GetMonitorInfoW, InvalidateRect, MonitorFromWindow, RedrawWindow, ScreenToClient,
-    SetBkColor, SetTextColor, ValidateRect, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, DEFAULT_CHARSET, FF_MODERN,
-    FIXED_PITCH, FW_NORMAL, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, RDW_ALLCHILDREN,
+    CreateSolidBrush, DeleteObject, GetMonitorInfoW, InvalidateRect, MonitorFromWindow, RedrawWindow, ScreenToClient,
+    SetBkColor, SetTextColor, ValidateRect, COLOR_WINDOW, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, RDW_ALLCHILDREN,
     RDW_INVALIDATE, RDW_UPDATENOW,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::Dialogs::{ChooseColorW, CC_ANYCOLOR, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW};
-use windows::Win32::UI::Controls::{SetWindowTheme, EM_LIMITTEXT, EM_SETREADONLY, EM_SETSEL, WM_MOUSELEAVE};
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_CONTROL, VK_DELETE,
@@ -57,23 +58,23 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
-    DefSubclassProc, FileOpenDialog, FileSaveDialog, IFileOpenDialog, IFileSaveDialog, SetWindowSubclass, FOS_FILEMUSTEXIST,
+    FileOpenDialog, FileSaveDialog, IFileOpenDialog, IFileSaveDialog, FOS_FILEMUSTEXIST,
     FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetParent, GetWindow, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, IsIconic, KillTimer, LoadCursorW, LoadIconW, PostMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow,
-    SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN, GW_OWNER, HMENU,
-    HTCLIENT, IDC_ARROW, MINMAXINFO, SIZE_MINIMIZED, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_HIDE, SW_RESTORE, SW_SHOW, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_CHAR,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindow, GetWindowRect, IsIconic, KillTimer, LoadCursorW, LoadIconW, PostMessageW, RegisterClassExW, SetForegroundWindow,
+    SetTimer, SetWindowPos, ShowWindow, GW_OWNER,
+    HTCLIENT, IDC_ARROW, MINMAXINFO, SIZE_MINIMIZED, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE, SW_SHOW, WA_INACTIVE, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_CHAR,
     WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_SETFONT,
-    WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_HSCROLL, WS_SYSMENU,
-    WS_THICKFRAME, WS_VSCROLL,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT,
+    WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CLIPCHILDREN, WS_SYSMENU,
+    WS_THICKFRAME,
 };
 
 use crate::app::AppState;
 use crate::ask::{Answer, AskBox};
+use crate::codebox::{CodeBox, Done, Mark};
+use crate::skincode::SkinLang;
 use crate::frame;
 use crate::kit::{self, size as ksize, Look, Scroller};
 use crate::log;
@@ -115,6 +116,10 @@ const LOGO_FIELD_W: f32 = 140.0;
 const LOGO_HINT: &str = "GLINT";
 /// What Glint couldn't understand in the skin's text, under the text.
 const NOTES_H: f32 = 86.0;
+/// The GUIDE button under the skin's text, and the guide's lines.
+const GUIDE_W: f32 = 104.0;
+const GUIDE_LINE: f32 = 16.0;
+const GUIDE_MONO: f32 = 11.5;
 const NOTE_LINE: f32 = 17.0;
 /// The window's size, and the smallest it gets (DIPs).
 const DEFAULT_W: f32 = 780.0;
@@ -124,10 +129,8 @@ const WHEEL_STEP: f32 = 96.0;
 /// Text box ids (textbox.rs: 600-699 belong to the customiser): the one-line box (a colour's
 /// #hex, the logo's word, renaming) and the skin's whole text.
 const EDIT_BOX: u16 = 600;
-const TEXT_BOX: u16 = 601;
 /// Results of background work for this window; Tab or Esc in the skin's text.
 const WM_APP_BG: u32 = WM_APP + 82;
-const WM_APP_TEXT_KEY: u32 = WM_APP + 83;
 /// Saving a moment after the last change; trying to draw again after a refused frame.
 const SAVE_TIMER: usize = 1;
 const RETRY_TIMER: usize = 2;
@@ -141,84 +144,114 @@ const TEXT_GROUP: u64 = u64::MAX;
 /// The skin's text is kept below this (EM_LIMITTEXT), like the files Glint reads.
 const MAX_TEXT: usize = 256 * 1024;
 
-/// Every colour a skin has (skin::COLOURS), by the skin's name for it, with its title here: the
-/// window from the top down, then text, selections and hovers, lines, and the rest.
+/// Every colour a skin has (skin::COLOURS), by the skin's name for it, with its title here, in
+/// COLOUR_GROUPS' order: what belongs together sits together.
 const COLOURS: [(&str, &str); 75] = [
+    // Main colours
     ("accent", "Accent"),
+    ("accent-text", "Text on accent"),
     ("background", "Background"),
+    ("text", "Text"),
+    ("text-bright", "Bright text"),
+    ("muted", "Muted text"),
+    ("disabled", "Disabled"),
+    ("line", "Lines"),
+    ("hover", "Hover"),
+    // Title bar
     ("title-bar", "Title bar"),
+    ("title-bar-inactive", "Title bar, inactive"),
+    ("title-gloss", "Title bar shine"),
     ("highlight", "Shine on bars"),
+    ("title-text", "Window titles"),
+    ("title-text-inactive", "Window titles, inactive"),
+    ("title-text-shadow", "Window title shadow"),
     ("logo", "Logo box"),
     ("logo-letters", "Logo letters"),
+    // Window buttons
+    ("caption-hover", "Window buttons hover"),
+    ("caption-pressed", "Window buttons pressed"),
+    ("close-hover", "Close hover"),
+    ("marble", "Window marbles"),
+    ("marble-close", "Close marble"),
+    // Tabs
     ("tab", "Tabs"),
     ("tab-text", "Tab names"),
     ("tab-active", "Current tab"),
     ("tab-active-text", "Current tab name"),
     ("tab-border", "Tab edges"),
     ("tab-line", "Line on current tab"),
-    ("caption-hover", "Window buttons hover"),
-    ("caption-pressed", "Window buttons pressed"),
-    ("close-hover", "Close hover"),
-    ("marble", "Window marbles"),
-    ("marble-close", "Close marble"),
+    // Toolbar
     ("toolbar", "Toolbar"),
     ("toolbar-line", "Line under toolbar"),
     ("tool-hover", "Toolbar icons hover"),
     ("tool-pressed", "Toolbar icons pressed"),
-    ("button", "Buttons"),
-    ("button-hover", "Buttons hover"),
-    ("button-text", "Button text"),
+    ("tool-border", "Toolbar button edges"),
+    ("back-button", "Back and forward"),
     ("input", "Text boxes"),
     ("input-border", "Text box edges"),
     ("path-hover", "Path hover"),
+    // Buttons
+    ("button", "Buttons"),
+    ("button-hover", "Buttons hover"),
+    ("button-text", "Button text"),
+    // Sidebar
     ("sidebar", "Sidebar"),
+    ("sidebar-text", "Sidebar names"),
     ("sidebar-panel", "Sidebar panels"),
     ("panel-header", "Panel headers"),
     ("panel-header-text", "Panel header text"),
     ("sidebar-selection", "Sidebar selection"),
     ("sidebar-selection-text", "Sidebar selection text"),
+    // File list
     ("panel", "Panels"),
     ("list-header", "Column titles"),
     ("list-header-text", "Column title text"),
     ("column-line", "Lines between columns"),
+    ("selection", "Selected rows"),
+    ("selection-edge", "Selected row edge"),
+    ("selection-text", "Selected row text"),
+    ("selection-border", "Selected row edges"),
+    // Scroll bars
     ("scrollbar", "Scroll bars"),
     ("scrollbar-hover", "Scroll bars hover"),
     ("scrollbar-track", "Scroll bar track"),
     ("scrollbar-border", "Scroll bar edges"),
     ("scrollbar-grip-lines", "Grip lines"),
-    ("back-button", "Back and forward"),
-    ("tool-border", "Toolbar button edges"),
-    ("selection-border", "Selected row edges"),
-    ("title-gloss", "Title bar shine"),
-    ("title-bar-inactive", "Title bar, inactive"),
-    ("title-text", "Window titles"),
-    ("title-text-inactive", "Window titles, inactive"),
-    ("title-text-shadow", "Window title shadow"),
-    ("bevel-highlight", "3D edge, lit outside"),
-    ("bevel-light", "3D edge, lit inside"),
-    ("bevel-shadow", "3D edge, shaded inside"),
-    ("bevel-dark", "3D edge, shaded outside"),
-    ("usage-bar", "Usage bar"),
-    ("usage-fill", "Usage bar fill"),
+    // Status bar
     ("status-bar", "Status bar"),
     ("status-text", "Status bar text"),
     ("status-line", "Line above status bar"),
-    ("text", "Text"),
-    ("text-bright", "Bright text"),
-    ("muted", "Muted text"),
-    ("selection", "Selected rows"),
-    ("selection-edge", "Selected row edge"),
-    ("selection-text", "Selected row text"),
-    ("hover", "Hover"),
-    ("line", "Lines"),
-    ("accent-text", "Text on accent"),
-    ("disabled", "Disabled"),
-    ("sidebar-text", "Sidebar names"),
+    // Drive usage bars
+    ("usage-bar", "Usage bar"),
+    ("usage-fill", "Usage bar fill"),
+    // Menus
     ("menu", "Menus"),
     ("menu-text", "Menu words"),
     ("menu-selection", "Menu item hover"),
     ("menu-selection-text", "Menu item hover words"),
     ("menu-border", "Menu edge"),
+    // 3D edges
+    ("bevel-highlight", "3D edge, lit outside"),
+    ("bevel-light", "3D edge, lit inside"),
+    ("bevel-shadow", "3D edge, shaded inside"),
+    ("bevel-dark", "3D edge, shaded outside"),
+];
+
+/// The cards the colours are shown in: a heading and how many of COLOURS (in order) it holds.
+const COLOUR_GROUPS: [(&str, usize); 13] = [
+    ("Main colours", 9),
+    ("Title bar", 9),
+    ("Window buttons", 5),
+    ("Tabs", 6),
+    ("Toolbar", 9),
+    ("Buttons", 3),
+    ("Sidebar", 7),
+    ("File list", 8),
+    ("Scroll bars", 5),
+    ("Status bar", 3),
+    ("Drive usage bars", 2),
+    ("Menus", 5),
+    ("3D edges", 4),
 ];
 
 /// The choices of the drop-downs.
@@ -320,6 +353,10 @@ enum Hot {
     /// "Show as text".
     Advanced,
     Ctl(Ctl, Part),
+    /// The skin's text, GUIDE under it, and a problem under it (by its line).
+    Code,
+    Guide,
+    Note(usize),
     ListThumb,
     PageThumb,
 }
@@ -491,16 +528,16 @@ pub struct SkinWindow {
     edit_at: Option<Rect>,
     /// The one-line box was just given its text and isn't in its place yet.
     edit_fresh: bool,
-    /// "Show as text": the skin's text in a multi-line EDIT instead of the controls.
+    /// "Show as text": the skin's text, typed like code (codebox.rs), instead of the controls.
     advanced: bool,
-    text_box: HWND,
-    text_font: HFONT,
-    text_font_dpi: u32,
-    /// What the text box was last given (a change from elsewhere is shown when it's not being typed in).
+    code: CodeBox,
+    /// What the text view was last given (a change from elsewhere is shown when it's not being typed in).
     text_shown: String,
-    text_at: Option<Rect>,
-    /// We are putting text in the text box (its EN_CHANGE isn't typing).
-    setting_text: bool,
+    /// The guide under the skin's text shows (GUIDE), and how tall it was last drawn.
+    guide: bool,
+    guide_h: f32,
+    /// The problems under the skin's text, as last drawn: (where, its line).
+    note_rects: Vec<(Rect, usize)>,
     /// Skins changed and waiting for SAVE_TIMER to save them.
     save_due: Vec<String>,
     /// Undo and redo: a skin's text before a change, with its id; newest last.
@@ -596,14 +633,6 @@ pub fn create(owner: HWND, theme: &Theme) -> Option<SkinWindow> {
         frame::init(hwnd);
         let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         let edit_box = TextBox::new(hwnd, EDIT_BOX);
-        // The skin's whole text: a multi-line EDIT with scroll bars, Tab and Esc told to the window.
-        let style = WS_CHILD | WS_VSCROLL | WS_HSCROLL | WINDOW_STYLE((ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN) as u32);
-        let text_box = CreateWindowExW(WINDOW_EX_STYLE(0), w!("EDIT"), w!(""), style, 0, 0, 0, 0, Some(hwnd), Some(HMENU(TEXT_BOX as usize as *mut _)), Some(instance.into()), None)
-            .unwrap_or_default();
-        if !text_box.is_invalid() {
-            SendMessageW(text_box, EM_LIMITTEXT, Some(WPARAM(MAX_TEXT)), Some(LPARAM(0)));
-            let _ = SetWindowSubclass(text_box, Some(text_proc), 3, 0);
-        }
         let mut window = SkinWindow {
             hwnd,
             serial: NEXT_SERIAL.fetch_add(1, Ordering::Relaxed),
@@ -631,12 +660,11 @@ pub fn create(owner: HWND, theme: &Theme) -> Option<SkinWindow> {
             edit_at: None,
             edit_fresh: false,
             advanced: false,
-            text_box,
-            text_font: HFONT::default(),
-            text_font_dpi: 0,
+            code: CodeBox::default(),
             text_shown: String::new(),
-            text_at: None,
-            setting_text: false,
+            guide: false,
+            guide_h: 0.0,
+            note_rects: Vec::new(),
             save_due: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -675,6 +703,11 @@ pub fn run_job(hwnd: HWND, scale: f32, job: Job, show_menu: fn(HWND, &Menu, f32)
             Job::Show => {
                 frame::cloak(hwnd, true);
                 let _ = ShowWindow(hwnd, SW_SHOW);
+                // Flush against the main window now that Windows knows its borders.
+                if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
+                    let r = visible_rect(hwnd);
+                    place_visible(hwnd, beside(owner, r.right - r.left));
+                }
                 let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
                 frame::cloak(hwnd, false);
                 let _ = SetForegroundWindow(hwnd);
@@ -771,30 +804,6 @@ fn save_file(owner: HWND, file_name: &str) -> Option<PathBuf> {
     }
 }
 
-/// The skin's text box's extra subclass: Tab and Esc go to the window (Tab moves on, Esc leaves
-/// the text), and Ctrl+A selects everything.
-unsafe extern "system" fn text_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _id: usize, _data: usize) -> LRESULT {
-    if msg == WM_KEYDOWN && (wparam.0 == VK_TAB.0 as usize || wparam.0 == VK_ESCAPE.0 as usize) {
-        // SAFETY: a key-state query and a post to our own parent window.
-        unsafe {
-            let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
-            if let Ok(parent) = GetParent(hwnd) {
-                let _ = PostMessageW(Some(parent), WM_APP_TEXT_KEY, WPARAM(wparam.0), LPARAM(shift as isize));
-            }
-        }
-        return LRESULT(0);
-    }
-    // SAFETY: a key-state query and a message to this same control.
-    if msg == WM_KEYDOWN && wparam.0 == 'A' as usize && unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 {
-        unsafe { SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1))) };
-        return LRESULT(0);
-    }
-    if msg == WM_CHAR && matches!(wparam.0, 0x09 | 0x1b | 0x01) {
-        return LRESULT(0); // no tab typed, no beep
-    }
-    // SAFETY: everything else goes on to the EDIT's own handling.
-    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
-}
 
 /// The window procedure. Messages that need no state are answered here; the rest go to the state,
 /// which the main window keeps, through its guard (window::skin_message).
@@ -845,11 +854,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 /// else on its left, else at the screen's right edge), as tall as it and level with it, so the
 /// skin shows in the main window as it changes.
 fn beside(owner: HWND, w: i32) -> (i32, i32, i32, i32) {
-    let mut main = RECT::default();
+    let main = visible_rect(owner);
     let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
     // SAFETY: plain queries with valid out-structs.
     let work = unsafe {
-        let _ = GetWindowRect(owner, &mut main);
         if GetMonitorInfoW(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() { info.rcWork } else { main }
     };
     let w = w.min((work.right - work.left).max(200));
@@ -863,6 +871,32 @@ fn beside(owner: HWND, w: i32) -> (i32, i32, i32, i32) {
     };
     let y = main.top.clamp(work.top, (work.bottom - h).max(work.top));
     (x, y, w, h)
+}
+
+/// The part of `hwnd` you can see (screen pixels): Windows 10 / 11 add invisible borders round a
+/// window's rectangle, which left a gap between the two windows.
+fn visible_rect(hwnd: HWND) -> RECT {
+    let mut r = RECT::default();
+    // SAFETY: plain queries on our own windows with valid out-structs.
+    unsafe {
+        if DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &mut r as *mut _ as *mut _, std::mem::size_of::<RECT>() as u32).is_err() || r.right <= r.left {
+            let _ = GetWindowRect(hwnd, &mut r);
+        }
+    }
+    r
+}
+
+/// Places `hwnd` so the part of it you can see is `x, y, w, h`, its invisible borders outside that.
+fn place_visible(hwnd: HWND, (x, y, w, h): (i32, i32, i32, i32)) {
+    let mut whole = RECT::default();
+    // SAFETY: a plain query and a move of our own window.
+    unsafe {
+        let _ = GetWindowRect(hwnd, &mut whole);
+        let seen = visible_rect(hwnd);
+        let (l, t) = (seen.left - whole.left, seen.top - whole.top);
+        let (r, b) = (whole.right - seen.right, whole.bottom - seen.bottom);
+        let _ = SetWindowPos(hwnd, None, x - l, y - t, w + l + r, h + t + b, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
 }
 
 /// WM_NCHITTEST: the edges resize, the rest is ours. The title bar doesn't move the window: it
@@ -995,11 +1029,6 @@ fn number(x: f32) -> String {
     }
 }
 
-/// Text for the multi-line EDIT: Windows' line ends.
-fn crlf(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\n', "\r\n")
-}
-
 impl SkinWindow {
     /// Docked beside the main window again (it moved or changed size, or the customiser did).
     pub fn follow_owner(&self) {
@@ -1009,10 +1038,8 @@ impl SkinWindow {
             if IsIconic(owner).as_bool() {
                 return;
             }
-            let mut r = RECT::default();
-            let _ = GetWindowRect(self.hwnd, &mut r);
-            let (x, y, w, h) = beside(owner, r.right - r.left);
-            let _ = SetWindowPos(self.hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+            let r = visible_rect(self.hwnd);
+            place_visible(self.hwnd, beside(owner, r.right - r.left));
         }
     }
 
@@ -1055,12 +1082,12 @@ impl SkinWindow {
     pub fn apply_theme(&mut self, theme: &Theme) {
         self.renderer.set_font(&theme.font, 1.0);
         self.renderer.set_title_font(&theme.title_font);
+        self.code.forget_font();
         self.layout_dirty = true;
         self.bar = kit::Bar::of(theme);
         self.edit_at = None;
         if self.classic != theme.era.classic() {
             self.classic = theme.era.classic();
-            self.text_at = None;
             let mut rc = RECT::default();
             // SAFETY: our own window and a valid out-struct.
             if unsafe { GetClientRect(self.hwnd, &mut rc) }.is_ok() && rc.right > rc.left {
@@ -1075,9 +1102,6 @@ impl SkinWindow {
             let old = EDIT_COLORS.with(|c| c.replace((bg, fg, brush.0 as isize))).2;
             if old != 0 {
                 let _ = DeleteObject(HGDIOBJ(old as *mut _));
-            }
-            if !self.text_box.is_invalid() {
-                let _ = SetWindowTheme(self.text_box, if theme.dark { w!("DarkMode_Explorer") } else { w!("Explorer") }, PCWSTR::null());
             }
             frame::apply_theme(self.hwnd, theme);
             let _ = RedrawWindow(Some(self.hwnd), None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
@@ -1214,7 +1238,13 @@ impl SkinWindow {
     /// The skin's text box (on screen), while "Show as text" is on.
     fn text_rect(&self) -> Rect {
         let p = self.page_rect();
-        Rect::new(p.x + PAD_X, p.y + 4.0, (p.w - 2.0 * PAD_X).max(80.0), (p.h - NOTES_H - 16.0).max(60.0))
+        Rect::new(p.x + PAD_X, p.y + 4.0, (p.w - 2.0 * PAD_X).max(80.0), (p.h - NOTES_H - 16.0 - self.guide_h).max(60.0))
+    }
+
+    /// GUIDE, at the right of the line under the skin's text.
+    fn guide_button(&self) -> Rect {
+        let t = self.text_rect();
+        Rect::new(t.right() - GUIDE_W, t.bottom() + self.guide_h + 8.0, GUIDE_W, 26.0)
     }
 
     /// A list item on screen.
@@ -1268,7 +1298,7 @@ impl SkinWindow {
         self.items = items;
         self.list.set_extent(y + 10.0, self.list_rect().h);
 
-        // The controls: two cards.
+        // The controls: shapes, style, then the colours in groups.
         let page = self.page_rect();
         let card_w = (page.w - 2.0 * PAD_X - GUTTER).clamp(300.0, MAX_CARD_W);
         let x0 = page.x + PAD_X;
@@ -1317,7 +1347,11 @@ impl SkinWindow {
             (Ctl::Icons, "Icons", ""),
         ];
         card("Style", &style, &mut y, &mut blocks, &mut rows);
-        card("Colours", &colours, &mut y, &mut blocks, &mut rows);
+        let mut from = 0;
+        for (title, n) in COLOUR_GROUPS {
+            card(title, &colours[from..from + n], &mut y, &mut blocks, &mut rows);
+            from += n;
+        }
         self.rows = rows;
         self.blocks = blocks;
         self.page.set_extent(y + 18.0, page.h);
@@ -1364,9 +1398,13 @@ impl SkinWindow {
         self.paint_list(&theme, app);
         self.paint_header(&theme, app);
         if self.advanced {
+            self.paint_code(&theme, app);
             self.paint_notes(&theme, app);
         } else {
             self.paint_page(&theme, app);
+        }
+        if self.advanced && self.asking.is_none() {
+            self.code.paint_list(&mut self.renderer, &theme);
         }
         if let Some((id, skin_id)) = &self.asking {
             let name = app.skins.find(skin_id).map_or_else(|| skin_id.clone(), |e| e.name.clone());
@@ -1494,30 +1532,108 @@ impl SkinWindow {
         r.fill_rect(Rect::new(h.x + PAD_X, h.bottom() - 1.0, (h.w - 2.0 * PAD_X).max(0.0), 1.0), theme.line);
     }
 
+    /// The skin's text, typed like code, and the guide under it (GUIDE).
+    fn paint_code(&mut self, theme: &Theme, app: &AppState) {
+        let width = (self.page_rect().w - 2.0 * PAD_X).max(80.0);
+        let lines = if self.guide { self.guide_lines(width) } else { Vec::new() };
+        let page_h = self.page_rect().h;
+        self.guide_h = if lines.is_empty() { 0.0 } else { (30.0 + lines.len() as f32 * GUIDE_LINE).min((page_h * 0.5).max(120.0)) };
+        let notes = app.skins.notes(&app.settings.skin);
+        self.code.set_marks(notes.iter().filter(|n| n.line > 0).map(|n| Mark { line: n.line, text: n.text.clone() }).collect());
+        self.code.focused = self.focus == Spot::Text && self.active;
+        let t = self.text_rect();
+        let room = Rect::new(0.0, size::TITLE_H, self.size.0, (self.size.1 - size::TITLE_H).max(0.0));
+        self.code.paint(&mut self.renderer, theme, &SkinLang, t, room);
+        if self.guide_h > 0.0 {
+            let g = Rect::new(t.x, t.bottom() + 8.0, t.w, self.guide_h - 8.0);
+            let r = &mut self.renderer;
+            r.push_clip(g);
+            r.text("Guide", Rect::new(g.x, g.y, 100.0, 18.0), &TextStyle::new(theme.text).semibold());
+            let style = TextStyle::new(theme.muted).size(ksize::NOTE_FONT);
+            let cw = r.mono_char_width(GUIDE_MONO);
+            for (i, (line, example)) in lines.iter().enumerate() {
+                let at = Rect::new(g.x, g.y + 22.0 + i as f32 * GUIDE_LINE, g.w, GUIDE_LINE);
+                if *example {
+                    // As in the text: the name in the accent colour, the note after // muted.
+                    let (code, note) = line.split_at(line.find("//").unwrap_or(line.len()));
+                    let (name, value) = code.split_at(code.find(':').map_or(0, |i| i + 1));
+                    r.mono_text(name, Rect::new(at.x + 8.0, at.y, at.w, at.h), GUIDE_MONO, theme.accent);
+                    let x = at.x + 8.0 + name.chars().count() as f32 * cw;
+                    r.mono_text(value, Rect::new(x, at.y, (at.right() - x).max(0.0), at.h), GUIDE_MONO, theme.text);
+                    if !note.is_empty() {
+                        let x = at.x + 8.0 + code.chars().count() as f32 * cw;
+                        r.mono_text(note, Rect::new(x, at.y, (at.right() - x).max(0.0), at.h), GUIDE_MONO, theme.muted);
+                    }
+                } else {
+                    r.text(line, at, &style);
+                }
+            }
+            r.pop_clip();
+        }
+        let me = Hot::Guide;
+        let look = Look { hover: self.hover == Some(me), pressed: self.pressed == Some(me), focused: false, enabled: true };
+        let b = self.guide_button();
+        kit::button(&mut self.renderer, theme, b, if self.guide { "HIDE GUIDE" } else { "GUIDE" }, look);
+    }
+
+    /// The guide: an example first (lines starting with "|", shown as typed), then the words.
+    fn guide_lines(&mut self, width: f32) -> Vec<(String, bool)> {
+        const GUIDE: &[&str] = &[
+            "For example:",
+            "|name: My skin          // its name in Settings",
+            "|dark: true             // a dark skin",
+            "|accent: #ff8ad8        // a colour, as #hex",
+            "|tab-line: accent       // the same colour as accent",
+            "|shape: rounded         // one of a few words",
+            "Each line is one setting: its name, a colon, then what it is.",
+            "Start typing a name and a list shows what fits. Tab or Enter takes one, then the list shows what it can be.",
+            "A colour is #hex, the name of another colour to copy it, or none.",
+            "Anything left out stays as in the standard skin. A line starting with // is a note.",
+            "Ctrl+/ turns a line into a note and back. Alt+Up and Alt+Down move a line.",
+        ];
+        let style = TextStyle::new(Color::hex(0)).size(ksize::NOTE_FONT);
+        let mut out = Vec::new();
+        for g in GUIDE {
+            match g.strip_prefix('|') {
+                Some(code) => out.push((code.to_string(), true)),
+                None => out.extend(kit::wrap(&mut self.renderer, g, &style, width).into_iter().map(|l| (l, false))),
+            }
+        }
+        out
+    }
+
     /// Under the skin's text: what Glint couldn't understand in it.
     fn paint_notes(&mut self, theme: &Theme, app: &AppState) {
         let t = self.text_rect();
-        let y0 = t.bottom() + 10.0;
+        let y0 = t.bottom() + self.guide_h + 12.0;
+        let t = Rect::new(t.x, t.y, (t.w - GUIDE_W - 12.0).max(40.0), t.h);
         let style = TextStyle::new(theme.muted).size(ksize::NOTE_FONT);
         let entry = app.skins.find(&app.settings.skin);
-        let mut lines: Vec<(String, Color)> = Vec::new();
+        // (Each problem with a line: clicking it goes there.)
+        let mut lines: Vec<(String, Color, usize)> = Vec::new();
         if entry.is_some_and(Entry::built_in) {
-            lines.push(("Built-in skins can't be edited here. DUPLICATE makes a copy you can edit.".into(), theme.text));
+            lines.push(("Built-in skins can't be edited here. DUPLICATE makes a copy you can edit.".into(), theme.text, 0));
         }
         let notes = app.skins.notes(&app.settings.skin);
         if notes.is_empty() {
-            lines.push(("Every line is understood.".into(), theme.muted));
+            lines.push(("Every line is understood.".into(), theme.muted, 0));
         } else {
             for n in notes.iter().take(4) {
                 let at = if n.line > 0 { format!("Line {}: ", n.line) } else { String::new() };
-                lines.push((format!("{at}{}", n.text), theme.accent));
+                lines.push((format!("{at}{}", n.text), theme.accent, n.line));
             }
             if notes.len() > 4 {
-                lines.push((format!("\u{2026}and {} more.", notes.len() - 4), theme.muted));
+                lines.push((format!("\u{2026}and {} more.", notes.len() - 4), theme.muted, 0));
             }
         }
-        for (i, (line, color)) in lines.iter().enumerate().take(5) {
-            self.renderer.text(line, Rect::new(t.x, y0 + i as f32 * NOTE_LINE, t.w, NOTE_LINE), &style.color(*color));
+        self.note_rects.clear();
+        for (i, (line, color, n)) in lines.iter().enumerate().take(5) {
+            let at = Rect::new(t.x, y0 + i as f32 * NOTE_LINE, t.w, NOTE_LINE);
+            let hot = *n > 0 && self.hover == Some(Hot::Note(*n));
+            self.renderer.text(line, at, &style.color(if hot { theme.text_strong } else { *color }));
+            if *n > 0 {
+                self.note_rects.push((at, *n));
+            }
         }
     }
 
@@ -1690,100 +1806,20 @@ impl SkinWindow {
             }
             self.edit_at = want;
         }
-        // The skin's text.
-        let text_want = (self.advanced && self.asking.is_none()).then(|| self.text_rect());
-        if text_want != self.text_at && !self.text_box.is_invalid() {
-            let s = self.scale();
-            let b = self.border();
-            // SAFETY: moves, shows or hides our own child window.
-            unsafe {
-                match text_want {
-                    Some(r) => {
-                        if self.text_font_dpi != self.dpi {
-                            self.make_text_font();
-                        }
-                        let _ = SetWindowPos(self.text_box, None, ((r.x + b) * s).round() as i32, ((r.y + b) * s).round() as i32, (r.w * s).round() as i32, (r.h * s).round() as i32, SWP_NOZORDER | SWP_NOACTIVATE);
-                        let _ = ShowWindow(self.text_box, SW_SHOW);
-                    }
-                    None => {
-                        let _ = ShowWindow(self.text_box, SW_HIDE);
-                        if frame::is_wine() {
-                            self.repaint_until = self.now() + 0.3;
-                            self.invalidate();
-                        }
-                    }
-                }
-            }
-            self.text_at = text_want;
-        }
     }
 
-    /// The skin's text in a fixed-width font (Consolas), at this window's DPI.
-    fn make_text_font(&mut self) {
-        let height = -((10.0 * PT * self.scale()).round() as i32);
-        // SAFETY: creates a GDI font (deleted in Drop or when replaced) and hands it to our own EDIT.
-        unsafe {
-            let font = CreateFontW(
-                height,
-                0,
-                0,
-                0,
-                FW_NORMAL.0 as i32,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS,
-                CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY,
-                (FIXED_PITCH.0 as u32) | (FF_MODERN.0 as u32),
-                w!("Consolas"),
-            );
-            SendMessageW(self.text_box, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
-            if !self.text_font.is_invalid() {
-                let _ = DeleteObject(HGDIOBJ(self.text_font.0));
-            }
-            self.text_font = font;
-        }
-        self.text_font_dpi = self.dpi;
-    }
-
-    /// Shows the skin's text in the text box, unless someone is typing there (then their text is
+    /// Shows the skin's text in the text view, unless someone is typing there (then their text is
     /// the truth); a built-in skin's text can't be changed.
     fn sync_text(&mut self, app: &AppState) {
-        if self.text_box.is_invalid() {
-            return;
-        }
-        // SAFETY: plain query.
-        if unsafe { GetFocus() } == self.text_box {
-            return;
-        }
         let entry = app.skins.find(&app.settings.skin);
-        let text = entry.map(|e| crlf(&e.text)).unwrap_or_default();
-        let read_only = entry.is_none_or(Entry::built_in);
+        self.code.read_only = entry.is_none_or(Entry::built_in);
+        if self.focus == Spot::Text && self.advanced {
+            return;
+        }
+        let text = entry.map(|e| e.text.replace("\r\n", "\n")).unwrap_or_default();
         if text != self.text_shown {
-            let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-            self.setting_text = true;
-            // SAFETY: the string lives across the call; our own child window.
-            unsafe {
-                let _ = SetWindowTextW(self.text_box, PCWSTR(wide.as_ptr()));
-            }
-            self.setting_text = false;
+            self.code.set_text(&text);
             self.text_shown = text;
-        }
-        // SAFETY: plain message to our own child.
-        unsafe {
-            SendMessageW(self.text_box, EM_SETREADONLY, Some(WPARAM(read_only as usize)), Some(LPARAM(0)));
-        }
-    }
-
-    fn text_box_text(&self) -> String {
-        // SAFETY: the buffer is sized from the reported length and written by the call.
-        unsafe {
-            let len = GetWindowTextLengthW(self.text_box).max(0) as usize;
-            let mut buf = vec![0u16; len + 1];
-            let n = GetWindowTextW(self.text_box, &mut buf).max(0) as usize;
-            String::from_utf16_lossy(&buf[..n])
         }
     }
 
@@ -1792,6 +1828,17 @@ impl SkinWindow {
     fn target_at(&self, p: Point) -> Option<Hot> {
         if p.y < size::TITLE_H {
             return self.close_rect().contains(p).then_some(Hot::Close);
+        }
+        if self.advanced && self.asking.is_none() {
+            if self.code.contains(p) {
+                return Some(Hot::Code);
+            }
+            if kit::button_contains(self.guide_button(), p) {
+                return Some(Hot::Guide);
+            }
+            if let Some((_, n)) = self.note_rects.iter().find(|(r, _)| r.contains(p)) {
+                return Some(Hot::Note(*n));
+            }
         }
         if p.x < LIST_W {
             if let Some(thumb) = self.list.thumb(self.list_track()) {
@@ -1852,6 +1899,15 @@ impl SkinWindow {
             self.holding.at = p;
             return;
         }
+        if self.code.busy() || (self.advanced && self.asking.is_none()) {
+            let busy = self.code.busy();
+            if self.code.mouse_move(p) {
+                self.invalidate();
+            }
+            if busy {
+                return;
+            }
+        }
         if let Some((which, grab)) = self.drag {
             let (track, scroller) = if which == Hot::ListThumb { (self.list_track(), &mut self.list) } else { (self.page_track(), &mut self.page) };
             if let Some(thumb) = scroller.thumb(track) {
@@ -1868,7 +1924,7 @@ impl SkinWindow {
         }
     }
 
-    fn mouse_down(&mut self, p: Point, app: &mut AppState) -> Vec<Ask> {
+    fn mouse_down(&mut self, p: Point, double: bool, app: &mut AppState) -> Vec<Ask> {
         self.cues = false;
         self.act_on_char = None;
         if self.asking.is_some() {
@@ -1919,6 +1975,21 @@ impl SkinWindow {
             Some(Hot::Button(b)) => self.focus = Spot::Button(b),
             Some(Hot::Advanced) => self.focus = Spot::Advanced,
             Some(Hot::Ctl(c, part)) => self.focus = Spot::Ctl(c, part),
+            Some(Hot::Code) => {
+                self.focus = Spot::Text;
+                self.code.focused = true;
+                if self.code.mouse_down(p, double, &SkinLang).0 == Done::Changed {
+                    asks.extend(self.text_typed(app));
+                }
+            }
+            Some(Hot::Guide) => {
+                self.guide = !self.guide;
+                self.focus = Spot::Text;
+            }
+            Some(Hot::Note(n)) => {
+                self.focus = Spot::Text;
+                self.code.go_to_line(n);
+            }
             _ => {}
         }
         self.invalidate();
@@ -1940,6 +2011,7 @@ impl SkinWindow {
         }
         let was = self.pressed.take();
         self.drag = None;
+        self.code.mouse_up();
         // SAFETY: releasing our own capture.
         unsafe {
             let _ = ReleaseCapture();
@@ -1961,6 +2033,13 @@ impl SkinWindow {
     }
 
     fn wheel(&mut self, p: Point, notches: f32) {
+        if self.advanced && self.asking.is_none() && self.code.rect.contains(p) {
+            // SAFETY: a plain key-state query.
+            let across = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+            self.code.wheel(notches, across);
+            self.invalidate();
+            return;
+        }
         let now = self.now();
         let moved = if p.x < LIST_W { self.list.scroll_by(-notches * WHEEL_STEP, now) } else { !self.advanced && self.page.scroll_by(-notches * WHEEL_STEP, now) };
         if moved {
@@ -2005,12 +2084,6 @@ impl SkinWindow {
         self.focus = spot;
         self.cues = true;
         match spot {
-            Spot::Text => {
-                // SAFETY: focuses our own child window.
-                unsafe {
-                    let _ = SetFocus(Some(self.text_box));
-                }
-            }
             Spot::Ctl(c, part) => {
                 if let Some(r) = self.rows.iter().find(|r| r.ctl == c).and_then(|r| self.part_rect(r, part)) {
                     let row = Rect::new(r.x, r.y - 14.0, r.w, r.h + 28.0);
@@ -2032,6 +2105,28 @@ impl SkinWindow {
             let a = self.ask.key(vk);
             asks.extend(self.answer(a, app));
             return true;
+        }
+        // The skin's text has the keyboard: its keys first.
+        if self.focus == Spot::Text && self.advanced {
+            match self.code.key(vk, self.hwnd, &SkinLang) {
+                Done::Changed => {
+                    asks.extend(self.text_typed(app));
+                    self.invalidate();
+                    return true;
+                }
+                Done::Moved => {
+                    self.invalidate();
+                    return true;
+                }
+                // Esc leaves the text (it doesn't close the window); Tab moves on.
+                Done::NotMine if is(VK_ESCAPE) => {
+                    self.focus = Spot::Advanced;
+                    self.cues = true;
+                    self.invalidate();
+                    return true;
+                }
+                Done::NotMine => {}
+            }
         }
         if alt && !is(VK_DOWN) {
             return false;
@@ -2676,7 +2771,7 @@ impl SkinWindow {
         if app.skins.find(&id).is_none_or(Entry::built_in) {
             return Vec::new();
         }
-        let typed = self.text_box_text();
+        let typed = self.code.text.clone();
         self.text_shown = typed.clone();
         if let Some(old) = app.skins.find(&id).map(|e| e.text.clone()).filter(|t| *t != typed) {
             self.remember(&id, old, Some(TEXT_GROUP));
@@ -2758,7 +2853,6 @@ impl SkinWindow {
                     self.size = self.inner_size(w, h);
                     self.layout_dirty = true;
                     self.edit_at = None;
-                    self.text_at = None;
                 }
                 self.invalidate();
                 Some(LRESULT(0))
@@ -2773,12 +2867,31 @@ impl SkinWindow {
                 }
                 self.layout_dirty = true;
                 self.edit_at = None;
-                self.text_at = None;
+                self.code.forget_font();
                 self.invalidate();
                 // SAFETY: lparam points to the suggested window rectangle.
                 let suggested = unsafe { *(lparam.0 as *const RECT) };
                 asks.push(Ask::Job(Job::Place(suggested)));
                 Some(LRESULT(0))
+            }
+            // An I-beam over the skin's text, a hand over a problem under it.
+            windows::Win32::UI::WindowsAndMessaging::WM_SETCURSOR if lo_word(lparam.0 as usize) == windows::Win32::UI::WindowsAndMessaging::HTCLIENT && self.advanced => {
+                use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursor, IDC_ARROW, IDC_HAND, IDC_IBEAM};
+                let mut pt = POINT::default();
+                // SAFETY: plain cursor queries and setting the cursor's shape.
+                unsafe {
+                    let _ = GetCursorPos(&mut pt);
+                    let _ = ScreenToClient(self.hwnd, &mut pt);
+                    let (s, b) = (self.scale(), self.border());
+                    let p = Point::new(pt.x as f32 / s - b, pt.y as f32 / s - b);
+                    let shape = match self.target_at(p) {
+                        Some(Hot::Code) if self.code.rect.contains(p) => IDC_IBEAM,
+                        Some(Hot::Note(_)) => IDC_HAND,
+                        _ => IDC_ARROW,
+                    };
+                    SetCursor(LoadCursorW(None, shape).ok());
+                }
+                Some(LRESULT(1))
             }
             WM_MOUSEMOVE => {
                 let p = self.client_point(lparam);
@@ -2787,6 +2900,7 @@ impl SkinWindow {
             }
             WM_MOUSELEAVE => {
                 self.tracking = false;
+                self.code.mouse_leave();
                 if self.drag.is_none() && self.hover.take().is_some() {
                     self.invalidate();
                 }
@@ -2794,7 +2908,7 @@ impl SkinWindow {
             }
             WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
                 let p = self.client_point(lparam);
-                asks.extend(self.mouse_down(p, app));
+                asks.extend(self.mouse_down(p, msg == WM_LBUTTONDBLCLK, app));
                 Some(LRESULT(0))
             }
             WM_LBUTTONUP => {
@@ -2805,6 +2919,7 @@ impl SkinWindow {
             WM_CAPTURECHANGED => {
                 self.pressed = None;
                 self.drag = None;
+                self.code.mouse_up();
                 self.holding.release(self.hwnd);
                 self.invalidate();
                 Some(LRESULT(0))
@@ -2821,6 +2936,15 @@ impl SkinWindow {
                 Some(LRESULT(0))
             }
             WM_KEYDOWN | WM_SYSKEYDOWN => self.key(wparam.0 as u16, app, &mut asks).then_some(LRESULT(0)),
+            WM_CHAR if self.focus == Spot::Text && self.advanced && self.asking.is_none() => {
+                if let Some(c) = char::from_u32(wparam.0 as u32) {
+                    if self.code.char(c, &SkinLang) == Done::Changed {
+                        asks.extend(self.text_typed(app));
+                    }
+                    self.invalidate();
+                }
+                Some(LRESULT(0))
+            }
             WM_CHAR => {
                 if let Some(spot) = self.act_on_char.take() {
                     asks.extend(self.activate_spot(spot, app));
@@ -2869,35 +2993,11 @@ impl SkinWindow {
                 asks.extend(self.text_event(ev, app));
                 Some(LRESULT(0))
             }
-            WM_APP_TEXT_KEY => {
-                // Tab or Esc in the skin's text: the keyboard goes back to the window.
-                // SAFETY: focuses our own window.
-                unsafe {
-                    let _ = SetFocus(Some(self.hwnd));
-                }
-                if wparam.0 == VK_TAB.0 as usize {
-                    self.focus = Spot::Text;
-                    self.move_focus(if lparam.0 != 0 { -1 } else { 1 }, app);
-                } else {
-                    self.focus = Spot::Advanced;
-                    self.cues = true;
-                }
-                self.invalidate();
-                Some(LRESULT(0))
-            }
             WM_COMMAND => {
                 let (id, code) = (lo_word(wparam.0) as u16, hi_word(wparam.0));
                 // EN_CHANGE (0x0300): typed (not set by us).
                 if code == 0x0300 && id == EDIT_BOX && !textbox::setting_text() {
                     asks.extend(self.text_event(TextEvent { id, kind: TextEventKind::Changed }, app));
-                }
-                if code == 0x0300 && id == TEXT_BOX && !self.setting_text {
-                    asks.extend(self.text_typed(app));
-                }
-                // EN_SETFOCUS (0x0100) on the skin's text: the keyboard is there.
-                if code == 0x0100 && id == TEXT_BOX {
-                    self.focus = Spot::Text;
-                    self.invalidate();
                 }
                 Some(LRESULT(0))
             }
@@ -2919,9 +3019,6 @@ impl Drop for SkinWindow {
         unsafe {
             if brush != 0 {
                 let _ = DeleteObject(HGDIOBJ(brush as *mut _));
-            }
-            if !self.text_font.is_invalid() {
-                let _ = DeleteObject(HGDIOBJ(self.text_font.0));
             }
         }
     }
@@ -3004,7 +3101,6 @@ mod tests {
         assert_eq!(size_label(9.0), "9 pt (standard)");
         assert_eq!(size_label(10.5), "10.5 pt");
         assert_eq!((width_label(0.0), width_label(2.0)), ("0 (none)".to_string(), "2".to_string()));
-        assert_eq!(crlf("a\nb\r\nc"), "a\r\nb\r\nc");
     }
 
     #[test]
@@ -3013,6 +3109,7 @@ mod tests {
             assert_eq!(COLOURS.iter().filter(|(k, _)| k == key).count(), 1, "{key}");
         }
         assert_eq!(COLOURS.len(), skin::COLOURS.len());
+        assert_eq!(COLOUR_GROUPS.iter().map(|(_, n)| n).sum::<usize>(), COLOURS.len());
         // Each shows what the skin says, read back from its own line.
         let text: String = COLOURS.iter().enumerate().map(|(i, (k, _))| format!("{k}: #{:02x}0203\n", i + 1)).collect();
         for (i, c) in shown_colours(&text).iter().enumerate() {

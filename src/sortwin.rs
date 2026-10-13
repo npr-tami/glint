@@ -2357,13 +2357,16 @@ impl SortWindow {
                     let n = self.completion.items.len();
                     self.pick = if down { (self.pick + 1) % n } else { (self.pick + n - 1) % n };
                 } else {
+                    // Moving between lines never opens a list; only typing does.
                     self.line_move(if down { 1 } else { -1 });
+                    self.list_closed = true;
                     self.suggest(app);
                 }
             }
             _ if vk == VK_PRIOR.0 || vk == VK_NEXT.0 => {
                 let lines = ((self.lay.editor.h - 2.0 * BOX_PAD) / LINE_H) as i32;
                 self.line_move(if vk == VK_NEXT.0 { lines } else { -lines });
+                self.list_closed = true;
             }
             _ if vk == VK_LEFT.0 || vk == VK_RIGHT.0 => {
                 let right = vk == VK_RIGHT.0;

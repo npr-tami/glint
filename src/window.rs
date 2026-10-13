@@ -794,7 +794,17 @@ fn open_settings(hwnd: HWND, ptr: *mut Window, page: Option<usize>) {
             return;
         }
         let (theme, remembered) = ((*ptr).app.theme.clone(), (*ptr).app.settings.settings_size);
-        let Some(win) = settingswin::create(hwnd, &theme, remembered, page.unwrap_or(0)) else {
+        let (opens, bounds) = ((*ptr).app.settings.settings_opens, (*ptr).app.settings.settings_bounds);
+        // Docked or as a tab, Settings takes the sort editor's and the customiser's place.
+        if matches!(opens, settings::SettingsOpens::Docked | settings::SettingsOpens::Tab) {
+            if let Some(s) = (*ptr).sort_win.as_ref() {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(s.hwnd()), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            if let Some(s) = (*ptr).skin_win.as_ref() {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(s.hwnd()), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+        }
+        let Some(win) = settingswin::create(hwnd, &theme, remembered, bounds, opens, page.unwrap_or(0)) else {
             BUSY.with(|b| b.set(true));
             (*ptr).app.say("Windows couldn't open the Settings window right now");
             (*ptr).invalidate();
@@ -807,6 +817,7 @@ fn open_settings(hwnd: HWND, ptr: *mut Window, page: Option<usize>) {
         BUSY.with(|b| b.set(true));
         (*ptr).settings_win = Some(win);
         (*ptr).deferred.push(Deferred::Settings(settingswin::Job::Show));
+        (*ptr).invalidate(); // its tab, when it opens as one
         BUSY.with(|b| b.set(false));
     }
 }
@@ -1363,6 +1374,17 @@ impl Window {
             }
             Command::OpenSettings(page) => self.deferred.push(Deferred::OpenSettings(page)),
             Command::OpenSkinEditor => self.deferred.push(Deferred::OpenSkins),
+            Command::CloseSettings => {
+                if self.settings_win.is_some() {
+                    self.deferred.push(Deferred::Settings(settingswin::Job::Close));
+                }
+            }
+            // A folder's tab picked while Settings is open as a tab: Settings closes.
+            Command::SwitchTab(i) if self.app.settings_tab => {
+                self.deferred.push(Deferred::Settings(settingswin::Job::Close));
+                self.app.settings_tab = false;
+                self.app.run(Command::SwitchTab(i));
+            }
             Command::OpenSortEditor => self.deferred.push(Deferred::OpenSort),
             Command::CheckForUpdates => {
                 // Only the main Glint looks (Settings > About says so in an extra window).
@@ -1713,6 +1735,7 @@ impl Window {
             self.drag_listing_changed(); // rows may have moved under something being dragged
         }
         self.sync_theme();
+        self.app.settings_tab = self.settings_win.is_some() && self.app.settings.settings_opens == settings::SettingsOpens::Tab;
         self.app.icons.begin_frame();
         // A new generation for the thumbnails: what isn't asked for again in this frame or the next
         // isn't on screen any more (thumbs.rs).
@@ -2531,8 +2554,9 @@ impl Window {
         let (result, asks) = s.handle(msg, wparam, lparam, app);
         self.settings_asks(asks);
         if msg == WM_NCDESTROY {
-            // Its last message: the state goes with it.
+            // Its last message: the state goes with it (and its tab, if it had one).
             self.settings_win = None;
+            self.invalidate();
         }
         result
     }

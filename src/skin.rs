@@ -271,7 +271,8 @@ pub const OTHERS: &[(&str, &str)] = &[
     ("see-through", "How much shows through the glass title bar (era 7, Windows 11): 0 to 90"),
     ("wallpaper", "A picture behind the files: its file name (next to the skin, or in the skins folder), or a full path"),
     ("wallpaper-opacity", "How strongly the wallpaper shows: 0 to 100 (40 if not set)"),
-    ("wallpaper-position", "Which side of the wallpaper stays in view: left, middle or right"),
+    ("wallpaper-position", "Which side of the wallpaper stays in view: left, middle or right, then top, middle or bottom if you like"),
+    ("wallpaper-zoom", "Zoom the wallpaper in (up to 500) or out (down to -500); 0 is its usual size"),
     ("wallpaper-fit", "fill (the picture fills the list) or whole (all of it, at its side)"),
     ("era", "Older Windows to look like: none, 98, 2000, xp or 7"),
     ("icons", "Icons: windows (today's), classic, xp or aero (follows the era)"),
@@ -842,6 +843,8 @@ pub fn parse(text: &str, fallback_name: &str) -> Parsed {
         wallpaper_opacity: 0.4,
         wallpaper_at: 1.0,
         wallpaper_whole: false,
+        wallpaper_at_y: None,
+        wallpaper_zoom: 1.0,
         era: Era::None,
         icons: IconSet::Windows,
         title_text: p("title-text").base(),
@@ -994,11 +997,26 @@ pub fn parse(text: &str, fallback_name: &str) -> Parsed {
     theme.wallpaper_whole = mine.map(|(v, _)| v).or(theirs).is_some_and(|v| v.trim().eq_ignore_ascii_case("whole"));
     let (mine, theirs) = value("wallpaper-position");
     if let Some(v) = mine.map(|(v, _)| v).or(theirs) {
-        theme.wallpaper_at = match v.trim().to_ascii_lowercase().as_str() {
-            "left" => 0.0,
-            "middle" | "center" | "centre" => 0.5,
-            _ => 1.0,
+        // "right", "left bottom", "middle top"...: across first, then up and down.
+        let words: Vec<String> = v.to_ascii_lowercase().split([' ', ',']).filter(|w| !w.is_empty()).map(str::to_string).collect();
+        let at = |w: &str| match w {
+            "left" | "top" => Some(0.0),
+            "middle" | "center" | "centre" => Some(0.5),
+            "right" | "bottom" => Some(1.0),
+            _ => None,
         };
+        match words.as_slice() {
+            [one] if one == "top" || one == "bottom" => theme.wallpaper_at_y = at(one),
+            [across, rest @ ..] => {
+                theme.wallpaper_at = at(across).unwrap_or(1.0);
+                theme.wallpaper_at_y = rest.first().and_then(|w| at(w));
+            }
+            [] => {}
+        }
+    }
+    // 0 its usual size; 100 twice as big and -100 half as big, up to 500 (6 times) either way.
+    if let Some(x) = number("wallpaper-zoom", -500.0, 500.0, None, &mut notes) {
+        theme.wallpaper_zoom = if x >= 0.0 { 1.0 + x / 100.0 } else { 1.0 / (1.0 - x / 100.0) };
     }
     if let Some(x) = number("scrollbar-width", 4.0, 18.0, None, &mut notes) {
         theme.scrollbar_w = x;
@@ -2498,6 +2516,14 @@ mod tests {
         let p = parse("see-through: 120\n", "x");
         assert_eq!((p.theme.see_through, p.notes.len()), (0.9, 1));
         assert_eq!(parse("era: 7\n", "x").theme.see_through, 0.0, "solid unless the skin says");
+        // The wallpaper's zoom, and where it sits across and up and down.
+        let t = parse("wallpaper-zoom: 50\nwallpaper-position: left bottom\n", "x").theme;
+        assert_eq!((t.wallpaper_zoom, t.wallpaper_at, t.wallpaper_at_y), (1.5, 0.0, Some(1.0)));
+        let t = parse("wallpaper-position: middle\n", "x").theme;
+        assert_eq!((t.wallpaper_zoom, t.wallpaper_at, t.wallpaper_at_y), (1.0, 0.5, None));
+        assert_eq!(parse("wallpaper-position: top\n", "x").theme.wallpaper_at_y, Some(0.0));
+        assert_eq!(parse("wallpaper-zoom: -100\n", "x").theme.wallpaper_zoom, 0.5);
+        assert_eq!(parse("wallpaper-zoom: 900\n", "x").theme.wallpaper_zoom, 6.0);
     }
 
     /// The skins shared as files (next to the source, not built in) read cleanly too, each with its

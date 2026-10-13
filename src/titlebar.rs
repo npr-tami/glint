@@ -74,6 +74,9 @@ enum Part {
     Close,
 }
 
+/// The name on Settings' tab, when it opens as a tab.
+const SETTINGS_TAB: &str = "Settings";
+
 /// Where a tab was drawn (filled in by `paint`, used for the mouse).
 #[derive(Clone, Copy, Debug, Default)]
 struct TabSlot {
@@ -185,7 +188,6 @@ impl TitleBar {
         };
         let left = self.rect.x + crate::logo::width(&app.theme) + 4.0;
         let room = (self.button(2).x - DRAG_ROOM - PLUS - 4.0 - left).max(0.0);
-        let n = app.tabs.len().max(1) as f32;
         let mut widths: Vec<f32> = app
             .tabs
             .iter()
@@ -195,6 +197,12 @@ impl TitleBar {
                 (TAB_PAD + size::ICON + TAB_ICON_GAP + text + 6.0 + TAB_CLOSE + TAB_PAD * 0.5).clamp(TAB_MIN, TAB_MAX)
             })
             .collect();
+        // Settings open as a tab: its tab after the folders' (no picture, the same ×).
+        if app.settings_tab {
+            let text = self.measure(r, SETTINGS_TAB, pills);
+            widths.push((TAB_PAD + text + 6.0 + TAB_CLOSE + TAB_PAD * 0.5).clamp(TAB_MIN, TAB_MAX));
+        }
+        let n = widths.len().max(1) as f32;
         let total: f32 = widths.iter().sum::<f32>() + gap * (n - 1.0);
         if total > room {
             let each = ((room - gap * (n - 1.0)) / n).max(TAB_SQUEEZED);
@@ -228,9 +236,10 @@ impl TitleBar {
         let pills = theme.tabs == TabStyle::Pills;
         // Tabs never run under the caption buttons.
         r.push_clip(Rect::new(self.rect.x, self.rect.y, self.button(2).x - self.rect.x, self.rect.h));
-        for (i, tab) in app.tabs.iter().enumerate() {
+        for i in 0..app.tabs.len() + app.settings_tab as usize {
             let Some(slot) = self.tabs.get_mut(i) else { break };
-            let active = i == app.active;
+            let tab = app.tabs.get(i);
+            let active = if app.settings_tab { tab.is_none() } else { i == app.active };
             let dropping = self.drop_tab == Some(i);
             let hot = matches!(self.hover, Some(Part::Tab(t) | Part::TabClose(t)) if t == i) || dropping;
             let rect = slot.rect;
@@ -266,7 +275,7 @@ impl TitleBar {
             let mid = rect.y + rect.h / 2.0 + if active && !pills { 1.0 } else { 0.0 };
             let mut x = rect.x + TAB_PAD;
             // The folder's icon, when there is room for it and a name.
-            if rect.w >= 80.0 {
+            if let Some(tab) = tab.filter(|_| rect.w >= 80.0) {
                 let at = Rect::new(x, (mid - size::ICON / 2.0).round(), size::ICON, size::ICON);
                 tab_icon(r, theme, app, &tab.path, at);
                 x += size::ICON + TAB_ICON_GAP;
@@ -279,7 +288,7 @@ impl TitleBar {
             } else {
                 theme.tab_text
             };
-            let title = app.display_name(&tab.path);
+            let title = tab.map_or_else(|| SETTINGS_TAB.to_string(), |t| app.display_name(&t.path));
             // The current pill's name is bold.
             let style = if pills && active { TextStyle::new(color).bold() } else { TextStyle::new(color) };
             let words = Rect::new(x, mid - 10.0, (right - x).max(0.0), 20.0);
@@ -506,11 +515,13 @@ impl TitleBar {
     fn paint_classic_tabs(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState) {
         r.push_clip(Rect::new(self.rect.x, self.rect.y, self.button(2).x - self.rect.x, self.rect.h));
         // The current tab last: it overlaps its neighbours.
-        let order: Vec<usize> = (0..app.tabs.len()).filter(|&i| i != app.active).chain((app.active < app.tabs.len()).then_some(app.active)).collect();
+        let current = if app.settings_tab { app.tabs.len() } else { app.active };
+        let count = app.tabs.len() + app.settings_tab as usize;
+        let order: Vec<usize> = (0..count).filter(|&i| i != current).chain((current < count).then_some(current)).collect();
         for i in order {
             let Some(slot) = self.tabs.get_mut(i) else { continue };
-            let tab = &app.tabs[i];
-            let active = i == app.active;
+            let tab = app.tabs.get(i);
+            let active = i == current;
             let dropping = self.drop_tab == Some(i);
             let hot = matches!(self.hover, Some(Part::Tab(t) | Part::TabClose(t)) if t == i) || dropping;
             let rect = slot.rect;
@@ -527,13 +538,14 @@ impl TitleBar {
             // The words and picture sit in the middle of the part below the top edge.
             let mid = (shape.y + 2.0 + (shape.h - 2.0) / 2.0).round();
             let mut x = rect.x + 8.0;
-            if rect.w >= 80.0 {
+            if let Some(tab) = tab.filter(|_| rect.w >= 80.0) {
                 tab_icon(r, theme, app, &tab.path, Rect::new(x, mid - size::ICON / 2.0, size::ICON, size::ICON));
                 x += size::ICON + 6.0;
             }
             let right = if show_close { close.x - 3.0 } else { rect.right() - 6.0 };
             let color = if active { theme.tab_active_text } else { theme.tab_text };
-            r.text(&app.display_name(&tab.path), Rect::new(x, mid - 10.0, (right - x).max(0.0), 20.0), &TextStyle::new(color));
+            let title = tab.map_or_else(|| SETTINGS_TAB.to_string(), |t| app.display_name(&t.path));
+            r.text(&title, Rect::new(x, mid - 10.0, (right - x).max(0.0), 20.0), &TextStyle::new(color));
             if show_close {
                 let close_hot = self.hover == Some(Part::TabClose(i));
                 let down = close_hot && self.pressed.is_some_and(|(p, _)| p == Part::TabClose(i));
@@ -726,11 +738,13 @@ impl Component for TitleBar {
         Effect::None
     }
 
-    fn mouse_down(&mut self, _ctx: &Ctx, e: &MouseEvent, _app: &mut AppState) -> Effect {
+    fn mouse_down(&mut self, _ctx: &Ctx, e: &MouseEvent, app: &mut AppState) -> Effect {
         self.pressed = None;
         let Some(part) = self.part_at(e.pos) else { return Effect::None };
         match (part, e.button) {
             // Switching happens on the way down, so it feels instant.
+            // Settings' own tab is already the current one.
+            (Part::Tab(i), MouseButton::Left) if i >= app.tabs.len() => Effect::None,
             (Part::Tab(i), MouseButton::Left) => Effect::Command(Command::SwitchTab(i)),
             // The tab menu comes on the way up, like everywhere in Windows.
             (Part::Tab(_) | Part::TabClose(_), MouseButton::Middle | MouseButton::Right) | (_, MouseButton::Left) => {
@@ -747,6 +761,14 @@ impl Component for TitleBar {
             return Effect::Redraw;
         }
         match part {
+            // Settings' tab: its × (or a middle-click) closes Settings; it has no menu.
+            Part::Tab(i) | Part::TabClose(i) if i >= app.tabs.len() => {
+                if matches!(part, Part::TabClose(_)) || button == MouseButton::Middle {
+                    Effect::Command(Command::CloseSettings)
+                } else {
+                    Effect::Redraw
+                }
+            }
             Part::Tab(i) | Part::TabClose(i) if button == MouseButton::Right => self.tab_menu(i, e.pos, app),
             Part::Tab(i) | Part::TabClose(i) if button == MouseButton::Middle => Effect::Command(Command::CloseTab(i)),
             Part::TabClose(i) => Effect::Command(Command::CloseTab(i)),
@@ -774,9 +796,9 @@ impl Component for TitleBar {
 
     /// A tab (its × too): things dropped on it go into its folder, and resting on it switches to
     /// it (window/drag.rs).
-    fn drop_target(&self, p: Point, _app: &AppState) -> Option<DropTarget> {
+    fn drop_target(&self, p: Point, app: &AppState) -> Option<DropTarget> {
         match self.part_at(p)? {
-            Part::Tab(i) | Part::TabClose(i) => Some(DropTarget::Tab(i)),
+            Part::Tab(i) | Part::TabClose(i) if i < app.tabs.len() => Some(DropTarget::Tab(i)),
             _ => None,
         }
     }

@@ -68,7 +68,7 @@ fn is_sep(c: char) -> bool {
 
 /// Puts `items` in matching order: the ones whose `key` starts with `typed` first, then the ones
 /// that contain it; the rest are dropped, and so is one that is exactly what's typed.
-fn rank(items: Vec<(String, Suggestion)>, typed: &str) -> Vec<Suggestion> {
+pub fn rank(items: Vec<(String, Suggestion)>, typed: &str) -> Vec<Suggestion> {
     let typed = typed.to_lowercase();
     let (mut first, mut then) = (Vec::new(), Vec::new());
     let mut seen = HashSet::new();
