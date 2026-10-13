@@ -12,6 +12,11 @@ Each new number counts as newer than the one before it (1.0.12-beta.1, 1.0.12-be
 1.0.13-beta.1, ...), so the updater offers them in that order. Versions up to 0.11.0 used
 MAJOR.MINOR.PATCH, where a new feature bumped the middle number.
 
+## 1.0.18-beta.2 (2026-10-13): Quick fix
+
+### Fixes
+- The skins and Settings windows no longer look stretched after you resize them or Glint.
+
 ## 1.0.18-beta.1 (2026-10-13): Settings beside Glint
 
 ### New

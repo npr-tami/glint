@@ -2129,10 +2129,10 @@ impl Window {
                 // (Minimised keeps `maximized` as it was: that's how the window comes back.)
                 self.maximized = wparam.0 == SIZE_MAXIMIZED as usize;
                 self.remember_normal_rect();
-                if let Some(s) = self.settings_win.as_ref() {
+                if let Some(s) = self.settings_win.as_mut() {
                     s.follow_owner();
                 }
-                if let Some(s) = self.skin_win.as_ref() {
+                if let Some(s) = self.skin_win.as_mut() {
                     s.follow_owner();
                 }
                 self.follow_sort();
@@ -2332,10 +2332,10 @@ impl Window {
             WM_MOVE => {
                 self.remember_normal_rect();
                 // Settings stays in the middle of the main window; the sort editor beside it.
-                if let Some(s) = self.settings_win.as_ref() {
+                if let Some(s) = self.settings_win.as_mut() {
                     s.follow_owner();
                 }
-                if let Some(s) = self.skin_win.as_ref() {
+                if let Some(s) = self.skin_win.as_mut() {
                     s.follow_owner();
                 }
                 self.follow_sort();

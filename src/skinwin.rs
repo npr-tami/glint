@@ -1031,7 +1031,7 @@ fn number(x: f32) -> String {
 
 impl SkinWindow {
     /// Docked beside the main window again (it moved or changed size, or the customiser did).
-    pub fn follow_owner(&self) {
+    pub fn follow_owner(&mut self) {
         // SAFETY: plain queries and a move of our own window.
         unsafe {
             let Ok(owner) = GetWindow(self.hwnd, GW_OWNER) else { return };
@@ -1041,6 +1041,23 @@ impl SkinWindow {
             let r = visible_rect(self.hwnd);
             place_visible(self.hwnd, beside(owner, r.right - r.left));
         }
+        self.fit_client();
+    }
+
+    /// Matches the drawing to the window's size. The move above sends WM_SIZE while the app's state
+    /// is busy, so that message never reaches us: the old picture showed stretched.
+    fn fit_client(&mut self) {
+        let mut rc = RECT::default();
+        // SAFETY: our own window and a valid out-struct.
+        if unsafe { GetClientRect(self.hwnd, &mut rc) }.is_err() || rc.right <= rc.left || rc.bottom <= rc.top {
+            return;
+        }
+        let (w, h) = ((rc.right - rc.left) as u32, (rc.bottom - rc.top) as u32);
+        self.renderer.resize(w, h);
+        self.size = self.inner_size(w, h);
+        self.layout_dirty = true;
+        self.edit_at = None;
+        self.invalidate();
     }
 
     pub fn hwnd(&self) -> HWND {

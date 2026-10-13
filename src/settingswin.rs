@@ -853,8 +853,19 @@ fn hi_word(v: usize) -> u32 {
 
 impl SettingsWindow {
     /// Back in its place by the main window (it moved or changed size, or Settings did).
-    pub fn follow_owner(&self) {
+    pub fn follow_owner(&mut self) {
         follow(self.hwnd, false);
+        // The move's WM_SIZE comes while the app's state is busy and never reaches us: match the
+        // drawing to the new size here, or the old picture shows stretched.
+        let mut rc = RECT::default();
+        // SAFETY: our own window and a valid out-struct.
+        if unsafe { GetClientRect(self.hwnd, &mut rc) }.is_ok() && rc.right > rc.left && rc.bottom > rc.top {
+            let (w, h) = ((rc.right - rc.left) as u32, (rc.bottom - rc.top) as u32);
+            self.renderer.resize(w, h);
+            self.size = self.inner_size(w, h);
+            self.layout_dirty = true;
+            self.invalidate();
+        }
     }
 
     /// Too narrow for the page list down the left: the pages are buttons along the top.
