@@ -21,6 +21,13 @@ use crate::ui::Command;
 /// What a file command in the Recycle Bin says instead of acting on its items.
 const RESTORE_FIRST: &str = "Restore it first (right-click > Restore).";
 
+/// Files that do something when opened (programs, scripts, shortcuts, registry files): not
+/// opened straight from the Recycle Bin.
+const RUNS: &[&str] = &[
+    "exe", "com", "scr", "pif", "msi", "msix", "msixbundle", "appx", "appxbundle", "appinstaller", "bat", "cmd", "ps1", "vbs", "vbe", "js", "jse",
+    "wsf", "wsh", "hta", "cpl", "reg", "inf", "lnk", "url", "jar", "application",
+];
+
 impl AppState {
     /// Whether the tab on screen shows the Recycle Bin, with its listing on screen (not another
     /// folder still on its way, or still shown while the bin is).
@@ -97,11 +104,12 @@ impl AppState {
     }
 
     /// Enter / double-click in the bin: a deleted file can be looked at as it is (opened where it's
-    /// kept); a folder has to be restored first.
+    /// kept); a folder has to be restored first, and so does a program or script, which would run.
     fn bin_look_at(&mut self, chosen: &[usize]) {
         let t = self.tab();
         match chosen {
             [one] => match t.folder.entries.get(*one) {
+                Some(e) if RUNS.contains(&e.ext.as_str()) => self.say("Restore it to run it (right-click > Restore)."),
                 Some(e) if !e.is_container() => match self.bin_items(chosen).first().and_then(|i| i.real.clone()) {
                     Some(real) => shell::open(&real),
                     None => self.say("Windows didn't say where this item is kept, so Glint can't open it."),

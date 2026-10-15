@@ -223,8 +223,8 @@ impl Peeker {
     }
 
     /// Asks about an item, replacing whatever was still waiting. `hwnd` is repainted when answers
-    /// are ready.
-    pub fn ask(&self, ask: Ask, hwnd: HWND) {
+    /// are ready. False when it couldn't be asked (no thread to be had right now).
+    pub fn ask(&self, ask: Ask, hwnd: HWND) -> bool {
         self.shared.hwnd.store(hwnd.0 as isize, Ordering::SeqCst);
         let start = {
             let mut slot = self.shared.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -238,10 +238,12 @@ impl Peeker {
                 let mut slot = self.shared.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 slot.running = false;
                 slot.waiting = None;
+                return false;
             }
         } else {
             self.shared.ready.notify_one();
         }
+        true
     }
 
     /// The answers that arrived since the last call.
@@ -376,32 +378,57 @@ const VIDEO_FRAME_RATE: PROPERTYKEY = key(0x64440491_4c8b_11d1_8b70_080036b11a03
 const VIDEO_BITRATE: PROPERTYKEY = key(0x64440491_4c8b_11d1_8b70_080036b11a03, 8);
 const VIDEO_TOTAL_BITRATE: PROPERTYKEY = key(0x64440491_4c8b_11d1_8b70_080036b11a03, 43);
 
-/// What Windows' property handlers know: picture and video size, length, a photo's orientation.
-fn shell_facts(path: &str, facts: &mut Facts) {
+/// The item for `path` in Windows' property system; None if Windows can't make one.
+fn shell_item(path: &str) -> Option<IShellItem2> {
     let w = wide_path(path);
     // SAFETY: `w` is NUL-terminated and outlives the call; the item is an owned COM pointer.
-    let Ok(item) = (unsafe { SHCreateItemFromParsingName::<_, _, IShellItem2>(PCWSTR(w.as_ptr()), None) }) else { return };
-    // SAFETY: plain property reads on a live item; the keys are constants.
+    unsafe { SHCreateItemFromParsingName::<_, _, IShellItem2>(PCWSTR(w.as_ptr()), None) }.ok()
+}
+
+/// A picture's or a video's size in pixels, and how long it plays (in 100-nanosecond steps), as
+/// Windows' property handlers know them.
+fn size_and_length(item: &IShellItem2) -> (Option<(u32, u32)>, Option<u64>) {
+    let mut dims = None;
+    // SAFETY: plain property reads on a live item; the keys are constants, and the one string
+    // read is freed with the allocator it came from.
     unsafe {
         for (across, down) in [(IMAGE_WIDTH, IMAGE_HEIGHT), (VIDEO_WIDTH, VIDEO_HEIGHT)] {
             if let (Ok(width), Ok(height)) = (item.GetUInt32(&across), item.GetUInt32(&down)) {
                 if width > 0 && height > 0 {
-                    facts.dims = Some((width, height));
+                    dims = Some((width, height));
                     break;
                 }
             }
         }
-        if facts.dims.is_none() {
+        if dims.is_none() {
             if let Ok(text) = item.GetString(&IMAGE_DIMENSIONS) {
                 if !text.is_null() {
-                    facts.dims = parse_dimensions(&text.to_string().unwrap_or_default());
+                    dims = parse_dimensions(&text.to_string().unwrap_or_default());
                     CoTaskMemFree(Some(text.0 as *const _));
                 }
             }
         }
-        if let Ok(ticks) = item.GetUInt64(&MEDIA_DURATION) {
-            facts.duration = (ticks > 0 && ticks < i64::MAX as u64).then_some(ticks);
-        }
+        let length = item.GetUInt64(&MEDIA_DURATION).ok().filter(|&ticks| ticks > 0 && ticks < i64::MAX as u64);
+        (dims, length)
+    }
+}
+
+/// The same for a file on disk, with a picture's header read with WIC when Windows has no size for
+/// it (as the details panel does): the list's Picture size and Length columns (media.rs).
+pub fn size_and_length_of(path: &str, picture: bool, wic: Option<&windows::Win32::Graphics::Imaging::IWICImagingFactory>) -> (Option<(u32, u32)>, Option<u64>) {
+    let (mut dims, length) = shell_item(path).map_or((None, None), |item| size_and_length(&item));
+    if dims.is_none() && picture {
+        dims = wic.and_then(|w| thumbs::picture_size(w, path));
+    }
+    (dims, length)
+}
+
+/// What Windows' property handlers know: picture and video size, length, a photo's orientation.
+fn shell_facts(path: &str, facts: &mut Facts) {
+    let Some(item) = shell_item(path) else { return };
+    (facts.dims, facts.duration) = size_and_length(&item);
+    // SAFETY: plain property reads on a live item; the keys are constants.
+    unsafe {
         if let Ok(o) = item.GetUInt32(&PHOTO_ORIENTATION) {
             facts.orientation = o;
         }
@@ -508,9 +535,11 @@ fn count_items(path: &str, show_hidden: bool, show_system: bool) -> Option<(usiz
     let mut data = WIN32_FIND_DATAW::default();
     // SAFETY: `pattern` is NUL-terminated and outlives the call; `data` is a valid WIN32_FIND_DATAW.
     let handle = unsafe { FindFirstFileExW(PCWSTR(pattern.as_ptr()), FindExInfoBasic, &mut data as *mut _ as *mut _, FindExSearchNameMatch, None, FIND_FIRST_EX_LARGE_FETCH) };
-    let Ok(handle) = handle else {
-        // A drive root with nothing on it finds nothing at all.
-        return std::path::Path::new(path).is_dir().then_some((0, false));
+    let handle = match handle {
+        Ok(h) => h,
+        // A drive root with nothing on it finds nothing at all ("not found"). Any other failure
+        // (no permission, as in System Volume Information) leaves it uncounted, not empty.
+        Err(e) => return (matches!(e.code().0 as u32, 0x8007_0002 | 0x8007_0012) && std::path::Path::new(path).is_dir()).then_some((0, false)),
     };
     let mut n = 0usize;
     let mut more = false;

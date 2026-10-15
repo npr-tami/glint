@@ -7,7 +7,9 @@
 //! A video never starts by itself: the engine is made only when the person presses play. Sound
 //! fades in over a fifth of a second when playing starts or resumes, and fades out briefly when it
 //! pauses, or when the preview closes or moves to another file (then the engine is shut down once
-//! it's quiet, see `retire`), so there's no click and no sudden blast.
+//! it's quiet, see `retire`), so there's no click and no sudden blast. Only deleting, renaming or
+//! moving the file, or ejecting its drive, shuts the engine down at once (`let_go`): it has the
+//! file open until then.
 //!
 //! While something is playing, a timer on the window (`wake_in`) repaints it about 30 times a
 //! second; nothing runs when nothing plays. Where Media Foundation isn't there (some Windows N
@@ -25,7 +27,7 @@ use windows::Win32::Graphics::Imaging::{GUID_WICPixelFormat32bppBGRA, IWICBitmap
 use windows::Win32::Media::MediaFoundation::{
     IMFAttributes, IMFMediaEngine, IMFMediaEngineClassFactory, IMFMediaEngineNotify, IMFMediaEngineNotify_Impl, MFCreateAttributes, MFStartup,
     CLSID_MFMediaEngineClassFactory, MFSTARTUP_LITE, MF_MEDIA_ENGINE_CALLBACK, MF_MEDIA_ENGINE_EVENT_ENDED, MF_MEDIA_ENGINE_EVENT_ERROR,
-    MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA, MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, MF_VERSION,
+    MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA, MF_MEDIA_ENGINE_EVENT_SEEKED, MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, MF_VERSION,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
@@ -91,6 +93,8 @@ impl IMFMediaEngineNotify_Impl for Notify_Impl {
             e.error.store(true, Ordering::SeqCst);
         } else if event == MF_MEDIA_ENGINE_EVENT_ENDED.0 {
             e.ended.store(true, Ordering::SeqCst);
+        } else if event == MF_MEDIA_ENGINE_EVENT_SEEKED.0 {
+            // A jump is done: the frame there is drawn (nothing repaints a paused video by itself).
         } else {
             return Ok(());
         }
@@ -195,9 +199,11 @@ impl Video {
 
     /// Plays from where it is (from the start once it has ended), the sound fading in.
     pub fn play(&mut self) {
+        // The "it ended" note goes either way: left behind, `tick` would stop it again at once.
+        let ended = self.events.ended.swap(false, Ordering::SeqCst);
         // SAFETY: plain calls on a live engine.
         unsafe {
-            if self.engine.IsEnded().as_bool() || self.events.ended.swap(false, Ordering::SeqCst) {
+            if ended || self.engine.IsEnded().as_bool() {
                 let _ = self.engine.SetCurrentTime(0.0);
             }
             let now = self.engine.GetVolume();
@@ -308,7 +314,8 @@ impl Video {
                 }
             }
         }
-        if self.events.ended.load(Ordering::SeqCst) && self.wants_play {
+        // At the end, or when the file can't be played, it stops (and nothing repaints for it).
+        if self.wants_play && (self.events.ended.load(Ordering::SeqCst) || self.failed()) {
             self.wants_play = false;
         }
         self.grab(max_px);
@@ -367,6 +374,25 @@ impl Drop for Video {
         // SAFETY: a plain call on a live engine.
         let now = unsafe { self.engine.GetVolume() };
         retire(self.engine.clone(), if self.wants_play || self.fade.is_some() { now } else { 0.0 }, self.hwnd);
+    }
+}
+
+/// Lets go of the files videos have open, at once: `video`'s engine and those still fading out are
+/// shut down now, with no fade. An engine keeps its file open (even paused), and Windows won't
+/// delete, rename or move a file that's open, nor eject the drive it's on.
+pub fn let_go(video: Option<Video>) {
+    if let Some(mut v) = video {
+        // Silent now, so dropping it shuts it down straight away (`retire`).
+        v.wants_play = false;
+        v.fade = None;
+    }
+    let fading = RETIRED.with(|r| std::mem::take(&mut *r.borrow_mut()));
+    for (engine, _, _) in fading {
+        // SAFETY: plain calls on engines we no longer use.
+        unsafe {
+            let _ = engine.Pause();
+            let _ = engine.Shutdown();
+        }
     }
 }
 

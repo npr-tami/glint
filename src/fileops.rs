@@ -1,5 +1,6 @@
 //! Working with files: copy and move (paste), delete (to the Recycle Bin or for good), rename, and
-//! new folders and text files - plus files on the clipboard.
+//! new folders and text files - plus files on the clipboard. Also unpacking and making .zip and .7z
+//! files (Extract here, Compress to zip): archive.rs does that work, in the copy queue.
 //!
 //! Everything goes through Windows' own copy engine (IFileOperation), the one File Explorer uses:
 //! - Windows shows its usual progress window, the "Replace or Skip Files" question when names clash,
@@ -24,7 +25,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::core::{implement, w, Interface, Ref, Result as WinResult, HRESULT, PCWSTR};
-use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
+use windows::Win32::Foundation::{GlobalFree, E_ABORT, HANDLE, HGLOBAL, HWND};
 use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetFileAttributesW, MoveFileExW, INVALID_FILE_ATTRIBUTES, MOVE_FILE_FLAGS};
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, IPersistFile, CLSCTX_ALL, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::DataExchange::{
@@ -61,6 +62,19 @@ pub enum Job {
     Bin(crate::recycle::BinJob),
     /// Items dragged and dropped into `dest` (dragdrop.rs): copied, moved, or shortcuts made to them.
     Drop { sources: Vec<String>, dest: String, how: DropHow },
+    /// Move each item to exactly this path, as (from, to) - Ctrl+Z after a move (undo.rs). Never
+    /// replaces anything.
+    MoveEach { pairs: Vec<(String, String)> },
+    /// Bring these items back from the Recycle Bin to where they were (undo.rs).
+    Restore { paths: Vec<String> },
+    /// Rename many items at once, as (full path, full new path) in the same folder (app/forms.rs).
+    /// Never replaces anything; names swapped among them work.
+    RenameMany { pairs: Vec<(String, String)> },
+    /// Unpack the .zip or .7z `archive` into its own folder (Extract here), or into a new folder
+    /// named after it there (`own_folder`: Extract to "Name"). Never replaces anything.
+    Extract { archive: String, own_folder: bool },
+    /// Pack these items (all of one folder) into a new .zip or .7z next to them (Compress to zip).
+    Compress { paths: Vec<String>, format: crate::archive::Format },
 }
 
 /// What dropping items into a folder does (Explorer's rules decide which: dragdrop.rs).
@@ -77,7 +91,17 @@ impl Job {
     /// them and stop them. Renames and new items are quick and quiet.
     fn shows_progress(&self) -> bool {
         // (A Recycle Bin job counts too: closing Glint mustn't stop a restore halfway.)
-        matches!(self, Job::Paste { .. } | Job::Delete { .. } | Job::Bin(_) | Job::Drop { how: DropHow::Copy | DropHow::Move, .. })
+        matches!(
+            self,
+            Job::Paste { .. }
+                | Job::Delete { .. }
+                | Job::Bin(_)
+                | Job::Drop { how: DropHow::Copy | DropHow::Move, .. }
+                | Job::MoveEach { .. }
+                | Job::Restore { .. }
+                | Job::Extract { .. }
+                | Job::Compress { .. }
+        )
     }
 }
 
@@ -101,6 +125,9 @@ pub struct Outcome {
     pub moved_folders: Vec<(String, String)>,
     /// A short line for the status bar.
     pub note: Option<String>,
+    /// What was done, so Ctrl+Z can undo it (undo.rs). None when nothing was done, or it can't be
+    /// undone (deleted for good).
+    pub undo: Option<crate::undo::Step>,
 }
 
 impl Outcome {
@@ -161,6 +188,7 @@ pub struct FinishOnExit;
 
 impl Drop for FinishOnExit {
     fn drop(&mut self) {
+        crate::copyqueue::resume_all();
         let deadline = Instant::now() + QUIET_WAIT;
         let Ok(mut r) = RUNNING.lock() else { return };
         let mut said = false;
@@ -190,6 +218,12 @@ fn run(job: Job) -> Outcome {
         Job::NewTextFile { dir } => new_item(&dir, false),
         Job::Bin(job) => crate::recycle::run(job),
         Job::Drop { sources, dest, how } => dropped(&sources, &dest, how),
+        Job::MoveEach { pairs } if pairs.iter().all(|(a, b)| parent(a).zip(parent(b)).is_some_and(|(x, y)| same_path(&x, &y))) => rename_many(&pairs),
+        Job::MoveEach { pairs } => move_each(&pairs),
+        Job::RenameMany { pairs } => rename_many(&pairs),
+        Job::Restore { paths } => crate::recycle::restore_paths(&paths),
+        Job::Extract { archive, own_folder } => extract(&archive, own_folder),
+        Job::Compress { paths, format } => compress(&paths, format),
     }
 }
 
@@ -298,20 +332,51 @@ fn transfer(sources: &[String], dest: &str, moving: bool, same_folder: bool) -> 
     if !is_folder(dest) {
         return Outcome::note(format!("Couldn't {verb} here: \u{201c}{}\u{201d} isn't there any more.", file_name(dest)));
     }
+    let mut flags = FOF_ALLOWUNDO | FOFX_ADDUNDORECORD | FOF_NOCONFIRMMKDIR;
+    // The copy queue (copyqueue.rs): a copy, or a move to another drive, waits its turn and shows
+    // in Glint's own list - instead of Windows' progress window (its questions still come).
+    let _ticket = if !moving || sources.iter().any(|s| !same_drive(s, dest)) {
+        let doing = if moving { "Moving" } else { "Copying" };
+        let ticket = crate::copyqueue::Ticket::join(format!("{doing} {} to \u{201c}{}\u{201d}", items_text(sources), file_name(dest)));
+        // (CANCEL stops the count too: size_of then gives None, and wait_turn says cancelled.)
+        let bytes = sources
+            .iter()
+            .map(|s| if is_folder(s) { crate::foldersize::size_of(s, ticket.cancel_flag()).unwrap_or(0) } else { std::fs::metadata(s).map(|m| m.len()).unwrap_or(0) })
+            .sum();
+        ticket.set_total(bytes);
+        if !ticket.wait_turn() {
+            let were = if sources.len() == 1 { "wasn't" } else { "weren't" };
+            return Outcome { changed, note: Some(format!("Cancelled: {} {were} {}.", items_text(sources), if moving { "moved" } else { "copied" })), ..Default::default() };
+        }
+        flags |= FOF_SILENT;
+        Some(ticket)
+    } else {
+        None
+    };
+    // An item deleted meanwhile (it may have waited its turn a while) is left out and named in the
+    // note; the rest is still done. (The older engine would refuse the lot, the newer say nothing.)
+    let (sources, gone): (Vec<String>, Vec<String>) = sources.iter().cloned().partition(|s| exists(s));
+    let gone_note = (!gone.is_empty()).then(|| format!("Couldn't {verb}: {} {} there any more.", items_text(&gone), if gone.len() == 1 { "isn't" } else { "aren't" }));
+    if sources.is_empty() {
+        return Outcome { note: gone_note, ..Default::default() };
+    }
     // The folders among what moves, to tell afterwards which of them went (tabs inside follow).
     let folders: Vec<&String> = if moving { sources.iter().filter(|s| is_folder(s)).collect() } else { Vec::new() };
-    let mut flags = FOF_ALLOWUNDO | FOFX_ADDUNDORECORD | FOF_NOCONFIRMMKDIR;
     if !moving && same_folder {
         flags |= FOF_RENAMEONCOLLISION;
     }
+    // The names in `dest` already taken before it runs (by lower case): an item that lands on one
+    // was merged into, replaced or skipped - it isn't what this job made or moved, for Ctrl+Z.
+    let there: HashSet<String> = sources.iter().map(|s| file_name(s)).filter(|n| exists(&join(dest, n))).map(str::to_lowercase).collect();
+    let was_there = |p: &str| parent(p).is_some_and(|d| same_path(&d, dest)) && there.contains(&file_name(p).to_lowercase());
     let (done, made) = match Engine::new(flags) {
         Some(engine) => {
             let Some(target) = shell_item(dest) else {
                 return Outcome::note(format!("Couldn't {verb} here: Windows can't open \u{201c}{}\u{201d}.", file_name(dest)));
             };
             let mut queued = 0;
-            for s in sources {
-                let Some(item) = shell_item(s) else { continue };
+            for s in &sources {
+                let Some(item) = engine.item(s) else { continue };
                 // SAFETY: COM calls on live objects of this thread; a null name keeps the item's own.
                 let added = unsafe {
                     if moving {
@@ -323,7 +388,10 @@ fn transfer(sources: &[String], dest: &str, moving: bool, same_folder: bool) -> 
                 queued += added.is_ok() as usize;
             }
             if queued == 0 {
-                return Outcome::note(format!("Couldn't {verb}: {} isn't there any more.", items_text(sources)));
+                return Outcome::note(match engine.unopened() {
+                    Some(name) => format!("Couldn't {verb}: Windows can't open \u{201c}{name}\u{201d}."),
+                    None => format!("Couldn't {verb}: {} isn't there any more.", items_text(&sources)),
+                });
             }
             let done = engine.run();
             let made = names_in_folder(&done.made, dest);
@@ -345,7 +413,7 @@ fn transfer(sources: &[String], dest: &str, moving: bool, same_folder: bool) -> 
                 })
                 .collect();
             let flags = FILEOPERATION_FLAGS((flags.0 | FOF_MULTIDESTFILES.0) & !FOF_RENAMEONCOLLISION.0);
-            let done = legacy(if moving { FO_MOVE } else { FO_COPY }, sources, &targets, flags);
+            let done = legacy(if moving { FO_MOVE } else { FO_COPY }, &sources, &targets, flags);
             let made = match (before, names_in(dest)) {
                 (Some(b), Some(a)) => a.difference(&b).cloned().collect(),
                 _ => Vec::new(),
@@ -355,22 +423,292 @@ fn transfer(sources: &[String], dest: &str, moving: bool, same_folder: bool) -> 
     };
     // What to select: what Windows reported (or what appeared), else the items' own names.
     let names = if !made.is_empty() {
-        made
+        made.clone()
     } else if !same_folder {
         sources.iter().map(|s| file_name(s).to_string()).collect()
     } else {
         Vec::new()
     };
+    // Where each moved item went: as the copy engine reported it ("a (2).txt" after "keep both"),
+    // else its own name in `dest`. (true: reported.)
+    let went = |s: &String| match done.moved.iter().find(|(from, _)| same_path(from, s)) {
+        Some((_, to)) => (to.clone(), true),
+        None => (join(dest, file_name(s)), false),
+    };
     // A folder that is gone from where it was and is in `dest` now has moved (some may have been
-    // skipped, or the move stopped halfway).
+    // skipped, or the move stopped halfway). One merged into a folder there counts too: what was in
+    // it is there now.
     let moved_folders = folders
         .into_iter()
-        .map(|s| (s.clone(), join(dest, file_name(s))))
+        .map(|s| (s.clone(), went(s).0))
         .filter(|(from, to)| !exists(from) && is_folder(to))
         .collect();
-    let mut out = Outcome { ok: done.ok(), changed, created: Some((dest.to_string(), names)), moved_folders, ..Default::default() };
-    out.note = done.problem(&format!("Couldn't {verb} everything"));
+    // What Ctrl+Z undoes: the items that really moved (gone from where they were, there now), or
+    // the copies made - never an item that was in `dest` before (a folder merged into; a file only
+    // when the engine said this one replaced it).
+    let undo = if moving {
+        let pairs: Vec<(String, String)> = sources
+            .iter()
+            .filter_map(|s| {
+                let (to, sure) = went(s);
+                (!exists(s) && exists(&to) && (!was_there(&to) || (sure && !is_folder(&to)))).then(|| (s.clone(), to))
+            })
+            .collect();
+        (!pairs.is_empty()).then_some(crate::undo::Step::Moved { pairs })
+    } else {
+        // Only what the copy really made (not the items' own names: those may be what was skipped).
+        let made: Vec<String> = made.iter().map(|n| join(dest, n)).filter(|p| !was_there(p) && exists(p)).collect();
+        (!made.is_empty()).then_some(crate::undo::Step::Made { paths: made, what: "copy" })
+    };
+    let mut out = Outcome { ok: done.ok() && gone.is_empty(), changed, created: Some((dest.to_string(), names)), moved_folders, undo, ..Default::default() };
+    out.note = done.problem(&format!("Couldn't {verb} everything")).or(gone_note);
     out
+}
+
+/// Extract here / Extract to "Name" (see [`Job::Extract`]), in the copy queue. A cancel removes
+/// what was made; a damaged archive leaves what came out before it.
+fn extract(archive: &str, own_folder: bool) -> Outcome {
+    let Some(dir) = parent(archive).filter(|d| !d.is_empty()) else { return Outcome::note("This archive isn't in a folder.") };
+    let name = file_name(archive).to_string();
+    if !exists(archive) || is_folder(archive) {
+        return Outcome::note(format!("\u{201c}{name}\u{201d} isn't there any more."));
+    }
+    let ticket = crate::copyqueue::Ticket::join(format!("Extracting \u{201c}{name}\u{201d}"));
+    // (The speed shown is then how fast the archive is gone through.)
+    ticket.set_total(std::fs::metadata(archive).map(|m| m.len()).unwrap_or(0));
+    if !ticket.wait_turn() {
+        return Outcome::note(format!("Cancelled: \u{201c}{name}\u{201d} wasn't extracted."));
+    }
+    let mut made = Vec::new();
+    let result = if own_folder {
+        // The folder's name is picked now, at its turn: the one free right now.
+        let folder = join(&dir, &crate::archive::extract_folder_name(&name, |n| exists(&join(&dir, n))));
+        match std::fs::create_dir(&folder) {
+            Ok(()) => {
+                made.push(folder.clone());
+                crate::archive::extract_all(archive, &folder, &mut Vec::new())
+            }
+            Err(e) => Err(format!("\u{201c}{}\u{201d} couldn't be made ({e}).", file_name(&folder))),
+        }
+    } else {
+        crate::archive::extract_all(archive, &dir, &mut made)
+    };
+    let cancelled = ticket.cancel_flag().load(std::sync::atomic::Ordering::SeqCst);
+    drop(ticket);
+    if cancelled {
+        remove_made(&made);
+        return Outcome { changed: vec![dir], note: Some(format!("Cancelled: \u{201c}{name}\u{201d} wasn't extracted.")), ..Default::default() };
+    }
+    // After a problem, folders left empty go again (the one Extract to made, for a damaged archive).
+    made.retain(|p| exists(p) && !(result.is_err() && is_folder(p) && std::fs::remove_dir(p).is_ok()));
+    let names: Vec<String> = made.iter().map(|p| file_name(p).to_string()).collect();
+    let undo = (!made.is_empty()).then(|| crate::undo::Step::Made { paths: made.clone(), what: "extract" });
+    let note = match &result {
+        Ok(()) if made.is_empty() => format!("\u{201c}{name}\u{201d} is empty: there was nothing to take out."),
+        Ok(()) => format!("Extracted \u{201c}{name}\u{201d}"),
+        Err(why) => why.clone(),
+    };
+    Outcome { ok: result.is_ok(), changed: vec![dir.clone()], created: Some((dir, names)), undo, note: Some(note), ..Default::default() }
+}
+
+/// Compress to zip / 7z (see [`Job::Compress`]), in the copy queue: one new archive next to the
+/// first item, named after it (or after its folder, for several), numbered when that's taken.
+fn compress(paths: &[String], format: crate::archive::Format) -> Outcome {
+    let Some(dir) = paths.first().and_then(|p| parent(p)).filter(|d| !d.is_empty()) else { return Outcome::note("Select what to compress first.") };
+    let what = items_text(paths);
+    let cancelled_note = format!("Cancelled: {what} {} compressed.", if paths.len() == 1 { "wasn't" } else { "weren't" });
+    let ticket = crate::copyqueue::Ticket::join(format!("Compressing {what}"));
+    // (Looking through the folders stops at CANCEL too.)
+    let plan = match crate::archive::plan_pack(paths, ticket.cancel_flag()) {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return Outcome::note(cancelled_note),
+        Err(why) => return Outcome::note(why),
+    };
+    ticket.set_total(plan.total);
+    if !ticket.wait_turn() {
+        return Outcome::note(cancelled_note);
+    }
+    let name = unique_name(&crate::archive::pack_name(paths), format.ext(), |n| exists(&join(&dir, n)));
+    let out = join(&dir, &name);
+    let result = crate::archive::pack(&plan, &out, format);
+    let cancelled = ticket.cancel_flag().load(std::sync::atomic::Ordering::SeqCst);
+    drop(ticket);
+    let changed = vec![dir.clone()];
+    if cancelled {
+        // (pack removed the half-made file. One finished just as CANCEL was clicked goes too.)
+        if result.is_ok() {
+            let _ = std::fs::remove_file(&out);
+        }
+        return Outcome { changed, note: Some(cancelled_note), ..Default::default() };
+    }
+    match result {
+        Ok(()) => Outcome {
+            ok: true,
+            changed,
+            created: Some((dir, vec![name.clone()])),
+            undo: Some(crate::undo::Step::Made { paths: vec![out], what: "new archive" }),
+            note: Some(format!("Compressed {what} to \u{201c}{name}\u{201d}")),
+            ..Default::default()
+        },
+        Err(why) => Outcome { changed, note: Some(format!("Couldn't compress {what}: {why}")), ..Default::default() },
+    }
+}
+
+/// Removes what a cancelled job made (all new: nothing that was there before).
+fn remove_made(paths: &[String]) {
+    for p in paths {
+        let _ = if is_folder(p) { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) };
+    }
+}
+
+/// Renames each item to the path given (all in their own folder), one after the other in an order
+/// that lets a name be handed on ("2.jpg" to "3.jpg" after "3.jpg" to "4.jpg"); names that go round
+/// in a circle pass through a temporary name. Nothing is ever replaced: an item whose new name is
+/// taken by something else stays as it is.
+fn rename_many(pairs: &[(String, String)]) -> Outcome {
+    let mut changed: Vec<String> = Vec::new();
+    for (a, _) in pairs {
+        if let Some(d) = parent(a) {
+            if !changed.iter().any(|c| same_path(c, &d)) {
+                changed.push(d);
+            }
+        }
+    }
+    // Each folder renamed, in the order it was done (through a temporary name too): followed one
+    // after the other, tabs inside them land where they went.
+    let mut moved_folders: Vec<(String, String)> = Vec::new();
+    let mut rename = |from: &str, to: &str| {
+        let (f, t) = (wide_path(from), wide_path(to));
+        // SAFETY: both paths are NUL-terminated and outlive the call. No flags: never replace.
+        let ok = unsafe { MoveFileExW(PCWSTR(f.as_ptr()), PCWSTR(t.as_ptr()), MOVE_FILE_FLAGS(0)) }.is_ok();
+        if ok && is_folder(to) {
+            moved_folders.push((from.to_string(), to.to_string()));
+        }
+        ok
+    };
+    // (where it was, where it is now, where it goes)
+    let mut todo: Vec<(String, String, String)> = pairs.iter().filter(|(a, _)| exists(a)).map(|(a, b)| (a.clone(), a.clone(), b.clone())).collect();
+    let mut done: Vec<(String, String)> = Vec::new();
+    let mut hops = 0;
+    loop {
+        let mut moved_any = false;
+        let mut i = 0;
+        while i < todo.len() {
+            let (_, now, to) = &todo[i];
+            // (A change of capitals only is the same item: its "taken" name is itself.)
+            if (!exists(to) || same_path(now, to)) && rename(now, to) {
+                let (was, _, to) = todo.remove(i);
+                done.push((was, to));
+                moved_any = true;
+            } else {
+                i += 1;
+            }
+        }
+        if todo.is_empty() || moved_any {
+            if todo.is_empty() {
+                break;
+            }
+            continue;
+        }
+        // Stuck: a circle of names (or names taken by other items). One whose new name is another's
+        // present name steps aside to a temporary name, which frees that one.
+        let Some(i) = todo.iter().position(|(_, _, to)| todo.iter().any(|(_, now, _)| same_path(now, to))) else { break };
+        let dir = parent(&todo[i].1).unwrap_or_default();
+        let tmp = unique_name(&format!("glint-renaming-{}", std::process::id()), ".tmp", |n| exists(&join(&dir, n)));
+        let tmp = join(&dir, &tmp);
+        hops += 1;
+        if hops > pairs.len() + 1 || !rename(&todo[i].1, &tmp) {
+            break;
+        }
+        todo[i].1 = tmp;
+    }
+    // Something left at a temporary name goes back to its old one.
+    for (was, now, _) in &todo {
+        if now != was {
+            rename(now, was);
+        }
+    }
+    let created = match done.first().and_then(|(_, to)| parent(to)) {
+        Some(d) if done.iter().all(|(_, to)| parent(to).is_some_and(|p| same_path(&p, &d))) => {
+            let names = done.iter().map(|(_, to)| file_name(to).to_string()).collect();
+            Some((d, names))
+        }
+        _ => None,
+    };
+    let note = if todo.is_empty() {
+        format!("Renamed {}", items_text(&done.iter().map(|(a, _)| a.clone()).collect::<Vec<_>>()))
+    } else {
+        let left: Vec<String> = todo.iter().map(|(a, _, _)| a.clone()).collect();
+        format!("Couldn't rename {}: the name is taken, or it's in use", items_text(&left))
+    };
+    let undo = (!done.is_empty()).then(|| crate::undo::Step::Moved { pairs: done.clone() });
+    Outcome { ok: todo.is_empty() && done.len() == pairs.len(), changed, created, moved_folders, note: Some(note), undo, ..Default::default() }
+}
+
+/// Moves each item to exactly the path given (Ctrl+Z after a move puts things back where they
+/// were, Ctrl+Y moves them again). An item whose place is taken meanwhile stays where it is: nothing
+/// is replaced.
+fn move_each(pairs: &[(String, String)]) -> Outcome {
+    let mut changed: Vec<String> = Vec::new();
+    for (a, b) in pairs {
+        for p in [a, b] {
+            if let Some(d) = parent(p) {
+                if !changed.iter().any(|c| same_path(c, &d)) {
+                    changed.push(d);
+                }
+            }
+        }
+    }
+    let (todo, taken): (Vec<&(String, String)>, Vec<&(String, String)>) = pairs.iter().filter(|(from, _)| exists(from)).partition(|(_, to)| !exists(to));
+    if todo.is_empty() {
+        let note = match taken.first() {
+            Some((_, to)) => format!("Couldn't move it back: something called \u{201c}{}\u{201d} is there now.", file_name(to)),
+            None => "It isn't where it was moved to any more.".to_string(),
+        };
+        return Outcome { changed, ..Outcome::note(note) };
+    }
+    // The folder it goes back to may be gone meanwhile: made again, as a restore from the bin does.
+    for (_, to) in &todo {
+        if let Some(d) = parent(to) {
+            if !is_folder(&d) {
+                let _ = std::fs::create_dir_all(&d);
+            }
+        }
+    }
+    let flags = FOF_ALLOWUNDO | FOFX_ADDUNDORECORD | FOF_NOCONFIRMMKDIR;
+    let done = match Engine::new(flags) {
+        Some(engine) => {
+            for (from, to) in &todo {
+                let (Some(item), Some(dir)) = (shell_item(from), parent(to).and_then(|d| shell_item(&d))) else { continue };
+                let name = wide(file_name(to));
+                // SAFETY: COM call on live objects of this thread; `name` outlives it.
+                let _ = unsafe { engine.op.MoveItem(&item, &dir, PCWSTR(name.as_ptr()), None) };
+            }
+            engine.run()
+        }
+        None => {
+            let from: Vec<String> = todo.iter().map(|(a, _)| a.clone()).collect();
+            let to: Vec<String> = todo.iter().map(|(_, b)| b.clone()).collect();
+            legacy(FO_MOVE, &from, &to, FILEOPERATION_FLAGS(flags.0 | FOF_MULTIDESTFILES.0))
+        }
+    };
+    let moved: Vec<(String, String)> = todo.iter().filter(|(from, to)| !exists(from) && exists(to)).map(|&p| p.clone()).collect();
+    let moved_folders = moved.iter().filter(|(_, to)| is_folder(to)).cloned().collect();
+    // Selected where they went, when that's one folder.
+    let created = match moved.first().and_then(|(_, to)| parent(to)) {
+        Some(d) if moved.iter().all(|(_, to)| parent(to).is_some_and(|p| same_path(&p, &d))) => {
+            let names = moved.iter().map(|(_, to)| file_name(to).to_string()).collect();
+            Some((d, names))
+        }
+        _ => None,
+    };
+    let ok = done.ok() && moved.len() == pairs.len();
+    let left: Vec<String> = pairs.iter().filter(|(a, _)| !moved.iter().any(|(m, _)| m == a)).map(|(a, _)| a.clone()).collect();
+    let note = done.problem("Couldn't move everything").or_else(|| {
+        (!left.is_empty()).then(|| format!("{} stayed where it was: its place is taken, or it's gone", items_text(&left)))
+    });
+    let undo = (!moved.is_empty()).then_some(crate::undo::Step::Moved { pairs: moved });
+    Outcome { ok, changed, created, moved_folders, note, undo, ..Default::default() }
 }
 
 /// Items dragged and dropped into `dest` (dragdrop.rs decided how, by Explorer's rules). Checked
@@ -444,7 +782,9 @@ fn shortcuts(sources: &[String], dest: &str) -> Outcome {
         None if n == 1 => format!("Made a shortcut in \u{201c}{}\u{201d}", file_name(dest)),
         None => format!("Made {} shortcuts in \u{201c}{}\u{201d}", format_count(n), file_name(dest)),
     };
-    Outcome { ok: error.is_none(), changed: vec![dest.to_string()], created: Some((dest.to_string(), made)), note: Some(note), ..Default::default() }
+    let paths: Vec<String> = made.iter().map(|n| join(dest, n)).collect();
+    let undo = (!paths.is_empty()).then_some(crate::undo::Step::Made { paths, what: "shortcut" });
+    Outcome { ok: error.is_none(), changed: vec![dest.to_string()], created: Some((dest.to_string(), made)), note: Some(note), undo, ..Default::default() }
 }
 
 /// Writes the shortcut file `lnk` pointing at `target` (Windows' own shortcut object).
@@ -487,12 +827,16 @@ fn delete(paths: &[String], recycle: bool) -> Outcome {
         Some(engine) => {
             let mut queued = 0;
             for p in paths {
-                let Some(item) = shell_item(p) else { continue };
+                let Some(item) = engine.item(p) else { continue };
                 // SAFETY: COM call on live objects of this thread.
                 queued += unsafe { engine.op.DeleteItem(&item, None) }.is_ok() as usize;
             }
             if queued == 0 {
-                return Outcome { changed, ..Outcome::note(format!("{} isn't there any more.", items_text(paths))) };
+                let note = match engine.unopened() {
+                    Some(name) => format!("Couldn't delete: Windows can't open \u{201c}{name}\u{201d}."),
+                    None => format!("{} isn't there any more.", items_text(paths)),
+                };
+                return Outcome { changed, ..Outcome::note(note) };
             }
             engine.run()
         }
@@ -501,14 +845,20 @@ fn delete(paths: &[String], recycle: bool) -> Outcome {
     if recycle && paths.iter().any(|p| !exists(p)) {
         crate::recycle::saw_full(true); // (the sidebar's bin icon)
     }
-    let mut out = Outcome { ok: done.ok(), changed, ..Default::default() };
-    out.note = done.problem("Couldn't delete everything").or_else(|| {
-        Some(if recycle {
-            format!("{} moved to the Recycle Bin", items_text(paths))
-        } else {
-            format!("{} deleted", items_text(paths))
-        })
-    });
+    // Sent to the Recycle Bin: Ctrl+Z brings back what really went. (Deleted for good - Windows
+    // asks first when something can't go there - there's no way back.)
+    let for_good = |p: &String| done.gone_for_good.iter().any(|g| same_path(g, p));
+    let gone: Vec<String> = paths.iter().filter(|p| !exists(p) && !for_good(p)).cloned().collect();
+    let note = if !recycle || gone.is_empty() {
+        format!("{} deleted", items_text(paths))
+    } else if done.gone_for_good.is_empty() {
+        format!("{} moved to the Recycle Bin", items_text(paths))
+    } else {
+        format!("{} moved to the Recycle Bin, {} deleted", items_text(&gone), items_text(&done.gone_for_good))
+    };
+    let undo = (recycle && !gone.is_empty()).then_some(crate::undo::Step::Recycled { paths: gone });
+    let mut out = Outcome { ok: done.ok(), changed, undo, ..Default::default() };
+    out.note = done.problem("Couldn't delete everything").or(Some(note));
     out
 }
 
@@ -549,7 +899,10 @@ fn rename(path: &str, new_name: &str) -> Outcome {
         }
     };
     match error {
-        None => Outcome { ok: true, changed: vec![dir.clone()], created: Some((dir, vec![new_name.to_string()])), ..Default::default() },
+        None => {
+            let undo = Some(crate::undo::Step::Renamed { dir: dir.clone(), from: old.clone(), to: new_name.to_string() });
+            Outcome { ok: true, changed: vec![dir.clone()], created: Some((dir, vec![new_name.to_string()])), undo, ..Default::default() }
+        }
         Some(hr) => {
             // Someone made an item with that name in the meantime: let the person pick another.
             // (Windows' copy engine says so with its own codes, COPYENGINE_E_ALREADY_EXISTS_*.)
@@ -598,7 +951,8 @@ fn new_item(dir: &str, folder: bool) -> Outcome {
     match error {
         None => {
             let name = made.into_iter().next().unwrap_or(name);
-            Outcome { ok: true, changed: vec![dir.to_string()], created: Some((dir.to_string(), vec![name])), rename_new: true, ..Default::default() }
+            let undo = Some(crate::undo::Step::Made { paths: vec![join(dir, &name)], what: if folder { "new folder" } else { "new text file" } });
+            Outcome { ok: true, changed: vec![dir.to_string()], created: Some((dir.to_string(), vec![name])), rename_new: true, undo, ..Default::default() }
         }
         Some(hr) => Outcome::note(format!("Couldn't make a new {what} here: {}", explain(hr))),
     }
@@ -615,11 +969,17 @@ struct Done {
     error: Option<HRESULT>,
     /// Full paths of what was made: copies, moved and renamed items, new items.
     made: Vec<String>,
+    /// Items moved, as (where it was, where it is now), as the engine reported them.
+    moved: Vec<(String, String)>,
+    /// The name of an item that is there but that Windows couldn't open, so it was left out.
+    unopened: Option<String>,
+    /// Deleted items that didn't go to the Recycle Bin: Windows asked, and they were deleted for good.
+    gone_for_good: Vec<String>,
 }
 
 impl Done {
     fn ok(&self) -> bool {
-        !self.aborted && self.error.is_none()
+        !self.aborted && self.error.is_none() && self.unopened.is_none()
     }
 
     /// A status-bar line when something didn't go through.
@@ -627,7 +987,7 @@ impl Done {
         match self.error {
             Some(hr) => Some(format!("{lead}: {}", explain(hr))),
             None if self.aborted => Some("Stopped before it was finished.".to_string()),
-            None => None,
+            None => self.unopened.as_ref().map(|name| format!("{lead}: Windows can't open \u{201c}{name}\u{201d}.")),
         }
     }
 }
@@ -674,14 +1034,20 @@ impl IFileOperationProgressSink_Impl for Sink_Impl {
         Ok(())
     }
     fn PreMoveItem(&self, _: u32, _: Ref<IShellItem>, _: Ref<IShellItem>, _: &PCWSTR) -> WinResult<()> {
-        Ok(())
+        go_on()
     }
-    fn PostMoveItem(&self, _: u32, _: Ref<IShellItem>, _: Ref<IShellItem>, _: &PCWSTR, hr: HRESULT, made: Ref<IShellItem>) -> WinResult<()> {
+    fn PostMoveItem(&self, _: u32, item: Ref<IShellItem>, _: Ref<IShellItem>, _: &PCWSTR, hr: HRESULT, made: Ref<IShellItem>) -> WinResult<()> {
         self.after(hr, made.as_ref());
+        // Where it went, for Ctrl+Z (its name may have changed: "keep both").
+        if hr.is_ok() {
+            if let (Some(from), Some(to)) = (item.as_ref().and_then(item_path), made.as_ref().and_then(item_path)) {
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).moved.push((from, to));
+            }
+        }
         Ok(())
     }
     fn PreCopyItem(&self, _: u32, _: Ref<IShellItem>, _: Ref<IShellItem>, _: &PCWSTR) -> WinResult<()> {
-        Ok(())
+        go_on()
     }
     fn PostCopyItem(&self, _: u32, _: Ref<IShellItem>, _: Ref<IShellItem>, _: &PCWSTR, hr: HRESULT, made: Ref<IShellItem>) -> WinResult<()> {
         self.after(hr, made.as_ref());
@@ -690,8 +1056,14 @@ impl IFileOperationProgressSink_Impl for Sink_Impl {
     fn PreDeleteItem(&self, _: u32, _: Ref<IShellItem>) -> WinResult<()> {
         Ok(())
     }
-    fn PostDeleteItem(&self, _: u32, _: Ref<IShellItem>, hr: HRESULT, _: Ref<IShellItem>) -> WinResult<()> {
-        // What a deleted item "became" is its copy in the Recycle Bin: nothing to select.
+    fn PostDeleteItem(&self, _: u32, item: Ref<IShellItem>, hr: HRESULT, in_bin: Ref<IShellItem>) -> WinResult<()> {
+        // What a deleted item "became" is its copy in the Recycle Bin: nothing to select. Without
+        // one, it was deleted for good.
+        if hr.is_ok() && in_bin.as_ref().is_none() {
+            if let Some(path) = item.as_ref().and_then(item_path) {
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).gone_for_good.push(path);
+            }
+        }
         self.after(hr, None);
         Ok(())
     }
@@ -702,8 +1074,9 @@ impl IFileOperationProgressSink_Impl for Sink_Impl {
         self.after(hr, made.as_ref());
         Ok(())
     }
-    fn UpdateProgress(&self, _: u32, _: u32) -> WinResult<()> {
-        Ok(())
+    fn UpdateProgress(&self, total: u32, so_far: u32) -> WinResult<()> {
+        // The copy queue's list shows how far it is; Pause holds it here, Cancel stops it.
+        if crate::copyqueue::progress(total, so_far) { Ok(()) } else { Err(E_ABORT.into()) }
     }
     fn ResetTimer(&self) -> WinResult<()> {
         Ok(())
@@ -714,6 +1087,25 @@ impl IFileOperationProgressSink_Impl for Sink_Impl {
     fn ResumeTimer(&self) -> WinResult<()> {
         Ok(())
     }
+}
+
+/// Before each item: on (Pause holds it here), or stopped by the copy queue's Cancel.
+fn go_on() -> WinResult<()> {
+    if crate::copyqueue::between_items() { Ok(()) } else { Err(E_ABORT.into()) }
+}
+
+/// Whether two paths are on the same drive (or network share): a move between them is only a
+/// rename on the disk.
+fn same_drive(a: &str, b: &str) -> bool {
+    let root = |p: &str| -> String {
+        let p = p.to_lowercase();
+        match p.strip_prefix("\\\\") {
+            // \\server\share
+            Some(rest) => rest.split('\\').take(2).collect::<Vec<_>>().join("\\"),
+            None => p.chars().take(2).collect(),
+        }
+    };
+    root(a) == root(b)
 }
 
 /// One run of Windows' copy engine: queue items on `op`, then [`Engine::run`].
@@ -739,6 +1131,21 @@ impl Engine {
         }
     }
 
+    /// The shell item for one of the job's items. One that is still there but that Windows can't
+    /// open (a very long path, an odd name) is noted, so the job doesn't say everything went through.
+    fn item(&self, path: &str) -> Option<IShellItem> {
+        let item = shell_item(path);
+        if item.is_none() && exists(path) {
+            self.done.lock().unwrap_or_else(|e| e.into_inner()).unopened.get_or_insert_with(|| file_name(path).to_string());
+        }
+        item
+    }
+
+    /// The name of an item `item` couldn't open although it's there, if any.
+    fn unopened(&self) -> Option<String> {
+        self.done.lock().unwrap_or_else(|e| e.into_inner()).unopened.clone()
+    }
+
     /// Does everything queued, showing Windows' own progress, questions and messages.
     fn run(self) -> Done {
         // SAFETY: COM calls on our own object, on the thread that made it.
@@ -757,11 +1164,13 @@ impl Engine {
     }
 }
 
-/// A Windows "shell item" for a path (what the copy engine works with), if the item is there.
+/// A Windows "shell item" for a path (what the copy engine works with), if the item is there. A
+/// long path Windows can't open as it is gets a second try with the "\\?\" prefix (see `wide_path`).
 fn shell_item(path: &str) -> Option<IShellItem> {
-    let w = wide(path);
     // SAFETY: `w` is NUL-terminated and outlives the call.
-    unsafe { SHCreateItemFromParsingName(PCWSTR(w.as_ptr()), None).ok() }
+    let parse = |w: &[u16]| unsafe { SHCreateItemFromParsingName(PCWSTR(w.as_ptr()), None).ok() };
+    let w = wide(path);
+    parse(&w).or_else(|| Some(wide_path(path)).filter(|long| long.len() > w.len()).and_then(|long| parse(&long)))
 }
 
 /// The full path of a shell item (None for things that aren't files, such as Recycle Bin entries).
@@ -823,15 +1232,15 @@ fn names_in(dir: &str) -> Option<HashSet<String>> {
     Some(entries.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
 }
 
-fn exists(path: &str) -> bool {
+pub(crate) fn exists(path: &str) -> bool {
     attributes(path).is_some()
 }
 
-fn is_folder(path: &str) -> bool {
+pub(crate) fn is_folder(path: &str) -> bool {
     attributes(path).is_some_and(|a| a & 0x10 != 0) // FILE_ATTRIBUTE_DIRECTORY
 }
 
-fn attributes(path: &str) -> Option<u32> {
+pub(crate) fn attributes(path: &str) -> Option<u32> {
     let w = wide_path(path);
     // SAFETY: `w` is NUL-terminated and outlives the call.
     let a = unsafe { GetFileAttributesW(PCWSTR(w.as_ptr())) };
@@ -1112,6 +1521,17 @@ unsafe fn global_bytes(h: HANDLE) -> Option<Vec<u8>> {
     }
 }
 
+/// Empties the clipboard (Ctrl+C inside an archive, until its items are out).
+pub fn clear_clipboard(owner: HWND) {
+    // SAFETY: the clipboard is opened here and closed again.
+    unsafe {
+        if OpenClipboard(Some(owner)).is_ok() {
+            let _ = EmptyClipboard();
+            let _ = CloseClipboard();
+        }
+    }
+}
+
 /// Empties the clipboard if nothing else was put on it since `seq` (after cut files were moved).
 fn clear_clipboard_if(seq: u32) {
     if !open_clipboard() {
@@ -1174,6 +1594,102 @@ pub fn parse_drop_files(bytes: &[u8]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A folder of its own in the temp folder, for a test that works with real files.
+    fn scratch(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("glint-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn compress_and_extract_jobs_pick_free_names() {
+        use crate::archive::Format;
+        let dir = scratch("archive-jobs");
+        let docs = join(&dir, "Docs");
+        std::fs::create_dir_all(join(&docs, "inner")).unwrap();
+        std::fs::write(join(&docs, "a.txt"), b"alpha").unwrap();
+        std::fs::write(join(&join(&docs, "inner"), "b.txt"), b"beta").unwrap();
+        // One folder: named after it; taken, so numbered.
+        let first = compress(&[docs.clone()], Format::Zip);
+        assert!(first.ok, "{:?}", first.note);
+        assert_eq!(first.created, Some((dir.clone(), vec!["Docs.zip".to_string()])));
+        assert_eq!(first.undo, Some(crate::undo::Step::Made { paths: vec![join(&dir, "Docs.zip")], what: "new archive" }));
+        assert_eq!(compress(&[docs.clone()], Format::Zip).created.unwrap().1, ["Docs (2).zip"]);
+        // Several items: named after their folder.
+        let seven = compress(&[join(&docs, "a.txt"), join(&docs, "inner")], Format::SevenZ);
+        assert_eq!(seven.created, Some((docs.clone(), vec!["Docs.7z".to_string()])));
+
+        // Extract to: "Docs" is taken (by the folder itself), so "Docs (2)".
+        let zip = join(&dir, "Docs.zip");
+        let to = extract(&zip, true);
+        assert!(to.ok, "{:?}", to.note);
+        assert_eq!(to.created, Some((dir.clone(), vec!["Docs (2)".to_string()])));
+        assert_eq!(std::fs::read(join(&join(&join(&dir, "Docs (2)"), "Docs"), "a.txt")).unwrap(), b"alpha");
+        // Extract here: the zip's "Docs" lands as the next free name, "Docs (3)".
+        let here = extract(&zip, false);
+        assert!(here.ok, "{:?}", here.note);
+        assert_eq!(here.created, Some((dir.clone(), vec!["Docs (3)".to_string()])));
+        assert_eq!(std::fs::read(join(&join(&join(&dir, "Docs (3)"), "inner"), "b.txt")).unwrap(), b"beta");
+        assert_eq!(std::fs::read(join(&join(&dir, "Docs"), "a.txt")).unwrap(), b"alpha", "the original is untouched");
+        assert_eq!(here.undo, Some(crate::undo::Step::Made { paths: vec![join(&dir, "Docs (3)")], what: "extract" }));
+        // A 7z made of two items comes out as those two, beside the originals.
+        let mut back = extract(&join(&docs, "Docs.7z"), false).created.unwrap().1;
+        back.sort();
+        assert_eq!(back, ["a (2).txt", "inner (2)"]);
+        assert!(!extract(&join(&dir, "missing.zip"), false).ok);
+    }
+
+    #[test]
+    fn a_rename_and_a_move_can_be_undone_and_redone() {
+        let _com = ComGuard::init();
+        let dir = scratch("undo");
+        let (a, b) = (join(&dir, "a"), join(&dir, "b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(join(&a, "note.txt"), "hi").unwrap();
+        // Renamed, then undone: the old name is back.
+        let out = run(Job::Rename { path: join(&a, "note.txt"), new_name: "memo.txt".into() });
+        let step = out.undo.expect("a rename can be undone");
+        assert!(exists(&join(&a, "memo.txt")));
+        assert!(run(step.undo_job()).ok);
+        assert!(exists(&join(&a, "note.txt")) && !exists(&join(&a, "memo.txt")));
+        assert!(run(step.redo_job()).ok);
+        assert!(exists(&join(&a, "memo.txt")));
+        // Moved to b, then back.
+        let step = crate::undo::Step::Moved { pairs: vec![(join(&a, "memo.txt"), join(&b, "memo.txt"))] };
+        assert!(run(step.redo_job()).ok);
+        assert!(exists(&join(&b, "memo.txt")) && !exists(&join(&a, "memo.txt")));
+        assert!(run(step.undo_job()).ok);
+        assert!(exists(&join(&a, "memo.txt")) && !exists(&join(&b, "memo.txt")));
+        // Never over something that took its place meanwhile.
+        std::fs::write(join(&b, "memo.txt"), "other").unwrap();
+        let out = run(step.redo_job());
+        assert!(!out.ok && exists(&join(&a, "memo.txt")));
+        assert_eq!(std::fs::read_to_string(join(&b, "memo.txt")).unwrap(), "other");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn many_renames_hand_names_on_and_swap() {
+        let dir = scratch("many");
+        for (n, text) in [("1.txt", "one"), ("2.txt", "two"), ("a.txt", "a"), ("b.txt", "b")] {
+            std::fs::write(join(&dir, n), text).unwrap();
+        }
+        let p = |n: &str| join(&dir, n);
+        // 1 -> 2 and 2 -> 3 (a chain), a <-> b (a circle).
+        let pairs = vec![(p("1.txt"), p("2.txt")), (p("2.txt"), p("3.txt")), (p("a.txt"), p("b.txt")), (p("b.txt"), p("a.txt"))];
+        let out = run(Job::RenameMany { pairs });
+        assert!(out.ok, "{:?}", out.note);
+        let read = |n: &str| std::fs::read_to_string(p(n)).unwrap();
+        assert_eq!((read("2.txt"), read("3.txt"), read("b.txt"), read("a.txt")), ("one".into(), "two".into(), "a".into(), "b".into()));
+        assert!(!exists(&p("1.txt")));
+        // Ctrl+Z puts every name back.
+        assert!(run(out.undo.unwrap().undo_job()).ok);
+        assert_eq!((read("1.txt"), read("2.txt"), read("a.txt"), read("b.txt")), ("one".into(), "two".into(), "a".into(), "b".into()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A network share has no Recycle Bin, so deleting there is asked as deleting for good.
     #[test]
@@ -1281,5 +1797,340 @@ mod tests {
         assert_eq!(explain(COPYENGINE_E_ALREADY_EXISTS_NORMAL), "there's already an item with that name.");
         assert_eq!(explain(COPYENGINE_E_SHARING_VIOLATION_SRC), "it's open in another program.");
         assert!(is_cancel(COPYENGINE_E_CANCELLED));
+    }
+
+    /// A `scratch` folder that goes again when the test ends (also when it fails).
+    struct Scratch(String);
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            Scratch(scratch(name))
+        }
+        fn at(&self, name: &str) -> String {
+            join(&self.0, name)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Writes `text` to `name` in `dir`; its path.
+    fn put(dir: &str, name: &str, text: &str) -> String {
+        let p = join(dir, name);
+        std::fs::write(&p, text).unwrap();
+        p
+    }
+
+    fn read(path: &str) -> String {
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    /// The copy queue's id of the job shown as `label`, once it has joined.
+    fn listed(label: &str) -> u64 {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(t) = crate::copyqueue::shown().into_iter().find(|t| t.label == label) {
+                return t.id;
+            }
+            assert!(Instant::now() < until, "{label} never joined the queue");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Whether this disk changes capitals in a rename (Windows does; Wine keeps the old ones).
+    fn renames_capitals(dir: &str) -> bool {
+        let probe = put(dir, "capitals-probe", "");
+        let _ = std::fs::rename(&probe, join(dir, "CAPITALS-PROBE"));
+        let found = names_in(dir).unwrap().contains("CAPITALS-PROBE");
+        let _ = std::fs::remove_file(join(dir, "CAPITALS-PROBE"));
+        found
+    }
+
+    #[test]
+    fn undoing_a_rename_never_replaces_what_took_the_old_name() {
+        use crate::undo::Step;
+        let _com = ComGuard::init();
+        let s = Scratch::new("undo-taken");
+        put(&s.0, "a.txt", "mine");
+        let step = run(Job::Rename { path: s.at("a.txt"), new_name: "b.txt".into() }).undo.expect("renamed");
+        assert_eq!(step, Step::Renamed { dir: s.0.clone(), from: "a.txt".into(), to: "b.txt".into() });
+        // Meanwhile something else got the old name (in other capitals).
+        put(&s.0, "A.TXT", "theirs");
+        let out = run(step.undo_job());
+        assert!(!out.ok && out.undo.is_none());
+        assert_eq!((read(&s.at("a.txt")), read(&s.at("b.txt"))), ("theirs".into(), "mine".into()));
+        assert_eq!(out.retry, Some((s.at("b.txt"), "a.txt".to_string())), "the name box opens again to pick another");
+        // Moved away elsewhere meanwhile: nothing happens, and it says so.
+        std::fs::create_dir(s.at("elsewhere")).unwrap();
+        std::fs::rename(s.at("b.txt"), s.at("elsewhere\\b.txt")).unwrap();
+        std::fs::remove_file(s.at("A.TXT")).unwrap();
+        let out = run(step.undo_job());
+        assert!(!out.ok && out.undo.is_none());
+        assert!(out.note.as_deref().is_some_and(|n| n.contains("isn't there any more")), "{:?}", out.note);
+        assert!(!exists(&s.at("a.txt")));
+        assert_eq!(read(&s.at("elsewhere\\b.txt")), "mine");
+    }
+
+    #[test]
+    fn a_change_of_capitals_only_is_undone_and_redone() {
+        let _com = ComGuard::init();
+        let s = Scratch::new("undo-capitals");
+        put(&s.0, "readme.txt", "text");
+        // The name "taken" is the item itself: not refused.
+        let out = run(Job::Rename { path: s.at("readme.txt"), new_name: "README.txt".into() });
+        assert!(out.ok, "{:?}", out.note);
+        let capitals = renames_capitals(&s.0);
+        let names = || names_in(&s.0).unwrap();
+        if capitals {
+            assert!(names().contains("README.txt"));
+        }
+        let step = out.undo.unwrap();
+        assert!(run(step.undo_job()).ok);
+        if capitals {
+            assert!(names().contains("readme.txt"));
+        }
+        assert!(run(step.redo_job()).ok);
+        assert_eq!(names().len(), 1, "never two, never none");
+        assert_eq!(read(&s.at("readme.txt")), "text");
+    }
+
+    #[test]
+    fn moving_back_makes_the_folder_it_came_from_again() {
+        use crate::undo::Step;
+        let _com = ComGuard::init();
+        let s = Scratch::new("undo-folder-gone");
+        let (from, to) = (s.at("src\\deep"), s.at("dst"));
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        put(&from, "a.txt", "a");
+        let step = Step::Moved { pairs: vec![(join(&from, "a.txt"), join(&to, "a.txt"))] };
+        assert!(run(step.redo_job()).ok);
+        // The folder it came from was deleted since.
+        std::fs::remove_dir_all(s.at("src")).unwrap();
+        let out = run(step.undo_job());
+        assert!(out.ok, "{:?}", out.note);
+        assert_eq!(read(&join(&from, "a.txt")), "a");
+        assert!(!exists(&join(&to, "a.txt")));
+        // Gone from where it was moved to: nothing to move back.
+        let out = run(step.undo_job());
+        assert!(!out.ok && out.undo.is_none());
+        assert_eq!(out.note.as_deref(), Some("It isn't where it was moved to any more."));
+    }
+
+    #[test]
+    fn moving_back_with_one_place_taken_moves_the_rest_and_replaces_nothing() {
+        use crate::undo::Step;
+        let _com = ComGuard::init();
+        let s = Scratch::new("undo-place-taken");
+        let (from, to) = (s.at("src"), s.at("dst"));
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        let pairs: Vec<(String, String)> = ["a.txt", "b.txt"].iter().map(|n| (put(&from, n, n), join(&to, n))).collect();
+        let step = Step::Moved { pairs };
+        assert!(run(step.redo_job()).ok);
+        // Something new is called b.txt where b.txt came from.
+        put(&from, "b.txt", "newcomer");
+        let out = run(step.undo_job());
+        assert!(!out.ok);
+        assert_eq!(read(&join(&from, "a.txt")), "a.txt");
+        assert_eq!(read(&join(&from, "b.txt")), "newcomer", "never replaced");
+        assert_eq!(read(&join(&to, "b.txt")), "b.txt", "stays where it is");
+        assert_eq!(out.undo, Some(Step::Moved { pairs: vec![(join(&to, "a.txt"), join(&from, "a.txt"))] }), "only what really moved");
+        assert!(out.note.as_deref().is_some_and(|n| n.contains("b.txt") && n.contains("stayed where it was")), "{:?}", out.note);
+    }
+
+    #[test]
+    fn deleting_for_good_leaves_nothing_to_undo() {
+        let _com = ComGuard::init();
+        let s = Scratch::new("for-good");
+        let file = put(&s.0, "a.txt", "a");
+        std::fs::create_dir(s.at("F")).unwrap();
+        put(&s.at("F"), "in.txt", "in");
+        let out = run(Job::Delete { paths: vec![file.clone(), s.at("F")], recycle: false });
+        assert!(out.ok, "{:?}", out.note);
+        assert!(out.undo.is_none(), "there's no way back");
+        assert!(!exists(&file) && !exists(&s.at("F")));
+        assert_eq!(out.note.as_deref(), Some("2 items deleted"));
+    }
+
+    #[test]
+    fn renaming_many_never_replaces_anything_and_does_the_rest() {
+        use crate::undo::Step;
+        let s = Scratch::new("many-taken");
+        for n in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+            put(&s.0, n, n);
+        }
+        put(&s.0, "outsider.txt", "keep me");
+        // a onto an item that isn't being renamed (in other capitals); b and c onto one name.
+        let pairs = vec![(s.at("a.txt"), s.at("Outsider.TXT")), (s.at("b.txt"), s.at("same.txt")), (s.at("c.txt"), s.at("same.txt")), (s.at("d.txt"), s.at("e.txt"))];
+        let out = run(Job::RenameMany { pairs });
+        assert!(!out.ok);
+        assert_eq!(read(&s.at("outsider.txt")), "keep me", "never replaced");
+        assert_eq!(read(&s.at("a.txt")), "a.txt", "left as it was");
+        assert_eq!((read(&s.at("same.txt")), read(&s.at("c.txt"))), ("b.txt".into(), "c.txt".into()), "the first gets the name, the other keeps its own");
+        assert_eq!(read(&s.at("e.txt")), "d.txt");
+        assert_eq!(names_in(&s.0).unwrap().len(), 5, "nothing lost, no temporary name left");
+        assert_eq!(out.undo, Some(Step::Moved { pairs: vec![(s.at("b.txt"), s.at("same.txt")), (s.at("d.txt"), s.at("e.txt"))] }), "Ctrl+Z undoes only what was done");
+        assert_eq!(out.note.as_deref(), Some("Couldn't rename 2 items: the name is taken, or it's in use"));
+    }
+
+    #[test]
+    fn names_going_round_in_a_circle_all_arrive_and_go_back() {
+        let s = Scratch::new("many-circle");
+        put(&s.0, "1", "one");
+        put(&s.0, "2", "two");
+        std::fs::create_dir(s.at("3")).unwrap();
+        put(&s.at("3"), "in.txt", "three");
+        // 1 -> 2 -> 3 -> 1, with a folder among them.
+        let out = run(Job::RenameMany { pairs: vec![(s.at("1"), s.at("2")), (s.at("2"), s.at("3")), (s.at("3"), s.at("1"))] });
+        assert!(out.ok, "{:?}", out.note);
+        assert_eq!((read(&s.at("2")), read(&s.at("3")), read(&s.at("1\\in.txt"))), ("one".into(), "two".into(), "three".into()));
+        assert_eq!(names_in(&s.0).unwrap().len(), 3, "no temporary name left");
+        // Ctrl+Z, Ctrl+Y, Ctrl+Z: the same three each time.
+        let step = out.undo.unwrap();
+        for job in [step.undo_job(), step.redo_job(), step.undo_job()] {
+            let out = run(job);
+            assert!(out.ok, "{:?}", out.note);
+        }
+        assert_eq!((read(&s.at("1")), read(&s.at("2")), read(&s.at("3\\in.txt"))), ("one".into(), "two".into(), "three".into()));
+        assert_eq!(names_in(&s.0).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn folders_renamed_together_say_where_each_went() {
+        let s = Scratch::new("many-folders");
+        for (n, text) in [("Day 1", "first"), ("Day 2", "second"), ("Other", "other")] {
+            std::fs::create_dir(s.at(n)).unwrap();
+            put(&s.at(n), "in.txt", text);
+        }
+        // The two days swap names, and "Other" gets a new one.
+        let out = run(Job::RenameMany { pairs: vec![(s.at("Day 2"), s.at("Day 1")), (s.at("Day 1"), s.at("Day 2")), (s.at("Other"), s.at("Day 3"))] });
+        assert!(out.ok, "{:?}", out.note);
+        let text = |n: &str| read(&join(&s.at(n), "in.txt"));
+        assert_eq!((text("Day 1"), text("Day 2"), text("Day 3")), ("second".into(), "first".into(), "other".into()));
+        // Followed one after the other, as tabs inside them follow (app.rs), each lands where it went.
+        let follow = |path: &str| out.moved_folders.iter().fold(path.to_string(), |p, (from, to)| crate::app::moved_path(&p, from, to).unwrap_or(p));
+        assert_eq!(follow(&s.at("Day 1\\in.txt")), s.at("Day 2\\in.txt"));
+        assert_eq!(follow(&s.at("Day 2")), s.at("Day 1"));
+        assert_eq!(follow(&s.at("Other")), s.at("Day 3"));
+    }
+
+    #[test]
+    fn a_swap_with_one_item_in_use_leaves_both_as_they_were() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let s = Scratch::new("many-in-use");
+        put(&s.0, "a.txt", "a");
+        put(&s.0, "b.txt", "b");
+        // b is open in a program that lets nothing else at it.
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(s.at("b.txt")).unwrap();
+        let out = run(Job::RenameMany { pairs: vec![(s.at("a.txt"), s.at("b.txt")), (s.at("b.txt"), s.at("a.txt"))] });
+        drop(held);
+        assert!(!out.ok && out.undo.is_none());
+        assert_eq!((read(&s.at("a.txt")), read(&s.at("b.txt"))), ("a".into(), "b".into()), "each back under its own name");
+        assert_eq!(names_in(&s.0).unwrap().len(), 2, "no temporary name left");
+    }
+
+    #[test]
+    fn renaming_many_works_in_a_folder_past_260_characters() {
+        let s = Scratch::new("many-long");
+        let mut deep = s.0.clone();
+        while deep.len() < 300 {
+            deep = join(&deep, "a folder with a long name");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let p = |n: &str| join(&deep, n);
+        put(&deep, "1.txt", "one");
+        put(&deep, "2.txt", "two");
+        let out = run(Job::RenameMany { pairs: vec![(p("1.txt"), p("2.txt")), (p("2.txt"), p("1.txt"))] });
+        assert!(out.ok, "{:?}", out.note);
+        assert_eq!((read(&p("1.txt")), read(&p("2.txt"))), ("two".into(), "one".into()));
+        assert!(run(out.undo.unwrap().undo_job()).ok);
+        assert_eq!((read(&p("1.txt")), read(&p("2.txt"))), ("one".into(), "two".into()));
+    }
+
+    #[test]
+    fn a_copy_cancelled_while_it_waits_copies_nothing() {
+        let s = Scratch::new("queue-cancel");
+        let dest = s.at("queue-cancel-dest");
+        std::fs::create_dir(&dest).unwrap();
+        let file = put(&s.0, "a.txt", "x");
+        // Another copy is running: this one waits its turn, and is cancelled meanwhile.
+        let running = crate::copyqueue::Ticket::join("queue-cancel: the copy before".into());
+        assert!(running.wait_turn());
+        let job = {
+            let (file, dest) = (file.clone(), dest.clone());
+            std::thread::spawn(move || {
+                let _com = ComGuard::init();
+                transfer(&[file], &dest, false, false)
+            })
+        };
+        crate::copyqueue::cancel(listed("Copying \u{201c}a.txt\u{201d} to \u{201c}queue-cancel-dest\u{201d}"));
+        let out = job.join().unwrap();
+        drop(running);
+        assert!(!out.ok && out.undo.is_none());
+        assert_eq!(out.note.as_deref(), Some("Cancelled: \u{201c}a.txt\u{201d} wasn't copied."));
+        assert!(names_in(&dest).unwrap().is_empty(), "nothing was copied");
+        assert_eq!(read(&file), "x");
+    }
+
+    #[test]
+    fn two_copies_into_one_folder_take_turns_and_each_undoes_only_its_own() {
+        use crate::undo::Step;
+        let s = Scratch::new("queue-two");
+        let dest = s.at("queue-two-dest");
+        std::fs::create_dir(&dest).unwrap();
+        let copy = |file: String| {
+            let dest = dest.clone();
+            std::thread::spawn(move || {
+                let _com = ComGuard::init();
+                transfer(&[file], &dest, false, false)
+            })
+        };
+        // Something else is copying: both wait, in the order they came.
+        let running = crate::copyqueue::Ticket::join("queue-two: the copy before".into());
+        assert!(running.wait_turn());
+        let first = copy(put(&s.0, "a.txt", "a"));
+        let one = listed("Copying \u{201c}a.txt\u{201d} to \u{201c}queue-two-dest\u{201d}");
+        let second = copy(put(&s.0, "b.txt", "b"));
+        let two = listed("Copying \u{201c}b.txt\u{201d} to \u{201c}queue-two-dest\u{201d}");
+        let order: Vec<u64> = crate::copyqueue::shown().iter().map(|t| t.id).filter(|id| [one, two].contains(id)).collect();
+        assert_eq!(order, [one, two]);
+        assert!(names_in(&dest).unwrap().is_empty(), "neither starts while another copy runs");
+        drop(running);
+        let (first, second) = (first.join().unwrap(), second.join().unwrap());
+        assert!(first.ok && second.ok, "{:?} {:?}", first.note, second.note);
+        assert_eq!(first.undo, Some(Step::Made { paths: vec![join(&dest, "a.txt")], what: "copy" }));
+        assert_eq!(second.undo, Some(Step::Made { paths: vec![join(&dest, "b.txt")], what: "copy" }), "not the other copy's file");
+    }
+
+    #[test]
+    fn a_copy_whose_item_vanished_while_it_waited_says_so() {
+        use crate::undo::Step;
+        let s = Scratch::new("queue-gone");
+        let dest = s.at("queue-gone-dest");
+        std::fs::create_dir(&dest).unwrap();
+        let sources = vec![put(&s.0, "kept.txt", "k"), put(&s.0, "gone.txt", "g")];
+        let running = crate::copyqueue::Ticket::join("queue-gone: the copy before".into());
+        assert!(running.wait_turn());
+        let job = {
+            let (sources, dest) = (sources.clone(), dest.clone());
+            std::thread::spawn(move || {
+                let _com = ComGuard::init();
+                transfer(&sources, &dest, false, false)
+            })
+        };
+        listed("Copying 2 items to \u{201c}queue-gone-dest\u{201d}");
+        // Deleted elsewhere while it waited its turn.
+        std::fs::remove_file(&sources[1]).unwrap();
+        drop(running);
+        let out = job.join().unwrap();
+        assert_eq!(read(&join(&dest, "kept.txt")), "k", "what's still there is copied");
+        assert!(!exists(&join(&dest, "gone.txt")));
+        assert!(!out.ok, "not everything was copied: {:?}", out.note);
+        assert!(out.note.as_deref().is_some_and(|n| n.contains("gone.txt") && n.contains("isn't there any more")), "{:?}", out.note);
+        assert_eq!(out.undo, Some(Step::Made { paths: vec![join(&dest, "kept.txt")], what: "copy" }));
     }
 }

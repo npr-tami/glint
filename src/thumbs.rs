@@ -1,6 +1,7 @@
 //! Thumbnails: the picture File Explorer shows for a file (a photo, a frame of a video, the first
 //! page of a PDF when Windows has a handler for it) - or, when there is none, its icon at a big
-//! size. The details panel, the Space preview and the big icon views all get them from here.
+//! size. The details panel, the Space preview and the big icon views all get them from here. A
+//! skin's wallpaper, behind the file list, is read here too ([`wallpaper`]).
 //!
 //! **How to use it** (on the UI thread; asking while painting is fine and cheap):
 //!
@@ -183,7 +184,8 @@ thread_local! {
 
 /// The thumbnail of the file or folder at `path` (or a shell place such as
 /// "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", This PC), fitting a `size_px` square. None until it's
-/// ready (the window is repainted then). See the top of this file.
+/// ready (the window is repainted then). Any version of it will do (see [`request_versioned`]). See
+/// the top of this file.
 pub fn request(path: &str, size_px: u32) -> Option<Arc<Picture>> {
     request_versioned(path, 0, size_px)
 }
@@ -212,6 +214,7 @@ pub fn begin_frame() {
         let mut s = s.borrow_mut();
         s.shared.frame.fetch_add(1, Ordering::SeqCst);
         s.take_done();
+        s.follow_archive_icon();
     });
 }
 
@@ -253,6 +256,8 @@ struct Service {
     /// Memory the pictures in `known` take.
     bytes: usize,
     clock: u64,
+    /// The zip and 7z icon changes taken in (icons.rs `archive_changes`).
+    archive_changes: u64,
 }
 
 /// What the UI thread and the worker share.
@@ -298,7 +303,7 @@ impl Service {
             frame: AtomicU64::new(1),
             hwnd: AtomicIsize::new(0),
         });
-        Service { shared, tx, rx, known: HashMap::new(), bytes: 0, clock: 0 }
+        Service { shared, tx, rx, known: HashMap::new(), bytes: 0, clock: 0, archive_changes: 0 }
     }
 
     fn request(&mut self, path: &str, version: u64, size_px: u32) -> Option<Arc<Picture>> {
@@ -308,6 +313,13 @@ impl Service {
         self.take_done();
         let px = bucket(size_px.max(1));
         let key = path.to_lowercase();
+        // No version (`request`): the one there is, or the one on its way - so it doesn't fight a
+        // request with a version for the same file (the details panel and a tile of the folder).
+        let version = match self.known.get(&key) {
+            Some(k) if version == 0 && k.asked > 0 => k.asked_version,
+            Some(k) if version == 0 => k.version,
+            _ => version,
+        };
         let frame = self.shared.frame.load(Ordering::SeqCst);
         self.clock += 1;
         let clock = self.clock;
@@ -427,6 +439,22 @@ impl Service {
         }
     }
 
+    /// Zip and 7z files that open in Glint show another icon now (icons.rs `set_archive_icon`):
+    /// their pictures go, so they're made again.
+    fn follow_archive_icon(&mut self) {
+        let changes = crate::icons::archive_changes();
+        if self.archive_changes == changes {
+            return;
+        }
+        self.archive_changes = changes;
+        let gone: Vec<String> = self.known.keys().filter(|key| crate::archive::is_archive_name(key)).cloned().collect();
+        for key in gone {
+            if let Some(k) = self.known.remove(&key) {
+                self.bytes = self.bytes.saturating_sub(k.picture.map_or(0, |p| p.bytes()));
+            }
+        }
+    }
+
     fn clear(&mut self) {
         self.shared.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).jobs.clear();
         while self.rx.try_recv().is_ok() {}
@@ -443,12 +471,19 @@ fn work(shared: &Shared, tx: &Sender<Done>) {
     let wic = wic_factory();
     let verbose = std::env::var_os("GLINT_THUMB_LOG").is_some();
     let mut last_repaint: Option<Instant> = None;
+    // A picture went back without a repaint (it waited for the next one).
+    let mut owed = false;
     loop {
         let (job, more) = {
             let mut q = shared.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             loop {
                 if let Some(j) = q.jobs.pop_front() {
                     break (j, !q.jobs.is_empty());
+                }
+                // Nothing left (the rest were dropped, say): what went back is drawn now.
+                if std::mem::take(&mut owed) {
+                    last_repaint = Some(Instant::now());
+                    repaint(&shared.hwnd);
                 }
                 let (guard, wait) = shared.ready.wait_timeout(q, IDLE_END).unwrap_or_else(std::sync::PoisonError::into_inner);
                 q = guard;
@@ -482,7 +517,10 @@ fn work(shared: &Shared, tx: &Sender<Done>) {
         }
         if !more || last_repaint.is_none_or(|t| t.elapsed() >= REPAINT_EVERY) {
             last_repaint = Some(Instant::now());
+            owed = false;
             repaint(&shared.hwnd);
+        } else {
+            owed = true;
         }
     }
 }
@@ -526,6 +564,10 @@ fn make(path: &str, px: u32, wic: Option<&IWICImagingFactory>) -> (Option<Arc<Pi
         }
     }
     let icon_px = px.min(MAX_ICON);
+    // Zip and 7z files that open in Glint: the icon Glint gave them, from glint.exe itself (icons.rs).
+    if let Some(pic) = crate::icons::archive_icon(&ext).and_then(|id| wic.and_then(|w| own_icon_pixels(w, id, icon_px))) {
+        return (Picture::new(pic.width, pic.height, pic.pixels, true), "Glint's zip icon");
+    }
     if let Some(pic) = item.as_ref().and_then(|f| shell_image(f, icon_px, SIIGBF_ICONONLY, wic)) {
         return (Picture::new(pic.width, pic.height, pic.pixels, true), "Windows' icon");
     }
@@ -831,6 +873,17 @@ fn trim_small(p: Pixels) -> Pixels {
     Pixels { width: side, height: side, pixels }
 }
 
+/// One of glint.exe's own icons (its number in res/glint.rc) at `px` pixels.
+fn own_icon_pixels(wic: &IWICImagingFactory, id: u32, px: u32) -> Option<Pixels> {
+    let icon = crate::icons::own_icon(id, px as i32)?;
+    let pixels = icon_pixels(wic, icon);
+    // SAFETY: we own the icon.
+    unsafe {
+        let _ = DestroyIcon(icon);
+    }
+    pixels
+}
+
 /// An icon as premultiplied BGRA pixels.
 fn icon_pixels(wic: &IWICImagingFactory, icon: HICON) -> Option<Pixels> {
     // SAFETY: `icon` is a valid icon handle; every WIC object is an owned wrapper.
@@ -841,6 +894,95 @@ fn icon_pixels(wic: &IWICImagingFactory, icon: HICON) -> Option<Pixels> {
         let (mut w, mut h) = (0u32, 0u32);
         conv.GetSize(&mut w, &mut h).ok()?;
         copy_out(&conv.cast().ok()?, w, h)
+    }
+}
+
+// ---------------------------------------------------------------- a skin's wallpaper
+
+/// A wallpaper is made at most this big (it fills the list on a 4K screen).
+const WALL_SIDE: u32 = 3840;
+const WALL_PIXELS: u64 = 3840 * 2160;
+/// A picture with more pixels than this isn't made a wallpaper (100 million: a big camera's photo):
+/// it would take long to decode, and a small PNG file can hold gigapixels.
+const WALL_MOST: u64 = 100_000_000;
+/// A wallpaper that couldn't be read is tried again after this long (its drive may be connected
+/// by then, or the picture copied in).
+const WALL_RETRY: Duration = Duration::from_secs(5);
+
+/// The wallpaper asked for and the one read last, shared with the thread that reads them.
+struct Wall {
+    /// The picture asked for and not read yet (its path; empty: none).
+    asked: String,
+    running: bool,
+    /// The last one read: its path, the picture (None: it couldn't be read, or is too big) and
+    /// when.
+    read: Option<(String, Option<Arc<Picture>>, Instant)>,
+}
+
+static WALL: Mutex<Wall> = Mutex::new(Wall { asked: String::new(), running: false, read: None });
+
+/// A skin's wallpaper: the picture at `path` (theme.rs `wallpaper`), fitting 3840 x 2160. It's read
+/// on a thread of its own, as a picture on a sleeping network drive (or a huge one) would hold the
+/// window up: None until it's there (the window is repainted then), and while it can't be read.
+pub fn wallpaper(path: &str) -> Option<Arc<Picture>> {
+    if path.is_empty() {
+        return None;
+    }
+    let mut w = WALL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((read, picture, when)) = &w.read {
+        // (A picture whose copy went with a lost graphics device is read again.)
+        let good = match picture {
+            Some(p) => !p.is_lost(),
+            None => when.elapsed() < WALL_RETRY,
+        };
+        if read == path && good {
+            return picture.clone();
+        }
+    }
+    if w.asked == path {
+        return None; // on its way
+    }
+    w.asked = path.to_string();
+    if !std::mem::replace(&mut w.running, true) {
+        let shared = SERVICE.with(|s| s.borrow().shared.clone());
+        if !shell::background("wallpaper", move || read_wallpapers(&shared)) {
+            // No thread right now: asked again the next time the list is painted.
+            w.running = false;
+            w.asked.clear();
+        }
+    }
+    None
+}
+
+/// The wallpaper's thread: reads what is asked for (only the newest, when the path changes while
+/// one is read) and repaints the window, until nothing new is asked.
+fn read_wallpapers(shared: &Shared) {
+    let _com = ComGuard::init();
+    let wic = wic_factory();
+    loop {
+        let path = {
+            let mut w = WALL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if w.asked.is_empty() {
+                w.running = false;
+                return;
+            }
+            w.asked.clone()
+        };
+        // Its size first, from the header: a picture too big isn't decoded at all.
+        let fits = |wic: &IWICImagingFactory| picture_size(wic, &path).is_some_and(|(w, h)| u64::from(w) * u64::from(h) <= WALL_MOST);
+        let picture = wic
+            .as_ref()
+            .filter(|wic| fits(wic))
+            .and_then(|wic| decode(wic, &path, WALL_SIDE, WALL_PIXELS, 0))
+            .and_then(|d| Picture::new(d.width, d.height, d.pixels, false));
+        {
+            let mut w = WALL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if w.asked == path {
+                w.asked.clear();
+            }
+            w.read = Some((path, picture, Instant::now()));
+        }
+        repaint(&shared.hwnd);
     }
 }
 

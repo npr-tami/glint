@@ -164,7 +164,7 @@ struct Target {
     pictures: Pictures,
     /// Direct2D copies of the logo's pictures (logo.rs), dark ones then light ones, made the first
     /// time each is drawn (`Renderer::wordmark`).
-    wordmarks: [Option<ID2D1Bitmap>; 2 * crate::logo::COUNT],
+    wordmarks: [Option<ID2D1Bitmap>; 4 * crate::logo::COUNT],
     /// Gradients' brushes, by their colours (`Renderer::fill_paint`), made the first time each is
     /// drawn and moved into place for each shape after that.
     gradients: HashMap<GradientKey, GradientBrushes>,
@@ -939,8 +939,6 @@ const MARBLE_SHADOW: [Stop; 3] = [
     Stop { at: 1.0, color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } },
 ];
 
-// (Not every part draws with all of these yet.)
-#[allow(dead_code)]
 impl Renderer {
     /// Fills `r` with a paint (theme.rs `Paint`), with corners `radius` DIPs round (0: square).
     /// A flat paint draws exactly as `fill_rect` / `fill_round_rect`; a gradient runs across the
@@ -1371,20 +1369,20 @@ impl Renderer {
         true
     }
 
-    /// Draws picture `index` of the chrome logo (logo.rs), for a dark skin or a light one, into
-    /// `dest`. `exact`: `dest` is the picture's own size on whole pixels, so it is copied pixel for
+    /// Draws picture `index` of the chrome logo (logo.rs; `caps`: GLiNT), for a dark skin or a
+    /// light one, into `dest`. `exact`: `dest` is the picture's own size on whole pixels, so it is copied pixel for
     /// pixel; otherwise it is shrunk smoothly (high-quality cubic where Direct2D 1.1 is there).
     ///
     /// The Direct2D copy is made the first time and kept with the render target. After a lost
     /// graphics device it is made again from the pixels logo.rs decoded once, never decoded again.
-    pub fn wordmark(&mut self, dark: bool, index: usize, dest: Rect, exact: bool) {
+    pub fn wordmark(&mut self, dark: bool, caps: bool, index: usize, dest: Rect, exact: bool) {
         if !self.in_frame || dest.is_empty() || index >= crate::logo::COUNT {
             return;
         }
         let Some(t) = self.target.as_mut() else { return };
-        let slot = if dark { index } else { crate::logo::COUNT + index };
+        let slot = (2 * usize::from(caps) + usize::from(!dark)) * crate::logo::COUNT + index;
         if t.wordmarks[slot].is_none() {
-            let Some(px) = crate::logo::pixels(dark, index) else { return };
+            let Some(px) = crate::logo::pixels(dark, caps, index) else { return };
             let size = D2D_SIZE_U { width: px.width, height: px.height };
             // SAFETY: `pixels` holds exactly height rows of width * 4 bytes (logo.rs decodes them so)
             // and lives across the call, which copies them.

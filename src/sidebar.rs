@@ -31,7 +31,6 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
 use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS};
 
 use crate::app::{can_pin, AppState};
@@ -218,8 +217,8 @@ impl Sidebar {
         let known = shell::known_folders();
         let mut icons = IconLoader::new();
         // Start on the folders' icons right away, while the window is still being made: they're
-        // usually in before the first frame.
-        icons.ask(known.iter().map(|k| (k.path.as_str(), "")));
+        // usually in before the first frame. Home's page has its own, for when Home opens it.
+        icons.ask(known.iter().map(|k| (k.path.as_str(), "")).chain(std::iter::once((recent::LOCATION, ""))));
         Sidebar {
             rect: Rect::default(),
             known,
@@ -629,7 +628,8 @@ impl Sidebar {
         let era_icons = theme.icons != IconSet::Windows;
         match item {
             Item::Known(i) => {
-                match self.icons.get(path) {
+                // (Home opening its page: the page's icon, or the folder's until that's in.)
+                match self.icons.get(path).or_else(|| self.known.get(i).and_then(|k| self.icons.get(&k.path))) {
                     _ if era_icons => {}
                     Some(id) => r.icon(&app.icons, id, icon),
                     None => r.icon(&app.icons, app.icons.folder(), icon),
@@ -751,6 +751,15 @@ impl Sidebar {
         };
         let pin_label = |p: &str| if app.is_pinned(p) { "Unpin from sidebar" } else { "Pin to sidebar" };
         match item {
+            // Home opening its page: a place, not a folder, so no path to copy, pin or open a
+            // terminal at.
+            Item::Known(_) if path.is_some_and(recent::is_recent) => {
+                open(&mut items);
+                items.push(MenuItem::new(PICK_REMOVE_PLACE, "Remove from Quick access"));
+                items.extend(self.show_again_menu(app));
+                items.push(MenuItem::separator());
+                items.push(MenuItem::new(PICK_EXPLORER, "Open in File Explorer"));
+            }
             Item::Known(_) => {
                 let p = path.unwrap_or("");
                 open(&mut items);
@@ -799,12 +808,21 @@ impl Sidebar {
 
     // ------------------------------------------------------------ renaming a pinned folder
 
-    /// Opens the name box over a pinned folder's name, with the name it shows selected.
+    /// Opens the name box over a pinned folder's name, with the name it shows selected. A row
+    /// partly out of sight is scrolled into view first: the box only goes over a whole row.
     fn begin_rename(&mut self, path: &str, app: &AppState) -> Effect {
         if self.hwnd.is_invalid() || !app.is_pinned(path) {
             return Effect::None;
         }
         self.end_rename(false, false, None);
+        if let Some(row) = app.settings.pinned.iter().position(|p| same_path(p, path)).and_then(|i| self.row_of(Item::Pin(i))) {
+            let by = if row.y < self.rect.y { row.y - self.rect.y } else { (row.bottom() - self.rect.bottom()).max(0.0) };
+            if by != 0.0 {
+                self.anim.stop();
+                self.scroll = (self.scroll + by).clamp(0.0, self.max_scroll());
+                let _ = self.update_hover();
+            }
+        }
         let hwnd = self.hwnd;
         let b = self.name_box.get_or_insert_with(|| TextBox::new(hwnd, PIN_NAME_BOX));
         b.set_text(&app.pin_name(path));
@@ -1392,7 +1410,7 @@ impl IconLoader {
                 if tx.send((path, icon)).is_err() {
                     return;
                 }
-                repaint(&hwnd);
+                crate::thumbs::repaint(&hwnd);
             }
         });
         if started.is_err() {
@@ -1411,17 +1429,6 @@ impl IconLoader {
             if id.is_some() || !self.got.contains_key(&path) {
                 self.got.insert(path, id);
             }
-        }
-    }
-}
-
-/// Asks the window to paint again (safe from any thread; it's a no-op if the window is gone).
-fn repaint(hwnd: &AtomicIsize) {
-    let h = hwnd.load(Ordering::SeqCst);
-    if h != 0 {
-        // SAFETY: invalidating a window from another thread is allowed; a stale handle just fails.
-        unsafe {
-            let _ = InvalidateRect(Some(HWND(h as *mut _)), None, false);
         }
     }
 }

@@ -89,17 +89,20 @@ pub enum Done {
     Changed,
 }
 
-/// A scrollbar as last drawn.
+/// A scrollbar as last drawn: where it runs, its thumb, and how far its page scrolls.
 #[derive(Clone, Copy, Debug)]
-struct Track {
+pub(crate) struct Track {
     rect: Rect,
     thumb: Rect,
     max: f32,
+    /// Along the bottom (scrolling sideways).
     across: bool,
 }
 
 impl Track {
-    fn new(rect: Rect, content: f32, view: f32, offset: f32, across: bool) -> Option<Track> {
+    /// The bar for a page `content` long with `view` of it showing, scrolled `offset`; None when
+    /// it all shows.
+    pub(crate) fn new(rect: Rect, content: f32, view: f32, offset: f32, across: bool) -> Option<Track> {
         let max = (content - view).max(0.0);
         let len = if across { rect.w } else { rect.h };
         if max <= 0.0 || view <= 0.0 || len <= 0.0 {
@@ -111,11 +114,13 @@ impl Track {
         Some(Track { rect, thumb, max, across })
     }
 
-    fn hit(&self, p: Point) -> bool {
+    /// Whether `p` is on it (a little wider than drawn, to be easy to hit).
+    pub(crate) fn hit(&self, p: Point) -> bool {
         if self.across { self.rect.inset(0.0, -3.0) } else { self.rect.inset(-3.0, 0.0) }.contains(p)
     }
 
-    fn grab(&self, p: Point) -> f32 {
+    /// Where on the thumb it's held: where it was pressed, or its middle when the track was.
+    pub(crate) fn grab(&self, p: Point) -> f32 {
         match (self.across, self.thumb.inset(-3.0, -3.0).contains(p)) {
             (true, true) => p.x - self.thumb.x,
             (false, true) => p.y - self.thumb.y,
@@ -124,12 +129,13 @@ impl Track {
         }
     }
 
-    fn offset_at(&self, p: Point, grab: f32) -> f32 {
+    /// The scroll that puts the thumb, held at `grab`, under `p`.
+    pub(crate) fn offset_at(&self, p: Point, grab: f32) -> f32 {
         let (len, t, start, at) = if self.across { (self.rect.w, self.thumb.w, self.rect.x, p.x) } else { (self.rect.h, self.thumb.h, self.rect.y, p.y) };
         ((at - grab - start) / (len - t).max(1.0)).clamp(0.0, 1.0) * self.max
     }
 
-    fn paint(&self, r: &mut Renderer, theme: &Theme, hot: bool) {
+    pub(crate) fn paint(&self, r: &mut Renderer, theme: &Theme, hot: bool) {
         let radius = self.thumb.w.min(self.thumb.h) / 2.0;
         r.fill_paint(self.thumb, radius, if hot { &theme.scroll_thumb_hover_paint } else { &theme.scroll_thumb_paint });
     }
@@ -593,9 +599,17 @@ impl CodeBox {
         self.selecting || self.drag.is_some()
     }
 
+    /// The suggestion under `p`: its place in the whole list (once the picked one is past the
+    /// eighth, the rows shown start further down it).
+    fn suggestion_at(&self, p: Point) -> Option<usize> {
+        let k = self.suggestion_rects.iter().position(|r| r.contains(p))?;
+        let first = self.pick.saturating_sub(POPUP_MAX - 1).min(self.completion.items.len().saturating_sub(self.suggestion_rects.len()));
+        Some(first + k)
+    }
+
     /// A press in the box (the window captures the mouse when this says `true`).
     pub fn mouse_down(&mut self, p: Point, double: bool, lang: &dyn Lang) -> (Done, bool) {
-        if let Some(k) = self.suggestion_rects.iter().position(|r| r.contains(p)) {
+        if let Some(k) = self.suggestion_at(p) {
             return (self.accept(k, lang), false);
         }
         for (across, t) in [(false, self.vtrack), (true, self.htrack)] {
@@ -653,7 +667,7 @@ impl CodeBox {
             }
             return false;
         }
-        let pick = self.suggestion_rects.iter().position(|r| r.contains(p));
+        let pick = self.suggestion_at(p);
         let bar = if self.vtrack.is_some_and(|t| t.hit(p)) {
             Some(false)
         } else if self.htrack.is_some_and(|t| t.hit(p)) {
@@ -796,25 +810,25 @@ impl CodeBox {
                     done = self.edit(a, b, "", kind, lang);
                 }
             }
-            _ if ctrl && vk == VK_A.0 => (self.anchor, self.caret) = (0, text_len),
-            _ if ctrl && (vk == VK_C.0 || vk == VK_X.0) => {
+            // (Not with Alt too: Ctrl+Alt is AltGr, which types letters like ą or @.)
+            _ if ctrl && !alt && vk == VK_A.0 => (self.anchor, self.caret) = (0, text_len),
+            _ if ctrl && !alt && (vk == VK_C.0 || vk == VK_X.0) => {
                 let (a, b) = self.selection();
-                if a != b {
-                    let _ = shell::copy_text(owner, &self.text[a..b].replace('\n', "\r\n"));
-                    if vk == VK_X.0 {
-                        done = self.insert("", lang);
-                    }
+                // Cut takes the text away only once it's on the clipboard (another program may
+                // have that open).
+                if a != b && shell::copy_text(owner, &self.text[a..b].replace('\n', "\r\n")) && vk == VK_X.0 {
+                    done = self.insert("", lang);
                 }
             }
-            _ if ctrl && vk == VK_V.0 => {
+            _ if ctrl && !alt && vk == VK_V.0 => {
                 if let Some(t) = clipboard_text(owner) {
                     let t = t.replace("\r\n", "\n").replace('\r', "\n").replace('\t', " ");
                     done = self.insert(&t, lang);
                     self.list_closed = true;
                 }
             }
-            _ if ctrl && vk == VK_Z.0 => done = self.undo_redo(key_down(VK_SHIFT.0), lang),
-            _ if ctrl && vk == VK_Y.0 => done = self.undo_redo(true, lang),
+            _ if ctrl && !alt && vk == VK_Z.0 => done = self.undo_redo(key_down(VK_SHIFT.0), lang),
+            _ if ctrl && !alt && vk == VK_Y.0 => done = self.undo_redo(true, lang),
             _ if ctrl && !alt && (vk == VK_OEM_2.0 || vk == VK_DIVIDE.0) => done = self.toggle_note(lang),
             _ => return Done::NotMine,
         }
@@ -833,8 +847,17 @@ impl CodeBox {
         if new == old {
             return Done::Moved;
         }
+        let caret = self.caret;
         let done = self.edit(first, last, &new, Edit::Other, lang);
-        (self.anchor, self.caret) = (first, first + new.len());
+        if a == b {
+            // The cursor stays by the same word (typing on mustn't replace the line).
+            let indent = first + old.len() - old.trim_start().len();
+            let moved = caret as isize + new.len() as isize - old.len() as isize;
+            let pos = if caret >= indent { moved.max(indent as isize) as usize } else { caret };
+            (self.anchor, self.caret) = (pos, pos);
+        } else {
+            (self.anchor, self.caret) = (first, first + new.len());
+        }
         self.list_closed = true;
         done
     }
@@ -849,24 +872,35 @@ impl CodeBox {
         let Some(((from, to), new, shift)) = swap_lines(&self.text, first, last, up) else { return Done::Moved };
         let (caret, anchor) = (self.caret, self.anchor);
         let done = self.edit(from, to, &new, Edit::Other, lang);
-        self.caret = (caret as isize + shift) as usize;
-        self.anchor = (anchor as isize + shift) as usize;
+        // (A selection ending at the start of the line below ends past the text when that was the
+        // last line: it ends at the end instead.)
+        self.caret = ((caret as isize + shift) as usize).min(self.text.len());
+        self.anchor = ((anchor as isize + shift) as usize).min(self.text.len());
         self.list_closed = true;
         self.reveal_caret();
         done
     }
 }
 
-fn key_down(vk: u16) -> bool {
+pub(crate) fn key_down(vk: u16) -> bool {
     // SAFETY: a plain key-state query.
     unsafe { GetKeyState(vk as i32) < 0 }
 }
 
 /// The text on the clipboard, if any.
-fn clipboard_text(owner: HWND) -> Option<String> {
+pub(crate) fn clipboard_text(owner: HWND) -> Option<String> {
     // SAFETY: the clipboard is opened and closed here; the memory is locked only while copied.
     unsafe {
-        OpenClipboard(Some(owner)).ok()?;
+        // Another program may have it open for a moment (a clipboard manager, or Remote Desktop,
+        // reading what was just copied): it's tried a few times.
+        let mut tries = 0;
+        while OpenClipboard(Some(owner)).is_err() {
+            tries += 1;
+            if tries == 5 {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let text = GetClipboardData(CF_UNICODETEXT.0 as u32).ok().and_then(|h: HANDLE| {
             let mem = HGLOBAL(h.0);
             let p = GlobalLock(mem) as *const u16;
@@ -893,30 +927,31 @@ fn fix_boundary(s: &str, mut i: usize) -> usize {
 }
 
 /// The byte offset of the start of the line `pos` is on, and the line's number (from 0).
-fn line_of(text: &str, pos: usize) -> (usize, usize) {
+pub(crate) fn line_of(text: &str, pos: usize) -> (usize, usize) {
     let start = text[..pos].rfind('\n').map_or(0, |i| i + 1);
     (start, text[..start].matches('\n').count())
 }
 
-fn line_end(text: &str, pos: usize) -> usize {
+pub(crate) fn line_end(text: &str, pos: usize) -> usize {
     text[pos..].find('\n').map_or(text.len(), |i| pos + i)
 }
 
-fn at_col(text: &str, start: usize, col: usize) -> usize {
+/// The byte offset of column `col` (in characters) of the line starting at `start`.
+pub(crate) fn at_col(text: &str, start: usize, col: usize) -> usize {
     let end = line_end(text, start);
     text[start..end].char_indices().nth(col).map_or(end, |(i, _)| start + i)
 }
 
-fn col_of(text: &str, pos: usize) -> usize {
+pub(crate) fn col_of(text: &str, pos: usize) -> usize {
     let (start, _) = line_of(text, pos);
     text[start..pos].chars().count()
 }
 
-fn prev_char(text: &str, pos: usize) -> usize {
+pub(crate) fn prev_char(text: &str, pos: usize) -> usize {
     text[..pos].char_indices().next_back().map_or(0, |(i, _)| i)
 }
 
-fn next_char(text: &str, pos: usize) -> usize {
+pub(crate) fn next_char(text: &str, pos: usize) -> usize {
     text[pos..].chars().next().map_or(pos, |c| pos + c.len_utf8())
 }
 
@@ -936,6 +971,10 @@ fn word_left(text: &str, pos: usize) -> usize {
 }
 
 fn word_right(text: &str, pos: usize) -> usize {
+    // At a line's end: on to the start of the next.
+    if text[pos..].starts_with('\n') {
+        return pos + 1;
+    }
     let mut p = pos;
     while p < text.len() && is_word(text[p..].chars().next().unwrap_or(' ')) {
         p = next_char(text, p);
@@ -946,7 +985,9 @@ fn word_right(text: &str, pos: usize) -> usize {
     p
 }
 
-fn whole_lines(text: &str, a: usize, b: usize) -> (usize, usize) {
+/// The whole lines the selection `a..b` is on: from the start of the first to the end of the
+/// last (one ending at the very start of a line leaves that line out).
+pub(crate) fn whole_lines(text: &str, a: usize, b: usize) -> (usize, usize) {
     let first = line_of(text, a).0;
     let b = if b > a && b > first && line_of(text, b).0 == b { b - 1 } else { b };
     (first, line_end(text, b))
@@ -971,7 +1012,10 @@ fn toggle_notes(lines: &str, mark: &str) -> String {
     lines.split('\n').map(line).collect::<Vec<_>>().join("\n")
 }
 
-fn swap_lines(text: &str, first: usize, last: usize, up: bool) -> Option<((usize, usize), String, isize)> {
+/// Alt+Up / Alt+Down: the whole lines `first..last` (from [`whole_lines`]) swapped with the line
+/// above or below. The part of the text that changes, what it becomes, and how far the lines went
+/// (bytes); None at the top or the bottom.
+pub(crate) fn swap_lines(text: &str, first: usize, last: usize, up: bool) -> Option<((usize, usize), String, isize)> {
     let lines = &text[first..last];
     if up {
         let above = line_of(text, first.checked_sub(1)?).0;
@@ -995,5 +1039,35 @@ mod tests {
     fn notes_go_on_and_off() {
         assert_eq!(toggle_notes("accent: #fff\n\n  text: #000", "//"), "// accent: #fff\n\n  // text: #000");
         assert_eq!(toggle_notes("// accent: #fff\n  // text: #000", "//"), "accent: #fff\n  text: #000");
+    }
+
+    /// A language with nothing to suggest or colour.
+    struct Plain;
+
+    impl Lang for Plain {
+        fn complete(&self, _text: &str, _caret: usize) -> Completion {
+            Completion::default()
+        }
+        fn explain(&self, _row: &str) -> Option<String> {
+            None
+        }
+        fn ink(&self, _row: &str, _theme: &Theme) -> Vec<(usize, usize, Color)> {
+            Vec::new()
+        }
+    }
+
+    /// Alt+Down with the selection ending at the start of the last line (Shift+Down, or Ctrl+A in
+    /// text ending with a new line): the cursor stays in the text, where it went one past its end.
+    #[test]
+    fn lines_moved_to_the_bottom_keep_the_cursor_in_the_text() {
+        let mut b = CodeBox { rect: Rect::new(0.0, 0.0, 300.0, 200.0), char_w: 7.0, ..Default::default() };
+        b.set_text("a\nb");
+        (b.anchor, b.caret) = (0, 2);
+        b.move_line(false, &Plain);
+        assert_eq!((b.text.as_str(), b.anchor, b.caret), ("b\na", 2, 3));
+        b.set_text("a\nb\n");
+        (b.anchor, b.caret) = (0, 4);
+        b.move_line(false, &Plain);
+        assert_eq!((b.text.as_str(), b.anchor, b.caret), ("\na\nb", 1, 4));
     }
 }

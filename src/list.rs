@@ -18,8 +18,9 @@
 //!
 //! The list's options (settings.json; right-click a column title for most of
 //! them):
-//! - which columns show next to Name ("Columns": Date modified, Date created, Type, Size), plus a
-//!   Folder column while subfolders are searched (search.rs);
+//! - which columns show next to Name ("Columns": Date modified, Date created, Type, Size, and Picture
+//!   size and Length, which media.rs reads in the background), plus a Folder column while subfolders
+//!   are searched (search.rs);
 //! - folders above files or mixed with them ("FoldersFirst");
 //! - how dates and sizes look ("DateFormat", "SizeFormat"; folder.rs formats them);
 //! - the row and text size ("Size": small, medium with more room, large with bigger text and
@@ -47,11 +48,13 @@
 //! highlighted) or into the folder on screen; near the top or bottom edge the list scrolls.
 
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetFocus, VK_A, VK_C, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F2, VK_HOME, VK_INSERT, VK_LEFT, VK_N, VK_NEXT, VK_PRIOR,
-    VK_RETURN, VK_RIGHT, VK_SPACE, VK_UP, VK_V, VK_X,
+    VK_RETURN, VK_RIGHT, VK_SPACE, VK_UP, VK_V, VK_X, VK_Y, VK_Z,
 };
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer, SystemParametersInfoW, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS};
 // Dragging items out, and things dragged in (dragdrop.rs).
@@ -64,6 +67,7 @@ use crate::home;
 use crate::folder::{self, Entry, EntryKind};
 use crate::frame;
 use crate::icons;
+use crate::media;
 use crate::recycle::{self, BinItem};
 use crate::pathbar::{fill_box_paint, outline_box};
 use crate::render::{Align, Renderer, TextStyle};
@@ -110,8 +114,11 @@ const HEAD_MODIFIED: u32 = 1;
 const HEAD_CREATED: u32 = 2;
 const HEAD_TYPE: u32 = 3;
 const HEAD_SIZE: u32 = 4;
+const HEAD_DIMENSIONS: u32 = 5;
+const HEAD_LENGTH: u32 = 6;
 const HEAD_FOLDERS_FIRST: u32 = 10;
 const HEAD_EXTENSIONS: u32 = 11;
+const HEAD_FOLDER_SIZES: u32 = 12;
 const HEAD_DATE_DEFAULT: u32 = 20;
 const HEAD_DATE_RELATIVE: u32 = 21;
 const HEAD_DATE_ISO: u32 = 22;
@@ -129,6 +136,10 @@ enum Col {
     Created,
     Type,
     Size,
+    /// Picture size: a picture's or a video's width and height (media.rs).
+    Dimensions,
+    /// How long a video or a song plays (media.rs).
+    Length,
     /// Where a search result is, below the folder searched.
     Folder,
     /// This PC: a drive's free space.
@@ -146,6 +157,8 @@ impl Col {
             Col::Created => "created",
             Col::Type => "type",
             Col::Size => "size",
+            Col::Dimensions => "dimensions",
+            Col::Length => "length",
             Col::Folder => "folder",
             Col::Free => "free",
             Col::Location => "location",
@@ -155,6 +168,8 @@ impl Col {
     fn default_width(self) -> f32 {
         match self {
             Col::Size => 90.0,
+            Col::Dimensions => 110.0,
+            Col::Length => 80.0,
             Col::Free => 110.0,
             Col::Folder => 220.0,
             Col::Location => 260.0,
@@ -174,6 +189,8 @@ impl Col {
             Col::Type => "Type",
             Col::Size if this_pc => "Total size",
             Col::Size => "Size",
+            Col::Dimensions => "Picture size",
+            Col::Length => "Length",
             Col::Folder => "Folder",
             Col::Free => "Free space",
             Col::Location => "Original location",
@@ -189,18 +206,20 @@ impl Col {
             Col::Created => SortKey::Created,
             Col::Type => SortKey::Type,
             Col::Size => SortKey::Size,
+            Col::Dimensions => SortKey::Dimensions,
+            Col::Length => SortKey::Length,
             Col::Folder => SortKey::Folder,
             Col::Location => return None,
         })
     }
 
     fn right_aligned(self) -> bool {
-        self == Col::Size
+        matches!(self, Col::Size | Col::Dimensions | Col::Length)
     }
 }
 
 /// The columns next to Name that settings.json can switch on, in the list's order.
-const OPTIONAL: [Col; 4] = [Col::Modified, Col::Created, Col::Type, Col::Size];
+const OPTIONAL: [Col; 6] = [Col::Modified, Col::Created, Col::Type, Col::Size, Col::Dimensions, Col::Length];
 
 /// A column where it sits now.
 #[derive(Clone, Copy, Debug)]
@@ -256,6 +275,9 @@ struct Press {
     on_item: bool,
     /// What a left click finishes with when the button comes up without a drag.
     then: Then,
+    /// It moved away, but nothing can be dragged from here (the Recycle Bin, This PC's drives):
+    /// not tried again at every move.
+    refused: bool,
 }
 
 /// The rest of a left click, done when the button comes up without a drag. Items by their key
@@ -328,6 +350,8 @@ pub struct ListView {
     /// The tab the running animation belongs to.
     anim_tab: u64,
     wheel_lines: f32,
+    /// Ctrl + wheel notches not yet used (a touchpad sends them in small parts).
+    zoom_wheel: f32,
     typed: String,
     typed_at: f64,
     /// The main window and its scale, from the last layout (for the name box and the slow-click timer).
@@ -371,9 +395,48 @@ pub struct ListView {
     /// Home's page (home.rs) and whether it's on screen (at the last frame).
     home: home::Home,
     home_on: bool,
-    /// The skin's wallpaper as last loaded: its path, and the picture (None when it couldn't be
-    /// read, so it isn't tried again every frame).
-    wall: Option<(String, Option<std::sync::Arc<crate::thumbs::Picture>>)>,
+    /// Split view: where the wallpaper lies (both halves); None: this list.
+    wall_area: Option<Rect>,
+    /// How media.rs tells this list's asks from the other half's (split view), and what this list
+    /// last asked it for (Picture size and Length).
+    media_id: u32,
+    media: MediaRead,
+}
+
+/// Numbers for the lists, for media.rs.
+static NEXT_LIST: AtomicU32 = AtomicU32::new(1);
+
+/// While picture sizes or lengths come in, a tab sorted by one of them sorts again at most this
+/// often (seconds), so its rows don't jump about with every value.
+const RESORT_EVERY: f64 = 0.25;
+
+/// What a list last asked media.rs for (the Picture size and Length columns), and how far through
+/// its listing handing over the rest has got.
+#[derive(Default)]
+struct MediaRead {
+    /// The tab and the listing (its folder, how many items) asked for, and the columns then: a
+    /// change starts the rest again from the top.
+    tab: u64,
+    listing: String,
+    entries: usize,
+    cols: media::Columns,
+    /// The listing's files may be read (it isn't inside a .zip or .7z), and it's on the PC's own
+    /// drives (the rest is read there; elsewhere only while the tab is sorted by one of the columns).
+    readable: bool,
+    local: bool,
+    /// The next entry to look at for the rest, and how many of the rest media.rs still had waiting.
+    next: usize,
+    waiting: usize,
+    /// What was handed over before was for an older listing (said with the next ask).
+    restart: bool,
+    /// This list asked during the last frame; it has asks at media.rs.
+    asked: bool,
+    active: bool,
+    /// `media::arrived` when the tab was last sorted again by a column, and when that was.
+    sorted: u64,
+    sorted_at: f64,
+    /// The tabs' folders when media.rs was last told which to keep (a hash).
+    kept: u64,
 }
 
 impl Default for ListView {
@@ -389,7 +452,7 @@ impl ListView {
         unsafe {
             let _ = SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, Some(&mut lines as *mut u32 as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
         }
-        let all = [Col::Modified, Col::Created, Col::Type, Col::Size, Col::Folder, Col::Free, Col::Location];
+        let all = [Col::Modified, Col::Created, Col::Type, Col::Size, Col::Dimensions, Col::Length, Col::Folder, Col::Free, Col::Location];
         ListView {
             rect: Rect::default(),
             wanted: all.iter().map(|c| (c.key(), c.default_width())).collect(),
@@ -409,6 +472,7 @@ impl ListView {
             anim_tab: 0,
             // "One screen per notch" comes back as u32::MAX; treat it as a big step.
             wheel_lines: if lines == u32::MAX { 20.0 } else { lines.clamp(1, 20) as f32 },
+            zoom_wheel: 0.0,
             typed: String::new(),
             typed_at: 0.0,
             hwnd: HWND::default(),
@@ -432,13 +496,15 @@ impl ListView {
             list_hit: Vec::new(),
             home: home::Home::default(),
             home_on: false,
-            wall: None,
+            wall_area: None,
+            media_id: NEXT_LIST.fetch_add(1, Ordering::Relaxed),
+            media: MediaRead::default(),
         }
     }
 
     /// The widths of the columns next to Name as last set (by default or by dragging), in DIPs,
-    /// by their names in settings.json ("modified", "created", "type", "size", "folder", "free",
-    /// "location").
+    /// by their names in settings.json ("modified", "created", "type", "size", "dimensions", "length",
+    /// "folder", "free", "location").
     pub fn column_widths(&self) -> BTreeMap<String, f32> {
         self.wanted.iter().map(|(k, w)| (k.to_string(), *w)).collect()
     }
@@ -538,8 +604,14 @@ impl ListView {
         if crate::recent::is_recent(&t.folder.path) {
             return vec![Col::Name, Col::Folder, Col::Modified, Col::Size, Col::Type];
         }
+        // Picture size and Length only where something can have them (pictures, videos, songs).
+        let here = |c: &Col| match c {
+            Col::Dimensions => t.media_here.dims,
+            Col::Length => t.media_here.length,
+            _ => true,
+        };
         let mut cols = vec![Col::Name];
-        cols.extend(OPTIONAL.iter().copied().filter(|c| app.settings.shows_column(c.key())));
+        cols.extend(OPTIONAL.iter().copied().filter(|c| app.settings.shows_column(c.key()) && here(c)));
         if t.is_searching() {
             cols.push(Col::Folder);
         }
@@ -547,7 +619,8 @@ impl ListView {
     }
 
     fn is_this_pc(t: &Tab) -> bool {
-        t.folder.path.is_empty() && !t.folder.entries.is_empty()
+        // (A search of every drive from This PC shows files, with the search results' columns.)
+        t.folder.path.is_empty() && !t.folder.entries.is_empty() && !t.is_searching()
     }
 
     /// Works out where every column sits: the ones next to Name keep the widths last set, squeezed
@@ -882,7 +955,8 @@ impl ListView {
     /// one with the cursor, else the first selected.
     pub fn begin_rename_selected(&mut self, ctx: &Ctx, app: &mut AppState) -> Effect {
         let tab = app.tab();
-        if tab.path.is_empty() {
+        // (What a search of every drive found there can be renamed, like any search result.)
+        if tab.path.is_empty() && !tab.is_searching() {
             app.say(THIS_PC_NOTE);
             return Effect::Redraw;
         }
@@ -894,6 +968,10 @@ impl ListView {
             return Effect::None;
         }
         let chosen = tab.selected_entries();
+        // Several selected: they're renamed all at once, with a form saying how (app/forms.rs).
+        if chosen.len() > 1 && !crate::recent::is_recent(&tab.folder.path) {
+            return Effect::Command(Command::RenameMany);
+        }
         let Some(index) = tab.focus.filter(|f| chosen.contains(f)).or(chosen.first().copied()) else { return Effect::None };
         let hide_ext = app.settings.hide_known_extensions;
         self.begin_rename(ctx.now, app.tab_mut(), index, None, hide_ext)
@@ -904,8 +982,9 @@ impl ListView {
     /// the box then holds the name without it, all selected, and the extension is put back after.
     fn begin_rename(&mut self, now: f64, tab: &mut Tab, index: usize, text: Option<&str>, hide_ext: bool) -> Effect {
         let Some(e) = tab.folder.entries.get(index) else { return Effect::None };
-        // Not drives, and not the Recycle Bin's deleted items.
-        if e.kind == EntryKind::Drive || tab.folder.path.is_empty() || folder::is_place(&tab.folder.path) || self.hwnd.is_invalid() {
+        // Not drives, and not the Recycle Bin's deleted items. (This PC's search results carry their
+        // full path.)
+        if e.kind == EntryKind::Drive || (tab.folder.path.is_empty() && e.target.is_none()) || folder::is_place(&tab.folder.path) || self.hwnd.is_invalid() {
             return Effect::None;
         }
         let Some(row) = tab.row_of(index) else { return Effect::None }; // hidden by the filter
@@ -1146,9 +1225,12 @@ impl ListView {
             col(HEAD_CREATED, "Date created", "created"),
             col(HEAD_TYPE, "Type", "type"),
             col(HEAD_SIZE, "Size", "size"),
+            col(HEAD_DIMENSIONS, "Picture size", "dimensions"),
+            col(HEAD_LENGTH, "Length", "length"),
             MenuItem::separator(),
             MenuItem::new(HEAD_FOLDERS_FIRST, "Folders first").checked(s.folders_first),
             MenuItem::new(HEAD_EXTENSIONS, "File extensions").checked(!s.hide_known_extensions),
+            MenuItem::new(HEAD_FOLDER_SIZES, "Folder sizes").checked(s.folder_sizes),
             MenuItem::separator(),
             MenuItem::submenu(
                 "Dates",
@@ -1176,10 +1258,17 @@ impl ListView {
     /// saves it a moment later).
     fn header_pick(&mut self, item: u32, app: &mut AppState) -> Effect {
         match item {
-            HEAD_MODIFIED | HEAD_CREATED | HEAD_TYPE | HEAD_SIZE => {
+            HEAD_MODIFIED | HEAD_CREATED | HEAD_TYPE | HEAD_SIZE | HEAD_DIMENSIONS | HEAD_LENGTH => {
                 let key = OPTIONAL[(item - HEAD_MODIFIED) as usize].key();
                 let on = !app.settings.shows_column(key);
                 app.set_column(key, on);
+                // Turned on where it can't show: say where it does.
+                let here = app.tab().media_here;
+                match item {
+                    HEAD_DIMENSIONS if on && !here.dims => app.say("Picture size shows in folders with pictures or videos"),
+                    HEAD_LENGTH if on && !here.length => app.say("Length shows in folders with videos or songs"),
+                    _ => {}
+                }
             }
             HEAD_FOLDERS_FIRST => {
                 let on = !app.settings.folders_first;
@@ -1188,6 +1277,10 @@ impl ListView {
             HEAD_EXTENSIONS => {
                 let hide = !app.settings.hide_known_extensions;
                 app.settings.hide_known_extensions = hide;
+            }
+            HEAD_FOLDER_SIZES => {
+                let on = !app.settings.folder_sizes;
+                app.set_folder_sizes(on);
             }
             HEAD_DATE_DEFAULT => app.settings.date_format = DateFormat::Default,
             HEAD_DATE_RELATIVE => app.settings.date_format = DateFormat::Relative,
@@ -1205,6 +1298,115 @@ impl ListView {
         Effect::Redraw
     }
 
+    // ------------------------------------------------------------ Picture size and Length (media.rs)
+
+    /// What media.rs knows about the rows on screen for the Picture size and Length columns, by
+    /// row; what it doesn't is asked for. The rows on screen first, then, while it has little of it
+    /// left, more of the rest of the listing (on the PC's own drives, or anywhere while the tab is
+    /// sorted by one of the columns). Nothing is asked while neither column shows.
+    fn media_rows(&mut self, tab: &Tab, geo: &Geometry, scroll: f32) -> Vec<(usize, media::Facts)> {
+        let cols = media::Columns { dims: self.cols.iter().any(|p| p.col == Col::Dimensions), length: self.cols.iter().any(|p| p.col == Col::Length) };
+        if !cols.any() {
+            return Vec::new();
+        }
+        self.media_ask(tab, cols, geo.visible(scroll))
+    }
+
+    /// A view without columns (List, the icons) of a tab sorted by Picture size or Length: the
+    /// listing is still read (the rest, as no value shows), so the sort gets them all.
+    fn media_for_sort(&mut self, tab: &Tab, app: &AppState) {
+        let cols = media::Columns {
+            dims: tab.sort == SortKey::Dimensions && app.settings.shows_column("dimensions"),
+            length: tab.sort == SortKey::Length && app.settings.shows_column("length"),
+        };
+        if cols.any() {
+            self.media_ask(tab, cols, std::iter::empty());
+        }
+    }
+
+    /// Asks media.rs for what `cols` need of the tab's listing (`media_rows`): these rows on screen,
+    /// and more of the rest. Returns what is known about those rows.
+    fn media_ask(&mut self, tab: &Tab, cols: media::Columns, on_screen: impl Iterator<Item = usize>) -> Vec<(usize, media::Facts)> {
+        let listing = &tab.folder.path;
+        let m = &mut self.media;
+        if m.tab != tab.id || m.listing != *listing || m.entries != tab.folder.entries.len() || m.cols != cols {
+            // Another listing (or items came or went, or another column shows): the rest from the top.
+            m.readable = !listing.is_empty() && crate::archive::split(listing).is_none();
+            m.local = m.readable && fileops::has_recycle_bin(listing);
+            (m.tab, m.listing, m.entries, m.cols) = (tab.id, listing.clone(), tab.folder.entries.len(), cols);
+            (m.next, m.waiting, m.restart) = (0, 0, true);
+        }
+        if !m.readable {
+            return Vec::new();
+        }
+        let rows: Vec<(usize, &Entry)> = on_screen.filter_map(|row| tab.entry_at(row).map(|e| (row, e))).filter(|(_, e)| media::worth_asking(e, cols)).collect();
+        let mut found = Vec::with_capacity(rows.len());
+        let mut screen = Vec::new();
+        for ((row, e), facts) in rows.iter().zip(media::known(listing, rows.iter().map(|(_, e)| *e))) {
+            match facts {
+                Some(f) => found.push((*row, f)),
+                None => screen.push(media::Ask::of(listing, e)),
+            }
+        }
+        // The rest: the items shown, in the listing's own order (which sorting doesn't change).
+        let sorted = matches!(tab.sort, SortKey::Dimensions | SortKey::Length);
+        let mut rest = Vec::new();
+        if (m.local || sorted) && m.waiting < media::REST_BATCH / 4 {
+            let entries = &tab.folder.entries;
+            while m.next < entries.len() && rest.len() < media::REST_BATCH {
+                let end = (m.next + media::REST_BATCH).min(entries.len());
+                let batch: Vec<&Entry> = (m.next..end).filter(|&i| tab.row_of(i).is_some()).map(|i| &entries[i]).filter(|e| media::worth_asking(e, cols)).collect();
+                for (e, facts) in batch.iter().zip(media::known(listing, batch.iter().copied())) {
+                    if facts.is_none() {
+                        rest.push(media::Ask::of(listing, e));
+                    }
+                }
+                m.next = end;
+            }
+        }
+        m.waiting = media::want(self.media_id, listing, screen, rest, std::mem::take(&mut m.restart), self.hwnd);
+        (m.asked, m.active) = (true, true);
+        found
+    }
+
+    /// Every frame, before painting: media.rs is told what this list no longer needs and which
+    /// folders' values to keep, and a tab sorted by Picture size or Length sorts again as values
+    /// come in (at most every RESORT_EVERY; as folder sizes do in app.rs). True while a sort is due.
+    fn tick_media(&mut self, now: f64, app: &mut AppState) -> bool {
+        // Both columns off: nothing is read, and what was is forgotten.
+        if !app.settings.shows_column("dimensions") && !app.settings.shows_column("length") {
+            media::clear();
+        }
+        let m = &mut self.media;
+        // Nothing asked during the last frame (another view, a place without these columns, split
+        // view closed): what this list asked for goes.
+        if !std::mem::take(&mut m.asked) && m.active {
+            media::stop(self.media_id);
+            (m.active, m.tab) = (false, 0);
+        }
+        // The values of folders no tab shows any more are forgotten.
+        let mut open = std::collections::hash_map::DefaultHasher::new();
+        for t in &app.tabs {
+            t.folder.path.hash(&mut open);
+        }
+        let open = open.finish();
+        if open != m.kept {
+            m.kept = open;
+            media::keep(app.tabs.iter().map(|t| t.folder.path.as_str()));
+        }
+        let t = app.tab();
+        let arrived = media::arrived();
+        if arrived == m.sorted || m.tab != t.id || !matches!(t.sort, SortKey::Dimensions | SortKey::Length) || t.custom_here().is_some() {
+            return false;
+        }
+        if now - m.sorted_at < RESORT_EVERY {
+            return true; // (a moment later)
+        }
+        (m.sorted, m.sorted_at) = (arrived, now);
+        app.tab_mut().rebuild_view();
+        false
+    }
+
     // ------------------------------------------------------------ drawing
 
     fn paint_header(&mut self, r: &mut Renderer, theme: &Theme, tab: &Tab) {
@@ -1215,6 +1417,9 @@ impl ListView {
         };
         let this_pc = Self::is_this_pc(tab);
         let bin = recycle::is_bin(&tab.folder.path);
+        // Home and Duplicates keep an order of their own until a column is clicked: till then no
+        // column is the sorted one.
+        let own_order = !tab.column_now && (crate::recent::is_recent(&tab.folder.path) || tab.search.as_ref().is_some_and(|s| s.is_dupes()));
         let end = self.rect.right() - SCROLL_GUTTER;
         if theme.era.old() {
             // An older Windows' column titles (retrolist.rs).
@@ -1229,7 +1434,7 @@ impl ListView {
                 let label = p.col.title(this_pc, bin, crate::recent::is_recent(&tab.folder.path));
                 let right = p.col.right_aligned();
                 let text_rect = if i == 0 { Rect::new(cell.x + ROW_PAD + 4.0, cell.y, cell.w - ROW_PAD - 16.0, cell.h) } else { cell.inset(10.0, 0.0) };
-                let sorted = p.col.sort_key() == Some(tab.sort) && tab.custom_here().is_none() && !(crate::recent::is_recent(&tab.folder.path) && !tab.column_now) && !(this_pc && p.col == Col::Free && tab.sort != SortKey::Date);
+                let sorted = p.col.sort_key() == Some(tab.sort) && tab.custom_here().is_none() && !own_order && !(this_pc && p.col == Col::Free && tab.sort != SortKey::Date);
                 let hot = hover_col == Some(p.col) && p.col.sort_key().is_some();
                 crate::retrolist::header_item(r, theme, cell, text_rect, label, right, sorted.then_some(tab.descending), hot);
             }
@@ -1259,7 +1464,7 @@ impl ListView {
             let style = if theme.buttons == ButtonStyle::Liquid { style.bold() } else { style };
             r.text(label, text_rect, &style);
             // (None while the custom sort order decides, or Recent keeps Windows' newest-first order.)
-            if p.col.sort_key() == Some(tab.sort) && tab.custom_here().is_none() && !(crate::recent::is_recent(&tab.folder.path) && !tab.column_now) && !(this_pc && p.col == Col::Free && tab.sort != SortKey::Date) {
+            if p.col.sort_key() == Some(tab.sort) && tab.custom_here().is_none() && !own_order && !(this_pc && p.col == Col::Free && tab.sort != SortKey::Date) {
                 // A small chevron beside the sorted column's title: up = A to Z / oldest first.
                 let w = r.measure(label, &style);
                 let cx = if right { text_rect.right() - w - 9.0 } else { (text_rect.x + w + 9.0).min(text_rect.right() - 4.0) };
@@ -1271,8 +1476,9 @@ impl ListView {
         r.fill_rect(Rect::new(header.x, header.bottom(), header.w, 1.0), theme.line);
     }
 
-    /// The text of one cell (not Name's). `bin`: what the Recycle Bin says about the item, in the bin.
-    fn cell_text(col: Col, e: &Entry, root: &str, app: &AppState, bin: Option<&BinItem>) -> String {
+    /// The text of one cell (not Name's). `bin`: what the Recycle Bin says about the item, in the bin;
+    /// `media`: its picture size and length, once media.rs has read them.
+    fn cell_text(col: Col, e: &Entry, root: &str, app: &AppState, bin: Option<&BinItem>, media: Option<&media::Facts>) -> String {
         let s = &app.settings;
         let drive = e.kind == EntryKind::Drive;
         match col {
@@ -1284,7 +1490,11 @@ impl ListView {
             Col::Size if drive => if e.size > 0 { folder::format_size(e.size) } else { String::new() },
             // A deleted folder's size is known too (Windows noted it when it was deleted).
             Col::Size if e.kind == EntryKind::File || bin.is_some() => folder::format_size_as(e.size, s.size_format),
+            // A folder's size, once Glint has added it up (foldersize.rs; an empty one shows none).
+            Col::Size if e.size > 0 && s.folder_sizes => folder::format_size_as(e.size, s.size_format),
             Col::Size => String::new(),
+            Col::Dimensions => media::size_text(media),
+            Col::Length => media::length_text(media),
             Col::Free if drive && e.size > 0 => format!("{} free", folder::format_size(e.free)),
             Col::Free => String::new(),
             Col::Folder => relative_folder(e, root),
@@ -1306,6 +1516,10 @@ impl ListView {
                 Flow::Rows => self.paint_lines(r, theme, app, tab, &geo, scroll),
                 Flow::Columns => self.paint_names(r, theme, app, tab, &geo, scroll),
                 Flow::Grid => self.paint_tiles(r, theme, app, tab, &geo, scroll),
+            }
+            // (Rows ask media.rs for their Picture size and Length as they're drawn.)
+            if self.flow != Flow::Rows {
+                self.media_for_sort(tab, app);
             }
         }
         // The name box is a Windows text box on top; this is the frame around it.
@@ -1426,11 +1640,21 @@ impl ListView {
         let bin = tab.folder.bin.as_ref().filter(|b| b.items.len() == tab.folder.entries.len());
         // The tree view: arrows on folders, items of open folders pulled in by their level.
         let tree = tab.view_mode == ViewMode::Tree && tab.tree_here();
+        // Picture size and Length: what media.rs knows about the rows on screen (the rest is asked for).
+        let media = self.media_rows(tab, geo, scroll);
+        // Duplicates: a line above each new set, so the sets stand apart (not once a column sorts
+        // them: a set's files are then apart anyway).
+        let dupes = tab.search.as_ref().is_some_and(|s| s.is_dupes()) && !tab.column_now;
+        // Colour tags: a dot after the name (tags.rs).
+        let mut tags = app.tags.lookup(&tab.folder.path);
         for row in geo.visible(scroll) {
             let Some(index) = tab.index_at(row) else { continue };
             let e = &tab.folder.entries[index];
             let line = geo.cell(row, scroll);
             let y = line.y;
+            if dupes && row > 0 && tab.index_at(row - 1).is_some_and(|p| tab.folder.entries[p].free != e.free) {
+                r.fill_rect(Rect::new(line.x, y, line.w, 1.0), theme.line);
+            }
             let selected = tab.is_selected(index);
             // The folder something dragged over the list would go into: outlined in red.
             let dropping = self.drop_row.as_deref().is_some_and(|d| e.is_container() && e.path_in(&tab.folder.path).to_lowercase() == d);
@@ -1490,23 +1714,27 @@ impl ListView {
             let name_x = line.x + ROW_PAD + offset + self.icon + 8.0;
             let name_right = self.name_right();
             let name_style = TextStyle::new(name_color).size(self.font);
+            let tag = tags.of(e);
             if label_only && selected {
                 // The selection behind the name only, and the keyboard's dotted box round it.
-                let w = r.measure(shown_name(e, hide_ext), &name_style).min((name_right - name_x - 8.0).max(0.0)).ceil();
+                let w = r.measure(shown_name(e, hide_ext), &name_style).min((name_right - name_x - 8.0 - crate::tags::room(tag)).max(0.0)).ceil();
                 let label = Rect::new(r.snap(name_x - 2.0), r.snap(y + 1.0), w + 4.0, (row_h - 2.0).round());
                 r.fill_paint(label, 0.0, &label_paint);
                 if tab.focus == Some(index) && lit {
                     crate::retroctl::dotted(r, label, theme.selection_text);
                 }
             }
-            r.text(shown_name(e, hide_ext), Rect::new(name_x, y, name_right - name_x - 8.0, row_h), &name_style);
+            let name_box = Rect::new(name_x, y, name_right - name_x - 8.0 - crate::tags::room(tag), row_h);
+            r.text(shown_name(e, hide_ext), name_box, &name_style);
+            crate::tags::after_name(r, theme, tag, shown_name(e, hide_ext), &name_style, name_box, selected);
             let detail = TextStyle::new(if selected && !label_only { theme.selection_details } else { theme.muted }).size(self.font);
+            let facts = media.iter().find(|(at, _)| *at == row).map(|(_, f)| f);
             for p in cols.iter().skip(1) {
                 let w = (p.x + p.w).min(end) - p.x - 20.0;
                 if w <= 0.0 {
                     continue;
                 }
-                let text = Self::cell_text(p.col, e, &tab.folder.path, app, bin.and_then(|b| b.items.get(index)));
+                let text = Self::cell_text(p.col, e, &tab.folder.path, app, bin.and_then(|b| b.items.get(index)), facts);
                 let style = if p.col.right_aligned() { detail.align(Align::Right) } else { detail };
                 r.text(&text, Rect::new(p.x + 10.0, y, w, row_h), &style);
             }
@@ -1522,6 +1750,7 @@ impl ListView {
         let hide_ext = app.settings.hide_known_extensions;
         let area = self.rows_area();
         self.list_hit.clear();
+        let mut tags = app.tags.lookup(&tab.folder.path);
         for row in geo.visible(scroll) {
             let Some(index) = tab.index_at(row) else { continue };
             let e = &tab.folder.entries[index];
@@ -1537,9 +1766,11 @@ impl ListView {
             let style = TextStyle::new(Self::name_color(theme, e, selected && (lit || !label_only), is_cut)).size(self.font);
             let name = shown_name(e, hide_ext);
             let name_x = cell.x + ROW_PAD + self.icon + 8.0;
-            let room = (cell.right() - name_x - 10.0).max(0.0);
+            // (A colour tag's dot goes after the name, in the item: tags.rs.)
+            let tag = tags.of(e);
+            let room = (cell.right() - name_x - 10.0 - crate::tags::room(tag)).max(0.0);
             let w = r.measure(name, &style).min(room);
-            let item = Rect::new(cell.x + 4.0, cell.y + 1.0, name_x + w + 6.0 - (cell.x + 4.0), cell.h - 2.0);
+            let item = Rect::new(cell.x + 4.0, cell.y + 1.0, name_x + w + 6.0 + crate::tags::room(tag) - (cell.x + 4.0), cell.h - 2.0);
             self.list_hit.push((row, item.right() - cell.x));
             let dropping = self.drop_row.as_deref().is_some_and(|d| e.is_container() && e.path_in(&tab.folder.path).to_lowercase() == d);
             if selected && label_only {
@@ -1568,6 +1799,7 @@ impl ListView {
                 r.fill_rect(icon_rect, theme.panel.with_alpha(0.55));
             }
             r.text(name, Rect::new(name_x, cell.y, room, cell.h), &style);
+            crate::tags::after_name(r, theme, tag, name, &style, Rect::new(name_x, cell.y, room, cell.h), selected);
         }
     }
 
@@ -1577,6 +1809,7 @@ impl ListView {
         let cut = app.cut_names(&tab.folder.path);
         let hide_ext = app.settings.hide_known_extensions;
         let side = self.tile.picture;
+        let mut tags = app.tags.lookup(&tab.folder.path);
         for row in geo.visible(scroll) {
             let Some(index) = tab.index_at(row) else { continue };
             let e = &tab.folder.entries[index];
@@ -1604,6 +1837,8 @@ impl ListView {
             Self::tint_icon(r, theme, label_only && selected && lit);
             let drawn = self.paint_picture(r, theme, app, &tab.folder.path, e, pic);
             Self::tint_icon(r, theme, false);
+            // A colour tag's dot, by the picture (tags.rs).
+            crate::tags::on_tile(r, theme, tags.of(e), drawn, tile, selected);
             let is_cut = Self::is_cut(tab, cut, e);
             if is_cut {
                 let under = if selected { theme.panel } else if hover == Some(row) { theme.hover } else { theme.panel };
@@ -1629,24 +1864,16 @@ impl ListView {
     /// with a thin frame) or Windows' big icon (at its own size at most) - made in the background
     /// (thumbs.rs), with the list's own icon meanwhile. Returns where it was drawn.
     /// The skin's wallpaper, filling the list (cut to fit, keeping `wallpaper_at`'s side and its
-    /// top in view), faint enough for the names to read over it.
-    fn paint_wallpaper(&mut self, r: &mut Renderer, theme: &Theme) {
+    /// top in view), faint enough for the names to read over it. It's read in the background
+    /// (thumbs.rs): none until it's there.
+    fn paint_wallpaper(&self, r: &mut Renderer, theme: &Theme) {
         if theme.wallpaper.is_empty() || theme.wallpaper_opacity <= 0.0 {
             return;
         }
-        let stale = match &self.wall {
-            Some((path, pic)) => *path != theme.wallpaper || pic.as_ref().is_some_and(|p| p.is_lost()),
-            None => true,
-        };
-        if stale {
-            let pic = thumbs::wic_factory()
-                .and_then(|w| thumbs::decode(&w, &theme.wallpaper, 3840, 3840 * 2160, 0))
-                .and_then(|d| thumbs::Picture::new(d.width, d.height, d.pixels, false));
-            self.wall = Some((theme.wallpaper.clone(), pic));
-        }
-        let Some((_, Some(pic))) = &self.wall else { return };
+        let Some(pic) = thumbs::wallpaper(&theme.wallpaper) else { return };
         let (w, h) = (pic.width() as f32, pic.height() as f32);
-        let b = self.rect;
+        // In split view the picture lies across both halves, as one (each shows its part).
+        let b = self.wall_area.unwrap_or(self.rect);
         // Filling covers the list (its top in view); whole fits all of it in (at the bottom).
         // Then the zoom, then whatever spills over the list is cut off.
         let fit = if theme.wallpaper_whole { (b.w / w).min(b.h / h) } else { (b.w / w).max(b.h / h) };
@@ -1659,7 +1886,12 @@ impl ListView {
             return;
         }
         let src = Rect::new((x0 - x) / k, (y0 - y) / k, (x1 - x0) / k, (y1 - y0) / k);
-        r.picture(pic, Rect::new(x0, y0, x1 - x0, y1 - y0), Some(src), theme.wallpaper_opacity, true);
+        r.picture(&pic, Rect::new(x0, y0, x1 - x0, y1 - y0), Some(src), theme.wallpaper_opacity, true);
+    }
+
+    /// Split view: the wallpaper is laid out over `area` (both halves) instead of this list alone.
+    pub fn set_wall_area(&mut self, area: Option<Rect>) {
+        self.wall_area = area;
     }
 
     fn paint_picture(&self, r: &mut Renderer, theme: &Theme, app: &AppState, dir: &str, e: &Entry, b: Rect) -> Rect {
@@ -1695,7 +1927,8 @@ impl ListView {
                 self.reveal(tab, r);
                 let cell = self.geo(tab).cell(r, tab.scroll);
                 let x = if self.flow == Flow::Rows { left + 16.0 } else { cell.x + cell.w / 2.0 };
-                Point::new(x.clamp(area.x, area.right()), cell.bottom().clamp(area.y, area.bottom()))
+                // (max: a clamp whose ends are the wrong way round panics.)
+                Point::new(x.clamp(area.x, area.right().max(area.x)), cell.bottom().clamp(area.y, area.bottom().max(area.y)))
             }
             None => Point::new(left, area.y + 4.0),
         };
@@ -1763,7 +1996,12 @@ pub(crate) fn picture(r: &mut Renderer, theme: &Theme, app: &AppState, dir: &str
     // Pictures are asked for in screen pixels, so they're sharp at any scaling.
     let px = (b.w * scale).round().max(16.0) as u32;
     let path = e.path_in(dir);
-    let version = thumbs::version_of(e.modified, e.size);
+    // The same version the details panel and the Space preview ask with (details.rs): pictures are
+    // kept by path, so two versions of one would be made again and again.
+    let mut version = thumbs::version_of(e.modified, e.size);
+    if e.kind == EntryKind::Drive {
+        version ^= e.free; // a drive's free space read again
+    }
     // With older Windows' icons, folders and drives show theirs, and so does any file without a
     // real picture of its own (Windows' icon for it would come back as its picture).
     let era = theme.icons != crate::theme::IconSet::Windows;
@@ -1894,28 +2132,33 @@ const EDGE_SCROLL_FAST: f32 = 32.0;
 
 impl ListView {
     /// The selected items, to drag out (dragdrop.rs): only from a real folder whose listing is on
-    /// screen (not This PC, not the Recycle Bin, not while another folder is on its way). Search
+    /// screen (not This PC's drives, not the Recycle Bin, not while another folder is on its way). Search
     /// results are found by their full path; they must all be in one folder (Windows' data object
     /// is made for items of one folder), otherwise the status bar says so and nothing is dragged.
     fn drag_out(&self, p: &Press, app: &mut AppState) -> Option<DragOut> {
         let tab = app.tab();
-        let real = tab.id == p.tab_id && !tab.waiting_long() && !tab.folder.path.is_empty() && tab.folder.path == tab.path && !recycle::is_bin(&tab.path);
+        let real = tab.id == p.tab_id && !tab.waiting_long() && (!tab.folder.path.is_empty() || tab.is_searching()) && tab.folder.path == tab.path && !recycle::is_bin(&tab.path);
         if !real {
             return None;
         }
-        let paths: Vec<String> = tab
-            .selected_entries()
-            .into_iter()
-            .map(|i| &tab.folder.entries[i])
-            .filter(|e| e.kind != EntryKind::Drive)
-            .map(|e| e.path_in(&tab.folder.path))
-            .collect();
+        let entries: Vec<&Entry> = tab.selected_entries().into_iter().map(|i| &tab.folder.entries[i]).filter(|e| e.kind != EntryKind::Drive).collect();
+        let paths: Vec<String> = entries.iter().map(|e| e.path_in(&tab.folder.path)).collect();
         let folder = paths.first().and_then(|p| folder::parent(p))?;
         if !paths.iter().all(|p| folder::parent(p).is_some_and(|f| fileops::same_path(&f, &folder))) {
             app.say("Drag items from one folder at a time.");
             return None;
         }
-        let names = paths.iter().map(|p| folder::file_name(p).to_string()).collect();
+        let names: Vec<String> = paths.iter().map(|p| folder::file_name(p).to_string()).collect();
+        // What the listing says about them goes along, so Windows needn't look each one up on disk
+        // again (not Home's: its dates are when files were opened).
+        if !crate::recent::is_recent(&tab.folder.path) {
+            let listed = entries
+                .iter()
+                .zip(&names)
+                .map(|(e, name)| crate::dragdrop::Listed { name: name.clone(), attributes: e.attributes, size: e.size, modified: e.modified, created: e.created })
+                .collect();
+            crate::dragdrop::about_to_drag(&folder, listed);
+        }
         Some(DragOut { folder, names, right: p.button == MouseButton::Right })
     }
 
@@ -2023,6 +2266,27 @@ impl ListView {
     }
 }
 
+impl ListView {
+    /// Ctrl + wheel ("Ctrl + scroll wheel changes view"), as in File Explorer: up for bigger,
+    /// down for smaller, through Details, List, Medium, Large and Extra large icons. The folder
+    /// keeps the view, as a VIEW pick does.
+    fn zoom(&mut self, notches: f32, app: &mut AppState) -> Effect {
+        const STEPS: [ViewMode; 5] = [ViewMode::Details, ViewMode::List, ViewMode::Medium, ViewMode::Large, ViewMode::ExtraLarge];
+        self.zoom_wheel += notches;
+        if self.zoom_wheel.abs() < 1.0 {
+            return Effect::None;
+        }
+        let up = self.zoom_wheel > 0.0;
+        self.zoom_wheel = 0.0;
+        let now = STEPS.iter().position(|v| *v == app.tab().view_mode).unwrap_or(0);
+        let next = if up { (now + 1).min(STEPS.len() - 1) } else { now.saturating_sub(1) };
+        if next == now {
+            return Effect::None;
+        }
+        Effect::Command(Command::SetView(STEPS[next]))
+    }
+}
+
 impl Component for ListView {
     fn layout(&mut self, rect: Rect, ctx: &Ctx, app: &AppState) {
         self.rect = rect;
@@ -2052,8 +2316,9 @@ impl Component for ListView {
         let tab = app.tab();
         self.take_size(app);
         self.place_columns(app);
-        r.fill_paint(self.rect, 0.0, &theme.panel_paint);
+        // (In split view a shaded background also lies across both halves, as one.)
         r.push_clip(self.rect);
+        r.fill_paint(self.wall_area.unwrap_or(self.rect), 0.0, &theme.panel_paint);
         self.paint_wallpaper(r, theme);
         if self.home_on {
             let max = (self.home.layout.height - self.rect.h).max(0.0);
@@ -2098,15 +2363,18 @@ impl Component for ListView {
         self.mouse = Some(e.pos);
         self.was_active = ctx.active;
         // Moved far enough from where a button went down on an item: the selection is dragged out.
-        if let Some(p) = self.press.as_ref().filter(|p| p.on_item && self.drag == Drag::None) {
+        if let Some(p) = self.press.as_ref().filter(|p| p.on_item && !p.refused && self.drag == Drag::None) {
             let (dx, dy) = drag_distance(self.scale);
             if (e.pos.x - p.at.x).abs() > dx || (e.pos.y - p.at.y).abs() > dy {
                 let p = self.press.take();
                 self.cancel_slow_click();
                 self.click_open = None; // a drag, not a click: nothing opens
-                if let Some(d) = p.and_then(|p| self.drag_out(&p, app)) {
+                if let Some(d) = p.as_ref().and_then(|p| self.drag_out(p, app)) {
                     return Effect::DragOut(d);
                 }
+                // No drag after all: the button coming up still finishes the click (or opens the
+                // right-click menu).
+                self.press = p.map(|p| Press { refused: true, ..p });
             }
         }
         // A rectangle over the empty space: it selects what it touches.
@@ -2252,7 +2520,7 @@ impl Component for ListView {
             };
         }
         let tab_id = tab.id;
-        let press = |on_item, then| Press { at: e.pos, button: e.button, tab_id, on_item, then };
+        let press = |on_item, then| Press { at: e.pos, button: e.button, tab_id, on_item, then, refused: false };
         match (self.row_at(tab, e.pos), e.button) {
             (Some(row), MouseButton::Left) => {
                 // A plain click on the name of the one item already selected may become a rename
@@ -2281,7 +2549,7 @@ impl Component for ListView {
                 if let Some(index) = index.filter(|_| plain && single_click) {
                     // One click opens: when the button comes up on the same item.
                     self.click_open = Some(ClickOpen { tab_id: tab.id, folder: tab.folder.path.clone(), index, key: tab.item_key(index), at: e.pos });
-                } else if let Some(index) = index.filter(|_| again && self.was_active && self.on_name(tab, row, e.pos) && !tab.folder.path.is_empty()) {
+                } else if let Some(index) = index.filter(|_| again && self.was_active && self.on_name(tab, row, e.pos) && (!tab.folder.path.is_empty() || tab.is_searching())) {
                     self.slow = Some(SlowClick { tab_id: tab.id, index, armed: false });
                 }
                 self.press = Some(press(true, then));
@@ -2417,6 +2685,9 @@ impl Component for ListView {
         if self.rename.is_some() {
             return self.end_rename(ctx.now, true, true).map_or(Effect::Redraw, Effect::Command);
         }
+        if e.mods.ctrl && app.settings.ctrl_wheel_view {
+            return self.zoom(e.wheel, app);
+        }
         let geo = self.geo(app.tab());
         let tab = app.tab_mut();
         let from = if self.anim.running() && self.anim_tab == tab.id { self.anim.target() } else { tab.scroll };
@@ -2463,6 +2734,8 @@ impl Component for ListView {
             }
             // Esc clears the filter first, then the selection.
             VK_ESCAPE if !tab.filter.is_empty() => Effect::Command(Command::SetFilter(String::new())),
+            // Duplicates: Esc goes back to the folder (after the selection is cleared).
+            VK_ESCAPE if !tab.selected.iter().any(|&s| s) && tab.search.as_ref().is_some_and(|s| s.is_dupes()) => Effect::Command(Command::EndDuplicates),
             VK_ESCAPE => {
                 tab.clear_selection();
                 Effect::Redraw
@@ -2477,6 +2750,10 @@ impl Component for ListView {
             VK_DELETE if !mods.ctrl => Effect::Command(Command::Delete { permanent: mods.shift }),
             VK_F2 if !mods.ctrl && !mods.shift => self.begin_rename_selected(ctx, app),
             VK_N if mods.ctrl && mods.shift => Effect::Command(Command::NewFolder),
+            // Undo and redo the last file actions (undo.rs).
+            VK_Z if mods.ctrl && !mods.shift => Effect::Command(Command::Undo),
+            VK_Y if mods.ctrl && !mods.shift => Effect::Command(Command::Redo),
+            VK_Z if mods.ctrl && mods.shift => Effect::Command(Command::Redo),
             _ => Effect::None,
         }
     }
@@ -2607,10 +2884,12 @@ impl Component for ListView {
             self.repaint_until = self.repaint_until.max(now + 0.3);
         }
         self.was_loading = loading;
+        // Picture size and Length (media.rs): sorted again as values come in.
+        let resort = self.tick_media(now, app);
         // The name box follows its item; a new folder's box opens once the folder is read again.
         self.keep_name_box(now, app);
         self.take_rename_request(now, app);
-        self.anim.running() || now < self.repaint_until || banding
+        self.anim.running() || now < self.repaint_until || banding || resort
     }
 }
 

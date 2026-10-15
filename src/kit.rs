@@ -164,8 +164,7 @@ fn edge(r: &mut Renderer, rect: Rect, radius: f32, color: Color) {
 
 /// The keyboard's outline round a capsule (a glass button or switch).
 fn capsule_ring(r: &mut Renderer, theme: &Theme, rect: Rect) {
-    let ring = rect.inset(-3.0, -3.0);
-    r.stroke_round_rect(ring, ring.h / 2.0, 1.0, theme.text.with_alpha(0.65));
+    focus_ring_round(r, theme, rect, rect.h / 2.0, 0.0);
 }
 
 /// A switch's knob in a glass skin: a small silver marble.
@@ -328,7 +327,7 @@ fn glass_checkbox(r: &mut Renderer, theme: &Theme, rect: Rect, t: f32, look: Loo
         tick(r, rect, faded(ink.with_alpha(ink.a * t), look));
     }
     if look.focused {
-        focus_ring(r, theme, rect, 0.0);
+        focus_ring_round(r, theme, rect, radius, 0.0);
     }
 }
 
@@ -742,10 +741,18 @@ pub fn sentence_case(label: &str) -> String {
     chars.next().map_or_else(String::new, |f| f.to_uppercase().chain(chars).collect())
 }
 
-/// The thin outline round the control that has the keyboard, in the control's shape (`lean`: how
-/// far it leans in this skin, `Theme::lean`).
+/// How thick the outline round the control that has the keyboard is.
+const FOCUS_W: f32 = 1.5;
+
+/// The thin outline round the control that has the keyboard, right against it and in its shape
+/// (`lean`: how far it leans in this skin, `Theme::lean`; else the skin's round corners).
 pub fn focus_ring(r: &mut Renderer, theme: &Theme, rect: Rect, lean: f32) {
-    outline_box(r, theme, rect.inset(-3.0, -3.0), lean, 1.0, theme.text.with_alpha(0.65));
+    focus_ring_round(r, theme, rect, if lean > 0.0 { 0.0 } else { theme.corner(rect.h) }, lean);
+}
+
+/// The same round a control with its own corners (`radius`).
+pub fn focus_ring_round(r: &mut Renderer, theme: &Theme, rect: Rect, radius: f32, lean: f32) {
+    crate::pathbar::ring_around(r, rect, lean, radius, FOCUS_W, theme.text.with_alpha(0.65));
 }
 
 // ---------------------------------------------------------------- text

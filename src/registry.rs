@@ -19,6 +19,14 @@
 //! **Start with Windows** is the "Glint" value of `...\CurrentVersion\Run`:
 //! `"glint.exe" --background`.
 //!
+//! **The zip and 7z icon** (Settings > Appearance > Zip icon): Windows shows a file with the icon of
+//! the app that opens it. "Open with > Always" on glint.exe makes that `Applications\glint.exe`
+//! (Windows' own key, named after the exe's file name), so its DefaultIcon - pointed at one of the
+//! icons in glint.exe (res/glint.rc), and marked with "GlintOwned" - is what those files show.
+//! `sync_archive_icon` keeps it in step: set while zip or 7z files open in Glint, gone otherwise.
+//! Which app a type opens in is under `...\Explorer\FileExts\.zip`: newer Windows 11 keeps it in
+//! `UserChoiceLatest\ProgId`, which wins over the older `UserChoice` when both are there.
+//!
 //! If glint.exe is moved, `repair_if_moved` (at start) points everything that pointed at the old
 //! place, which no longer exists, at the new one.
 //!
@@ -36,6 +44,7 @@ use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLongPathNameW};
 use windows::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
 
 use crate::folder::wide;
+use crate::settings::ZipIcon;
 
 /// The verb Glint adds to folders and drives.
 const VERB: &str = "glint";
@@ -58,6 +67,9 @@ pub struct Places {
     classes: String,
     backup: String,
     run: String,
+    /// Where Windows keeps which app opens each file type (".zip\UserChoiceLatest\ProgId" on newer
+    /// Windows 11, ".zip\UserChoice" before).
+    file_exts: String,
     /// The real places: Windows is told when folder associations change.
     real: bool,
     /// Tell Windows right away instead of on a thread of its own (the process is about to end).
@@ -73,6 +85,7 @@ impl Places {
                 classes: r"Software\Classes".into(),
                 backup: r"Software\Glint\RegistryBackup".into(),
                 run: r"Software\Microsoft\Windows\CurrentVersion\Run".into(),
+                file_exts: r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts".into(),
                 real: true,
                 at_once: false,
             },
@@ -81,7 +94,14 @@ impl Places {
 
     /// Everything under `root` (in HKEY_CURRENT_USER), for tests.
     pub fn under(root: &str) -> Places {
-        Places { classes: format!(r"{root}\Classes"), backup: format!(r"{root}\Backup"), run: format!(r"{root}\Run"), real: false, at_once: false }
+        Places {
+            classes: format!(r"{root}\Classes"),
+            backup: format!(r"{root}\Backup"),
+            run: format!(r"{root}\Run"),
+            file_exts: format!(r"{root}\FileExts"),
+            real: false,
+            at_once: false,
+        }
     }
 
     /// The same places, but Windows is told about changes before the call returns (for the
@@ -357,10 +377,18 @@ pub fn folders_exe(places: &Places) -> Option<String> {
 /// The exe Win+E opens, when it's Glint's (marked).
 pub fn win_e_exe(places: &Places) -> Option<String> {
     let cmd = Key::open(&places.win_e(), false)?;
-    if !cmd.has(MARKER) {
+    if !win_e_ours(&cmd) {
         return None;
     }
     exe_of(&cmd.string("")?)
+}
+
+/// Whether this Win+E key is Glint's: marked by Glint, and still starting a Glint. An app that
+/// took Win+E over afterwards may have left the mark behind; its command is then kept and backed
+/// up like any other app's.
+fn win_e_ours(cmd: &Key) -> bool {
+    let glint = |exe: String| std::path::Path::new(&exe).file_name().is_some_and(|n| n.to_string_lossy().to_ascii_lowercase().starts_with("glint"));
+    cmd.has(MARKER) && cmd.string("").and_then(|c| exe_of(&c)).is_some_and(glint)
 }
 
 /// The exe that starts at sign-in ("Start with Windows"), if any.
@@ -444,7 +472,7 @@ fn win_e(places: &Places, on: bool, exe: &str, backup: &Key) -> Result<(), Strin
     if on {
         // Another app's Win+E (File Pilot, say) is remembered, so turning Glint's off gives it back.
         if let Some(existing) = Key::open(&path, false) {
-            if !existing.has(MARKER) {
+            if !win_e_ours(&existing) {
                 backup.set_string("WinE.Command", existing.string("").as_deref().unwrap_or(NONE), &places.backup)?;
                 backup.set_string("WinE.DelegateExecute", existing.string("DelegateExecute").as_deref().unwrap_or(NONE), &places.backup)?;
             }
@@ -458,7 +486,12 @@ fn win_e(places: &Places, on: bool, exe: &str, backup: &Key) -> Result<(), Strin
         let old_command = backup.string("WinE.Command");
         let old_delegate = backup.string("WinE.DelegateExecute");
         if let Some(cmd) = Key::open(&path, true) {
-            if cmd.has(MARKER) {
+            if !win_e_ours(&cmd) {
+                // Another app's now: only Glint's old mark goes.
+                if cmd.has(MARKER) {
+                    cmd.delete_value(MARKER, &path)?;
+                }
+            } else {
                 cmd.delete_value(MARKER, &path)?;
                 match old_command.filter(|c| c != NONE) {
                     Some(c) => cmd.set_string("", &c, &path)?,
@@ -495,6 +528,100 @@ pub fn restore_explorer(places: &Places, exe: &str) -> Result<(), String> {
     let a = set_win_e(places, false, exe);
     let b = set_folders(places, false, exe);
     a.and(b)
+}
+
+// ---------------------------------------------------------------- the zip and 7z icon
+
+/// The file types whose icon Glint sets while they open in it.
+const ARCHIVES: [&str; 2] = [".zip", ".7z"];
+
+/// The icons in glint.exe zip and 7z files can show, by their numbers in res/glint.rc. The first is
+/// Glint's own, which Windows shows when there's no DefaultIcon.
+const ICON_GLINT: u32 = 1;
+const ICON_LABEL: u32 = 2;
+const ICON_LABEL_7Z: u32 = 3;
+const ICON_FOLDER: u32 = 4;
+const ICON_PAGE: u32 = 5;
+
+/// The app the user picked for a file type (".zip") with "Open with > Always": its ProgId. Newer
+/// Windows 11 writes `UserChoiceLatest\ProgId`, which wins over the older `UserChoice` (often left
+/// behind, out of date).
+fn chosen_app(places: &Places, ext: &str) -> Option<String> {
+    let prog_id = |key: &str| Key::open(&format!(r"{}\{ext}\{key}", places.file_exts), false).and_then(|k| k.string("ProgId")).filter(|p| !p.is_empty());
+    prog_id(r"UserChoiceLatest\ProgId").or_else(|| prog_id("UserChoice"))
+}
+
+/// The archive types (".zip", ".7z") that open in this glint.exe: the app picked for them is
+/// `Applications\<this exe's file name>`.
+pub fn archives_in_glint(places: &Places, exe: &str) -> Vec<&'static str> {
+    let Some(ours) = std::path::Path::new(exe).file_name().map(|n| format!(r"Applications\{}", n.to_string_lossy())) else { return Vec::new() };
+    ARCHIVES.into_iter().filter(|ext| chosen_app(places, ext).is_some_and(|p| p.eq_ignore_ascii_case(&ours))).collect()
+}
+
+/// The icon in glint.exe that zip and 7z files opening in it show for `icon`: one for both types
+/// (they share the app's key), so the red label says 7Z only when 7z files are the only ones.
+fn archive_icon(icon: ZipIcon, types: &[&str]) -> u32 {
+    match icon {
+        ZipIcon::Label if types == [".7z"] => ICON_LABEL_7Z,
+        ZipIcon::Label => ICON_LABEL,
+        ZipIcon::Folder => ICON_FOLDER,
+        ZipIcon::Page => ICON_PAGE,
+        ZipIcon::Glint => ICON_GLINT,
+    }
+}
+
+/// What zip and 7z files that open in this glint.exe look like, after [`sync_archive_icon`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ArchiveIcon {
+    /// The types that open in this glint.exe (".zip", ".7z").
+    pub types: Vec<&'static str>,
+    /// The icon in glint.exe they show, by its number in res/glint.rc (1 is Glint's own). None when
+    /// it isn't Glint's doing: a DefaultIcon that isn't Glint's, or a glint.exe that may soon be gone
+    /// (which writes nothing).
+    pub icon: Option<u32>,
+}
+
+/// Makes zip and 7z files that open in this glint.exe show `icon` (Settings > Appearance > Zip
+/// icon), or Glint's own icon again: the DefaultIcon of `Applications\glint.exe`. Nothing is
+/// written while neither type opens in Glint (a DefaultIcon of Glint's from before goes), nor from
+/// a glint.exe that may soon be gone (`risky_place`); a DefaultIcon that isn't Glint's is left
+/// alone. Explorer is told when something changed. Returns what the files look like now.
+pub fn sync_archive_icon(places: &Places, exe: &str, icon: ZipIcon) -> Result<ArchiveIcon, String> {
+    let types = archives_in_glint(places, exe);
+    let Some(name) = std::path::Path::new(exe).file_name().map(|n| n.to_string_lossy().into_owned()) else { return Ok(ArchiveIcon::default()) };
+    if risky_place(exe).is_some() {
+        return Ok(ArchiveIcon { types, icon: None });
+    }
+    let app = format!(r"{}\Applications\{name}", places.classes);
+    let path = format!(r"{app}\DefaultIcon");
+    let (ours, now) = match Key::open(&path, false) {
+        Some(k) if !k.has(MARKER) => return Ok(ArchiveIcon { types, icon: None }),
+        Some(k) => (true, k.string("")),
+        None => (false, None),
+    };
+    let id = archive_icon(icon, &types);
+    // (Glint's own icon needs no DefaultIcon.)
+    let want = (!types.is_empty() && id != ICON_GLINT).then(|| format!("{exe},-{id}"));
+    let shows = ArchiveIcon { icon: (!types.is_empty()).then_some(id), types };
+    match want {
+        Some(want) if now.as_deref() == Some(want.as_str()) => return Ok(shows),
+        Some(want) => {
+            let key = Key::create(&path)?;
+            key.set_string("", &want, &path)?;
+            key.set_dword(MARKER, 1, &path)?;
+        }
+        None if ours => {
+            if let Some(k) = Key::open(&app, true) {
+                k.delete_tree("DefaultIcon", &app)?;
+            }
+            // Applications\glint.exe itself is Windows' (Open with made it); gone only if Glint's
+            // DefaultIcon was all there was.
+            delete_empty_keys(&app, &format!(r"{}\Applications", places.classes));
+        }
+        None => return Ok(shows),
+    }
+    notify_shell(places);
+    Ok(shows)
 }
 
 /// glint.exe was moved (or copied elsewhere and the old copy deleted): what points at the old place,
@@ -607,6 +734,28 @@ mod tests {
     }
 
     #[test]
+    fn win_e_taken_over_after_glint_is_kept() {
+        let t = TestRoot::new("wine2");
+        let p = &t.1;
+        set_win_e(p, true, EXE).unwrap();
+        // Another app takes Win+E over afterwards and leaves Glint's mark behind.
+        Key::open(&p.win_e(), true).unwrap().set_string("", r#""C:\Pilot\FPilot.exe""#, "").unwrap();
+        assert!(win_e_exe(p).is_none(), "not Glint's any more");
+        set_win_e(p, true, EXE).unwrap();
+        set_win_e(p, false, EXE).unwrap();
+        let cmd = Key::open(&p.win_e(), false).unwrap();
+        assert_eq!(cmd.string("").as_deref(), Some(r#""C:\Pilot\FPilot.exe""#), "backed up and given back");
+        drop(cmd);
+        // Turning Glint's off while the other app has it leaves the other app's alone.
+        set_win_e(p, true, EXE).unwrap();
+        Key::open(&p.win_e(), true).unwrap().set_string("", r#""C:\Pilot\FPilot2.exe""#, "").unwrap();
+        set_win_e(p, false, EXE).unwrap();
+        let cmd = Key::open(&p.win_e(), false).unwrap();
+        assert_eq!(cmd.string("").as_deref(), Some(r#""C:\Pilot\FPilot2.exe""#));
+        assert!(!cmd.has(MARKER));
+    }
+
+    #[test]
     fn restore_explorer_and_start_with_windows() {
         let t = TestRoot::new("restore");
         let p = &t.1;
@@ -636,6 +785,100 @@ mod tests {
         assert!(risky_place(&format!(r"{temp}x\glint.exe")).is_none(), "only inside the temporary folder itself");
     }
 
+    /// "Open with > Always" for `ext`, as Windows 10 and older Windows 11 write it.
+    fn open_with_glint(t: &TestRoot, ext: &str, prog_id: &str) {
+        Key::create(&format!(r"{}\FileExts\{ext}\UserChoice", t.0)).unwrap().set_string("ProgId", prog_id, "").unwrap();
+    }
+
+    /// The same, as newer Windows 11 writes it.
+    fn open_with_latest(t: &TestRoot, ext: &str, prog_id: &str) {
+        Key::create(&format!(r"{}\FileExts\{ext}\UserChoiceLatest\ProgId", t.0)).unwrap().set_string("ProgId", prog_id, "").unwrap();
+    }
+
+    fn shows(types: &[&'static str], icon: u32) -> Result<ArchiveIcon, String> {
+        Ok(ArchiveIcon { types: types.to_vec(), icon: Some(icon) })
+    }
+
+    fn default_icon(t: &TestRoot) -> Option<String> {
+        t.key(r"Classes\Applications\glint.exe\DefaultIcon").and_then(|k| k.string(""))
+    }
+
+    #[test]
+    fn zip_and_7z_files_opening_in_glint_get_the_chosen_icon() {
+        let t = TestRoot::new("zipicon");
+        let p = &t.1;
+        // Nothing opens in Glint: nothing is written.
+        assert_eq!(sync_archive_icon(p, EXE, ZipIcon::Label), Ok(ArchiveIcon::default()));
+        assert!(t.key(r"Classes\Applications").is_none());
+        // Another app opens zip files: still nothing.
+        open_with_glint(&t, ".zip", "WinRAR.ZIP");
+        assert_eq!(sync_archive_icon(p, EXE, ZipIcon::Label), Ok(ArchiveIcon::default()));
+        // 7z files open in Glint (any capitals): the red label saying 7Z.
+        open_with_glint(&t, ".7z", r"Applications\Glint.exe");
+        assert_eq!(archives_in_glint(p, EXE), [".7z"]);
+        assert_eq!(sync_archive_icon(p, EXE, ZipIcon::Label), shows(&[".7z"], 3));
+        assert_eq!(default_icon(&t).as_deref(), Some(r"C:\Tools\Glint\glint.exe,-3"));
+        // And zip files too: the label says ZIP (one icon for both).
+        open_with_glint(&t, ".zip", r"Applications\glint.exe");
+        assert_eq!(sync_archive_icon(p, EXE, ZipIcon::Label), shows(&[".zip", ".7z"], 2));
+        assert_eq!(default_icon(&t).as_deref(), Some(r"C:\Tools\Glint\glint.exe,-2"));
+        assert_eq!(sync_archive_icon(p, EXE, ZipIcon::Page), shows(&[".zip", ".7z"], 5));
+        assert_eq!(default_icon(&t).as_deref(), Some(r"C:\Tools\Glint\glint.exe,-5"));
+        // A glint.exe elsewhere points it at itself (the icons are in every glint.exe).
+        sync_archive_icon(p, r"D:\Glint\glint.exe", ZipIcon::Folder).unwrap();
+        assert_eq!(default_icon(&t).as_deref(), Some(r"D:\Glint\glint.exe,-4"));
+        // Glint's own icon: Glint's DefaultIcon goes, and the key Glint made with it.
+        assert_eq!(sync_archive_icon(p, EXE, ZipIcon::Glint), shows(&[".zip", ".7z"], 1));
+        assert!(t.key(r"Classes\Applications\glint.exe").is_none());
+        // Back to the label, then zip and 7z go to another app: the DefaultIcon goes, while the key
+        // Windows made (its open command) stays.
+        Key::create(&format!(r"{}\Classes\Applications\glint.exe\shell\open\command", t.0)).unwrap().set_string("", r#""C:\Tools\Glint\glint.exe" "%1""#, "").unwrap();
+        sync_archive_icon(p, EXE, ZipIcon::Label).unwrap();
+        assert!(default_icon(&t).is_some());
+        open_with_glint(&t, ".zip", "CompressedFolder");
+        open_with_glint(&t, ".7z", "7-Zip.7z");
+        assert_eq!(sync_archive_icon(p, EXE, ZipIcon::Label), Ok(ArchiveIcon::default()));
+        assert!(t.key(r"Classes\Applications\glint.exe\DefaultIcon").is_none());
+        assert!(t.key(r"Classes\Applications\glint.exe\shell\open\command").is_some());
+    }
+
+    #[test]
+    fn a_default_icon_that_isnt_glints_is_left_alone() {
+        let t = TestRoot::new("zipicon-other");
+        let p = &t.1;
+        open_with_glint(&t, ".zip", r"Applications\glint.exe");
+        Key::create(&format!(r"{}\Classes\Applications\glint.exe\DefaultIcon", t.0)).unwrap().set_string("", r"C:\Mine\zip.ico,0", "").unwrap();
+        assert_eq!(sync_archive_icon(p, EXE, ZipIcon::Folder), Ok(ArchiveIcon { types: vec![".zip"], icon: None }));
+        assert_eq!(default_icon(&t).as_deref(), Some(r"C:\Mine\zip.ico,0"));
+        sync_archive_icon(p, EXE, ZipIcon::Glint).unwrap();
+        assert_eq!(default_icon(&t).as_deref(), Some(r"C:\Mine\zip.ico,0"));
+        // Nor is anything pointed at a glint.exe that may soon be gone.
+        let temp = std::env::temp_dir().to_string_lossy().trim_end_matches('\\').to_string();
+        let t2 = TestRoot::new("zipicon-temp");
+        open_with_glint(&t2, ".zip", r"Applications\glint.exe");
+        assert_eq!(sync_archive_icon(&t2.1, &format!(r"{temp}\Temp1_glint.zip\glint.exe"), ZipIcon::Label), Ok(ArchiveIcon { types: vec![".zip"], icon: None }));
+        assert!(default_icon(&t2).is_none());
+    }
+
+    #[test]
+    fn newer_windows_keeps_the_pick_in_user_choice_latest() {
+        let t = TestRoot::new("zipicon-latest");
+        let p = &t.1;
+        // Only the newer place, as on Windows 11 build 26200: 7z files open in Glint.
+        open_with_latest(&t, ".7z", r"Applications\Glint.exe");
+        assert_eq!(archives_in_glint(p, EXE), [".7z"]);
+        assert_eq!(sync_archive_icon(p, EXE, ZipIcon::Label), shows(&[".7z"], 3));
+        assert_eq!(default_icon(&t).as_deref(), Some(r"C:\Tools\Glint\glint.exe,-3"));
+        // Both places: the newer one wins, whichever way round.
+        open_with_glint(&t, ".zip", r"Applications\glint.exe");
+        open_with_latest(&t, ".zip", "WinRAR.ZIP");
+        assert_eq!(archives_in_glint(p, EXE), [".7z"]);
+        open_with_glint(&t, ".zip", "CompressedFolder");
+        open_with_latest(&t, ".zip", r"Applications\glint.exe");
+        assert_eq!(archives_in_glint(p, EXE), [".zip", ".7z"]);
+        assert_eq!(sync_archive_icon(p, EXE, ZipIcon::Folder), shows(&[".zip", ".7z"], 4));
+    }
+
     #[test]
     fn moved_exe_is_repaired_but_nothing_else() {
         let t = TestRoot::new("repair");
@@ -656,5 +899,81 @@ mod tests {
         repair_if_moved(p, &me);
         assert!(folders_on(p, r"C:\windows\system32\notepad.exe"));
         restore_explorer(p, &me).unwrap();
+    }
+
+    #[test]
+    fn switching_the_zip_icon_back_and_forth_always_ends_on_the_last_pick() {
+        let t = TestRoot::new("zipicon-switch");
+        let p = &t.1;
+        open_with_latest(&t, ".zip", r"Applications\glint.exe");
+        let picks = [(ZipIcon::Label, 2), (ZipIcon::Folder, 4), (ZipIcon::Page, 5), (ZipIcon::Glint, 1), (ZipIcon::Folder, 4), (ZipIcon::Label, 2), (ZipIcon::Label, 2), (ZipIcon::Glint, 1), (ZipIcon::Glint, 1), (ZipIcon::Page, 5)];
+        for (icon, id) in picks {
+            assert_eq!(sync_archive_icon(p, EXE, icon), shows(&[".zip"], id), "{icon:?}");
+            match id {
+                1 => assert!(t.key(r"Classes\Applications\glint.exe").is_none(), "Glint's own icon needs no key"),
+                _ => assert_eq!(default_icon(&t), Some(format!(r"{EXE},-{id}"))),
+            }
+        }
+        // The last pick stays through a restart (nothing more is written for it).
+        assert_eq!(sync_archive_icon(p, EXE, ZipIcon::Page), shows(&[".zip"], 5));
+        assert_eq!(default_icon(&t).as_deref(), Some(r"C:\Tools\Glint\glint.exe,-5"));
+    }
+
+    #[test]
+    fn an_empty_user_choice_latest_falls_back_to_the_older_pick() {
+        let t = TestRoot::new("zipicon-emptylatest");
+        let p = &t.1;
+        open_with_glint(&t, ".zip", r"Applications\glint.exe");
+        open_with_latest(&t, ".zip", "");
+        assert_eq!(archives_in_glint(p, EXE), [".zip"], "an empty newer pick says nothing");
+        // Another app owns zip in the newer place only after Glint set its icon: the icon goes.
+        sync_archive_icon(p, EXE, ZipIcon::Folder).unwrap();
+        assert!(default_icon(&t).is_some());
+        open_with_latest(&t, ".zip", "7-Zip.zip");
+        assert_eq!(sync_archive_icon(p, EXE, ZipIcon::Folder), Ok(ArchiveIcon::default()));
+        assert!(default_icon(&t).is_none());
+        // Then Glint gets it back: the icon is made again.
+        open_with_latest(&t, ".zip", r"Applications\GLINT.EXE");
+        assert_eq!(sync_archive_icon(p, EXE, ZipIcon::Folder), shows(&[".zip"], 4));
+    }
+
+    #[test]
+    fn another_glint_exe_name_or_an_exe_with_no_name_is_handled() {
+        let t = TestRoot::new("zipicon-names");
+        let p = &t.1;
+        // Zip belongs to glint.exe: a copy called glint-beta.exe is not it.
+        open_with_glint(&t, ".zip", r"Applications\glint.exe");
+        let beta = r"C:\Tools\glint-beta.exe";
+        assert!(archives_in_glint(p, beta).is_empty());
+        assert_eq!(sync_archive_icon(p, beta, ZipIcon::Folder), Ok(ArchiveIcon::default()));
+        assert!(t.key(r"Classes\Applications").is_none());
+        // A name with spaces and accents gets a key of its own.
+        let odd = r"C:\Program Files\Glint \u00e9\glint (2).exe";
+        open_with_glint(&t, ".7z", r"Applications\glint (2).exe");
+        assert_eq!(sync_archive_icon(p, odd, ZipIcon::Page), shows(&[".7z"], 5));
+        assert_eq!(t.key(r"Classes\Applications\glint (2).exe\DefaultIcon").and_then(|k| k.string("")), Some(format!("{odd},-5")));
+        // No file name at all: nothing happens.
+        for none in ["", r"C:\", r"\"] {
+            assert!(sync_archive_icon(p, none, ZipIcon::Label).is_ok(), "{none:?}");
+        }
+        assert!(t.key(r"Classes\Applications\glint.exe").is_none());
+    }
+
+    #[test]
+    fn a_moved_exe_gets_its_zip_icon_pointed_at_the_new_place() {
+        let t = TestRoot::new("zipicon-moved");
+        let p = &t.1;
+        open_with_glint(&t, ".zip", r"Applications\glint.exe");
+        sync_archive_icon(p, r"C:\Old place\glint.exe", ZipIcon::Label).unwrap();
+        assert_eq!(default_icon(&t).as_deref(), Some(r"C:\Old place\glint.exe,-2"));
+        // Glint starts from the new place and syncs: the same icon, now from there.
+        assert_eq!(sync_archive_icon(p, EXE, ZipIcon::Label), shows(&[".zip"], 2));
+        assert_eq!(default_icon(&t).as_deref(), Some(r"C:\Tools\Glint\glint.exe,-2"));
+        // Once more changes nothing.
+        assert_eq!(sync_archive_icon(p, EXE, ZipIcon::Label), shows(&[".zip"], 2));
+        // Run from a temporary folder (a zip opened in place): the good path is left in the registry.
+        let temp = std::env::temp_dir().to_string_lossy().trim_end_matches('\\').to_string();
+        assert_eq!(sync_archive_icon(p, &format!(r"{temp}\Temp1_x.zip\glint.exe"), ZipIcon::Page), Ok(ArchiveIcon { types: vec![".zip"], icon: None }));
+        assert_eq!(default_icon(&t).as_deref(), Some(r"C:\Tools\Glint\glint.exe,-2"));
     }
 }

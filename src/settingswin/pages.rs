@@ -39,6 +39,7 @@ pub const LIVE: &[&str] = &[
     "StartupFolder",
     "NewTab", "HomeOpens",
     "SettingsOpens",
+    "RememberSplit",
     "@Folders",
     "@WinE",
     "StayRunning",
@@ -49,6 +50,7 @@ pub const LIVE: &[&str] = &[
     // Appearance
     "Skin",
     "Theme",
+    "ZipIcon",
     "@SkinEditor",
     "Size",
     "ShowSidebar",
@@ -64,10 +66,12 @@ pub const LIVE: &[&str] = &[
     "SizeFormat",
     "FoldersFirst",
     "CustomSort",
+    "CustomViews",
     "ConfirmDelete",
     // Mouse and keyboard
     "SingleClick",
     "DoubleClickUp",
+    "CtrlWheelView",
     "Backspace",
     "@Search",
     "@Pins",
@@ -76,6 +80,7 @@ pub const LIVE: &[&str] = &[
     "@About",
     "@Update",
     "CheckForUpdates",
+    "@ReportBug",
     "@SettingsFolder",
     "@Portable",
     "@Cache",
@@ -109,6 +114,15 @@ pub fn after_change(key: &str, before: &Settings, app: &mut AppState) -> Option<
             app.apply_skin();
             None
         }
+        // Windows is told (registry.rs). Until zip or 7z files open in Glint there's nothing to see.
+        "ZipIcon" => {
+            match life::apply_zip_icon(app.settings.zip_icon) {
+                Ok(true) => {}
+                Ok(false) => app.say("The icon shows once zip or 7z files open in Glint"),
+                Err(e) => app.say(e),
+            }
+            None
+        }
         "ShowHidden" => {
             let on = app.settings.show_hidden;
             app.set_show_hidden(on);
@@ -123,6 +137,11 @@ pub fn after_change(key: &str, before: &Settings, app: &mut AppState) -> Option<
         "CustomSort" => {
             let on = app.settings.custom_sort;
             app.set_custom_sort(on, None);
+            None
+        }
+        "CustomViews" => {
+            let on = app.settings.custom_views;
+            app.set_custom_views(on);
             None
         }
         "ErrorLog" => {
@@ -256,6 +275,10 @@ pub enum Act {
     Update,
     SkinEditor,
     SortEditor,
+    /// GitHub's issues page, to report a bug.
+    ReportBug,
+    /// Glint's Discord (not there yet: the row is greyed).
+    Discord,
 }
 
 /// The control on the right of a row.
@@ -383,7 +406,7 @@ pub fn page(i: usize, f: &Facts) -> Vec<Item> {
     match i {
         0 => general(f),
         1 => appearance(f),
-        2 => files(f),
+        2 => files(),
         3 => mouse(),
         _ => about(f),
     }
@@ -407,6 +430,7 @@ fn general(f: &Facts) -> Vec<Item> {
             Row::new("StartupFolder", "", None, Ctl::Folder).only_if("Startup", S("folder")),
             choice("NewTab", "New tabs open", None, &[(S("same"), "Current folder"), (S("home"), "Home folder"), (S("thispc"), "This PC")]),
             choice("HomeOpens", "Home opens", None, &[(S("page"), "Home, like File Explorer"), (S("folder"), "Your user folder")]),
+            toggle("RememberSplit", "Reopen split view", None),
         ]),
         Item::Heading("Default file explorer"),
         Item::Card(vec![toggle("@Folders", "Open folders and drives in Glint", None), toggle("@WinE", "Open with Win+E", None)]),
@@ -441,7 +465,13 @@ fn appearance(f: &Facts) -> Vec<Item> {
         Item::Card(vec![
             Row::new("Skin", "Skin", None, Ctl::Choice("Skin", skins)),
             choice("Theme", "Light or dark", None, &[(S("system"), "Same as Windows"), (S("light"), "Light"), (S("dark"), "Dark")]),
-            choice("Logo", "Logo", None, &[(S("box"), "Box"), (S("chrome"), "Chrome"), (S("none"), "None")]),
+            choice("Logo", "Logo", None, &[(S("box"), "Box"), (S("chrome"), "Chrome"), (S("caps"), "GLiNT"), (S("none"), "None")]),
+            choice(
+                "ZipIcon",
+                "Zip icon",
+                Some("Shows on zip and 7z files that open in Glint"),
+                &[(S("label"), "Red label"), (S("folder"), "Folder"), (S("page"), "Page"), (S("glint"), "Glint icon")],
+            ),
             Row::new("@SkinEditor", "Customise skins", None, Ctl::Button("CUSTOMISE\u{2026}".into(), Act::SkinEditor)),
         ]),
         Item::Heading("Layout"),
@@ -449,7 +479,7 @@ fn appearance(f: &Facts) -> Vec<Item> {
             choice(
                 "View",
                 "View",
-                Some("Every tab, but folders with a view of their own keep it (VIEW \u{203a} Views for folders)"),
+                None,
                 &[(S("details"), "Details"), (S("list"), "List"), (S("medium"), "Medium icons"), (S("large"), "Large icons"), (S("extralarge"), "Extra large icons"), (S("tree"), "Tree")],
             ),
             choice("Size", "Row size", None, &[(S("small"), "Small"), (S("medium"), "Medium"), (S("large"), "Large")]),
@@ -466,12 +496,8 @@ fn appearance(f: &Facts) -> Vec<Item> {
     ]
 }
 
-fn files(f: &Facts) -> Vec<Item> {
+fn files() -> Vec<Item> {
     use Val::S;
-    let custom = f.values.get("CustomSort").and_then(Value::as_bool).unwrap_or(false);
-    // While the custom sort order is on, it decides in the folders it has rules for (in the others,
-    // this still does): say so.
-    let folders_note = custom.then_some("Where the custom sort order has rules, it decides");
     let column = |name: &'static str, title: &str| Row::new("Columns", title, None, Ctl::ToggleIn("Columns", name));
     vec![
         Item::Heading("Show"),
@@ -481,16 +507,17 @@ fn files(f: &Facts) -> Vec<Item> {
             Row::new("HideKnownExtensions", "File extensions", None, Ctl::ToggleNot("HideKnownExtensions")),
         ]),
         Item::Heading("Columns"),
-        Item::Card(vec![column("modified", "Date modified"), column("created", "Date created"), column("type", "Type"), column("size", "Size")]),
+        Item::Card(vec![column("modified", "Date modified"), column("created", "Date created"), column("type", "Type"), column("size", "Size"), column("dimensions", "Picture size"), column("length", "Length")]),
         Item::Heading("Dates and sizes"),
         Item::Card(vec![
             choice("DateFormat", "Dates", None, &[(S("default"), "Windows default"), (S("relative"), "Relative (Today, Yesterday…)"), (S("iso"), "Year first (2026-10-06 14:32)")]),
             choice("SizeFormat", "Sizes", None, &[(S("auto"), "Automatic (KB, MB, GB)"), (S("kb"), "Always KB")]),
         ]),
-        Item::Heading("Sorting"),
+        Item::Heading("Sorting and views"),
         Item::Card(vec![
-            toggle("FoldersFirst", "Folders first", folders_note),
+            toggle("FoldersFirst", "Folders first", None),
             Row::new("CustomSort", "Custom sort order", None, Ctl::ButtonToggle("EDIT…".into(), Act::SortEditor, "CustomSort")),
+            Row::new("CustomViews", "Custom views", None, Ctl::ButtonToggle("EDIT…".into(), Act::SortEditor, "CustomViews")),
         ]),
         Item::Heading("Deleting"),
         Item::Card(vec![choice("ConfirmDelete", "Ask before deleting", None, &[(S("permanent"), "Only when deleting permanently"), (S("always"), "Always"), (S("never"), "Never")])]),
@@ -504,6 +531,7 @@ fn mouse() -> Vec<Item> {
         Item::Card(vec![
             choice("SingleClick", "Open items with", None, &[(B(false), "Double-click"), (B(true), "Single click")]),
             toggle("DoubleClickUp", "Double-click empty space to go up", None),
+            toggle("CtrlWheelView", "Ctrl + scroll wheel changes view", None),
         ]),
         Item::Heading("Keyboard"),
         Item::Card(vec![choice("Backspace", "Backspace", None, &[(S("up"), "Goes up a folder"), (S("back"), "Goes back")])]),
@@ -513,19 +541,23 @@ fn mouse() -> Vec<Item> {
             keys("@Keys", "Ctrl+Shift+T", "Reopen closed tab"),
             keys("@Keys", "Ctrl+L or F4", "Type a path"),
             keys("@Keys", "Ctrl+F", "Filter"),
-            keys("@Keys", "Ctrl+Shift+1 to 6", "Change view"),
-            keys("@Keys", "Ctrl+B", "Show or hide sidebar"),
             keys("@Search", "Ctrl+Shift+F", "Search subfolders"),
+            keys("@Keys", "Ctrl+Z / Ctrl+Y", "Undo / redo"),
+            keys("@Keys", "F2", "Rename (several at once too)"),
             keys("@Keys", "Ctrl+Shift+C", "Copy path"),
+            keys("@Preview", "Space", "Preview"),
+            keys("@Keys", "Shift+right-click", "Full Windows menu"),
+            keys("@Keys", "Ctrl+Shift+1 to 6", "Change view"),
+            keys("@Keys", "Ctrl+\\ / F6", "Split view / other side"),
+            keys("@Keys", "Ctrl+B", "Show or hide sidebar"),
+            keys("ShowDetails", "Alt+P", "Show or hide details panel"),
+            keys("@Keys", "Ctrl+H", "Show or hide hidden files"),
+            keys("@Keys", "Ctrl+Shift+L", "Light or dark"),
             keys("@Pins", "Ctrl+D", "Pin folder to sidebar"),
             keys("@Keys", "Ctrl+`", "Open terminal here"),
             keys("@DiskUsage", "Ctrl+Shift+U", "Disk usage"),
-            keys("ShowDetails", "Alt+P", "Show or hide details panel"),
-            keys("@Preview", "Space", "Preview"),
-            keys("@Keys", "Shift+right-click", "Full Windows menu"),
-            keys("@Keys", "Ctrl+H", "Show or hide hidden files"),
-            keys("@Keys", "Ctrl+Shift+L", "Light or dark"),
             keys("@Keys", "Ctrl+,", "Settings"),
+            keys("@Keys", "Ctrl+U", "Command box"),
         ]),
     ]
 }
@@ -551,6 +583,11 @@ fn about(f: &Facts) -> Vec<Item> {
             Row::new("@About", &format!("Glint {}", crate::log::VERSION), Some("A lightweight file explorer for Windows. This is a beta, so some things may not work yet."), Ctl::None),
             Row::new("@Update", "Updates", Some(&f.update_said), Ctl::Button(if f.update_busy { "CHECKING…".into() } else { "CHECK FOR UPDATES".into() }, Act::Update)).needs("@UpdateReady"),
             toggle("CheckForUpdates", "Check for updates automatically", None).indent(),
+        ]),
+        Item::Heading("Help"),
+        Item::Card(vec![
+            Row::new("@ReportBug", "Report a bug", None, Ctl::Button("REPORT".into(), Act::ReportBug)),
+            Row::new("@Discord", "Discord", None, Ctl::Button("DISCORD".into(), Act::Discord)),
         ]),
         Item::Heading("Settings and cache"),
         Item::Card(vec![

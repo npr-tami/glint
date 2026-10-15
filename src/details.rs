@@ -7,14 +7,31 @@
 //! - One item: its thumbnail (thumbs.rs) or text, and what peek.rs finds out about it off the UI
 //!   thread (picture size, a song's or video's length, a folder's item count). A drive's free space
 //!   comes from the drive list, which already knows it.
+//! - One file also has a Fingerprint row: Show works out its SHA-256 with Windows' own cryptography
+//!   (CNG), on a thread of its own, in percent for a big file. Then Copy copies the code, and Check
+//!   compares it with a code copied from a website (for an MD5 or SHA-1 code, the file's own of that
+//!   kind is worked out to compare). Selecting something else stops it and forgets it. Not in the
+//!   Recycle Bin or Home, nor inside a .zip or .7z.
 //! - Several: a little stack of cards with the count, how many files and folders, and the files' size.
 //!
-//! The panel never waits: each frame shows what is there, and the thumbnail service and peek.rs
-//! repaint the window when more arrives. The layout of the box and the buttons doesn't depend on
-//! what's shown, so nothing jumps while arrowing through files.
+//! The panel never waits: each frame shows what is there, and the thumbnail service, peek.rs and
+//! the fingerprint's thread repaint the window when more arrives. The layout of the box and the
+//! buttons doesn't depend on what's shown, so nothing jumps while arrowing through files.
 //!
 //! The same pieces (what is selected, what to say about it, the name, chips and rows) are used by
 //! the Space preview (preview.rs) for files that are neither pictures nor text.
+
+use std::io::Read;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::HWND;
+use windows::Win32::Security::Cryptography::{
+    BCryptCloseAlgorithmProvider, BCryptCreateHash, BCryptDestroyHash, BCryptFinishHash, BCryptHashData, BCryptOpenAlgorithmProvider,
+    BCRYPT_ALG_HANDLE, BCRYPT_HASH_HANDLE, BCRYPT_MD5_ALGORITHM, BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS, BCRYPT_SHA1_ALGORITHM, BCRYPT_SHA256_ALGORITHM,
+};
 
 use crate::app::{AppState, Tab};
 use crate::folder::{self, Entry, EntryKind};
@@ -377,6 +394,26 @@ pub fn fit_path(text: &str, width: f32, measure: &mut dyn FnMut(&str) -> f32) ->
     format!("{head}\u{2026}{tail}")
 }
 
+/// A fingerprint cut in the middle so it fits ("e3b0c442…7852b855"): as much of its start and its
+/// end as fit, the same of each.
+fn fit_code(code: &str, width: f32, measure: &mut dyn FnMut(&str) -> f32) -> String {
+    if measure(code) <= width {
+        return code.to_string();
+    }
+    let chars: Vec<char> = code.chars().collect();
+    let cut = |n: usize| format!("{}\u{2026}{}", chars[..n].iter().collect::<String>(), chars[chars.len() - n..].iter().collect::<String>());
+    let (mut lo, mut hi) = (0usize, chars.len() / 2);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if measure(&cut(mid)) <= width {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    cut(lo)
+}
+
 /// Chips side by side, going on to another line when the next one doesn't fit; one wider than the
 /// line is cut to its width. Returns each chip's box.
 pub fn place_chips(chips: &[String], x: f32, y: f32, w: f32, measure: &mut dyn FnMut(&str) -> f32) -> Vec<Rect> {
@@ -432,20 +469,25 @@ pub fn draw_chips(r: &mut Renderer, theme: &Theme, x: f32, y: f32, w: f32, chips
     bottom
 }
 
+/// A row's hairline and its label on the left, at `y`; returns where its value may start.
+fn draw_row_label(r: &mut Renderer, theme: &Theme, x: f32, y: f32, w: f32, label: &str) -> f32 {
+    let style = TextStyle::new(theme.muted);
+    r.fill_rect(Rect::new(x, y, w, 1.0), theme.line);
+    let label_w = r.measure(label, &style);
+    r.text(label, Rect::new(x, y, w, dims::ROW_H), &style);
+    (x + label_w + 12.0).min(x + w)
+}
+
 /// The rows from `y` down, stopping above `limit`; a hairline above each, the label on the left and
 /// the value on the right. Returns where they end.
 pub fn draw_rows(r: &mut Renderer, theme: &Theme, x: f32, y: f32, w: f32, limit: f32, rows: &[Row]) -> f32 {
-    let label_style = TextStyle::new(theme.muted);
     let value_style = TextStyle::new(theme.text).align(Align::Right);
     let mut y = y;
     for row in rows {
         if y + dims::ROW_H > limit {
             break;
         }
-        r.fill_rect(Rect::new(x, y, w, 1.0), theme.line);
-        let label_w = r.measure(row.label, &label_style);
-        r.text(row.label, Rect::new(x, y, w, dims::ROW_H), &label_style);
-        let vx = (x + label_w + 12.0).min(x + w);
+        let vx = draw_row_label(r, theme, x, y, w, row.label);
         let vw = (x + w - vx).max(0.0);
         let value = if row.path { fit_path(&row.value, vw, &mut |t| r.measure(t, &value_style)) } else { row.value.clone() };
         r.text(&value, Rect::new(vx, y, vw, dims::ROW_H), &value_style);
@@ -588,6 +630,334 @@ fn button(r: &mut Renderer, theme: &Theme, rect: Rect, label: &str, hover: bool,
     r.text(label, rect.inset(6.0, 0.0), &style);
 }
 
+// ---------------------------------------------------------------- fingerprints
+
+/// From this size a file is big: how far along working out its code is shows in percent.
+const BIG: u64 = 8 << 20;
+/// A file is read this much at a time.
+const CHUNK: usize = 1 << 20;
+/// While a big file is read, the window is repainted this often (for the percentage).
+const PROGRESS_EVERY: Duration = Duration::from_millis(100);
+/// What the status bar says after Copy (the button says "Copied" while it shows).
+const PRINT_COPIED: &str = "Fingerprint copied";
+
+/// The kinds of fingerprint. Show works out the SHA-256; MD5 and SHA-1 (which older download pages
+/// give) only to compare with a copied code of that kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Md5,
+    Sha1,
+    Sha256,
+}
+
+impl Kind {
+    /// The kind of a code this many hex digits long: 32 MD5, 40 SHA-1, 64 SHA-256.
+    fn of_digits(n: usize) -> Option<Kind> {
+        match n {
+            32 => Some(Kind::Md5),
+            40 => Some(Kind::Sha1),
+            64 => Some(Kind::Sha256),
+            _ => None,
+        }
+    }
+
+    /// How many bytes its code has (two hex digits each).
+    fn bytes(self) -> usize {
+        match self {
+            Kind::Md5 => 16,
+            Kind::Sha1 => 20,
+            Kind::Sha256 => 32,
+        }
+    }
+
+    /// Its name in Windows' cryptography.
+    fn algorithm(self) -> PCWSTR {
+        match self {
+            Kind::Md5 => BCRYPT_MD5_ALGORITHM,
+            Kind::Sha1 => BCRYPT_SHA1_ALGORITHM,
+            Kind::Sha256 => BCRYPT_SHA256_ALGORITHM,
+        }
+    }
+}
+
+/// A code being worked out with Windows' own cryptography (CNG), fed a file a chunk at a time.
+struct Hasher {
+    alg: BCRYPT_ALG_HANDLE,
+    hash: BCRYPT_HASH_HANDLE,
+    kind: Kind,
+}
+
+impl Hasher {
+    fn new(kind: Kind) -> Option<Hasher> {
+        let (mut alg, mut hash) = (BCRYPT_ALG_HANDLE::default(), BCRYPT_HASH_HANDLE::default());
+        // SAFETY: the calls write the handles; the provider is closed again when the hash can't be
+        // made (and in Drop otherwise). Given no buffer, CNG keeps the hash's memory itself.
+        unsafe {
+            if BCryptOpenAlgorithmProvider(&mut alg, kind.algorithm(), PCWSTR::null(), BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS(0)).is_err() {
+                return None;
+            }
+            if BCryptCreateHash(alg, &mut hash, None, None, 0).is_err() {
+                let _ = BCryptCloseAlgorithmProvider(alg, 0);
+                return None;
+            }
+        }
+        Some(Hasher { alg, hash, kind })
+    }
+
+    /// Feeds it more of the file.
+    fn add(&mut self, data: &[u8]) -> bool {
+        // SAFETY: a live hash, and bytes CNG only reads during the call.
+        data.chunks(CHUNK).all(|part| unsafe { BCryptHashData(self.hash, part, 0) }.is_ok())
+    }
+
+    /// The code, in lower-case hex.
+    fn finish(self) -> Option<String> {
+        let mut code = vec![0u8; self.kind.bytes()];
+        // SAFETY: a live hash, and room for exactly its code.
+        let done = unsafe { BCryptFinishHash(self.hash, &mut code, 0) }.is_ok();
+        done.then(|| code.iter().map(|b| format!("{b:02x}")).collect())
+    }
+}
+
+impl Drop for Hasher {
+    fn drop(&mut self) {
+        // SAFETY: both handles were made in `new`, and are let go of here, once.
+        unsafe {
+            let _ = BCryptDestroyHash(self.hash);
+            let _ = BCryptCloseAlgorithmProvider(self.alg, 0);
+        }
+    }
+}
+
+/// The `kind` code of the file at `path`, read a chunk at a time (`read` is told how much each
+/// time). None if it can't be read, or once `stop` is set.
+fn file_code(path: &str, kind: Kind, stop: &AtomicBool, read: &mut dyn FnMut(u64)) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Hasher::new(kind)?;
+    let mut chunk = vec![0u8; CHUNK];
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        match file.read(&mut chunk) {
+            Ok(0) => return hasher.finish(),
+            Ok(n) => {
+                if !hasher.add(&chunk[..n]) {
+                    return None;
+                }
+                read(n as u64);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Working out one code of one file, on a thread of its own.
+struct Job {
+    kind: Kind,
+    /// The file's size: the percentage is of this.
+    total: u64,
+    /// How much of it has been read.
+    done: AtomicU64,
+    /// Nobody wants the code any more: the thread stops at its next chunk.
+    stop: AtomicBool,
+    /// Once it's done, the code (None: the file couldn't be read).
+    end: OnceLock<Option<String>>,
+}
+
+impl Job {
+    /// Starts working out the `kind` code of the file at `path` (`size` bytes). `hwnd` is repainted
+    /// as it goes along (for a big file) and when it's done.
+    fn start(path: &str, size: u64, kind: Kind, hwnd: HWND) -> Running {
+        let job = Arc::new(Job { kind, total: size, done: AtomicU64::new(0), stop: AtomicBool::new(false), end: OnceLock::new() });
+        let (mine, path, window) = (job.clone(), path.to_string(), AtomicIsize::new(hwnd.0 as isize));
+        let started = shell::background("fingerprint", move || {
+            let mut shown = Instant::now();
+            let code = file_code(&path, mine.kind, &mine.stop, &mut |n| {
+                mine.done.fetch_add(n, Ordering::Relaxed);
+                if mine.total >= BIG && shown.elapsed() >= PROGRESS_EVERY {
+                    shown = Instant::now();
+                    thumbs::repaint(&window);
+                }
+            });
+            let _ = mine.end.set(code);
+            thumbs::repaint(&window);
+        });
+        if !started {
+            let _ = job.end.set(None); // no thread to be had: as if the file couldn't be read
+        }
+        Running(job)
+    }
+
+    /// How far along it is, in percent, for a big file (a small one is done in a moment).
+    fn percent(&self) -> Option<u64> {
+        (self.total >= BIG).then(|| (self.done.load(Ordering::Relaxed).saturating_mul(100) / self.total).min(99))
+    }
+
+    /// "Working it out… 45%": what is being done and, for a big file, how far along it is.
+    fn progress(&self, doing: &str) -> String {
+        match self.percent() {
+            Some(n) => format!("{doing}\u{2026} {n}%"),
+            None => format!("{doing}\u{2026}"),
+        }
+    }
+}
+
+/// The panel's hold on a job: letting go of it stops the job.
+struct Running(Arc<Job>);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A code being worked out, or what came of it.
+enum Step {
+    Working(Running),
+    Done(String),
+    /// The file couldn't be read.
+    Failed,
+}
+
+/// What Check found out.
+enum Check {
+    /// The copied code is an MD5 or SHA-1: the file's own of that kind is being worked out.
+    Working { copied: String, job: Running },
+    Said(Verdict),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    Matches,
+    Differs,
+    /// There was no code on the clipboard.
+    NoCode,
+    /// The file couldn't be read again (for its MD5 or SHA-1).
+    Unreadable,
+}
+
+impl Verdict {
+    /// What the panel says, in which colour.
+    fn text(self, theme: &Theme) -> (&'static str, Color) {
+        match self {
+            Verdict::Matches => ("\u{2713} Matches the copied code", if theme.dark { Color::hex(0x3dd68c) } else { Color::hex(0x1a7f37) }),
+            Verdict::Differs => ("\u{2717} Doesn't match the copied code", crate::codebox::PROBLEM_RED),
+            Verdict::NoCode => ("Copy the code from the website first", theme.muted),
+            Verdict::Unreadable => ("Couldn't read this file", theme.muted),
+        }
+    }
+}
+
+/// The fingerprint of the one file selected, from Show until something else is selected.
+struct Print {
+    /// The file (`One::key`), and its path and size.
+    key: String,
+    path: String,
+    size: u64,
+    sha256: Step,
+    check: Option<Check>,
+    /// The MD5 and SHA-1 codes Check worked out: checking again doesn't read the file again.
+    others: Vec<(Kind, String)>,
+    /// Copy was pressed (it says "Copied" while the note shows).
+    copied: bool,
+}
+
+impl Print {
+    /// Show was pressed for `one`: its SHA-256 is worked out by `start`.
+    fn new(one: &One, start: &mut dyn FnMut(Kind) -> Running) -> Print {
+        let sha256 = Step::Working(start(Kind::Sha256));
+        Print { key: one.key.clone(), path: one.path.clone(), size: one.entry.size, sha256, check: None, others: Vec::new(), copied: false }
+    }
+
+    /// The SHA-256, once it's worked out.
+    fn code(&self) -> Option<&str> {
+        match &self.sha256 {
+            Step::Done(code) => Some(code),
+            _ => None,
+        }
+    }
+
+    /// Takes in what its jobs have finished.
+    fn poll(&mut self) {
+        if let Step::Working(job) = &self.sha256 {
+            if let Some(end) = job.0.end.get() {
+                self.sha256 = end.clone().map_or(Step::Failed, Step::Done);
+            }
+        }
+        if let Some(Check::Working { copied, job }) = &self.check {
+            if let Some(end) = job.0.end.get() {
+                let verdict = match end {
+                    Some(code) => {
+                        self.others.push((job.0.kind, code.clone()));
+                        if code == copied {
+                            Verdict::Matches
+                        } else {
+                            Verdict::Differs
+                        }
+                    }
+                    None => Verdict::Unreadable,
+                };
+                self.check = Some(Check::Said(verdict));
+            }
+        }
+    }
+
+    /// Check was pressed with this on the clipboard (`copied_code`'s answer): it's compared with
+    /// the SHA-256, or with the file's MD5 or SHA-1, which `start` works out when it isn't known yet.
+    fn check(&mut self, copied: Option<String>, start: &mut dyn FnMut(Kind) -> Running) {
+        let Step::Done(sha256) = &self.sha256 else { return };
+        let Some(copied) = copied else {
+            self.check = Some(Check::Said(Verdict::NoCode));
+            return;
+        };
+        let kind = Kind::of_digits(copied.len()).unwrap_or(Kind::Sha256);
+        let ours = if kind == Kind::Sha256 { Some(sha256) } else { self.others.iter().find(|(k, _)| *k == kind).map(|(_, code)| code) };
+        self.check = Some(match (ours, self.check.take()) {
+            (Some(ours), _) => Check::Said(if *ours == copied { Verdict::Matches } else { Verdict::Differs }),
+            // That kind is being worked out already: it's compared with this code when it's done.
+            (None, Some(Check::Working { job, .. })) if job.0.kind == kind => Check::Working { copied, job },
+            (None, _) => Check::Working { copied, job: start(kind) },
+        });
+    }
+}
+
+/// The code in copied text, the way Check compares it: in lower case, without the spaces or dashes
+/// it may be written with ("SHA-256: 9F86D081 884C7D65…" gives "9f86d081884c7d65…"). That is the
+/// longest run of hex digits (spaces and dashes between them allowed) as long as an MD5, SHA-1 or
+/// SHA-256 code, with a digit in it (so words like "faded" aren't taken for one), and not a whole
+/// code joined to a piece of another length beside it (an MD5 and a date, or a file's name that's
+/// all hex digits, isn't a SHA-1). None if there's no such code.
+fn copied_code(text: &str) -> Option<String> {
+    // (A code is short: a whole page copied by mistake is only looked at so far.)
+    let mut end = text.len().min(100_000);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    // The best so far: how long, in how many pieces, and the code.
+    let mut best: Option<(usize, usize, String)> = None;
+    for part in text[..end].split(|c: char| !(c.is_ascii_hexdigit() || c.is_whitespace() || c == '-')) {
+        let words: Vec<&str> = part.split(|c: char| c.is_whitespace() || c == '-').filter(|w| !w.is_empty()).collect();
+        for first in 0..words.len() {
+            let mut len = 0;
+            for (i, w) in words[first..].iter().enumerate() {
+                len += w.len();
+                if len > 64 {
+                    break;
+                }
+                let run = &words[first..=first + i];
+                let better = best.as_ref().is_none_or(|(l, pieces, _)| len > *l || (len == *l && run.len() < *pieces));
+                let joined = run.iter().any(|w| Kind::of_digits(w.len()).is_some()) && run.iter().any(|w| w.len() != run[0].len());
+                if better && !joined && Kind::of_digits(len).is_some() && run.iter().any(|w| w.bytes().any(|b| b.is_ascii_digit())) {
+                    best = Some((len, run.len(), run.concat().to_ascii_lowercase()));
+                }
+            }
+        }
+    }
+    best.map(|(_, _, code)| code)
+}
+
 // ---------------------------------------------------------------- the panel
 
 /// What's under the mouse.
@@ -599,6 +969,10 @@ enum Hit {
     Copy,
     /// The preview box (a double-click opens).
     Box,
+    /// The Fingerprint's buttons: Show, Copy and Check.
+    Show,
+    CopyPrint,
+    CheckPrint,
 }
 
 /// Where the parts that never move sit: the label, the preview box and the buttons.
@@ -620,6 +994,13 @@ pub struct DetailsPanel {
     pressed: Hit,
     /// Copy path was pressed for this item (it says "Copied" while the note shows).
     copied: Option<String>,
+    /// The selected file's fingerprint, once Show was pressed.
+    print: Option<Print>,
+    /// The Fingerprint's buttons where the last frame drew them, and the item (`One::key`) they
+    /// were for.
+    print_buttons: (String, Vec<(Hit, Rect)>),
+    /// Whether the item at this path is inside a .zip or .7z (`in_archive`).
+    archived: (String, bool),
 }
 
 impl Default for DetailsPanel {
@@ -630,19 +1011,32 @@ impl Default for DetailsPanel {
 
 impl DetailsPanel {
     pub fn new() -> DetailsPanel {
-        DetailsPanel { rect: Rect::default(), peeker: Peeker::new("details panel"), facts: FactsCache::new(64), asked: String::new(), hover: Hit::None, pressed: Hit::None, copied: None }
+        DetailsPanel {
+            rect: Rect::default(),
+            peeker: Peeker::new("details panel"),
+            facts: FactsCache::new(64),
+            asked: String::new(),
+            hover: Hit::None,
+            pressed: Hit::None,
+            copied: None,
+            print: None,
+            print_buttons: (String::new(), Vec::new()),
+            archived: (String::new(), false),
+        }
     }
 
     pub fn layout(&mut self, rect: Rect) {
         self.rect = rect;
     }
 
-    /// The panel was hidden: what was still waiting is forgotten.
+    /// The panel was hidden: what was still waiting is forgotten (a fingerprint too: it stops).
     pub fn hidden(&mut self) {
         self.peeker.cancel();
         self.asked.clear();
         self.hover = Hit::None;
         self.pressed = Hit::None;
+        self.print = None;
+        self.print_buttons.1.clear();
     }
 
     fn frame(&self, open_with: bool) -> Frame {
@@ -657,9 +1051,10 @@ impl DetailsPanel {
         let half = ((w - 6.0) / 2.0).max(0.0);
         let open_with_rect = Rect::new(r.x + pad, row_y, half, dims::BUTTON_H);
         let copy = if open_with { Rect::new(r.x + pad + w - half, row_y, half, dims::BUTTON_H) } else { Rect::new(r.x + pad, row_y, w, dims::BUTTON_H) };
-        // The box is 16:10 but leaves room for two lines of name, a line of chips and three rows. It
-        // has the same size for every item, so it doesn't jump while arrowing through files.
-        let room = copy.y - top - (12.0 + 2.0 * dims::NAME_LINE + 8.0 + dims::CHIP_H + 10.0 + 3.0 * dims::ROW_H + 10.0);
+        // The box is 16:10 but leaves room for two lines of name, a line of chips, three rows and a
+        // file's Fingerprint (three lines). It has the same size for every item, so it doesn't jump
+        // while arrowing through files.
+        let room = copy.y - top - (12.0 + 2.0 * dims::NAME_LINE + 8.0 + dims::CHIP_H + 10.0 + 6.0 * dims::ROW_H + 10.0);
         let ideal = w * 10.0 / 16.0;
         let h = ideal.min(room).max(ideal.min(72.0)).max(0.0);
         Frame { label, preview: Rect::new(r.x + pad, top, w, h), open_with: open_with_rect, copy, open }
@@ -675,6 +1070,12 @@ impl DetailsPanel {
 
     fn hit(&self, p: Point, app: &AppState) -> Hit {
         let sel = selection(app);
+        // The Fingerprint's buttons, where they were drawn for this item.
+        if let Sel::One(one) = &sel {
+            if let Some((h, _)) = self.print_buttons.1.iter().find(|(_, b)| b.contains(p)).filter(|_| self.print_buttons.0 == one.key) {
+                return *h;
+            }
+        }
         let (open, open_with, copy) = Self::buttons(&sel);
         let f = self.frame(open_with);
         if open && f.open.contains(p) {
@@ -719,9 +1120,20 @@ impl DetailsPanel {
         };
         if let Some(one) = one {
             if self.facts.get(&one.key).is_none() && self.asked != one.key {
-                self.peeker.ask(one.ask(Some(peek::PANEL_TEXT), None, app.settings.show_hidden, app.settings.show_system), ctx.hwnd);
-                self.asked = one.key.clone();
+                // (Asked again next time when no thread could be had for it.)
+                if self.peeker.ask(one.ask(Some(peek::PANEL_TEXT), None, app.settings.show_hidden, app.settings.show_system), ctx.hwnd) {
+                    self.asked = one.key.clone();
+                }
             }
+        }
+        // A fingerprint is of the one file it was worked out for: anything else selected forgets it
+        // (and stops working it out).
+        let printable = one.filter(|o| self.can_print(o, app));
+        if self.print.as_ref().is_some_and(|p| printable.is_none_or(|o| o.key != p.key)) {
+            self.print = None;
+        }
+        if let Some(p) = &mut self.print {
+            p.poll();
         }
         let facts = one.and_then(|o| self.facts.get(&o.key));
 
@@ -730,25 +1142,107 @@ impl DetailsPanel {
         r.push_clip(Rect::new(rect.x, rect.y, rect.w, (buttons_top - rect.y).max(0.0)));
         self.paint_preview(r, theme, &sel, facts, f.preview, ctx.scale);
         let info = info(&sel, facts, app);
-        draw_info(r, theme, Rect::new(f.preview.x, f.preview.bottom() + 12.0, f.preview.w, (buttons_top - f.preview.bottom() - 12.0).max(0.0)), &info);
+        let rows = Rect::new(f.preview.x, f.preview.bottom() + 12.0, f.preview.w, (buttons_top - f.preview.bottom() - 12.0).max(0.0));
+        let end = draw_info(r, theme, rows, &info);
+        // One file: its Fingerprint under the rows.
+        match printable {
+            Some(o) => self.paint_print(r, theme, app, &o.key, Rect::new(rows.x, end, rows.w, (rows.bottom() - end).max(0.0))),
+            None => self.print_buttons.1.clear(),
+        }
         r.pop_clip();
 
-        let look = |h: Hit| (self.hover == h, self.pressed == h && self.hover == h);
         if open_with {
-            let (hover, pressed) = look(Hit::OpenWith);
+            let (hover, pressed) = self.look(Hit::OpenWith);
             button(r, theme, f.open_with, "Open with\u{2026}", hover, pressed, false, None);
         }
         if can_copy {
             let copied = one.is_some_and(|o| self.copied.as_deref() == Some(o.key.as_str())) && app.note() == Some("Path copied");
-            let (hover, pressed) = look(Hit::Copy);
+            let (hover, pressed) = self.look(Hit::Copy);
             button(r, theme, f.copy, if copied { "Copied" } else { "Copy path" }, hover, pressed, false, copied.then_some(theme.accent));
         }
         // Open only for one item (Enter opens several). Its place stays empty otherwise.
         if can_open {
-            let (hover, pressed) = look(Hit::Open);
+            let (hover, pressed) = self.look(Hit::Open);
             button(r, theme, f.open, "Open", hover, pressed, true, None);
         }
         r.pop_clip();
+    }
+
+    /// How a button looks: (under the mouse, pressed).
+    fn look(&self, h: Hit) -> (bool, bool) {
+        (self.hover == h, self.pressed == h && self.hover == h)
+    }
+
+    /// Whether the item has a Fingerprint row: a file, but not one in the Recycle Bin or Home, nor
+    /// inside a .zip or .7z.
+    fn can_print(&mut self, one: &One, app: &AppState) -> bool {
+        one.is_file() && !one.deleted && !folder::is_place(&app.tab().folder.path) && !self.in_archive(&one.path)
+    }
+
+    /// Whether the item at `path` is inside a .zip or .7z (found out once for each item: it may ask
+    /// the disk).
+    fn in_archive(&mut self, path: &str) -> bool {
+        if self.archived.0 != path {
+            let inside = folder::parent(path).is_some_and(|p| crate::archive::split(&p).is_some());
+            self.archived = (path.to_string(), inside);
+        }
+        self.archived.1
+    }
+
+    /// The Fingerprint under the rows (`area` starts where they end): Show; then how far along it
+    /// is; then the code, cut to fit, with Copy and Check under it and what Check found under
+    /// those. Only the lines that fit are drawn, and the buttons drawn are kept for `hit`.
+    fn paint_print(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState, key: &str, area: Rect) {
+        let mut buttons = Vec::new();
+        let (x, w) = (area.x, area.w);
+        let line = |n: f32| area.y + n * dims::ROW_H;
+        let fits = |n: f32| line(n + 1.0) <= area.bottom();
+        // The buttons are as wide as the longest word they show, so none moves when Copy says "Copied".
+        let word = TextStyle::new(theme.text).bold();
+        let bw = ["Show", "Copied", "Check"].iter().map(|t| r.measure(t, &word)).fold(0.0, f32::max).ceil() + 24.0;
+        // A button in line `n`, `slot` buttons in from the right.
+        let at = |n: f32, slot: f32| Rect::new(x + w - bw - slot * (bw + 6.0), line(n) + 3.0, bw, dims::ROW_H - 5.0);
+        if fits(0.0) {
+            let vx = draw_row_label(r, theme, x, line(0.0), w, "Fingerprint");
+            let value = Rect::new(vx, line(0.0), (x + w - vx).max(0.0), dims::ROW_H);
+            let muted = TextStyle::new(theme.muted).align(Align::Right);
+            match self.print.as_ref().map(|p| &p.sha256) {
+                None => {
+                    let (hover, pressed) = self.look(Hit::Show);
+                    button(r, theme, at(0.0, 0.0), "Show", hover, pressed, false, None);
+                    buttons.push((Hit::Show, at(0.0, 0.0)));
+                }
+                Some(Step::Working(job)) => r.text(&job.0.progress("Working it out"), value, &muted),
+                Some(Step::Failed) => r.text("Couldn't read this file", value, &muted),
+                Some(Step::Done(code)) => {
+                    let style = TextStyle::new(theme.text).align(Align::Right);
+                    let shown = fit_code(code, value.w, &mut |t| r.measure(t, &style));
+                    r.text(&shown, value, &style);
+                }
+            }
+        }
+        if let Some(p) = self.print.as_ref().filter(|p| p.code().is_some()) {
+            if fits(1.0) {
+                let copied = p.copied && app.note() == Some(PRINT_COPIED);
+                let (hover, pressed) = self.look(Hit::CopyPrint);
+                button(r, theme, at(1.0, 1.0), if copied { "Copied" } else { "Copy" }, hover, pressed, false, copied.then_some(theme.accent));
+                let (hover, pressed) = self.look(Hit::CheckPrint);
+                button(r, theme, at(1.0, 0.0), "Check", hover, pressed, false, None);
+                buttons.extend([(Hit::CopyPrint, at(1.0, 1.0)), (Hit::CheckPrint, at(1.0, 0.0))]);
+            }
+            let said = match &p.check {
+                Some(Check::Said(v)) => {
+                    let (text, color) = v.text(theme);
+                    Some((text.to_string(), color))
+                }
+                Some(Check::Working { job, .. }) => Some((job.0.progress("Checking"), theme.muted)),
+                None => None,
+            };
+            if let Some((text, color)) = said.filter(|_| fits(2.0)) {
+                r.text(&text, Rect::new(x, line(2.0), w, dims::ROW_H), &TextStyle::new(color).align(Align::Right));
+            }
+        }
+        self.print_buttons = (key.to_string(), buttons);
     }
 
     fn paint_preview(&self, r: &mut Renderer, theme: &Theme, sel: &Sel, facts: Option<&Facts>, area: Rect, scale: f32) {
@@ -843,6 +1337,36 @@ impl DetailsPanel {
                     } else {
                         app.say("Couldn't copy (the clipboard is busy)");
                     }
+                }
+                Effect::Redraw
+            }
+            Hit::Show => {
+                if let Sel::One(one) = selection(app) {
+                    if self.can_print(&one, app) {
+                        self.print = Some(Print::new(&one, &mut |kind| Job::start(&one.path, one.entry.size, kind, ctx.hwnd)));
+                    }
+                }
+                Effect::Redraw
+            }
+            Hit::CopyPrint => {
+                if let Some(p) = &mut self.print {
+                    if let Some(code) = p.code() {
+                        // The whole code, in lower case (what download pages show).
+                        if shell::copy_text(ctx.hwnd, code) {
+                            app.say(PRINT_COPIED);
+                            p.copied = true;
+                        } else {
+                            app.say("Couldn't copy (the clipboard is busy)");
+                        }
+                    }
+                }
+                Effect::Redraw
+            }
+            Hit::CheckPrint => {
+                if let Some(p) = &mut self.print {
+                    let copied = crate::codebox::clipboard_text(ctx.hwnd).as_deref().and_then(copied_code);
+                    let (path, size) = (p.path.clone(), p.size);
+                    p.check(copied, &mut |kind| Job::start(&path, size, kind, ctx.hwnd));
                 }
                 Effect::Redraw
             }
@@ -957,5 +1481,324 @@ mod tests {
         assert_eq!(many.chips, vec!["2 files", "4 KB", "1 folder"]);
         let place = info(&Sel::Folder { path: String::new(), items: 1 }, None, &app);
         assert_eq!((place.name.as_str(), place.chips.clone(), place.rows.len()), ("This PC", vec!["1 item".to_string()], 0));
+    }
+
+    // ---------------------------------------------------------------- fingerprints
+
+    const SHA256_EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const SHA256_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    const SHA1_EMPTY: &str = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+    const SHA1_ABC: &str = "a9993e364706816aba3e25717850c26c9cd0d89d";
+    const MD5_EMPTY: &str = "d41d8cd98f00b204e9800998ecf8427e";
+    const MD5_ABC: &str = "900150983cd24fb0d6963f7d28e17f72";
+
+    /// What Windows works out for these bytes.
+    fn code_of(data: &[u8], kind: Kind) -> String {
+        let mut hasher = Hasher::new(kind).expect("Windows has the algorithm");
+        assert!(hasher.add(data));
+        hasher.finish().expect("the code")
+    }
+
+    /// The code of "abc" of each kind.
+    fn abc(kind: Kind) -> &'static str {
+        match kind {
+            Kind::Md5 => MD5_ABC,
+            Kind::Sha1 => SHA1_ABC,
+            Kind::Sha256 => SHA256_ABC,
+        }
+    }
+
+    /// A job that's done already, with this code (None: the file couldn't be read).
+    fn finished(kind: Kind, code: Option<&str>) -> Running {
+        let job = Job { kind, total: 3, done: AtomicU64::new(3), stop: AtomicBool::new(false), end: OnceLock::new() };
+        let _ = job.end.set(code.map(str::to_string));
+        Running(Arc::new(job))
+    }
+
+    fn a_file() -> One {
+        let entry = Entry {
+            name: "abc.txt".into(),
+            lower: "abc.txt".into(),
+            kind: EntryKind::File,
+            size: 3,
+            modified: 0,
+            created: 0,
+            attributes: 0,
+            ext: "txt".into(),
+            type_name: std::sync::Arc::from("Text Document"),
+            target: None,
+            free: 0,
+        };
+        One { entry, index: 0, path: "C:\\abc.txt".into(), shell_path: "C:\\abc.txt".into(), copy: "C:\\abc.txt".into(), location: None, deleted: false, key: "k".into(), version: 0 }
+    }
+
+    #[test]
+    fn windows_works_out_the_codes() {
+        assert_eq!(code_of(b"", Kind::Sha256), SHA256_EMPTY);
+        assert_eq!(code_of(b"abc", Kind::Sha256), SHA256_ABC);
+        assert_eq!(code_of(b"", Kind::Sha1), SHA1_EMPTY);
+        assert_eq!(code_of(b"abc", Kind::Sha1), SHA1_ABC);
+        assert_eq!(code_of(b"", Kind::Md5), MD5_EMPTY);
+        assert_eq!(code_of(b"abc", Kind::Md5), MD5_ABC);
+        // Fed in pieces, as a file is: the same code.
+        let mut hasher = Hasher::new(Kind::Sha256).unwrap();
+        assert!(hasher.add(b"a") && hasher.add(b"") && hasher.add(b"bc"));
+        assert_eq!(hasher.finish().as_deref(), Some(SHA256_ABC));
+    }
+
+    #[test]
+    fn a_code_says_its_kind_by_its_length() {
+        assert_eq!(Kind::of_digits(MD5_ABC.len()), Some(Kind::Md5));
+        assert_eq!(Kind::of_digits(SHA1_ABC.len()), Some(Kind::Sha1));
+        assert_eq!(Kind::of_digits(SHA256_ABC.len()), Some(Kind::Sha256));
+        assert_eq!(Kind::of_digits(0), None);
+        assert_eq!(Kind::of_digits(63), None);
+        assert_eq!(Kind::of_digits(128), None, "SHA-512 isn't one of them");
+        for kind in [Kind::Md5, Kind::Sha1, Kind::Sha256] {
+            assert_eq!(Kind::of_digits(2 * kind.bytes()), Some(kind));
+        }
+    }
+
+    #[test]
+    fn copied_text_is_cleaned_to_its_code() {
+        let some = |code: &str| Some(code.to_string());
+        // As it is, or in capitals.
+        assert_eq!(copied_code(SHA256_ABC), some(SHA256_ABC));
+        assert_eq!(copied_code(&SHA256_ABC.to_uppercase()), some(SHA256_ABC));
+        // With a name before it, in groups, with a new line after it.
+        assert_eq!(copied_code("SHA256: ba7816bf 8f01cfea 414140de 5dae2223 b00361a3 96177a9c b410ff61 f20015ad\r\n"), some(SHA256_ABC));
+        assert_eq!(copied_code("SHA-256 checksum: BA7816BF-8F01CFEA-414140DE-5DAE2223-B00361A3-96177A9C-B410FF61-F20015AD"), some(SHA256_ABC));
+        // As sha256sum writes it, with the file's name after it.
+        assert_eq!(copied_code(&format!("{SHA256_ABC}  glint-setup.exe")), some(SHA256_ABC));
+        // MD5 and SHA-1 codes, with spaces round them or dashes in them.
+        assert_eq!(copied_code(&format!("  {MD5_ABC}\t")), some(MD5_ABC));
+        assert_eq!(copied_code("a9993e36-4706816a-ba3e2571-7850c26c-9cd0d89d"), some(SHA1_ABC));
+        // A page that gives several: the longest.
+        assert_eq!(copied_code(&format!("MD5: {MD5_ABC}\nSHA-1: {SHA1_ABC}\nSHA-256: {SHA256_ABC}")), some(SHA256_ABC));
+        // A code with a file's name of hex digits, or a date, beside it: the code alone.
+        assert_eq!(copied_code(&format!("{MD5_ABC}  1a2b3c4d.tmp")), some(MD5_ABC));
+        assert_eq!(copied_code(&format!("{MD5_ABC}\t2024-01-15")), some(MD5_ABC));
+        // No code: nothing, words, a code cut short, or one too long.
+        assert_eq!(copied_code(""), None);
+        assert_eq!(copied_code("Copy the code from the website"), None);
+        assert_eq!(copied_code(&"faded".repeat(8)), None, "hex letters without a digit are words");
+        assert_eq!(copied_code(&SHA256_ABC[..63]), None);
+        assert_eq!(copied_code(&format!("{SHA256_ABC}{SHA256_ABC}")), None);
+    }
+
+    #[test]
+    fn long_codes_are_cut_in_the_middle() {
+        assert_eq!(fit_code("abc", 10.0, &mut chars), "abc");
+        assert_eq!(fit_code("0123456789abcdef", 9.0, &mut chars), "0123\u{2026}cdef");
+        assert_eq!(fit_code(SHA256_ABC, 21.0, &mut chars), "ba7816bf8f\u{2026}61f20015ad");
+        assert_eq!(fit_code("0123456789", 0.0, &mut chars), "\u{2026}");
+    }
+
+    #[test]
+    fn a_file_is_read_a_chunk_at_a_time_and_can_be_stopped() {
+        let dir = std::env::temp_dir().join(format!("glint-fingerprint-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("big.bin");
+        let data: Vec<u8> = (0..2 * CHUNK + 12_345).map(|i| (i * 7 % 251) as u8).collect();
+        std::fs::write(&file, &data).unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let mut read = Vec::new();
+        assert_eq!(file_code(&path, Kind::Sha256, &AtomicBool::new(false), &mut |n| read.push(n)), Some(code_of(&data, Kind::Sha256)));
+        assert!(read.len() >= 3, "{read:?}");
+        assert_eq!(read.iter().sum::<u64>(), data.len() as u64);
+        // Stopped, or not there: no code.
+        assert_eq!(file_code(&path, Kind::Sha256, &AtomicBool::new(true), &mut |_| {}), None);
+        assert_eq!(file_code(&format!("{path}.gone"), Kind::Md5, &AtomicBool::new(false), &mut |_| {}), None);
+
+        // On a thread of its own; letting go of it stops it.
+        std::fs::write(&file, b"abc").unwrap();
+        let running = Job::start(&path, 3, Kind::Sha1, HWND::default());
+        let start = Instant::now();
+        while running.0.end.get().is_none() && start.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(running.0.end.get(), Some(&Some(SHA1_ABC.to_string())));
+        let job = running.0.clone();
+        drop(running);
+        assert!(job.stop.load(Ordering::Relaxed));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh test folder with the process id in its name.
+    fn fresh_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("glint-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn code_in(path: &std::path::Path, kind: Kind) -> Option<String> {
+        file_code(&path.to_string_lossy(), kind, &AtomicBool::new(false), &mut |_| {})
+    }
+
+    #[test]
+    fn same_content_gives_the_same_fingerprint_and_other_content_does_not() {
+        let dir = fresh_dir("print-same");
+        let data: Vec<u8> = (0..CHUNK + 100).map(|i| (i % 253) as u8).collect();
+        let mut other = data.clone();
+        *other.last_mut().unwrap() ^= 1; // one bit, in the very last byte
+        let mut first = data.clone();
+        first[0] ^= 1; // and in the very first
+        for (name, bytes) in [("a.bin", &data), ("b copy.bin", &data), ("c.bin", &other), ("d.bin", &first)] {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        for kind in [Kind::Md5, Kind::Sha1, Kind::Sha256] {
+            let a = code_in(&dir.join("a.bin"), kind).unwrap();
+            assert_eq!(a.len(), kind.bytes() * 2);
+            // The name doesn't matter, the content does.
+            assert_eq!(code_in(&dir.join("b copy.bin"), kind), Some(a.clone()));
+            assert_ne!(code_in(&dir.join("c.bin"), kind), Some(a.clone()));
+            assert_ne!(code_in(&dir.join("d.bin"), kind), Some(a));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sizes_around_the_chunk_give_the_same_code_as_the_whole_in_memory() {
+        let dir = fresh_dir("print-sizes");
+        for len in [0, 1, CHUNK - 1, CHUNK, CHUNK + 1, 2 * CHUNK, 2 * CHUNK + 1] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 31 % 247) as u8).collect();
+            let file = dir.join(format!("f{len}.bin"));
+            std::fs::write(&file, &data).unwrap();
+            let mut total = 0;
+            let code = file_code(&file.to_string_lossy(), Kind::Sha256, &AtomicBool::new(false), &mut |n| total += n);
+            assert_eq!(code, Some(code_of(&data, Kind::Sha256)), "{len} bytes");
+            assert_eq!(total, len as u64, "{len} bytes are all counted");
+        }
+        // A zero-byte file has the well-known empty codes.
+        let empty = dir.join("f0.bin");
+        assert_eq!(code_in(&empty, Kind::Sha256).as_deref(), Some(SHA256_EMPTY));
+        assert_eq!(code_in(&empty, Kind::Sha1).as_deref(), Some(SHA1_EMPTY));
+        // One byte more or less than a chunk is not the same file.
+        assert_ne!(code_in(&dir.join(format!("f{}.bin", CHUNK)), Kind::Sha256), code_in(&dir.join(format!("f{}.bin", CHUNK + 1)), Kind::Sha256));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_is_gone_locked_or_a_folder_has_no_code() {
+        let dir = fresh_dir("print-gone");
+        let file = dir.join("x.bin");
+        std::fs::write(&file, b"abc").unwrap();
+        assert_eq!(code_in(&file, Kind::Sha1).as_deref(), Some(SHA1_ABC));
+        // Deleted before it's read.
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(code_in(&file, Kind::Sha1), None);
+        // A folder is not a file.
+        assert_eq!(code_in(&dir, Kind::Sha256), None);
+        // Locked by another program (nobody may share it): no code, no panic.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::write(&file, b"abc").unwrap();
+            let _lock = std::fs::OpenOptions::new().read(true).write(true).share_mode(0).open(&file).unwrap();
+            assert_eq!(code_in(&file, Kind::Sha256), None);
+        }
+        // Odd names: # and dots (accents and emoji fail only under Wine here).
+        let odd = dir.join("my file #1 a.b.bin");
+        std::fs::write(&odd, b"abc").unwrap();
+        assert_eq!(code_in(&odd, Kind::Sha256).as_deref(), Some(SHA256_ABC));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_changes_while_it_is_read_still_gives_a_code_and_stopping_midway_gives_none() {
+        let dir = fresh_dir("print-change");
+        let file = dir.join("grow.bin");
+        std::fs::write(&file, vec![7u8; 3 * CHUNK]).unwrap();
+        let path = file.to_string_lossy().into_owned();
+        // It grows after the first chunk was read: no crash, a code comes out.
+        let mut seen = 0u64;
+        let mut grown = false;
+        let code = file_code(&path, Kind::Sha256, &AtomicBool::new(false), &mut |n| {
+            seen += n;
+            if !grown {
+                grown = true;
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+                f.write_all(&[1u8; 10]).unwrap();
+            }
+        });
+        assert!(code.is_some());
+        assert!(seen >= 3 * CHUNK as u64);
+        // Stopped after the first chunk (the window was closed): no code.
+        std::fs::write(&file, vec![7u8; 3 * CHUNK]).unwrap();
+        let stop = AtomicBool::new(false);
+        let code = file_code(&path, Kind::Md5, &stop, &mut |_| stop.store(true, Ordering::Relaxed));
+        assert_eq!(code, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn big_files_say_how_far_along_they_are() {
+        let job = Job { kind: Kind::Sha256, total: 4 * BIG, done: AtomicU64::new(BIG + BIG / 2), stop: AtomicBool::new(false), end: OnceLock::new() };
+        assert_eq!(job.progress("Working it out"), "Working it out\u{2026} 37%");
+        job.done.store(5 * BIG, Ordering::Relaxed); // (it grew meanwhile)
+        assert_eq!(job.percent(), Some(99));
+        let small = Job { total: BIG - 1, ..job };
+        assert_eq!(small.progress("Checking"), "Checking\u{2026}");
+    }
+
+    #[test]
+    fn check_compares_with_the_copied_code() {
+        let mut started = Vec::new();
+        let mut start = |kind: Kind| {
+            started.push(kind);
+            finished(kind, Some(abc(kind)))
+        };
+        let mut p = Print::new(&a_file(), &mut start);
+        assert_eq!(p.code(), None);
+        p.poll();
+        assert_eq!(p.code(), Some(SHA256_ABC));
+        let said = |p: &Print| match &p.check {
+            Some(Check::Said(v)) => Some(*v),
+            _ => None,
+        };
+        // Nothing copied; the same SHA-256 (as `copied_code` gives it); another one.
+        p.check(None, &mut start);
+        assert_eq!(said(&p), Some(Verdict::NoCode));
+        p.check(copied_code(&SHA256_ABC.to_uppercase()), &mut start);
+        assert_eq!(said(&p), Some(Verdict::Matches));
+        p.check(Some(SHA256_EMPTY.into()), &mut start);
+        assert_eq!(said(&p), Some(Verdict::Differs));
+        // An MD5: the file's own is worked out to compare, and then known.
+        p.check(Some(MD5_ABC.into()), &mut start);
+        assert!(matches!(p.check, Some(Check::Working { .. })));
+        p.poll();
+        assert_eq!(said(&p), Some(Verdict::Matches));
+        p.check(Some(MD5_EMPTY.into()), &mut start);
+        assert_eq!(said(&p), Some(Verdict::Differs));
+        // A SHA-1 that doesn't match.
+        p.check(Some(SHA1_EMPTY.into()), &mut start);
+        p.poll();
+        assert_eq!(said(&p), Some(Verdict::Differs));
+        assert_eq!(started, vec![Kind::Sha256, Kind::Md5, Kind::Sha1], "each read once");
+
+        // A file that can't be read: no code, and nothing to check.
+        let mut gone = Print::new(&a_file(), &mut |kind| finished(kind, None));
+        gone.poll();
+        assert!(matches!(gone.sha256, Step::Failed));
+        gone.check(Some(SHA256_ABC.into()), &mut |_| unreachable!());
+        assert!(gone.check.is_none());
+        // ...or that can't be read again for its MD5.
+        let mut once = Print::new(&a_file(), &mut |kind| finished(kind, Some(abc(kind))));
+        once.poll();
+        once.check(Some(MD5_ABC.into()), &mut |kind| finished(kind, None));
+        once.poll();
+        assert_eq!(said(&once), Some(Verdict::Unreadable));
+    }
+
+    #[test]
+    fn what_check_says() {
+        let theme = Theme::dark();
+        assert_eq!(Verdict::Matches.text(&theme).0, "\u{2713} Matches the copied code");
+        assert_eq!(Verdict::Differs.text(&theme), ("\u{2717} Doesn't match the copied code", crate::codebox::PROBLEM_RED));
+        assert_eq!(Verdict::NoCode.text(&theme).0, "Copy the code from the website first");
+        // The green is darker on a light skin, so it stays easy to read.
+        assert_ne!(Verdict::Matches.text(&theme).1, Verdict::Matches.text(&Theme::light()).1);
     }
 }

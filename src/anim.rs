@@ -197,7 +197,9 @@ pub fn decode_gif(wic: &IWICImagingFactory, path: &str, max_side: u32) -> Option
         let screen = decoder.GetMetadataQueryReader().ok();
         let sw = screen.as_ref().and_then(|r| number(r, w!("/logscrdesc/Width"))).filter(|&v| v > 0).unwrap_or(fw);
         let sh = screen.as_ref().and_then(|r| number(r, w!("/logscrdesc/Height"))).filter(|&v| v > 0).unwrap_or(fh);
-        if sw == 0 || sh == 0 || sw > 16384 || sh > 16384 {
+        // The canvas, a saved copy and the frame being shrunk are each this big: keep them small
+        // (bigger GIFs show as a still picture).
+        if sw == 0 || sh == 0 || sw > 16384 || sh > 16384 || sw as u64 * sh as u64 * 4 > MAX_BYTES / 4 {
             return None;
         }
         let kept = (count as usize).min(MAX_FRAMES);
@@ -209,7 +211,8 @@ pub fn decode_gif(wic: &IWICImagingFactory, path: &str, max_side: u32) -> Option
             let meta = frame.GetMetadataQueryReader().ok();
             let get = |name: PCWSTR| meta.as_ref().and_then(|m| number(m, name));
             let (mut w, mut h) = (0u32, 0u32);
-            if frame.GetSize(&mut w, &mut h).is_err() || w == 0 || h == 0 {
+            // A frame bigger than the canvas is broken (or made to use up memory).
+            if frame.GetSize(&mut w, &mut h).is_err() || w == 0 || h == 0 || w > sw || h > sh {
                 break;
             }
             let patch = Patch { x: get(w!("/imgdesc/Left")).unwrap_or(0), y: get(w!("/imgdesc/Top")).unwrap_or(0), w, h };

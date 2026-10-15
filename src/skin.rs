@@ -67,14 +67,19 @@ use std::time::{Duration, Instant};
 
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WPARAM};
+use windows::Win32::Globalization::{MultiByteToWideChar, CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS};
 use windows::Win32::Storage::FileSystem::{
     FindCloseChangeNotification, FindFirstChangeNotificationW, FindNextChangeNotification, FILE_NOTIFY_CHANGE_FILE_NAME,
     FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
 };
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects, INFINITE};
-use windows::Win32::UI::Shell::{SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FO_DELETE, SHFILEOPSTRUCTW};
+use windows::Win32::UI::Shell::{
+    SHFileOperationW, SHQueryRecycleBinW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING, FO_DELETE,
+    SHFILEOPSTRUCTW, SHQUERYRBINFO,
+};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
+use crate::fileops;
 use crate::log;
 use crate::settings;
 use crate::shell;
@@ -693,6 +698,12 @@ fn stops_of(colours: &[Color], at: &mut [Option<f32>]) -> Vec<Stop> {
 /// Reads a skin. Never fails: what can't be understood is noted and taken from the base skin.
 /// `fallback_name` is the name when the text has none (the file's name).
 pub fn parse(text: &str, fallback_name: &str) -> Parsed {
+    parse_in(text, fallback_name, None)
+}
+
+/// `parse` for a skin whose file is in `dir`: a wallpaper named by its file name is looked for
+/// there first (a skin in a folder of its own, with its pictures).
+fn parse_in(text: &str, fallback_name: &str, dir: Option<&Path>) -> Parsed {
     let mut notes = Vec::new();
     let lines = read_lines(text, &mut notes);
     let mut own: HashMap<String, (String, usize)> = HashMap::new();
@@ -989,7 +1000,7 @@ pub fn parse(text: &str, fallback_name: &str) -> Parsed {
         theme.see_through = x / 100.0;
     }
     let (mine, theirs) = value("wallpaper");
-    theme.wallpaper = wallpaper_path(mine.map(|(v, _)| v).or(theirs).unwrap_or_default().trim().trim_matches(['"', '\'']));
+    theme.wallpaper = wallpaper_path(mine.map(|(v, _)| v).or(theirs).unwrap_or_default().trim().trim_matches(['"', '\'']), dir);
     if let Some(x) = number("wallpaper-opacity", 0.0, 100.0, None, &mut notes) {
         theme.wallpaper_opacity = x / 100.0;
     }
@@ -997,7 +1008,8 @@ pub fn parse(text: &str, fallback_name: &str) -> Parsed {
     theme.wallpaper_whole = mine.map(|(v, _)| v).or(theirs).is_some_and(|v| v.trim().eq_ignore_ascii_case("whole"));
     let (mine, theirs) = value("wallpaper-position");
     if let Some(v) = mine.map(|(v, _)| v).or(theirs) {
-        // "right", "left bottom", "middle top"...: across first, then up and down.
+        // "right", "left bottom", "middle top"...: across, then up and down - or the other way
+        // round ("top right" is "right top").
         let words: Vec<String> = v.to_ascii_lowercase().split([' ', ',']).filter(|w| !w.is_empty()).map(str::to_string).collect();
         let at = |w: &str| match w {
             "left" | "top" => Some(0.0),
@@ -1005,11 +1017,16 @@ pub fn parse(text: &str, fallback_name: &str) -> Parsed {
             "right" | "bottom" => Some(1.0),
             _ => None,
         };
+        let up_down = |w: &str| w == "top" || w == "bottom";
         match words.as_slice() {
-            [one] if one == "top" || one == "bottom" => theme.wallpaper_at_y = at(one),
-            [across, rest @ ..] => {
+            [one] if up_down(one) => theme.wallpaper_at_y = at(one),
+            [first, rest @ ..] => {
+                let (across, down) = match rest.first() {
+                    Some(second) if up_down(first) || second == "left" || second == "right" => (second, Some(first)),
+                    second => (first, second),
+                };
                 theme.wallpaper_at = at(across).unwrap_or(1.0);
-                theme.wallpaper_at_y = rest.first().and_then(|w| at(w));
+                theme.wallpaper_at_y = down.and_then(|w| at(w));
             }
             [] => {}
         }
@@ -1118,10 +1135,9 @@ fn guess_dark(own: &HashMap<String, (String, usize)>) -> bool {
     own.get("background").and_then(|(v, _)| first(v)).is_none_or(|c| c.lightness() < 0.5)
 }
 
-/// A list of fonts tidied: "\"A\", 'B',C" is "A, B, C" (at most MAX_FONTS, each name at most
-/// MAX_FONT_NAME characters: every one is looked up when the skin is applied).
-/// A wallpaper's full path: a bare file name is looked for in the skins folder.
-fn wallpaper_path(v: &str) -> String {
+/// A wallpaper's full path: a bare file name is looked for next to the skin (in `dir`, its file's
+/// folder), then in the skins folder.
+fn wallpaper_path(v: &str, dir: Option<&Path>) -> String {
     if v.is_empty() {
         return String::new();
     }
@@ -1129,8 +1145,12 @@ fn wallpaper_path(v: &str) -> String {
     if p.is_absolute() || v.starts_with('\\') {
         return v.to_string();
     }
-    // In the skins folder itself, or in one of its folders (a skin kept in a folder of its own,
-    // with its pictures).
+    // Next to the skin: another skin's folder may have a picture of the same name.
+    if let Some(next_to) = dir.map(|d| d.join(v)).filter(|p| p.exists()) {
+        return next_to.to_string_lossy().into_owned();
+    }
+    // Else in the skins folder itself, or in one of its folders (a skin kept in a folder of its
+    // own, with its pictures).
     let skins = folder();
     let here = skins.join(v);
     if here.exists() {
@@ -1140,6 +1160,8 @@ fn wallpaper_path(v: &str) -> String {
     inside.unwrap_or(here).to_string_lossy().into_owned()
 }
 
+/// A list of fonts tidied: "\"A\", 'B',C" is "A, B, C" (at most MAX_FONTS, each name at most
+/// MAX_FONT_NAME characters: every one is looked up when the skin is applied).
 fn font_list(v: &str) -> String {
     v.split(',')
         .map(|f| f.trim().trim_matches(['"', '\'']).trim())
@@ -1334,6 +1356,9 @@ static REFUSED: Mutex<Vec<(PathBuf, Option<PathBuf>)>> = Mutex::new(Vec::new());
 /// Every such file, lower case, for as long as Glint runs: a later save to one is refused too, until
 /// Glint itself makes or renames a file there.
 static NOT_OURS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// A skin file the worker was to delete is still there (the person said no at Windows' question,
+/// or Windows couldn't): the folder is listed again, so the skin is back in the list.
+static KEPT: AtomicBool = AtomicBool::new(false);
 
 impl Library {
     /// The built-in skins only (a person's own are added by `read_now` or a listing).
@@ -1431,7 +1456,7 @@ impl Library {
     pub fn theme(&self, id: &str, dark: bool) -> Theme {
         match self.find(id) {
             Some(e) if e.built_in() => built_in_theme(&e.id),
-            Some(e) => parse(&e.text, &e.name).theme,
+            Some(e) => parse_in(&e.text, &e.name, e.file.as_deref().and_then(Path::parent)).theme,
             None => built_in_theme(if dark { DEFAULT } else { DEFAULT_LIGHT }),
         }
     }
@@ -1444,7 +1469,8 @@ impl Library {
     // ------------------------------------------------------------ the person's own, changed
 
     /// A free name for a new skin, starting from `wanted` ("My skin", "My skin 2"...), whose file
-    /// name is free too.
+    /// name is free too. A long name is cut to make room for its number: a file name keeps only
+    /// MAX_STEM characters, so "... 2", "... 3" cut there would all be the same file.
     pub fn free_name(&self, wanted: &str) -> String {
         let wanted = wanted.trim();
         let wanted = if wanted.is_empty() { "My skin" } else { wanted };
@@ -1455,7 +1481,11 @@ impl Library {
         if !taken(wanted) {
             return wanted.to_string();
         }
-        (2..).map(|n| format!("{wanted} {n}")).find(|n| !taken(n)).unwrap_or_else(|| wanted.to_string())
+        let numbered = |n: usize| {
+            let room = MAX_STEM.saturating_sub(n.to_string().len() + 1);
+            format!("{} {n}", wanted.chars().take(room).collect::<String>().trim_end())
+        };
+        (2..).map(numbered).find(|n| !taken(n)).unwrap_or_else(|| wanted.to_string())
     }
 
     /// Adds a skin of the person's with this text (called `name`, a free one) and saves it.
@@ -1524,7 +1554,8 @@ impl Library {
         if !self.free_for(at, new_name) {
             return None; // the customiser picks free names, and says so
         }
-        let new_file = folder().join(format!("{}.{EXTENSION}", file_stem(new_name)));
+        // (In the folder it's in: a skin in a folder of its own stays next to its pictures.)
+        let new_file = old_file.with_file_name(format!("{}.{EXTENSION}", file_stem(new_name)));
         let text = with_value(&self.entries[at].text, "name", new_name);
         self.dirty.remove(id);
         let e = &mut self.entries[at];
@@ -1551,15 +1582,24 @@ impl Library {
         !other && (same_stem || !self.stems.contains(&stem.to_lowercase()))
     }
 
-    /// Deletes one of the person's skins: its file goes to the Recycle Bin.
-    pub fn delete(&mut self, id: &str) {
-        let Some(at) = self.entries.iter().position(|e| e.id == id && !e.built_in()) else { return };
+    /// Whether deleting skin `id` puts its file in the Recycle Bin. A USB stick or a network drive
+    /// has none: there the file is deleted for good.
+    pub fn recycles(&self, id: &str) -> bool {
+        self.find(id).and_then(|e| e.file.as_ref()).is_some_and(|f| fileops::has_recycle_bin(&f.to_string_lossy()))
+    }
+
+    /// Deletes one of the person's skins: its file goes to the Recycle Bin. Returns whether it does
+    /// (`recycles`): false where there's none, the file being deleted for good.
+    pub fn delete(&mut self, id: &str) -> bool {
+        let recycled = self.recycles(id);
+        let Some(at) = self.entries.iter().position(|e| e.id == id && !e.built_in()) else { return false };
         let e = self.entries.remove(at);
         self.dirty.remove(id);
         self.generation += 1;
         if let Some(file) = e.file {
             self.queue(FileJob::Delete { file, name: e.name });
         }
+        recycled
     }
 
     /// Exports a skin's text to `to` (any file the person picked).
@@ -1668,6 +1708,9 @@ impl Library {
             }
             self.said = Some(r);
         }
+        if KEPT.swap(false, Ordering::SeqCst) {
+            self.list_again = true;
+        }
         if self.ops_done >= self.ops_queued {
             self.ops_done = self.ops_queued;
             // The folder may have been made just now.
@@ -1691,7 +1734,7 @@ impl Library {
         while let Some(at) = self.entries.iter().position(|e| !e.built_in() && same(e)) {
             let (old_id, old_name) = (self.entries[at].id.clone(), self.entries[at].name.clone());
             let name = self.free_name(&old_name);
-            let (new_id, new_file) = (id_for(&name), folder().join(format!("{}.{EXTENSION}", file_stem(&name))));
+            let (new_id, new_file) = (id_for(&name), file.with_file_name(format!("{}.{EXTENSION}", file_stem(&name))));
             let text = with_value(&self.entries[at].text, "name", &name);
             let e = &mut self.entries[at];
             (e.id, e.name, e.text, e.file) = (new_id.clone(), name.clone(), text.clone(), Some(new_file.clone()));
@@ -1715,12 +1758,15 @@ pub fn id_for(name: &str) -> String {
     format!("{FILE_PREFIX}{}", file_stem(name))
 }
 
+/// The longest a skin's file name gets (without .glint), in characters.
+const MAX_STEM: usize = 60;
+
 /// A file name (without .glint) for a skin's name: the characters Windows doesn't allow in names
 /// left out, not empty, not one of Windows' device names.
 pub fn file_stem(name: &str) -> String {
     let cleaned: String = name.chars().map(|c| if c.is_control() || "<>:\"/\\|?*".contains(c) { ' ' } else { c }).collect();
     let mut stem: String = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    stem = stem.trim_matches(['.', ' ']).chars().take(60).collect::<String>().trim_end_matches(['.', ' ']).to_string();
+    stem = stem.trim_matches(['.', ' ']).chars().take(MAX_STEM).collect::<String>().trim_end_matches(['.', ' ']).to_string();
     if stem.is_empty() {
         stem = "My skin".into();
     }
@@ -1733,11 +1779,27 @@ pub fn file_stem(name: &str) -> String {
     stem
 }
 
-/// Text from a file's bytes: UTF-8 (with or without its mark) or UTF-16 (Notepad's "Unicode").
+/// Text from a file's bytes: UTF-8 (with or without its mark), UTF-16 (Notepad's "Unicode", and
+/// "Unicode big endian"), or else the PC's own old code page (Notepad's "ANSI", what it saved before
+/// Windows 10: an é in it isn't UTF-8).
 pub fn decode(bytes: &[u8]) -> String {
+    let utf16 = |rest: &[u8], unit: fn([u8; 2]) -> u16| String::from_utf16_lossy(&rest.chunks_exact(2).map(|c| unit([c[0], c[1]])).collect::<Vec<u16>>());
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        let units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        return String::from_utf16_lossy(&units);
+        return utf16(rest, u16::from_le_bytes);
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return utf16(rest, u16::from_be_bytes);
+    }
+    if std::str::from_utf8(bytes).is_err() && !bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        // SAFETY: both buffers are slices the call only reads and writes within.
+        let len = unsafe { MultiByteToWideChar(CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0), bytes, None) };
+        let mut wide = vec![0u16; len.max(0) as usize];
+        // SAFETY: as above.
+        let len = unsafe { MultiByteToWideChar(CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0), bytes, Some(&mut wide)) };
+        if len > 0 {
+            wide.truncate(len as usize);
+            return String::from_utf16_lossy(&wide);
+        }
     }
     String::from_utf8_lossy(bytes).trim_start_matches('\u{feff}').to_string()
 }
@@ -1752,18 +1814,26 @@ struct Listing {
 
 /// The person's skins in `dir`: every *.glint file (not too many, not too big), by name - also
 /// those in its folders, one level down (a skin in a folder of its own, with its pictures).
+/// A skin's id is "file:" and its file's name; when another file has that name too (a dark.glint
+/// in two folders), the later one adds its folder's name ("file:Pack\dark"), so each stays a skin
+/// of its own. `dir`'s own files come first, then each folder's by name: the same one keeps the
+/// plain id every time.
 fn read_folder(dir: &Path) -> Listing {
     let mut found = Listing { own: Vec::new(), stems: HashSet::new() };
     let Ok(listing) = std::fs::read_dir(dir) else { return found };
-    let mut items: Vec<std::fs::DirEntry> = Vec::new();
+    // Each with the name of the folder it's in (None: `dir` itself).
+    let mut items: Vec<(Option<String>, std::fs::DirEntry)> = Vec::new();
     for item in listing.flatten() {
         if item.file_type().is_ok_and(|t| t.is_dir()) {
-            items.extend(std::fs::read_dir(item.path()).into_iter().flatten().flatten());
+            let pack = item.file_name().to_string_lossy().into_owned();
+            items.extend(std::fs::read_dir(item.path()).into_iter().flatten().flatten().map(|i| (Some(pack.clone()), i)));
         } else {
-            items.push(item);
+            items.push((None, item));
         }
     }
-    for item in items {
+    items.sort_by_cached_key(|(pack, item)| (pack.as_ref().map(|p| p.to_lowercase()), item.file_name().to_string_lossy().to_lowercase()));
+    let mut ids = HashSet::new();
+    for (pack, item) in items {
         let path = item.path();
         if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case(EXTENSION)) {
             continue;
@@ -1774,7 +1844,14 @@ fn read_folder(dir: &Path) -> Listing {
             continue;
         }
         let Ok(bytes) = std::fs::read(&path) else { continue };
-        found.own.push(Entry::new(format!("{FILE_PREFIX}{stem}"), decode(&bytes), Some(path), &stem));
+        let mut id = format!("{FILE_PREFIX}{stem}");
+        if !ids.insert(id.to_lowercase()) {
+            if let Some(pack) = &pack {
+                id = format!("{FILE_PREFIX}{pack}\\{stem}");
+                ids.insert(id.to_lowercase());
+            }
+        }
+        found.own.push(Entry::new(id, decode(&bytes), Some(path), &stem));
     }
     found.own.sort_by_key(|e| e.name.to_lowercase());
     found
@@ -1910,7 +1987,20 @@ fn run_job(job: FileJob) -> Result<String, String> {
             if !file.exists() {
                 return Ok(String::new());
             }
-            recycle(&file).map(|()| format!("{name} is in the Recycle Bin")).map_err(|e| format!("Couldn't delete the skin \u{201c}{name}\u{201d}: {e}"))
+            // (Where there's no Recycle Bin, Windows deletes it for good: Glint says so.)
+            let bin = fileops::has_recycle_bin(&file.to_string_lossy());
+            let before = if bin { bin_items(&file) } else { None };
+            let problem = match recycle(&file, bin) {
+                // Where the Recycle Bin is switched off for the drive, Windows asked and deleted it
+                // for good: the Recycle Bin holds no more than before.
+                Ok(true) if bin && before.is_some_and(|n| bin_items(&file).is_some_and(|now| now <= n)) => return Ok(format!("Deleted {name}")),
+                Ok(true) => return Ok(if bin { format!("{name} is in the Recycle Bin") } else { format!("Deleted {name}") }),
+                Ok(false) => format!("{name} wasn't deleted"),
+                Err(e) => format!("Couldn't delete the skin \u{201c}{name}\u{201d}: {e}"),
+            };
+            // (Still there: listed again, the skin is back in the list.)
+            KEPT.store(true, Ordering::SeqCst);
+            Err(problem)
         }
     }
 }
@@ -1960,24 +2050,37 @@ fn write_atomic(file: &Path, text: &str) -> std::io::Result<()> {
     }
 }
 
-/// Sends a file to the Recycle Bin (Windows' own way, without asking: Glint asked already).
-fn recycle(file: &Path) -> Result<(), String> {
+/// Sends a file to the Recycle Bin (Windows' own way, without asking: Glint asked already). On a
+/// drive without one (a USB stick, a network drive) Windows deletes it for good. `bin`: Glint said
+/// it goes to the Recycle Bin, so where it can't after all (the Recycle Bin is switched off for that
+/// drive) Windows asks before it deletes it for good. Ok(false): the person said no there.
+fn recycle(file: &Path, bin: bool) -> Result<bool, String> {
     let mut from: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(file.as_os_str()).collect();
     from.extend([0, 0]);
+    let flags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
     let mut op = SHFILEOPSTRUCTW {
         hwnd: HWND::default(),
         wFunc: FO_DELETE,
         pFrom: PCWSTR(from.as_ptr()),
-        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI).0 as u16,
+        fFlags: (if bin { flags | FOF_WANTNUKEWARNING } else { flags }).0 as u16,
         ..Default::default()
     };
     // SAFETY: the struct and the double-NUL-terminated list live across the call.
     let code = unsafe { SHFileOperationW(&mut op) };
-    if code == 0 && !op.fAnyOperationsAborted.as_bool() {
-        Ok(())
-    } else {
-        Err(format!("Windows said {code:#x}"))
+    match code {
+        // Stopped at Windows' question (ERROR_CANCELLED, DE_OPCANCELLED).
+        _ if op.fAnyOperationsAborted.as_bool() || matches!(code, 1223 | 0x75) => Ok(false),
+        0 => Ok(true),
+        _ => Err(format!("Windows said {code:#x}")),
     }
+}
+
+/// How many things the Recycle Bin of `file`'s drive holds (None when Windows doesn't say).
+fn bin_items(file: &Path) -> Option<i64> {
+    let root: Vec<u16> = file.to_string_lossy().chars().take(3).collect::<String>().encode_utf16().chain([0]).collect();
+    let mut info = SHQUERYRBINFO { cbSize: std::mem::size_of::<SHQUERYRBINFO>() as u32, ..Default::default() };
+    // SAFETY: a NUL-terminated root path and a struct with its size set, both alive for the call.
+    unsafe { SHQueryRecycleBinW(PCWSTR(root.as_ptr()), &mut info) }.ok().map(|_| info.i64NumItems)
 }
 
 // ---------------------------------------------------------------- watching the folder
@@ -2044,8 +2147,9 @@ const LONGEST_BURST: Duration = Duration::from_secs(1);
 
 fn watch_thread(dir: &Path, hwnd: isize, stop: &Signal) {
     let path = HSTRING::from(dir.as_os_str());
+    // The subfolders too: a skin can sit in a folder of its own.
     // SAFETY: `path` lives across the call; the handle is closed below.
-    let Ok(change) = (unsafe { FindFirstChangeNotificationW(&path, false, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE) })
+    let Ok(change) = (unsafe { FindFirstChangeNotificationW(&path, true, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE) })
     else {
         return;
     };
@@ -2300,6 +2404,22 @@ mod tests {
         assert_eq!(base_name("Moss"), "Moss");
         assert_eq!(decode(b"\xef\xbb\xbfname: x"), "name: x");
         assert_eq!(decode(&[0xFF, 0xFE, b'a', 0, b':', 0]), "a:");
+        assert_eq!(decode(&[0xFE, 0xFF, 0, b'a', 0, b':']), "a:");
+    }
+
+    #[test]
+    fn a_long_name_still_finds_a_free_one() {
+        // A file name keeps 60 characters: each copy's number has to fit in them (or "... 2",
+        // "... 3" are all the same file, none is ever free, and Glint hangs looking).
+        let mut lib = Library::new();
+        let long = "A skin whose name is far too long to fit in a file name of its own";
+        let mut ids = HashSet::new();
+        for n in 1..=12 {
+            let name = lib.free_name(long);
+            assert!(n == 1 || name.ends_with(&format!(" {n}")), "{name}");
+            assert!(ids.insert(id_for(&name).to_lowercase()), "{name} is taken");
+            lib.add_for_tests(&id_for(&name), &format!("name: {name}\n"));
+        }
     }
 
     #[test]
@@ -2315,10 +2435,19 @@ mod tests {
         std::fs::create_dir_all(dir.join("Pink")).unwrap();
         std::fs::write(dir.join("Pink").join("Pink.glint"), "wallpaper: pink.png").unwrap();
         std::fs::write(dir.join("Pink").join("pink.png"), "not really a picture").unwrap();
+        // Another of the same file name in a folder of its own, with its own picture of that name.
+        std::fs::create_dir_all(dir.join("Rose")).unwrap();
+        std::fs::write(dir.join("Rose").join("Pink.glint"), "name: Rose\nwallpaper: pink.png").unwrap();
+        std::fs::write(dir.join("Rose").join("pink.png"), "not really a picture").unwrap();
         let listing = read_folder(&dir);
         let listed = &listing.own;
         let ids: Vec<&str> = listed.iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(ids, ["file:Mine", "file:Other", "file:Pink"]);
+        assert_eq!(ids, ["file:Mine", "file:Other", "file:Pink", "file:Rose\\Pink"]);
+        let mut lib = Library::new();
+        lib.take_own(listed.clone());
+        assert_eq!(lib.find("file:Rose\\Pink").map(|e| e.name.as_str()), Some("Rose"));
+        assert_eq!(lib.theme("file:Pink", true).wallpaper, dir.join("Pink").join("pink.png").to_string_lossy());
+        assert_eq!(lib.theme("file:Rose\\Pink", true).wallpaper, dir.join("Rose").join("pink.png").to_string_lossy());
         assert!(listed[0].text.contains("#654321"));
         assert_eq!(listed[1].name, "Other", "no name: the file's name");
         assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")));
@@ -2522,6 +2651,11 @@ mod tests {
         let t = parse("wallpaper-position: middle\n", "x").theme;
         assert_eq!((t.wallpaper_zoom, t.wallpaper_at, t.wallpaper_at_y), (1.0, 0.5, None));
         assert_eq!(parse("wallpaper-position: top\n", "x").theme.wallpaper_at_y, Some(0.0));
+        // Up and down first is fine too.
+        for (v, at) in [("top right", (1.0, Some(0.0))), ("right top", (1.0, Some(0.0))), ("bottom left", (0.0, Some(1.0))), ("middle right", (1.0, Some(0.5)))] {
+            let t = parse(&format!("wallpaper-position: {v}\n"), "x").theme;
+            assert_eq!((t.wallpaper_at, t.wallpaper_at_y), at, "{v}");
+        }
         assert_eq!(parse("wallpaper-zoom: -100\n", "x").theme.wallpaper_zoom, 0.5);
         assert_eq!(parse("wallpaper-zoom: 900\n", "x").theme.wallpaper_zoom, 6.0);
     }

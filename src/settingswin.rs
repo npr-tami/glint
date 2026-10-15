@@ -35,9 +35,9 @@ use serde_json::{Map, Value};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, GetMonitorInfoW, InvalidateRect, MonitorFromWindow, RedrawWindow, ScreenToClient, SetBkColor,
-    SetTextColor, ValidateRect, COLOR_WINDOW, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, RDW_ALLCHILDREN, RDW_INVALIDATE,
-    RDW_UPDATENOW,
+    CreateSolidBrush, DeleteObject, GetMonitorInfoW, InvalidateRect, MonitorFromRect, MonitorFromWindow, RedrawWindow, ScreenToClient,
+    SetBkColor, SetTextColor, ValidateRect, COLOR_WINDOW, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
+    RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW,
 };
 use windows::Win32::Storage::FileSystem::GetDriveTypeW;
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
@@ -66,13 +66,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::app::AppState;
 use crate::frame;
+use crate::winutil::{hi_word, lo_word, place_visible, visible_rect};
 use crate::kit::{self, size as ksize, Look, Scroller};
 use crate::log;
 // Settings > About > Updates (update.rs).
 use crate::{life, update};
 use crate::render::{FrameResult, Renderer, TextStyle};
 use crate::settings::{self, Settings, SettingsOpens, Terminal};
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use crate::shell;
 use crate::textbox::{self, TextBox, TextEvent, TextEventKind, WM_APP_TEXT};
 use crate::theme::{size, Color, Theme};
@@ -198,6 +198,8 @@ pub enum Ask {
 enum Bg {
     Terminals([bool; 6]),
     CacheSize(u64),
+    /// CLEAR is done: the bytes left (files in use).
+    Cleared(u64),
     Portable(Result<String, String>),
     /// The folder exists now (it was made if needed): open it in a tab.
     Open(String),
@@ -465,8 +467,9 @@ pub fn create(owner: HWND, theme: &Theme, remembered: Option<[f32; 2]>, bounds: 
             (SettingsOpens::Docked, _) => beside(owner, px(DOCK_W)),
             (SettingsOpens::Small, _) => centred_on(owner, px(SMALL_W), px(SMALL_H)),
             (SettingsOpens::Tab, _) => over_files(owner, scale),
-            (SettingsOpens::Free, Some([x, y, w, h])) => (x, y, w, h),
-            (SettingsOpens::Free, None) => {
+            (SettingsOpens::Free, Some([x, y, w, h])) if on_a_screen([x, y, w, h]) => (x, y, w, h),
+            // None yet, or its screen is gone since (a second monitor unplugged): over the main window.
+            (SettingsOpens::Free, _) => {
                 let [w, h] = remembered.unwrap_or([DEFAULT_W, DEFAULT_H]);
                 centred_on(owner, px(w.max(MIN_W)), px(h.max(MIN_H)))
             }
@@ -713,17 +716,11 @@ fn centred_on(owner: HWND, w: i32, h: i32) -> (i32, i32, i32, i32) {
     (x, y, w, h)
 }
 
-/// The part of `hwnd` you can see (screen pixels): Windows 10 / 11 add invisible borders round a
-/// window's rectangle.
-fn visible_rect(hwnd: HWND) -> RECT {
-    let mut r = RECT::default();
-    // SAFETY: plain queries on our own windows with valid out-structs.
-    unsafe {
-        if DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &mut r as *mut _ as *mut _, std::mem::size_of::<RECT>() as u32).is_err() || r.right <= r.left {
-            let _ = GetWindowRect(hwnd, &mut r);
-        }
-    }
-    r
+/// Whether a window at `x, y, w, h` (screen pixels) would be (at least partly) on a screen there is.
+fn on_a_screen([x, y, w, h]: [i32; 4]) -> bool {
+    let r = RECT { left: x, top: y, right: x + w, bottom: y + h };
+    // SAFETY: a plain monitor query with a valid in-struct.
+    !unsafe { MonitorFromRect(&r, MONITOR_DEFAULTTONULL) }.is_invalid()
 }
 
 /// The screen's work area round `owner` (or `fallback`).
@@ -762,19 +759,6 @@ fn over_files(owner: HWND, scale: f32) -> (i32, i32, i32, i32) {
     let main = visible_rect(owner);
     let top = main.top + ((size::TITLE_H + size::TOOLBAR_H) * scale) as i32;
     (main.left, top, main.right - main.left, (main.bottom - top).max(100))
-}
-
-/// Places `hwnd` so the part of it you can see is `x, y, w, h`, its invisible borders outside it.
-fn place_visible(hwnd: HWND, (x, y, w, h): (i32, i32, i32, i32)) {
-    let mut whole = RECT::default();
-    // SAFETY: a plain query and a move of our own window.
-    unsafe {
-        let _ = GetWindowRect(hwnd, &mut whole);
-        let seen = visible_rect(hwnd);
-        let (l, t) = (seen.left - whole.left, seen.top - whole.top);
-        let (r, b) = (whole.right - seen.right, whole.bottom - seen.bottom);
-        let _ = SetWindowPos(hwnd, None, x - l, y - t, w + l + r, h + t + b, SWP_NOZORDER | SWP_NOACTIVATE);
-    }
 }
 
 /// Back in its place by the main window (it moved or changed size, or Settings did); `fresh`:
@@ -843,18 +827,26 @@ fn edit_colors(hdc: HDC) -> LRESULT {
     LRESULT(brush)
 }
 
-fn lo_word(v: usize) -> u32 {
-    (v & 0xffff) as u32
-}
-
-fn hi_word(v: usize) -> u32 {
-    ((v >> 16) & 0xffff) as u32
-}
-
 impl SettingsWindow {
     /// Back in its place by the main window (it moved or changed size, or Settings did).
     pub fn follow_owner(&mut self) {
         follow(self.hwnd, false);
+        // Moved onto a screen of another scale: that WM_DPICHANGED came while busy too. The new
+        // scale is taken here, at the size WM_DPICHANGED would give (the same to the eye), and
+        // Settings goes back in its place at that size.
+        // SAFETY: plain queries and a move of our own window; a valid out-struct.
+        unsafe {
+            let dpi = GetDpiForWindow(self.hwnd).max(96);
+            let mut r = RECT::default();
+            if dpi != self.dpi && GetWindowRect(self.hwnd, &mut r).is_ok() {
+                let grow = |v: i32| (v as i64 * dpi as i64 / self.dpi as i64) as i32;
+                let _ = SetWindowPos(self.hwnd, None, 0, 0, grow(r.right - r.left), grow(r.bottom - r.top), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                self.dpi = dpi;
+                self.renderer.set_dpi(dpi);
+                self.box_at = None;
+                follow(self.hwnd, false);
+            }
+        }
         // The move's WM_SIZE comes while the app's state is busy and never reaches us: match the
         // drawing to the new size here, or the old picture shows stretched.
         let mut rc = RECT::default();
@@ -1609,7 +1601,8 @@ impl SettingsWindow {
                 self.go_to_page(page, true);
             }
             _ if self.focus == Spot::Nav && (is(VK_RIGHT) || is(VK_RETURN)) => self.move_focus(1, false),
-            _ if is(VK_UP) || is(VK_DOWN) => self.move_focus(if is(VK_UP) { -1 } else { 1 }, false),
+            // (Not Alt+Down: that opens a drop-down, below.)
+            _ if !alt && (is(VK_UP) || is(VK_DOWN)) => self.move_focus(if is(VK_UP) { -1 } else { 1 }, false),
             _ if is(VK_LEFT) && self.focus != Spot::Nav => self.set_focus(Spot::Nav),
             _ if is(VK_SPACE) || is(VK_RETURN) || is(VK_F4) || (alt && is(VK_DOWN)) => {
                 self.cues = true;
@@ -1742,6 +1735,9 @@ impl SettingsWindow {
                     post(to, Bg::Open(dir.display().to_string()));
                 });
             }
+            Act::ReportBug => shell::open_link(&format!("https://github.com/{}/issues", settings::UPDATE_REPO)),
+            // (Greyed until there's a Discord: the row isn't in LIVE.)
+            Act::Discord => {}
             Act::ClearCache => {
                 // Deleting files asks twice: the cache folder is next to glint.exe when portable,
                 // where a folder called "cache" might not be only Glint's.
@@ -1756,7 +1752,7 @@ impl SettingsWindow {
                     self.clearing = true;
                     self.cache_said = Some("Clearing…".into());
                     self.cache_size = None;
-                    let started = shell::background("settings: clear cache", move || post(to, Bg::CacheSize(settings::clear_cache())));
+                    let started = shell::background("settings: clear cache", move || post(to, Bg::Cleared(settings::clear_cache())));
                     if !started {
                         self.clearing = false;
                         self.cache_said = Some("Windows couldn't do that right now. Try again.".into());
@@ -1816,15 +1812,20 @@ impl SettingsWindow {
         for bg in results {
             match bg {
                 Bg::Terminals(found) => self.terminals = Some(found),
+                // (A size measured before CLEAR was pressed is out of date while clearing.)
                 Bg::CacheSize(bytes) => {
-                    self.cache_size = Some(bytes);
-                    if std::mem::take(&mut self.clearing) {
-                        self.cache_said = Some(if bytes == 0 {
-                            "Cleared.".to_string()
-                        } else {
-                            format!("Cleared. {} is in use and was left.", crate::folder::format_size(bytes))
-                        });
+                    if !self.clearing {
+                        self.cache_size = Some(bytes);
                     }
+                }
+                Bg::Cleared(bytes) => {
+                    self.clearing = false;
+                    self.cache_size = Some(bytes);
+                    self.cache_said = Some(if bytes == 0 {
+                        "Cleared.".to_string()
+                    } else {
+                        format!("Cleared. {} is in use and was left.", crate::folder::format_size(bytes))
+                    });
                 }
                 Bg::Portable(result) => {
                     self.portable_busy = false;
@@ -1872,7 +1873,7 @@ impl SettingsWindow {
                 Vec::new()
             }
             // (The down arrow just moves the caret here; Windows' suggestions use it too.)
-            TextEventKind::Down => Vec::new(),
+            TextEventKind::Down | TextEventKind::Tab => Vec::new(),
         }
     }
 
@@ -2161,7 +2162,7 @@ mod tests {
         assert_eq!(s.confirm_delete, settings::ConfirmDelete::Never);
         // Everything else stays as it was, the remembered state too.
         let mut before = Settings { bounds: Some([1, 2, 3, 4]), column_width_map: [("size".to_string(), 99.5)].into(), sort_column: 2, ..Default::default() };
-        before.tabs = vec![settings::SavedTab { path: "C:\\x".into(), sort_column: 1, sort_descending: true, view: None }];
+        before.tabs = vec![settings::SavedTab { path: "C:\\x".into(), sort_column: 1, sort_descending: true, view: None, pinned: false }];
         let mut after = before.clone();
         assert!(set_in(&mut after, "Terminal", Value::String("cmd".into())));
         after.terminal = before.terminal;

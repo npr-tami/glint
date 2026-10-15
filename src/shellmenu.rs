@@ -1038,11 +1038,13 @@ fn place_in_windows_menu(hmenu: HMENU, submenu: usize, lparam: isize) -> isize {
 
 /// Properties: the "properties" command of the items' own Windows menu, as Explorer does it (one
 /// window for one item, a combined one for several, a drive's for a drive). If that fails for
-/// several items, SHMultiFileProperties is tried directly. Windows shows these windows without
-/// waiting for them to close.
+/// several items, SHMultiFileProperties is tried directly. More items than a menu takes (see
+/// [`MAX_ITEMS`]) go straight to SHMultiFileProperties, which takes them all (the menu would cover
+/// only the first ones). Windows shows these windows without waiting for them to close.
 fn show_properties(owner: HWND, paths: &[String]) {
     let req = ShellRequest { target: ShellTarget::Items(paths.to_vec()), extended: false, full: false };
-    let done = match make_session(owner, &req) {
+    let session = if paths.len() <= MAX_ITEMS { make_session(owner, &req) } else { None };
+    let done = match session {
         Some(s) => match invoke_command(&s, owner, Verb::Name("properties"), Keys::default()) {
             Ok(()) => true,
             Err(e) => {
@@ -1062,7 +1064,7 @@ fn multi_properties(paths: &[String]) -> bool {
     let Some(parent_pidl) = parse(&parent) else { return false };
     let mut pidls = Vec::new();
     let mut children: Vec<*const ITEMIDLIST> = Vec::new();
-    for p in paths.iter().take(MAX_ITEMS) {
+    for p in paths {
         let Some(pidl) = parse(p) else { continue };
         let mut child: *mut ITEMIDLIST = std::ptr::null_mut();
         // SAFETY: as in `build`; the folder itself is not needed, only the child's place in `pidl`.

@@ -13,30 +13,34 @@
 //!
 //! Type names ("Text Document") are cached per extension too, behind a lock, because the folder
 //! loader thread asks for them.
+//!
+//! Zip and 7z files that open in Glint show the icon Settings > Appearance > Zip icon gave them
+//! (registry.rs). Glint draws that one straight from glint.exe ([`set_archive_icon`]), so a change
+//! shows at once instead of whenever Windows' own answer catches up.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmap, IWICImagingFactory, WICBitmapCacheOnLoad,
     WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom,
 };
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES};
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     SHGetFileInfoW, SHGetStockIconInfo, SHParseDisplayName, SHFILEINFOW, SHGFI_FLAGS, SHGFI_ICON, SHGFI_PIDL, SHGFI_SMALLICON,
     SHGFI_TYPENAME, SHGFI_USEFILEATTRIBUTES, SHGSI_ICON, SHGSI_SMALLICON, SHSTOCKICONINFO, SIID_DRIVECD, SIID_DRIVEFIXED,
     SIID_DRIVENET, SIID_DRIVERAM, SIID_DRIVEREMOVE,
 };
-use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
+use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetSystemMetrics, LoadImageW, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, SM_CXICON, SM_CXSMICON};
 
 use windows::core::w;
 use windows::Win32::System::Registry::{RegCloseKey, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_CLASSES_ROOT, KEY_READ, RRF_RT_ANY, RRF_RT_REG_SZ};
@@ -80,6 +84,8 @@ struct Inner {
     asked: HashSet<String>,
     /// The way to the background thread, made the first time a file needs its own icon.
     loader: Option<Loader>,
+    /// The zip and 7z icon changes taken in (see `ARCHIVE_CHANGES`).
+    archive_changes: u64,
 }
 
 /// The icon cache. Lives on the UI thread (inside AppState).
@@ -107,6 +113,7 @@ impl Icons {
                 by_key: HashMap::new(),
                 asked: HashSet::new(),
                 loader: None,
+                archive_changes: 0,
             }),
             hwnd: Arc::new(AtomicIsize::new(0)),
         }
@@ -115,10 +122,20 @@ impl Icons {
     /// The window to repaint when icons arrive from the background thread.
     pub fn set_window(&self, hwnd: HWND) {
         self.hwnd.store(hwnd.0 as isize, Ordering::SeqCst);
+        WINDOW.store(hwnd.0 as isize, Ordering::SeqCst);
     }
 
     /// Call at the start of each frame (the window does): takes in the icons that arrived.
     pub fn begin_frame(&self) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            let changes = ARCHIVE_CHANGES.load(Ordering::SeqCst);
+            if inner.archive_changes != changes {
+                // Zip and 7z files show another icon: Windows' ones from before are asked again.
+                inner.archive_changes = changes;
+                inner.by_key.retain(|key, _| !matches!(key.get(1..), Some("zip" | "7z")));
+            }
+        }
         let arrived: Vec<(String, LoadedIcon)> = {
             let inner = self.inner.borrow();
             let Some(loader) = &inner.loader else { return };
@@ -156,10 +173,27 @@ impl Icons {
                 self.generic_sized(&e.ext, &format!("x.{}", e.ext), FILE_ATTRIBUTE_NORMAL, large)
             }
             EntryKind::File => {
+                if let Some(id) = archive_icon(&e.ext).and_then(|id| self.own_sized(id, large)) {
+                    return id;
+                }
                 let probe = if e.ext.is_empty() { "x".to_string() } else { format!("x.{}", e.ext) };
                 self.generic_sized(&e.ext, &probe, FILE_ATTRIBUTE_NORMAL, large)
             }
         }
+    }
+
+    /// One of glint.exe's own icons (its number in res/glint.rc) at the list's small size, or the
+    /// big one when `large`. None if it can't be had.
+    fn own_sized(&self, id: u32, large: bool) -> Option<IconId> {
+        let key = format!("{}glint:{id}", if large { LARGE_MARK } else { '\u{1}' });
+        let known = self.inner.borrow().by_key.get(&key).copied();
+        let id = known.unwrap_or_else(|| {
+            // (The sizes Windows' own small and big icons have.)
+            // SAFETY: plain metric lookups.
+            let px = unsafe { GetSystemMetrics(if large { SM_CXICON } else { SM_CXSMICON }) };
+            self.store(key, own_icon(id, px))
+        });
+        self.inner.borrow().bitmaps.get(id.index()).is_some_and(Option::is_some).then_some(id)
     }
 
     /// A drive's icon without ever asking the drive: its own icon if a background lookup already
@@ -224,7 +258,8 @@ impl Icons {
         if let Some(&id) = self.inner.borrow().by_key.get(path) {
             return id;
         }
-        let icon = shell_icon(path, FILE_ATTRIBUTE_NORMAL, false, false);
+        // ("::{…}" places go by their id list: Windows 11 gives no icon for the name itself.)
+        let icon = load_path_icon(path).map(LoadedIcon::into_raw);
         self.store(path.to_string(), icon)
     }
 
@@ -270,6 +305,56 @@ impl Icons {
     pub fn bitmap(&self, id: IconId) -> Option<IWICBitmap> {
         self.inner.borrow().bitmaps.get(id.index()).cloned().flatten()
     }
+}
+
+// ---------------------------------------------------------------- zip and 7z files that open in Glint
+
+/// The icon in glint.exe that zip and 7z files show (its number in res/glint.rc), while Glint
+/// decides it (registry.rs `sync_archive_icon`); 0 when Windows' own lookup does.
+static ZIP_ICON: AtomicU32 = AtomicU32::new(0);
+static SEVEN_Z_ICON: AtomicU32 = AtomicU32::new(0);
+/// Counts the changes to those: icons and pictures of zip and 7z files from before are forgotten.
+static ARCHIVE_CHANGES: AtomicU64 = AtomicU64::new(0);
+/// The main window, repainted when they change.
+static WINDOW: AtomicIsize = AtomicIsize::new(0);
+
+/// What zip and 7z files show from now on: `types` (".zip", ".7z") open in Glint and show its icon
+/// number `icon`; None, or a type that isn't there: whatever Windows says. From any thread.
+pub fn set_archive_icon(types: &[&str], icon: Option<u32>) {
+    let id = |ext| if types.contains(&ext) { icon.unwrap_or(0) } else { 0 };
+    let zip = ZIP_ICON.swap(id(".zip"), Ordering::SeqCst) != id(".zip");
+    let seven_z = SEVEN_Z_ICON.swap(id(".7z"), Ordering::SeqCst) != id(".7z");
+    if zip || seven_z {
+        ARCHIVE_CHANGES.fetch_add(1, Ordering::SeqCst);
+        crate::thumbs::repaint(&WINDOW);
+    }
+}
+
+/// The icon in glint.exe that files with this extension (lower case, no dot) show, when Glint
+/// decides it (see [`set_archive_icon`]).
+pub fn archive_icon(ext: &str) -> Option<u32> {
+    let id = match ext {
+        "zip" => ZIP_ICON.load(Ordering::SeqCst),
+        "7z" => SEVEN_Z_ICON.load(Ordering::SeqCst),
+        _ => 0,
+    };
+    (id != 0).then_some(id)
+}
+
+/// How many times that changed (thumbs.rs forgets its zip and 7z pictures when it does).
+pub fn archive_changes() -> u64 {
+    ARCHIVE_CHANGES.load(Ordering::SeqCst)
+}
+
+/// One of glint.exe's own icons (its number in res/glint.rc), `px` pixels square. The caller owns
+/// it. Any thread.
+pub fn own_icon(id: u32, px: i32) -> Option<HICON> {
+    // SAFETY: loads an icon resource of this exe by number (MAKEINTRESOURCE); not shared, so ours.
+    let loaded = unsafe {
+        let instance = GetModuleHandleW(None).ok()?;
+        LoadImageW(Some(instance.into()), PCWSTR(std::ptr::without_provenance(id as usize)), IMAGE_ICON, px, px, LR_DEFAULTCOLOR)
+    };
+    loaded.ok().map(|h| HICON(h.0)).filter(|i| !i.is_invalid())
 }
 
 /// What the UI thread and the icon thread share: the files waiting, newest at the front, and
@@ -353,21 +438,10 @@ impl Loader {
                 // Repaint when the last one is in, and now and then while many are coming.
                 if !more_waiting || last_repaint.is_none_or(|t| t.elapsed() >= REPAINT_EVERY) {
                     last_repaint = Some(Instant::now());
-                    repaint(&hwnd);
+                    crate::thumbs::repaint(&hwnd);
                 }
             }
         })
-    }
-}
-
-/// Asks the window to paint again (safe from any thread; nothing happens if the window is gone).
-fn repaint(hwnd: &AtomicIsize) {
-    let h = hwnd.load(Ordering::SeqCst);
-    if h != 0 {
-        // SAFETY: invalidating a window from another thread is allowed; a stale handle just fails.
-        unsafe {
-            let _ = InvalidateRect(Some(HWND(h as *mut _)), None, false);
-        }
     }
 }
 
@@ -538,4 +612,27 @@ pub fn type_name(ext: &str, is_dir: bool) -> Arc<str> {
         c.insert(key, name.clone());
     }
     name
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zip_and_7z_files_follow_the_icon_glint_gave_them() {
+        let before = archive_changes();
+        set_archive_icon(&[".7z"], Some(3));
+        assert_eq!((archive_icon("7z"), archive_icon("zip"), archive_icon("txt")), (Some(3), None, None));
+        assert_eq!(archive_changes(), before + 1);
+        // The same again is no change (nothing to forget).
+        set_archive_icon(&[".7z"], Some(3));
+        assert_eq!(archive_changes(), before + 1);
+        set_archive_icon(&[".zip", ".7z"], Some(4));
+        assert_eq!((archive_icon("7z"), archive_icon("zip")), (Some(4), Some(4)));
+        // Windows decides again: a DefaultIcon that isn't Glint's, or nothing opens in Glint.
+        set_archive_icon(&[".zip"], None);
+        assert_eq!((archive_icon("7z"), archive_icon("zip")), (None, None));
+        set_archive_icon(&[], Some(2));
+        assert_eq!(archive_changes(), before + 3);
+    }
 }

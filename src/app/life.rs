@@ -16,13 +16,14 @@ impl AppState {
     pub fn go_to_background(&mut self) {
         self.hidden = true;
         self.watcher.stop();
+        self.split_watch.stop(); // the other half's of split view (app/split.rs)
         self.bin_watch = None; // the Recycle Bin's watch too (app/bin.rs)
         self.skins.pause(); // and the skins folder's (app/skins.rs)
         self.branch_watch.clear(); // and those of folders open in the tree view (app/tree.rs)
         self.searches_stopped.clear();
         for i in 0..self.tabs.len() {
-            if self.tabs[i].search.as_ref().is_some_and(|s| !s.done) {
-                self.searches_stopped.push(self.tabs[i].id);
+            if let Some(s) = self.tabs[i].search.as_ref().filter(|s| !s.done) {
+                self.searches_stopped.push((self.tabs[i].id, s.is_dupes()));
                 self.end_search(i, false);
             }
         }
@@ -42,8 +43,18 @@ impl AppState {
         self.hidden = false;
         if self.settings.startup != Startup::Restore && (seen || open.is_some()) {
             let (fresh, active) = settings::initial_tabs(&self.settings, open.map(|t| t.folder.as_str()), &self.settings.home_place());
-            let old = std::mem::take(&mut self.tabs);
-            for saved in &fresh {
+            let mut old = std::mem::take(&mut self.tabs);
+            // Pinned tabs stay as they are, first in the row.
+            let mut i = 0;
+            while i < old.len() {
+                if old[i].pinned {
+                    self.tabs.push(old.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            let pinned = self.tabs.len();
+            for saved in fresh.iter().filter(|t| !t.pinned) {
                 let mut tab = self.make_tab(saved.path.clone());
                 tab.sort = settings::sort_key(saved.sort_column);
                 tab.descending = saved.sort_descending;
@@ -56,11 +67,26 @@ impl AppState {
             }
             // From the right, so the first Ctrl+Shift+T brings back the leftmost.
             for (index, t) in old.into_iter().enumerate().rev().filter(|_| seen) {
-                self.closed.push(ClosedTab { index, path: t.path, back: t.back, forward: t.forward, sort: t.sort, descending: t.descending, view: t.own_view });
+                self.closed.push(ClosedTab { index, path: t.path, back: t.back, forward: t.forward, sort: t.sort, descending: t.descending, view: t.own_view, pinned: false });
             }
             let extra = self.closed.len().saturating_sub(CLOSED_TABS_KEPT);
             self.closed.drain(..extra);
-            self.active = active.min(self.tabs.len() - 1);
+            // (`active` is a place in `fresh`, whose saved pinned tabs made way for the ones open now.)
+            let saved_pinned = fresh.iter().filter(|t| t.pinned).count();
+            self.active = match active.checked_sub(saved_pinned) {
+                Some(k) => pinned + k,
+                // The folder from outside is a pinned tab's: the pinned tab showing it comes forward
+                // (or, when none does any more, it opens in a tab of its own).
+                None => match self.tabs[..pinned].iter().position(|t| crate::fileops::same_path(&t.path, &fresh[active].path)) {
+                    Some(i) => i,
+                    None => {
+                        let tab = self.make_tab(fresh[active].path.clone());
+                        self.tabs.push(tab);
+                        self.tabs.len() - 1
+                    }
+                },
+            }
+            .min(self.tabs.len() - 1);
             if let Some(name) = open.and_then(|t| t.select.clone()) {
                 self.tabs[self.active].select_after_load = Some(name);
             }
@@ -74,8 +100,12 @@ impl AppState {
         // The skins folder too: watched again and listed (a skin may have been edited meanwhile).
         self.skins.resume();
         // Searches stopped on the way into the background run again (in tabs that are still there).
-        for id in std::mem::take(&mut self.searches_stopped) {
-            if let Some(i) = self.tabs.iter().position(|t| t.id == id).filter(|&i| self.search_wanted(i) && !self.tabs[i].is_searching()) {
+        // (A duplicate search too: it isn't "wanted" by the filter, which it cleared.)
+        for (id, dupes) in std::mem::take(&mut self.searches_stopped) {
+            let Some(i) = self.tabs.iter().position(|t| t.id == id).filter(|&i| !self.tabs[i].is_searching()) else { continue };
+            if dupes {
+                self.start_search_for(i, false, true);
+            } else if self.search_wanted(i) {
                 self.start_search(i, false);
             }
         }
@@ -129,7 +159,7 @@ mod tests {
         t.search = Some(search::test_search("C:\\x"));
         a.go_to_background();
         assert!(!a.tab().is_searching(), "it could walk a whole drive while nobody looks");
-        assert_eq!(a.searches_stopped, vec![a.tab().id], "to search again when the window is back");
+        assert_eq!(a.searches_stopped, vec![(a.tab().id, false)], "to search again when the window is back");
         // A search that has finished does no more work: its results stay.
         let mut b = AppState::for_tests(Settings::default());
         let mut done = search::test_search("C:\\x");
@@ -137,5 +167,19 @@ mod tests {
         b.tab_mut().search = Some(done);
         b.go_to_background();
         assert!(b.tab().is_searching() && b.searches_stopped.is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_search_runs_again_when_the_window_is_back() {
+        let mut a = AppState::for_tests(Settings::default());
+        let t = a.tab_mut();
+        (t.path, t.folder.path) = ("C:\\x".into(), "C:\\x".into());
+        let mut dupes = search::test_search("C:\\x");
+        dupes.dupes = Some(Default::default());
+        t.search = Some(dupes);
+        a.go_to_background();
+        assert_eq!(a.searches_stopped, vec![(a.tab().id, true)]);
+        a.back_from_background(None, false);
+        assert!(a.tab().search.as_ref().is_some_and(|s| s.is_dupes()), "no filter is typed, yet it looks again");
     }
 }

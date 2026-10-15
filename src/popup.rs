@@ -1,7 +1,7 @@
 //! Showing the file list's right-click menus (menu.rs makes them): a native popup menu with Glint's
 //! items and submenus, Windows' items for the same files merged in where the menu has its
 //! `SHELL_SLOT` - or Windows' whole menu on its own. See shellmenu.rs for where Windows' items
-//! come from.
+//! come from. Tag ›'s colours get a little round picture of their colour beside their words.
 //!
 //! Windows' items are copied into Glint's menu as they are: their text, their pictures (an app's
 //! bitmap, or "the app draws it"), their submenus (Send to, Give access to, New...) and their
@@ -14,17 +14,20 @@ use std::cell::Cell;
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Graphics::Gdi::{CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HGDIOBJ};
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetMenuItemCount, GetMenuItemInfoW, InsertMenuItemW, RemoveMenu, SetMenuDefaultItem,
-    TrackPopupMenuEx, HMENU, MENUITEMINFOW, MENU_ITEM_STATE, MENU_ITEM_TYPE, MFS_DEFAULT, MF_BYPOSITION, MF_CHECKED, MF_GRAYED,
-    MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_BITMAP, MIIM_CHECKMARKS, MIIM_DATA, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING,
-    MIIM_SUBMENU, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WM_INITMENUPOPUP,
+    SetMenuItemInfoW, TrackPopupMenuEx, HMENU, MENUITEMINFOW, MENU_ITEM_STATE, MENU_ITEM_TYPE, MFS_DEFAULT, MFT_OWNERDRAW, MF_BYPOSITION,
+    MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_BITMAP, MIIM_CHECKMARKS, MIIM_DATA, MIIM_FTYPE, MIIM_ID, MIIM_STATE,
+    MIIM_STRING, MIIM_SUBMENU, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WM_INITMENUPOPUP,
 };
 
 use crate::folder::wide;
 use crate::menu;
 use crate::log;
 use crate::shellmenu::{self, Built, Forwarded, ShellItem, SHELL_FIRST, SHELL_LAST};
+use crate::theme::Color;
 use crate::ui::{Menu, MenuItem, SHELL_SLOT};
 
 /// MFT_BITMAP: an old-style item whose "text" is a bitmap handle (not copied).
@@ -72,6 +75,9 @@ pub fn show(owner: HWND, at: POINT, menu: &Menu, default_item: u32, built: Optio
             let _ = SetMenuDefaultItem(h, default_item, 0);
         }
         crate::oldmenu::dress(h, &shared);
+        // The colours' dots (Tag ›), on the items the dressing left for Windows to draw.
+        let mut dots = Vec::new();
+        add_dots(h, &menu.items, GetDpiForWindow(owner), &mut dots);
         SHOWING.with(|s| s.set(built.map_or(0, |b| b.session)));
         let picked = TrackPopupMenuEx(h, flags, at.x, at.y, owner, None);
         SHOWING.with(|s| s.set(0));
@@ -88,8 +94,110 @@ pub fn show(owner: HWND, at: POINT, menu: &Menu, default_item: u32, built: Optio
             }
         }
         let _ = DestroyMenu(h);
+        // (A menu doesn't delete its items' pictures.)
+        for picture in dots {
+            let _ = DeleteObject(HGDIOBJ(picture.0));
+        }
         to_pick(picked.0, &menu.items)
     }
+}
+
+/// Puts each item's dot (`MenuItem::dot`: Tag ›'s colours) beside its words, as a little picture -
+/// on the items Windows draws: a skin's own menus (oldmenu.rs) draw their items themselves, words
+/// only. The pictures go in `made`, to be deleted once the menu is gone.
+///
+/// # Safety
+/// `h` must be a live menu.
+unsafe fn add_dots(h: HMENU, items: &[MenuItem], dpi: u32, made: &mut Vec<HBITMAP>) {
+    for item in items {
+        // SAFETY: as for this function.
+        unsafe { add_dots(h, &item.submenu, dpi, made) };
+        let Some(color) = item.dot.filter(|_| item.submenu.is_empty() && item.id != 0) else { continue };
+        let size = std::mem::size_of::<MENUITEMINFOW>() as u32;
+        let mut now = MENUITEMINFOW { cbSize: size, fMask: MIIM_FTYPE, ..Default::default() };
+        // (By its id: Windows finds it in the submenus too.)
+        // SAFETY: a live menu; the call fills in `now`.
+        if unsafe { GetMenuItemInfoW(h, item.id, false, &mut now) }.is_err() || now.fType.0 & MFT_OWNERDRAW.0 != 0 {
+            continue;
+        }
+        let Some(picture) = dot_bitmap(color, dpi) else { continue };
+        let set = MENUITEMINFOW { cbSize: size, fMask: MIIM_BITMAP, hbmpItem: picture, ..Default::default() };
+        // SAFETY: as above. The picture lives until the caller deletes it, after the menu.
+        if unsafe { SetMenuItemInfoW(h, item.id, false, &set) }.is_ok() {
+            made.push(picture);
+        } else {
+            // SAFETY: a picture made above and handed to nothing.
+            let _ = unsafe { DeleteObject(HGDIOBJ(picture.0)) };
+        }
+    }
+}
+
+/// A dot of `color` as a menu item's picture at `dpi` (16 pixels square at 96 DPI): 32-bit, with
+/// see-through corners, as Windows' menus take them. None if Windows can't make it.
+fn dot_bitmap(color: Color, dpi: u32) -> Option<HBITMAP> {
+    let scale = dpi.max(96) as f32 / 96.0;
+    let side = (16.0 * scale).round() as usize;
+    let pixels = dot_pixels(color, side, scale);
+    let header = BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: side as i32,
+        biHeight: -(side as i32), // the top row first
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        ..Default::default()
+    };
+    let info = BITMAPINFO { bmiHeader: header, ..Default::default() };
+    let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: a new side x side 32-bit picture; `bits` points to its side * side pixels, filled here
+    // before anything else sees it.
+    unsafe {
+        let picture = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        if bits.is_null() {
+            let _ = DeleteObject(HGDIOBJ(picture.0));
+            return None;
+        }
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u32, pixels.len());
+        Some(picture)
+    }
+}
+
+/// The pixels of a `side` x `side` picture of a round dot in `color`, 10 DIPs across at `scale`
+/// (whole pixels, its edge smoothed), with a thin darker rim so a light colour holds up on a light
+/// menu. Top row first; each pixel see-through, red, green and blue from the top byte down, the
+/// colours already times the see-through, as Windows wants them.
+fn dot_pixels(color: Color, side: usize, scale: f32) -> Vec<u32> {
+    const SAMPLES: usize = 4;
+    let d = (10.0 * scale).round().min(side as f32);
+    // Its edges where pixels' edges are: an odd width centred on a pixel, an even one between two.
+    let c = ((side as f32 - d) / 2.0).floor() + d / 2.0;
+    let r = d / 2.0;
+    let inner = (r - scale.max(1.0)).max(0.0);
+    let rim = color.darker(0.3);
+    let n = (SAMPLES * SAMPLES) as f32;
+    let byte = |v: f32| ((v / n).clamp(0.0, 1.0) * 255.0).round() as u32;
+    let mut out = vec![0u32; side * side];
+    for y in 0..side {
+        for x in 0..side {
+            let (mut a, mut rgb) = (0.0, [0.0f32; 3]);
+            for sy in 0..SAMPLES {
+                for sx in 0..SAMPLES {
+                    let dx = x as f32 + (sx as f32 + 0.5) / SAMPLES as f32 - c;
+                    let dy = y as f32 + (sy as f32 + 0.5) / SAMPLES as f32 - c;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist <= r {
+                        let k = if dist > inner { rim } else { color };
+                        a += 1.0;
+                        rgb[0] += k.r;
+                        rgb[1] += k.g;
+                        rgb[2] += k.b;
+                    }
+                }
+            }
+            out[y * side + x] = (byte(a) << 24) | (byte(rgb[0]) << 16) | (byte(rgb[1]) << 8) | byte(rgb[2]);
+        }
+    }
+    out
 }
 
 /// What a picked id means. Windows' commands are SHELL_FIRST and up; anything else must be one of
@@ -274,5 +382,23 @@ mod tests {
         assert_eq!(to_pick(SHELL_SLOT as i32, &ours), Pick::None, "the slot itself is never an item");
         assert_eq!(to_pick(0, &ours), Pick::None);
         assert_eq!(to_pick(1, &[]), Pick::None, "Windows' whole menu has none of Glint's items");
+    }
+
+    #[test]
+    fn a_menu_dot_is_round_with_see_through_corners() {
+        let side = 16;
+        let px = dot_pixels(Color::hex(0xff0000), side, 1.0);
+        let at = |x: usize, y: usize| px[y * side + x];
+        let alpha = |p: u32| p >> 24;
+        assert_eq!(alpha(at(0, 0)), 0, "a corner");
+        assert_eq!(at(8, 8), 0xffff_0000, "the middle: solid red");
+        // No colour is more than its see-through allows (Windows draws it wrong otherwise).
+        assert!(px.iter().all(|&p| (p >> 16 & 0xff).max(p >> 8 & 0xff).max(p & 0xff) <= alpha(p)));
+        // Round: the same seen from each side.
+        assert!((0..side).all(|y| (0..side).all(|x| at(x, y) == at(side - 1 - x, y) && at(x, y) == at(x, side - 1 - y) && at(x, y) == at(y, x))));
+        // 10 pixels across at 100 %, 15 at 150 % (in a 24-pixel picture).
+        let across = |px: &[u32], side: usize, row: usize| (0..side).filter(|&x| px[row * side + x] >> 24 > 0).count();
+        assert_eq!(across(&px, side, 8), 10);
+        assert_eq!(across(&dot_pixels(Color::hex(0xff0000), 24, 1.5), 24, 11), 15);
     }
 }

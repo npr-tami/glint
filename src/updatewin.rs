@@ -21,11 +21,14 @@
 //!   again). While installing it stays open, says so, and shows what went wrong if it did (the
 //!   window quits and the new Glint starts when it went well).
 //!
-//! Keyboard: Tab / Shift+Tab go round the checkbox, "Turn off automatic updates" and the two
+//! Keyboard: with Glint in front, it pops up without taking the keyboard (the person may be typing
+//! a name there). Tab / Shift+Tab go round the checkbox, "Turn off automatic updates" and the two
 //! buttons; Enter presses UPDATE (or the button that has the keyboard), Space presses or ticks what
-//! has the keyboard; the arrows, PgUp / PgDn, Home / End scroll what's new; Esc closes (remind me
-//! again later).
+//! has the keyboard - neither in the first second after it pops up, when the person may still be
+//! typing in another window; the arrows, PgUp / PgDn, Home / End scroll what's new; Esc closes
+//! (remind me again later).
 
+use crate::winutil::{hi_word, lo_word};
 use std::cell::{Cell, RefCell};
 
 use windows::core::{w, PCWSTR};
@@ -42,9 +45,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowRect, IsWindow, KillTimer, LoadCursorW, LoadIconW,
-    PostMessageW, RegisterClassExW, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, HTCAPTION, HTCLIENT, IDC_ARROW,
-    MINMAXINFO, SIZE_MINIMIZED, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, WA_INACTIVE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetAncestor, GetClientRect, GetForegroundWindow, GetWindowRect, IsWindow, KillTimer,
+    LoadCursorW, LoadIconW, PostMessageW, RegisterClassExW, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, GA_ROOTOWNER,
+    HTCAPTION, HTCLIENT, IDC_ARROW, MINMAXINFO, SIZE_MINIMIZED, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SW_SHOW, SW_SHOWNOACTIVATE, WA_INACTIVE,
     WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO,
     WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCDESTROY,
     WM_NCHITTEST, WM_PAINT, WM_SIZE, WM_SYSCHAR, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_SYSMENU, WS_THICKFRAME,
@@ -78,6 +82,9 @@ const QUIET_PAD: f32 = 4.0;
 const QUIET_GAP: f32 = 16.0;
 const STATUS_LINE: f32 = 17.0;
 const WHEEL_STEP: f32 = 60.0;
+/// Enter and Space press nothing this long (seconds) after the window pops up: the person may still
+/// be typing in another window, and those keys were meant for it.
+const KEY_GRACE: f64 = 1.0;
 /// Shows the window (posted by `open`: see the module comment).
 const WM_APP_PROMPT_SHOW: u32 = WM_APP + 71;
 /// Closes it without an answer (posted by `close`).
@@ -115,14 +122,15 @@ enum Act {
     /// Tell the main window what the person said.
     Answer(isize),
     Destroy,
-    Show,
+    /// `quiet`: without taking the keyboard (see WM_APP_PROMPT_SHOW).
+    Show { quiet: bool },
     Place(RECT),
 }
 
 /// What kind of line of the changelog this is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
-    /// "## 0.3.1 (2026-10-12): ..." - a version.
+    /// "## 1.0.19-beta.1 · 15/10/2026" - a version, and when it came out.
     Version,
     /// "### Fixes".
     Heading,
@@ -139,12 +147,15 @@ struct Block {
     /// How deep a list item sits (0 = not nested).
     depth: usize,
     text: String,
+    /// What goes beside a version, in grey: its date.
+    aside: String,
 }
 
 /// A line of the changelog as laid out (page coordinates inside the box).
 struct Line {
     kind: Kind,
     text: String,
+    aside: String,
     x: f32,
     y: f32,
     /// A list item's first line: draw its bullet here.
@@ -173,8 +184,9 @@ fn plain(text: &str) -> String {
     out.replace("**", "").replace('`', "")
 }
 
-/// The changelog's Markdown as blocks: "## " versions, "### " headings, "- " list items (lines
-/// indented under one belong to it), and paragraphs.
+/// The changelog's Markdown as blocks: "## " versions ("## 1.0.19-beta.1 · 15/10/2026" becomes
+/// "Glint 1.0.19-beta.1" with the date beside it), "### " headings, "- " list items (lines indented
+/// under one belong to it), and paragraphs.
 fn blocks(md: &str) -> Vec<Block> {
     let mut out: Vec<Block> = Vec::new();
     // Whether the next indented or plain line goes on with the last block.
@@ -188,13 +200,17 @@ fn blocks(md: &str) -> Vec<Block> {
         }
         let indent = line.len() - text.len();
         if let Some(h) = text.strip_prefix("## ") {
-            out.push(Block { kind: Kind::Version, depth: 0, text: plain(h.trim()) });
+            let h = plain(h.trim());
+            let (version, aside) = h.split_once(char::is_whitespace).unwrap_or((&h, ""));
+            let aside = aside.trim().trim_start_matches(['·', ':']).trim().to_string();
+            let text = if version.starts_with(|c: char| c.is_ascii_digit()) { format!("Glint {version}") } else { version.to_string() };
+            out.push(Block { kind: Kind::Version, depth: 0, text, aside });
             open = false;
         } else if let Some(h) = text.strip_prefix("### ").or_else(|| text.strip_prefix("#### ")) {
-            out.push(Block { kind: Kind::Heading, depth: 0, text: plain(h.trim()) });
+            out.push(Block { kind: Kind::Heading, depth: 0, text: plain(h.trim()), aside: String::new() });
             open = false;
         } else if let Some(item) = text.strip_prefix("- ").or_else(|| text.strip_prefix("* ")) {
-            out.push(Block { kind: Kind::Bullet, depth: indent / 2, text: plain(item.trim()) });
+            out.push(Block { kind: Kind::Bullet, depth: indent / 2, text: plain(item.trim()), aside: String::new() });
             open = true;
         } else if open && out.last().is_some_and(|b| b.kind == Kind::Bullet || b.kind == Kind::Text) {
             if let Some(last) = out.last_mut() {
@@ -202,7 +218,7 @@ fn blocks(md: &str) -> Vec<Block> {
                 last.text.push_str(&plain(text));
             }
         } else if !text.starts_with("# ") {
-            out.push(Block { kind: Kind::Text, depth: 0, text: plain(text) });
+            out.push(Block { kind: Kind::Text, depth: 0, text: plain(text), aside: String::new() });
             open = true;
         }
     }
@@ -212,15 +228,18 @@ fn blocks(md: &str) -> Vec<Block> {
 /// The style of a kind of line.
 fn style_of(kind: Kind, theme: &Theme) -> TextStyle {
     match kind {
-        Kind::Version => TextStyle::new(theme.text_strong).size(13.5).semibold(),
+        Kind::Version => TextStyle::new(theme.text_strong).size(VERSION_FONT).semibold(),
         Kind::Heading => TextStyle::new(theme.text).size(12.5).semibold(),
         Kind::Bullet | Kind::Text => TextStyle::new(theme.text),
     }
 }
 
+/// The size of a version's line (its date beside it is the same size, in grey).
+const VERSION_FONT: f32 = 15.0;
+
 fn line_height(kind: Kind) -> f32 {
     match kind {
-        Kind::Version => 22.0,
+        Kind::Version => 24.0,
         Kind::Heading => 20.0,
         Kind::Bullet | Kind::Text => 18.0,
     }
@@ -235,6 +254,8 @@ struct Prompt {
     /// Client size in DIPs.
     size: (f32, f32),
     started: std::time::Instant,
+    /// When the window last popped up (`now`): Enter and Space wait `KEY_GRACE` after it.
+    shown: f64,
     version: String,
     ours: String,
     blocks: Vec<Block>,
@@ -315,6 +336,7 @@ pub fn open(owner: HWND, theme: &Theme, release: &Release, ours: &str) -> bool {
         dpi,
         size: (0.0, 0.0),
         started: std::time::Instant::now(),
+        shown: 0.0,
         version: String::new(),
         ours: String::new(),
         blocks: Vec::new(),
@@ -518,12 +540,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 Act::Destroy => {
                     let _ = DestroyWindow(hwnd);
                 }
-                Act::Show => {
+                Act::Show { quiet } => {
                     frame::cloak(hwnd, true);
-                    let _ = ShowWindow(hwnd, SW_SHOW);
+                    let _ = ShowWindow(hwnd, if quiet { SW_SHOWNOACTIVATE } else { SW_SHOW });
                     let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
                     frame::cloak(hwnd, false);
-                    let _ = SetForegroundWindow(hwnd);
+                    if !quiet {
+                        let _ = SetForegroundWindow(hwnd);
+                    }
                     if frame::is_wine() {
                         // Wine shows a frame only once the next one is drawn.
                         let _ = InvalidateRect(Some(hwnd), None, false);
@@ -562,14 +586,6 @@ fn hit_test(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     LRESULT(code as isize)
 }
 
-fn lo_word(v: usize) -> u32 {
-    (v & 0xffff) as u32
-}
-
-fn hi_word(v: usize) -> u32 {
-    ((v >> 16) & 0xffff) as u32
-}
-
 impl Prompt {
     fn scale(&self) -> f32 {
         self.dpi as f32 / 96.0
@@ -597,7 +613,7 @@ impl Prompt {
         self.ours = ours.to_string();
         let mut b = blocks(&release.changelog);
         if b.is_empty() {
-            b.push(Block { kind: Kind::Text, depth: 0, text: "This version came without a list of what's new.".into() });
+            b.push(Block { kind: Kind::Text, depth: 0, text: "This version came without a list of what's new.".into(), aside: String::new() });
         }
         self.blocks = b;
         self.laid_out_for = -1.0;
@@ -703,7 +719,8 @@ impl Prompt {
                 let text_x = indent + if block.kind == Kind::Bullet { 14.0 } else { 0.0 };
                 for (i, piece) in kit::wrap(&mut self.renderer, &block.text, &style, (width - text_x).max(40.0)).into_iter().enumerate() {
                     let bullet = (block.kind == Kind::Bullet && i == 0).then_some(indent);
-                    lines.push(Line { kind: block.kind, text: piece, x: text_x, y, bullet });
+                    let aside = if i == 0 { block.aside.clone() } else { String::new() };
+                    lines.push(Line { kind: block.kind, text: piece, aside, x: text_x, y, bullet });
                     y += h;
                 }
             }
@@ -811,6 +828,10 @@ impl Prompt {
                 r.fill_rect(Rect::new(r.snap(inner.x + bx + 1.0), r.snap(y + h / 2.0 - 2.0), 4.0, 4.0), theme.accent);
             }
             r.text(&line.text, Rect::new(inner.x + line.x, y, (inner.w - line.x).max(0.0), h), &style);
+            if !line.aside.is_empty() {
+                let x = line.x + r.measure(&line.text, &style) + 10.0;
+                r.text(&line.aside, Rect::new(inner.x + x, y, (inner.w - x).max(0.0), h), &TextStyle::new(theme.muted).size(VERSION_FONT));
+            }
         }
         r.pop_clip();
         kit::scrollbar(r, theme, track, &self.scroller, thumb_hot, hold);
@@ -1019,6 +1040,9 @@ impl Prompt {
                 self.invalidate();
             }
             _ if is(VK_SPACE) || is(VK_RETURN) => {
+                if self.now() - self.shown < KEY_GRACE {
+                    return true; // typed for the main window, just as the window popped up
+                }
                 self.cues = true;
                 // Enter presses UPDATE (or the button that has the keyboard); the checkbox is
                 // ticked with Space, as in Windows' own windows.
@@ -1150,7 +1174,20 @@ impl Prompt {
                 Some(LRESULT(0))
             }
             WM_APP_PROMPT_SHOW => {
-                acts.push(Act::Show);
+                self.shown = self.now();
+                // Glint in front (the main window, or a window of its: Settings, the sort editor):
+                // the prompt comes up over it but leaves it the keyboard, which may be typing a new
+                // name or a folder to go to (a name box that loses the keyboard keeps what's typed
+                // so far).
+                // SAFETY: plain window queries.
+                let quiet = unsafe {
+                    let front = GetForegroundWindow();
+                    front != self.hwnd && GetAncestor(front, GA_ROOTOWNER) == self.owner
+                };
+                if quiet {
+                    self.active = false;
+                }
+                acts.push(Act::Show { quiet });
                 Some(LRESULT(0))
             }
             WM_APP_PROMPT_QUIT => {
@@ -1203,11 +1240,12 @@ mod tests {
     fn markdown_becomes_plain_blocks() {
         let md = "## 0.3.1 (2026-10-12): fixes\n\nSome **words** with `code`.\nGoing on.\n\n### The list\n\n- **Ctrl+W** closes the last tab\n  (like File Explorer).\n  - nested [link](https://x.y) here\n- second\n\n# Ignored title\n";
         let b = blocks(md);
+        assert_eq!(b[0].aside, "(2026-10-12): fixes");
         let kinds: Vec<(Kind, usize, &str)> = b.iter().map(|b| (b.kind, b.depth, b.text.as_str())).collect();
         assert_eq!(
             kinds,
             vec![
-                (Kind::Version, 0, "0.3.1 (2026-10-12): fixes"),
+                (Kind::Version, 0, "Glint 0.3.1"),
                 (Kind::Text, 0, "Some words with code. Going on."),
                 (Kind::Heading, 0, "The list"),
                 (Kind::Bullet, 0, "Ctrl+W closes the last tab (like File Explorer)."),
@@ -1215,6 +1253,10 @@ mod tests {
                 (Kind::Bullet, 0, "second"),
             ]
         );
+        // Versions as they're written from 1.0.19 on: the date goes beside, in grey.
+        let b = blocks("## 1.0.19-beta.1 · 15/10/2026\n\n- Added split view\n- Fixed the outline\n");
+        assert_eq!((b[0].text.as_str(), b[0].aside.as_str()), ("Glint 1.0.19-beta.1", "15/10/2026"));
+        assert_eq!(b.len(), 3);
     }
 
     #[test]

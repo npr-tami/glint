@@ -526,6 +526,10 @@ fn rule_words() -> Vec<&'static str> {
 /// "vid_first" -> "video_first", "folder_fist" -> "folder_first". Rules first: a file type only
 /// when it's one letter off one (so "new" never becomes -nef).
 fn suggestion(word: &str) -> Option<String> {
+    // (Not for something long pasted in by mistake: comparing it with every rule would take long.)
+    if word.len() > 100 {
+        return None;
+    }
     let (rule, place, grain) = split(word);
     // The ending misspelt: _fist, _lst.
     if place == Place::Normal && grain.is_none() {
@@ -642,12 +646,14 @@ fn split(word: &str) -> (String, Place, Option<Grain>) {
             }
         }
         if place == Place::Normal {
-            if let Some(base) = w.strip_suffix("_first").filter(|b| !b.is_empty()) {
+            // (Not when it's all a name rule has: -name_has_last takes names with "last" in them.)
+            let bare = |b: &&str| matches!(*b, "name_has" | "name_contains" | "name_starts_with" | "name_ends_with");
+            if let Some(base) = w.strip_suffix("_first").filter(|b| !b.is_empty() && !bare(b)) {
                 w = base.to_string();
                 place = Place::First;
                 continue;
             }
-            if let Some(base) = w.strip_suffix("_last").filter(|b| !b.is_empty()) {
+            if let Some(base) = w.strip_suffix("_last").filter(|b| !b.is_empty() && !bare(b)) {
                 w = base.to_string();
                 place = Place::Last;
                 continue;
@@ -942,7 +948,21 @@ pub fn place_path(label: &str) -> Option<String> {
 }
 
 fn same_path(a: &str, b: &str) -> bool {
-    a.trim_end_matches('\\').eq_ignore_ascii_case(b.trim_end_matches('\\'))
+    same_letters(a.trim_end_matches('\\'), b.trim_end_matches('\\'))
+}
+
+/// Whether two paths (or parts of them) are the same letters, whatever their case, like Windows
+/// sees them: "C:\Users\Иван" is "c:\users\иван".
+fn same_letters(a: &str, b: &str) -> bool {
+    let (mut x, mut y) = (a.chars(), b.chars());
+    a.len() == b.len()
+        && loop {
+            match (x.next(), y.next()) {
+                (None, None) => break true,
+                (Some(c), Some(d)) if c == d || c.to_lowercase().eq(d.to_lowercase()) => {}
+                _ => break false,
+            }
+        }
 }
 
 /// Whether `path` is inside the folder `parent` (below it, not the folder itself).
@@ -957,7 +977,7 @@ fn under<'a>(path: &'a str, parent: &str) -> Option<&'a str> {
     let path = path.trim_end_matches('\\');
     let head = path.get(..parent.len())?;
     let rest = &path[parent.len()..];
-    (!parent.is_empty() && head.eq_ignore_ascii_case(parent) && (rest.is_empty() || rest.starts_with('\\'))).then_some(rest)
+    (!parent.is_empty() && same_letters(head, parent) && (rest.is_empty() || rest.starts_with('\\'))).then_some(rest)
 }
 
 /// Where the rules that sort a folder are.
@@ -992,7 +1012,9 @@ pub fn moved(text: &str, from: &str, to: &str) -> Option<String> {
             Some(start) => format!("{start}{}{rest}", folder::file_name(to)),
             None => format!("{}{rest}", to.trim_end_matches('\\')),
         };
-        changes.push((w.span, new));
+        // (In quotes when a # in the new name would start a note: "D:\Trip #2".)
+        let quoted = text[..w.span.0].ends_with('"');
+        changes.push((w.span, if quoted { new } else { quote_path(&new) }));
     }
     if changes.is_empty() {
         return None;
@@ -1030,6 +1052,8 @@ pub struct Recipe {
     pub blocks: Vec<Block>,
     /// The folders as written.
     pub places: Vec<Written>,
+    /// The text it was read from (set by `cached`): the same rules, read again, are still the same.
+    pub source: String,
     /// The lines of a "(" whose ")" never came (Enter after one adds it).
     pub unclosed: Vec<usize>,
 }
@@ -1967,20 +1991,54 @@ fn is_rule(raw: &str) -> bool {
     matches!(meaning(&word, &word), Meaning::Order(_) | Meaning::Group(_) | Meaning::View(_) | Meaning::Subfolders)
 }
 
-/// Notes start with # (or //) and are left out.
+/// Notes start with # (or //) at the start of a line or after a space, and are left out - but not
+/// inside quotes ("D:\Photos #2"), and not before the "(" of an "in" line: in "in D:\Photos #2 ("
+/// the # is part of the folder's name (a note can still follow the "("). Nor is the // of a
+/// network folder written with forward slashes ("in //nas/photos (").
 pub fn strip_note(line: &str) -> &str {
-    let mut end = line.len();
-    for mark in ["#", "//"] {
-        let mut from = 0;
-        while let Some(i) = line[from..].find(mark).map(|i| i + from) {
-            if i == 0 || line[..i].ends_with(char::is_whitespace) {
-                end = end.min(i);
-                break;
-            }
-            from = i + mark.len();
+    let from = strip_in(line.trim_start()).filter(|rest| rest.starts_with("//")).map_or(0, |rest| line.len() - rest.len() + 2);
+    let Some(cut) = note_start(line, from) else { return line };
+    let code = line[..cut].trim();
+    // (Not after a "(" or ")" already there: "in Downloads (-newest_first) # see (" keeps its note.)
+    if strip_in(code).is_some() && !code.ends_with(['(', '{', '[', ')', '}', ']', ':']) {
+        // The "(" that opens the folder's rules: one with nothing after it but a note.
+        let opens = line[cut..].char_indices().map(|(i, c)| (cut + i, c)).filter(|&(_, c)| matches!(c, '(' | '{' | '[')).find(|&(i, _)| {
+            let rest = &line[i + 1..];
+            let after = rest.trim_start();
+            after.is_empty() || (after.len() < rest.len() && (after.starts_with('#') || after.starts_with("//")))
+        });
+        if let Some((open, _)) = opens {
+            return &line[..note_start(line, open + 1).unwrap_or(line.len())];
         }
     }
-    &line[..end]
+    &line[..cut]
+}
+
+/// Where the first note in `line` starts, from byte `from` on: a # or // at the start of the line
+/// or after a space, and not inside quotes.
+fn note_start(line: &str, from: usize) -> Option<usize> {
+    let mut quoted = false;
+    let mut after_space = true; // (the start of the line)
+    for (i, c) in line.char_indices() {
+        if c == '"' {
+            // A quote opens only with another one after it: 5" alone quotes nothing.
+            quoted = !quoted && line[i + 1..].contains('"');
+        } else if !quoted && after_space && i >= from && (c == '#' || line[i..].starts_with("//")) {
+            return Some(i);
+        }
+        after_space = c.is_whitespace();
+    }
+    None
+}
+
+/// A folder's path as it goes on a line of the rules: in quotes when a # or // in it would start a
+/// note there ("D:\Photos #2").
+pub fn quote_path(path: &str) -> String {
+    if note_start(path, 0).is_some() {
+        format!("\"{path}\"")
+    } else {
+        path.to_string()
+    }
 }
 
 /// The words of a line, split at spaces, commas and semicolons, with where each one is.
@@ -2288,15 +2346,28 @@ fn what_it_takes(g: &Group) -> String {
     }
 }
 
-/// Adds an order rule (false when one for the same thing is already there, which a tip says).
+/// Adds an order rule (false when one for the same thing is already there, which a tip says). A
+/// date rule after a rounded one still counts when it can tell apart what that one couldn't:
+/// -newest_by_day then -oldest puts the oldest first within each day.
 fn add_order(into: &mut Vec<Order>, o: Order, written: &str, for_whom: &str, line: usize, span: Option<(usize, usize)>, messages: &mut Vec<Message>) -> bool {
-    if into.iter().any(|x| x.key == o.key) {
+    if into.iter().any(|x| x.key == o.key && always_tied(x.grain, o.grain)) {
         let text = format!("{written}: there's already an order rule for the {}{for_whom} before it, so this one never decides anything.", key_name(o.key));
         messages.push(Message { line, text, error: false, span, fix: None, fix_label: None });
         return false;
     }
     into.push(o);
     true
+}
+
+/// Whether dates that are the same to `first` (rounded to its grain, or exact) are always the same
+/// to `then` too: the same day is the same week, month and year, and the same month the same
+/// year, but a week can cross into the next month or year.
+fn always_tied(first: Option<Grain>, then: Option<Grain>) -> bool {
+    match (first, then) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(a), Some(b)) => a == b || a == Grain::Day || (a == Grain::Month && b == Grain::Year),
+    }
 }
 
 /// Tips for rules that can't make a difference.
@@ -2413,7 +2484,7 @@ pub fn cached(text: &str) -> Arc<Recipe> {
             return r.clone();
         }
     }
-    let r = Arc::new(Recipe::parse(text));
+    let r = Arc::new(Recipe { source: text.to_string(), ..Recipe::parse(text) });
     *cache = Some((text.to_string(), r.clone()));
     r
 }
@@ -2565,6 +2636,9 @@ mod tests {
         assert_eq!(order("-folder\n-a_to_z"), "Alpha,Zeta,a.txt,b.exe,c.pdf,m.txt,p.png,q.jpg,s.png,z.exe");
         assert_eq!(order("-folder\n-file\n-name"), order("-folder\n-a_to_z"));
         assert_eq!(sorted_in("-newest_first_by_day\n-a_to_z", "C:\\t")[..4], ["a.txt", "b.exe", "m.txt", "s.png"]);
+        // A date rule after a rounded one orders what's left tied, unless it can't.
+        let unused = |text: &str| Recipe::parse(text).messages.iter().filter(|m| m.text.contains("never decides")).count();
+        assert_eq!([unused("-newest_by_day\n-oldest"), unused("-newest_by_week\n-newest_by_month"), unused("-newest_by_day\n-oldest_by_month"), unused("-newest\n-oldest_by_day")], [0, 0, 1, 1]);
         assert_eq!(sorted_in("-today\n-folder", "C:\\t")[..5], ["a.txt", "b.exe", "m.txt", "s.png", "Alpha"]);
         let blend = Recipe::parse("-blend");
         assert!(!blend.has_errors());
@@ -2619,6 +2693,7 @@ mod tests {
         assert!(errors("-bigger_than_lots").iter().any(|m| m.text.contains("100mb")));
         assert!(errors("-documnet_first").iter().any(|m| m.text.contains("-document_first")), "a typo keeps the _first");
         assert!(is_order_word("-biggest_last") && is_order_word("-newest_first_by_day") && !is_order_word("-image_last"));
+        assert!(!Recipe::parse("-name_has_last\n-name_starts_with_first_last").has_errors());
     }
 
     #[test]
@@ -2895,6 +2970,25 @@ mod tests {
         assert_eq!(strip_note("-folder  # folders"), "-folder  ");
         assert_eq!(strip_note("-name_has_c#"), "-name_has_c#");
         assert_eq!(strip_note("// all of it"), "");
+        assert_eq!(strip_note("see http://example.com"), "see http://example.com");
+        // A # in a folder's name: before the "(" of an "in" line, or in quotes.
+        assert_eq!(strip_note("in D:\\Photos #2 ("), "in D:\\Photos #2 (");
+        assert_eq!(strip_note("  in D:\\Photos #2 ( # mine"), "  in D:\\Photos #2 ( ");
+        assert_eq!(strip_note("in D:\\Photos # mine"), "in D:\\Photos ", "no ( after it: a note");
+        assert_eq!(strip_note("in Downloads ( # new ("), "in Downloads ( ");
+        assert_eq!(strip_note("in Downloads (-newest_first) # see ("), "in Downloads (-newest_first) ");
+        assert_eq!(strip_note("\"D:\\Photos #2\" # mine"), "\"D:\\Photos #2\" ");
+        assert_eq!(strip_note("-name_has 5\" # inch"), "-name_has 5\" ", "a quote alone quotes nothing");
+        assert_eq!(strip_note("in //nas/photos ( // mine"), "in //nas/photos ( ");
+        assert_eq!(strip_note("// in //nas"), "");
+        assert_eq!(quote_path("D:\\Photos #2"), "\"D:\\Photos #2\"");
+        assert_eq!(quote_path("D:\\Photos#2"), "D:\\Photos#2");
+        let r = Recipe::parse("in D:\\Photos #2 ( # my photos\n-large_icons\n)\nin \"D:\\Art #3\" (\n-extra_large_icons\n)\nin = (\n\"E:\\Old #1\" # scans\n-details\n)\n");
+        assert!(!r.has_errors(), "{:?}", r.messages);
+        assert_eq!(r.view_for("D:\\Photos #2"), Some(ViewMode::Large));
+        assert_eq!(r.view_for("D:\\Photos"), None);
+        assert_eq!(r.view_for("D:\\Art #3"), Some(ViewMode::ExtraLarge));
+        assert_eq!(r.view_for("E:\\Old #1"), Some(ViewMode::Details));
         assert_eq!(year_month(clock().day(NOW)), (2026, 10));
         // 1 January 1601 was a Monday: weeks start on Mondays.
         let monday = clock().day(NOW) - 2; // 7 October 2026 is a Wednesday
@@ -3190,6 +3284,7 @@ mod tests {
         assert_eq!(moved("in ~\\old (\n)", &format!("{home}\\old"), &format!("{home}\\new")).as_deref(), Some("in ~\\new (\n)"));
         // Not about it.
         assert_eq!(moved("in C:\\p\\older (\n)", "C:\\p\\old", "C:\\p\\new"), None);
+        assert_eq!(moved("in = (\nC:\\p\\old\n\"C:\\p\\old\\b\"\n)", "C:\\p\\old", "C:\\p\\old #2").as_deref(), Some("in = (\n\"C:\\p\\old #2\"\n\"C:\\p\\old #2\\b\"\n)"));
         assert_eq!(moved("in Downloads (\n)", &place_path("Downloads").unwrap(), "C:\\z"), None);
     }
 }

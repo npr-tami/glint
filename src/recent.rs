@@ -4,9 +4,10 @@
 //!
 //! **Where the files come from.** Windows keeps that list itself: each file opened gets a shortcut in
 //! `%APPDATA%\Microsoft\Windows\Recent`, written again each time it's opened. [`read`] follows
-//! those shortcuts to the files (folders and files that are gone are left out) and takes each
-//! shortcut's time as when the file was last opened. Tabs and the sidebar use [`LOCATION`] (the
-//! name Windows gives Explorer's Home) as its path.
+//! those shortcuts to the files (folders and files that are gone are left out; files on another
+//! computer aren't looked at, as that could take long) and takes each shortcut's time as when the
+//! file was last opened. Tabs and the sidebar use [`LOCATION`] (the name Windows gives Explorer's
+//! Home) as its path.
 //!
 //! The entries are the files themselves with their full path as `target` (like search results), so
 //! opening, copying, deleting and the right-click menus act on the real file. Their date is when
@@ -16,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use windows::core::{Interface, PCWSTR};
-use windows::Win32::Storage::FileSystem::{FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FIND_FIRST_EX_FLAGS, WIN32_FIND_DATAW};
+use windows::Win32::Storage::FileSystem::{FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, GetFileAttributesW, FIND_FIRST_EX_FLAGS, INVALID_FILE_ATTRIBUTES, WIN32_FIND_DATAW};
 use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ};
 use windows::Win32::UI::Shell::{IShellLinkW, ShellLink, FOLDERID_Recent, SLGP_RAWPATH};
 
@@ -35,6 +36,13 @@ const MAX_ITEMS: usize = 500;
 /// Whether `path` is Home (Glint's own path for it, in any case).
 pub fn is_recent(path: &str) -> bool {
     path.eq_ignore_ascii_case(LOCATION)
+}
+
+/// Whether something typed into the path box means Home: its path, or just "Home" (what the path
+/// box shows there).
+pub fn means_home(typed: &str) -> bool {
+    let t = typed.trim();
+    is_recent(t) || t.eq_ignore_ascii_case(NAME)
 }
 
 /// Where each part of Home's entries starts: the standard folders come first (from 0), then the
@@ -74,7 +82,10 @@ pub fn read() -> Folder {
         let mut known: Vec<_> = shell::known_folders().into_iter().filter(|k| ORDER.contains(&k.name)).collect();
         known.sort_by_key(|k| ORDER.iter().position(|n| *n == k.name));
         for k in known {
-            if let Some(mut e) = item_entry(&k.path, &mut types, Some(true)) {
+            // (One moved to another computer, such as Documents on a server, isn't asked for either:
+            // it could take long.)
+            let e = if is_network(&k.path) { Some(unchecked_entry(&k.path, Some(true))) } else { item_entry(&k.path, &mut types, Some(true)) };
+            if let Some(mut e) = e {
                 e.modified = 0; // (no date, as in Explorer's Quick access)
                 f.entries.push(e);
             }
@@ -87,7 +98,7 @@ pub fn read() -> Folder {
         if f.entries.iter().any(|e| e.target.as_deref().is_some_and(|t| same_path(t, p))) {
             continue;
         }
-        if let Some(e) = if is_network(p) { Some(unchecked_entry(p, true)) } else { item_entry(p, &mut types, Some(true)) } {
+        if let Some(e) = if is_network(p) { Some(unchecked_entry(p, Some(true))) } else { item_entry(p, &mut types, Some(true)) } {
             f.entries.push(e);
         }
     }
@@ -102,11 +113,17 @@ pub fn read() -> Folder {
         if seen.len() >= MAX_ITEMS {
             break;
         }
-        let Some(path) = target_of(&join(&dir, &link.name)) else { continue };
+        let Some((path, attributes)) = target_of(&join(&dir, &link.name)) else { continue };
         if !seen.insert(path.to_lowercase()) {
             continue;
         }
-        if let Some(mut e) = item_entry(&path, &mut types, Some(false)) {
+        // A file on another computer isn't looked at either: the shortcut says if it was a folder.
+        let e = if is_network(&path) {
+            (attributes & 0x10 == 0).then(|| unchecked_entry(&path, Some(false))) // FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            item_entry(&path, &mut types, Some(false))
+        };
+        if let Some(mut e) = e {
             e.modified = link.modified; // when it was opened
             f.entries.push(e);
         }
@@ -114,7 +131,7 @@ pub fn read() -> Folder {
     // Last the favorites (files and folders), as marked; ones that are gone are left out.
     parts.favorites = f.entries.len();
     for p in &favorites {
-        if let Some(e) = if is_network(p) { Some(unchecked_entry(p, false)) } else { item_entry(p, &mut types, None) } {
+        if let Some(e) = if is_network(p) { Some(unchecked_entry(p, None)) } else { item_entry(p, &mut types, None) } {
             f.entries.push(e);
         }
     }
@@ -122,16 +139,30 @@ pub fn read() -> Folder {
     f
 }
 
-/// A path on another computer (\\server\share...): not looked at while Home is read.
-fn is_network(path: &str) -> bool {
-    path.starts_with("\\\\")
+/// Whether entry `index` of Home's list `f` is a favorite on another computer: whether it's a file
+/// or a folder was only guessed from its name (see `read`), so opening it lets the folder read
+/// find out (app.rs, `open_entry`).
+pub fn guessed(f: &Folder, index: usize) -> bool {
+    f.home.as_ref().is_some_and(|p| index >= p.favorites) && f.entries.get(index).and_then(|e| e.target.as_deref()).is_some_and(is_network)
 }
 
-/// An entry for a path without asking the disk: a folder, or a file when its name has an extension.
-fn unchecked_entry(path: &str, folder: bool) -> Entry {
+/// A path on another computer (\\server\share..., or a network drive such as Z:\): not looked at
+/// while Home is read.
+fn is_network(path: &str) -> bool {
+    path.starts_with("\\\\") || (path.get(1..3) == Some(":\\") && crate::peek::on_network(path))
+}
+
+/// A drive's root, such as D:\.
+fn is_drive_root(path: &str) -> bool {
+    path.len() == 3 && path.ends_with(":\\") && path.as_bytes()[0].is_ascii_alphabetic()
+}
+
+/// An entry for a path without asking the disk: a folder with `Some(true)`, a file with
+/// `Some(false)`, else a file when its name has an extension.
+fn unchecked_entry(path: &str, folder: Option<bool>) -> Entry {
     let name = folder::file_name(path).to_string();
-    let ext = if folder { String::new() } else { name.rsplit_once('.').map(|(_, x)| x.to_lowercase()).unwrap_or_default() };
-    let kind = if folder || ext.is_empty() { EntryKind::Folder } else { EntryKind::File };
+    let ext = if folder == Some(true) { String::new() } else { name.rsplit_once('.').map(|(_, x)| x.to_lowercase()).unwrap_or_default() };
+    let kind = if folder.unwrap_or(ext.is_empty()) { EntryKind::Folder } else { EntryKind::File };
     Entry {
         lower: name.to_lowercase(),
         name,
@@ -147,8 +178,9 @@ fn unchecked_entry(path: &str, folder: bool) -> Entry {
     }
 }
 
-/// The file a shortcut points at, as written in it.
-fn target_of(lnk: &str) -> Option<String> {
+/// The file a shortcut points at, as written in it, and its attributes as the shortcut recorded
+/// them (0 if it didn't).
+fn target_of(lnk: &str) -> Option<(String, u32)> {
     // SAFETY: COM calls in this thread's apartment (ComGuard in `read`); the buffers outlive them.
     unsafe {
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
@@ -156,11 +188,12 @@ fn target_of(lnk: &str) -> Option<String> {
         let w = wide_path(lnk);
         file.Load(PCWSTR(w.as_ptr()), STGM_READ).ok()?;
         let mut buf = [0u16; 1024];
-        link.GetPath(&mut buf, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32).ok()?;
+        let mut data = WIN32_FIND_DATAW::default();
+        link.GetPath(&mut buf, &mut data, SLGP_RAWPATH.0 as u32).ok()?;
         let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
         let path = String::from_utf16_lossy(&buf[..len]);
         let path = expand(&path);
-        (!path.is_empty()).then_some(path)
+        (!path.is_empty()).then_some((path, data.dwFileAttributes))
     }
 }
 
@@ -186,6 +219,12 @@ fn expand(path: &str) -> String {
 /// with `Some(false)`), None otherwise.
 fn item_entry(path: &str, types: &mut HashMap<String, Arc<str>>, folder: Option<bool>) -> Option<Entry> {
     let w = wide_path(path);
+    // FindFirstFile can't open a drive's root (D:\), so a drive is checked by its attributes.
+    if is_drive_root(path) {
+        // SAFETY: `w` is NUL-terminated and outlives the call.
+        let attrs = unsafe { GetFileAttributesW(PCWSTR(w.as_ptr())) };
+        return (folder != Some(false) && attrs != INVALID_FILE_ATTRIBUTES).then(|| unchecked_entry(path, Some(true)));
+    }
     let mut data = WIN32_FIND_DATAW::default();
     // SAFETY: `w` is NUL-terminated and outlives the call; `data` is a valid WIN32_FIND_DATAW.
     let handle = unsafe { FindFirstFileExW(PCWSTR(w.as_ptr()), FindExInfoBasic, &mut data as *mut _ as *mut _, FindExSearchNameMatch, None, FIND_FIRST_EX_FLAGS(0)) }.ok()?;
@@ -209,6 +248,13 @@ mod tests {
         assert_eq!(expand("%GLINT_RECENT_TEST_DIR%\\Downloads\\a.txt"), "C:\\Users\\me\\Downloads\\a.txt");
         assert_eq!(expand("C:\\100% sure\\a.txt"), "C:\\100% sure\\a.txt");
         assert!(is_recent(&LOCATION.to_lowercase()));
+    }
+
+    #[test]
+    fn a_drive_root_is_told_apart() {
+        assert!(is_drive_root("D:\\"));
+        assert!(!is_drive_root("D:\\Work"));
+        assert!(!is_drive_root("\\\\s\\"));
     }
 
     /// Windows' shortcuts are followed to the files, newest first; folders and files that are gone

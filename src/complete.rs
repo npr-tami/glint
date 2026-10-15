@@ -107,8 +107,20 @@ fn place_paths(places: &[Place]) -> Vec<(String, Suggestion)> {
     places
         .iter()
         .filter(|p| !p.path.is_empty())
-        .map(|p| (p.name.clone(), Suggestion { insert: p.path.clone(), label: p.name.clone(), hint: format!("{} \u{00b7} {}", p.hint, p.path) }))
+        .map(|p| (p.name.clone(), Suggestion { insert: sortrecipe::quote_path(&p.path), label: p.name.clone(), hint: format!("{} \u{00b7} {}", p.hint, p.path) }))
         .collect()
+}
+
+/// A subfolder picked on a folder's own line: its path with a "\" to go on, or the whole path in
+/// quotes when a # in it would start a note ("D:\Pics\Photos #2").
+fn subfolder(dir: &str, name: &str) -> String {
+    let path = format!("{dir}{name}");
+    let quoted = sortrecipe::quote_path(&path);
+    if quoted.len() == path.len() {
+        path + "\\"
+    } else {
+        quoted
+    }
 }
 
 /// Whether what follows "in " is a path being typed rather than a place's name.
@@ -182,7 +194,7 @@ pub fn complete(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str
         let mut done = Completion { start: caret - trimmed.len(), end: caret, ..Completion::default() };
         match listed(&folder::normalize(dir)) {
             Some(names) => {
-                let items = names.iter().map(|n| (n.clone(), Suggestion { insert: format!("{dir}{n}\\"), label: n.clone(), hint: "folder".into() })).collect();
+                let items = names.iter().map(|n| (n.clone(), Suggestion { insert: subfolder(dir, n), label: n.clone(), hint: "folder".into() })).collect();
                 done.items = rank(items, partial);
             }
             None => done.wants = Some(folder::normalize(dir)),
@@ -269,40 +281,64 @@ pub fn complete(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str
 /// window hears with a posted message and asks again.
 #[derive(Default)]
 pub struct Lister {
-    done: Arc<Mutex<HashMap<String, Arc<Vec<String>>>>>,
-    asked: HashSet<String>,
+    done: Arc<Mutex<Cache<Arc<Vec<String>>>>>,
+    /// The folders asked about, with how often `done` had been cleared then.
+    asked: HashMap<String, usize>,
     /// Whether folders are there (the folders the rules name), looked at the same way.
-    found: Arc<Mutex<HashMap<String, bool>>>,
-    looked: HashSet<String>,
+    found: Arc<Mutex<Cache<bool>>>,
+    looked: HashMap<String, usize>,
+}
+
+/// What the background threads found, emptied when it grows too big.
+#[derive(Default)]
+struct Cache<T> {
+    map: HashMap<String, T>,
+    clears: usize,
+}
+
+impl<T> Cache<T> {
+    fn insert(&mut self, key: String, value: T, most: usize) {
+        if self.map.len() > most {
+            self.map.clear();
+            self.clears += 1;
+        }
+        self.map.insert(key, value);
+    }
+}
+
+/// Whether `key` needs asking about: never asked, or its answer was cleared away since. (One still
+/// on its way when the cache was cleared may be asked for twice, which does no harm.)
+fn needs_asking<T>(asked: &mut HashMap<String, usize>, cache: &Mutex<Cache<T>>, key: &str) -> bool {
+    let cache = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.map.contains_key(key) || asked.get(key) == Some(&cache.clears) {
+        return false;
+    }
+    asked.insert(key.to_string(), cache.clears);
+    true
 }
 
 impl Lister {
     /// The subfolders of `dir` (normalised) when they've been listed.
     pub fn get(&self, dir: &str) -> Option<Arc<Vec<String>>> {
-        self.done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&dir.to_lowercase()).cloned()
+        self.done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).map.get(&dir.to_lowercase()).cloned()
     }
 
     /// Whether the folder `path` (normalised) is there, once it's been looked at.
     pub fn exists(&self, path: &str) -> Option<bool> {
-        self.found.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&path.to_lowercase()).copied()
+        self.found.lock().unwrap_or_else(std::sync::PoisonError::into_inner).map.get(&path.to_lowercase()).copied()
     }
 
     /// Looks whether the folder `path` is there in the background (once: a network folder can take
     /// a while to answer), then posts `msg` to `hwnd`.
     pub fn look(&mut self, path: &str, hwnd: HWND, msg: u32) {
         let key = path.to_lowercase();
-        if path.is_empty() || !self.looked.insert(key.clone()) {
+        if path.is_empty() || !needs_asking(&mut self.looked, &self.found, &key) {
             return;
         }
         let (found, path, target) = (self.found.clone(), path.to_string(), hwnd.0 as isize);
         crate::shell::background("glint-sort-folder-there", move || {
             let there = std::path::Path::new(&path).is_dir();
-            let mut map = found.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if map.len() > 500 {
-                map.clear();
-            }
-            map.insert(key, there);
-            drop(map);
+            found.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, there, 500);
             // SAFETY: posting to a window by handle; if it's gone the message is dropped.
             unsafe {
                 let _ = PostMessageW(Some(HWND(target as *mut _)), msg, WPARAM(0), LPARAM(0));
@@ -313,7 +349,7 @@ impl Lister {
     /// Lists `dir` in the background (once), then posts `msg` to `hwnd`.
     pub fn ask(&mut self, dir: &str, hwnd: HWND, msg: u32) {
         let key = dir.to_lowercase();
-        if dir.is_empty() || !self.asked.insert(key.clone()) {
+        if dir.is_empty() || !needs_asking(&mut self.asked, &self.done, &key) {
             return;
         }
         let (done, dir, target) = (self.done.clone(), dir.to_string(), hwnd.0 as isize);
@@ -323,12 +359,7 @@ impl Lister {
             let mut names: Vec<String> = read.entries.iter().filter(|e| e.is_container() && !e.is_hidden()).map(|e| e.name.clone()).collect();
             names.sort_by(|a, b| folder::natural_cmp(&a.to_lowercase(), &b.to_lowercase()));
             names.truncate(500);
-            let mut map = done.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if map.len() > 200 {
-                map.clear();
-            }
-            map.insert(key, Arc::new(names));
-            drop(map);
+            done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, Arc::new(names), 200);
             // SAFETY: posting to a window by handle; if it's gone the message is dropped.
             unsafe {
                 let _ = PostMessageW(Some(HWND(target as *mut _)), msg, WPARAM(0), LPARAM(0));
@@ -360,6 +391,21 @@ mod tests {
 
     fn labels(c: &Completion) -> Vec<&str> {
         c.items.iter().map(|s| s.label.as_str()).collect()
+    }
+
+    /// A folder is asked about once, and again only after its answer was cleared away.
+    #[test]
+    fn asks_again_after_a_clear() {
+        let cache = Mutex::new(Cache::default());
+        let mut asked = HashMap::new();
+        assert!(needs_asking(&mut asked, &cache, "c:\\a"));
+        assert!(!needs_asking(&mut asked, &cache, "c:\\a")); // (still on its way)
+        cache.lock().unwrap().insert("c:\\a".into(), true, 1);
+        assert!(!needs_asking(&mut asked, &cache, "c:\\a"));
+        cache.lock().unwrap().insert("c:\\b".into(), true, 1);
+        cache.lock().unwrap().insert("c:\\c".into(), true, 1); // clears a and b
+        assert!(needs_asking(&mut asked, &cache, "c:\\a"));
+        assert!(!needs_asking(&mut asked, &cache, "c:\\a"));
     }
 
     #[test]

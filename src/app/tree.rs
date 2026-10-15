@@ -291,8 +291,8 @@ pub(super) struct BranchWatch {
 
 impl BranchWatch {
     /// WM_DEVICECHANGE: let go of a drive that is being ejected (see watch.rs).
-    pub(super) fn device_event(&self, event: u32, data: isize) {
-        self.watcher.device_event(event, data);
+    pub(super) fn device_event(&self, event: u32, data: isize) -> Option<String> {
+        self.watcher.device_event(event, data)
     }
 }
 

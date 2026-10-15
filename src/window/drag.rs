@@ -132,9 +132,9 @@ impl Window {
     }
 
     /// The part under `p` and where it says a drop would go.
-    fn drop_spot(&self, p: Point) -> Option<(Part, DropTarget)> {
-        // Nothing is dropped while a question is open (it gets all input).
-        if self.drag.files.is_none() || self.app.question.is_some() {
+    fn drop_spot(&mut self, p: Point) -> Option<(Part, DropTarget)> {
+        // Nothing is dropped while a question or form is open (it gets all input).
+        if self.drag.files.is_none() || self.app.question.is_some() || self.app.form.is_some() {
             return None;
         }
         let part = self.part_at(p)?;
@@ -143,6 +143,12 @@ impl Window {
             Part::Toolbar => self.toolbar.drop_target(p, &self.app),
             Part::Sidebar => self.sidebar.drop_target(p, &self.app),
             Part::List => self.list.drop_target(p, &self.app),
+            Part::List2 => self.app.split_index().and_then(|o| {
+                let keep = std::mem::replace(&mut self.app.active, o);
+                let t = self.list2.drop_target(p, &self.app);
+                self.app.active = keep;
+                t
+            }),
             Part::Status => self.status.drop_target(p, &self.app),
             Part::Side => self.side.drop_target(p, &self.app),
         }?;
@@ -232,9 +238,26 @@ impl Window {
         }
     }
 
+    /// How fast the list under the drag should scroll, and whether that is split view's other
+    /// half (`list2`, asked with its own tab as the active one, as in `drop_spot`).
+    fn edge_scroll_speed(&mut self) -> (f32, bool) {
+        if self.drag.files.is_none() {
+            return (0.0, false);
+        }
+        let speed = self.list.drag_scroll_speed(self.drag.at, &self.app);
+        if speed != 0.0 {
+            return (speed, false);
+        }
+        let Some(o) = self.app.split_index() else { return (0.0, false) };
+        let keep = std::mem::replace(&mut self.app.active, o);
+        let speed = self.list2.drag_scroll_speed(self.drag.at, &self.app);
+        self.app.active = keep;
+        (speed, true)
+    }
+
     /// Near the list's top or bottom edge the list scrolls (a timer moves it); elsewhere it stops.
     fn scroll_near_edge(&mut self) {
-        let near = self.drag.files.is_some() && self.list.drag_scroll_speed(self.drag.at, &self.app) != 0.0;
+        let near = self.edge_scroll_speed().0 != 0.0;
         if near == self.drag.scrolling.is_some() {
             return;
         }
@@ -266,7 +289,7 @@ impl Window {
                 }
             }
             DRAG_SCROLL_TIMER => {
-                let speed = if self.drag.files.is_some() { self.list.drag_scroll_speed(self.drag.at, &self.app) } else { 0.0 };
+                let (speed, other) = self.edge_scroll_speed();
                 let (Some(since), true) = (self.drag.scrolling, speed != 0.0) else {
                     self.drag.scrolling = None;
                     // SAFETY: stops our own timer.
@@ -279,7 +302,15 @@ impl Window {
                 // Steady speed whatever the timer's real pace (Windows rounds timers to ~16 ms).
                 let dt = now.duration_since(since).as_secs_f32().min(0.1);
                 self.drag.scrolling = Some(now);
-                self.list.drag_scroll(speed * dt, &mut self.app);
+                if other {
+                    if let Some(o) = self.app.split_index() {
+                        let keep = std::mem::replace(&mut self.app.active, o);
+                        self.list2.drag_scroll(speed * dt, &mut self.app);
+                        self.app.active = keep;
+                    }
+                } else {
+                    self.list.drag_scroll(speed * dt, &mut self.app);
+                }
                 self.invalidate();
                 // Other rows are under the mouse now.
                 let _ = self.drag_update();
@@ -299,12 +330,14 @@ impl Window {
         if !msg.files.is_empty() {
             self.drag.files = Some(std::mem::take(&mut msg.files));
         }
-        let target = self.drop_spot(self.drag.at).map(|(_, t)| t);
+        let spot = self.drop_spot(self.drag.at);
+        let on_other = matches!(spot, Some((Part::List2, _)));
+        let target = spot.map(|(_, t)| t);
         let shown = self.drag.shown.as_ref().map(|(_, t)| t.clone());
         // The same place, and still the same folder behind it (see `shown_dest`).
         let same = |t: &DropTarget, s: &DropTarget| t == s && self.dest_of(t) == self.drag.shown_dest;
         let decided = match (&target, &shown) {
-            (Some(t), Some(s)) if same(t, s) => self.plan_for(t, msg.keys),
+            (Some(t), Some(s)) if same(t, s) => self.plan_for(t, msg.keys, on_other),
             (_, Some(_)) => {
                 self.app.say("The list changed, so nothing was dropped. Try again.");
                 None
@@ -319,8 +352,9 @@ impl Window {
         self.invalidate();
     }
 
-    /// What dropping onto `target` with `keys` does, and its effect (DROPEFFECT).
-    fn plan_for(&mut self, target: &DropTarget, keys: u32) -> Option<(Plan, u32)> {
+    /// What dropping onto `target` with `keys` does, and its effect (DROPEFFECT). `on_other`: the
+    /// target is in split view's other half.
+    fn plan_for(&mut self, target: &DropTarget, keys: u32, on_other: bool) -> Option<(Plan, u32)> {
         let dest = self.dest_of(target)?;
         let (effect, _) = self.drop_effect(target, keys);
         if effect == 0 {
@@ -339,6 +373,7 @@ impl Window {
         // The tab whose folder it is gets the new items selected.
         let tab_id = match target {
             DropTarget::Tab(i) => self.app.tabs.get(*i)?.id,
+            _ if on_other => self.app.tabs[self.app.split_index()?].id,
             _ => self.app.tab().id,
         };
         Some((Plan { dest, files, action, choices, tab_id, from_glint: self.drag.out }, effect))
@@ -373,13 +408,43 @@ impl Window {
     /// The list asks to drag its selected items out. Windows' drag loop runs after this message
     /// (it has a message loop of its own) and takes the mouse: the part loses it now, and hover
     /// highlights go, since no mouse moves come while it runs.
-    pub(super) fn start_drag_out(&mut self, d: DragOut) {
+    pub(super) fn start_drag_out(&mut self, mut d: DragOut) {
         self.capture = None;
         // SAFETY: releasing our own capture (the WM_CAPTURECHANGED it sends finds us busy).
         unsafe {
             let _ = ReleaseCapture();
         }
         self.mouse_leave();
+        // Dropped somewhere they may be moved: a video the preview plays from them lets go of its
+        // file first (one that's open can't be moved).
+        self.side.release_files();
+        // Out of a .zip or .7z: the items are taken out to Glint's temporary folder first, and
+        // those real files are dragged (a big one is copied out with Ctrl+C instead, which doesn't
+        // hold the window up).
+        if let Some((archive, inner)) = crate::archive::split(&d.folder) {
+            const MOST: u64 = 256 * 1024 * 1024;
+            let items: Vec<String> = d.names.iter().map(|n| if inner.is_empty() { n.clone() } else { format!("{inner}\\{n}") }).collect();
+            // Counted from the archive, not the list: a folder there shows 0 bytes, and a 7z unpacks
+            // what's packed before an item too.
+            let taken = crate::archive::unpack_size(&archive, &items).and_then(|bytes| {
+                if bytes > MOST {
+                    return Err("That's a lot to drag out of an archive. Copy it (Ctrl+C) and paste it instead.".to_string());
+                }
+                let dir = crate::archive::temp_dir_for(&archive)?;
+                crate::archive::extract(&archive, &items, &dir).map(|paths| (dir, paths))
+            });
+            match taken {
+                Ok((dir, paths)) => {
+                    d.names = paths.iter().map(|p| crate::folder::file_name(p).to_string()).collect();
+                    d.folder = dir;
+                }
+                Err(why) => {
+                    self.app.say(why);
+                    self.invalidate();
+                    return;
+                }
+            }
+        }
         self.deferred.push(Deferred::DragOut(d));
     }
 }

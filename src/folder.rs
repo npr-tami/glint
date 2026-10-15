@@ -78,14 +78,10 @@ impl Entry {
     pub fn is_hidden(&self) -> bool {
         self.attributes & ATTR_HIDDEN != 0
     }
-    /// A protected operating-system file (hidden and system, like desktop.ini or pagefile.sys).
-    pub fn is_protected(&self) -> bool {
-        self.attributes & (ATTR_HIDDEN | ATTR_SYSTEM) == ATTR_HIDDEN | ATTR_SYSTEM
-    }
     /// Whether it shows, Explorer's way: hidden items only with `show_hidden`, protected
     /// operating-system files only with `show_system` as well.
     pub fn is_visible(&self, show_hidden: bool, show_system: bool) -> bool {
-        !self.is_hidden() || (show_hidden && (show_system || !self.is_protected()))
+        visible(self.attributes, show_hidden, show_system)
     }
     /// The full path of this entry inside `folder`.
     pub fn path_in(&self, folder: &str) -> String {
@@ -107,6 +103,7 @@ impl Entry {
 /// subfolder search, which decides before it makes an entry).
 pub fn visible(attributes: u32, show_hidden: bool, show_system: bool) -> bool {
     let hidden = attributes & ATTR_HIDDEN != 0;
+    // Protected operating-system files are hidden and system, like desktop.ini or pagefile.sys.
     let protected = attributes & (ATTR_HIDDEN | ATTR_SYSTEM) == ATTR_HIDDEN | ATTR_SYSTEM;
     !hidden || (show_hidden && (show_system || !protected))
 }
@@ -162,6 +159,10 @@ pub enum SortKey {
     Created,
     /// The folder a search result is in (only while search results are shown).
     Folder,
+    /// Picture size: how many pixels a picture or a video has (media.rs reads it).
+    Dimensions,
+    /// How long a video or a song plays (media.rs reads it).
+    Length,
 }
 
 /// "This is a file, not a folder.": what reading a path that is a file says. Going to a file
@@ -188,6 +189,9 @@ pub fn read(path: &str) -> Folder {
         // current folder has nothing to do with what's on screen).
         let error = format!("\u{201c}{path}\u{201d} isn't a full path. Type one like C:\\Users.");
         Folder { path: path.to_string(), error: Some(error), ..Default::default() }
+    } else if let Some((archive, inner)) = crate::archive::split(path) {
+        // Inside a .zip or .7z: read from the archive (archive.rs).
+        crate::archive::read(&archive, &inner, path)
     } else {
         let mut f = Folder { path: path.to_string(), ..Default::default() };
         match list_dir(path) {
@@ -232,12 +236,20 @@ fn list_dir(path: &str) -> Result<Vec<Entry>, String> {
     };
     let mut entries = Vec::with_capacity(256);
     let mut types: HashMap<String, Arc<str>> = HashMap::new();
+    let mut failed = None;
     loop {
         if let Some(e) = entry_from(&data, &mut types) {
             entries.push(e);
         }
         // SAFETY: `handle` is the live search handle from above; `data` is valid.
-        if unsafe { FindNextFileW(handle, &mut data) }.is_err() {
+        if let Err(e) = unsafe { FindNextFileW(handle, &mut data) } {
+            // A drive or network share that stopped answering part way (pulled out, the network
+            // gone) is an error, not a shorter list. (Other errors end the list as before: some
+            // drives end it their own way.)
+            let code = e.code().0 as u32;
+            if code >> 16 == 0x8007 && matches!(code & 0xFFFF, 21 | 31 | 53 | 59 | 64 | 121 | 1117 | 1167 | 1231 | 1236) {
+                failed = Some(explain(code, &e.message()));
+            }
             break;
         }
     }
@@ -245,7 +257,10 @@ fn list_dir(path: &str) -> Result<Vec<Entry>, String> {
     unsafe {
         let _ = FindClose(handle);
     }
-    Ok(entries)
+    match failed {
+        Some(msg) => Err(msg),
+        None => Ok(entries),
+    }
 }
 
 /// One item from a FindFirstFile / FindNextFile result (None for "." and ".."). `types` caches the
@@ -394,7 +409,7 @@ fn is_dir(path: &str) -> bool {
     attrs != INVALID_FILE_ATTRIBUTES && attrs & ATTR_DIRECTORY != 0
 }
 
-fn is_file(path: &str) -> bool {
+pub(crate) fn is_file(path: &str) -> bool {
     let w = wide_path(path);
     // SAFETY: `w` is NUL-terminated and outlives the call.
     let attrs = unsafe { GetFileAttributesW(PCWSTR(w.as_ptr())) };
@@ -491,11 +506,7 @@ pub fn sort_view(entries: &[Entry], view: &mut [u32], key: SortKey, descending: 
                 return group;
             }
         }
-        let by_name = || {
-            natural_cmp(&a.lower, &b.lower)
-                .then_with(|| a.name.cmp(&b.name))
-                .then_with(|| natural_cmp_ignore_case(result_folder(a), result_folder(b)))
-        };
+        let by_name = || name_order(a, b);
         let flip = |o: Ordering| if descending { o.reverse() } else { o };
         match key {
             SortKey::Name => flip(by_name()),
@@ -504,8 +515,37 @@ pub fn sort_view(entries: &[Entry], view: &mut [u32], key: SortKey, descending: 
             SortKey::Type => flip(cmp_ignore_case(&a.type_name, &b.type_name)).then_with(by_name),
             SortKey::Size => flip(a.size.cmp(&b.size)).then_with(by_name),
             SortKey::Folder => flip(natural_cmp_ignore_case(result_folder(a), result_folder(b))).then_with(by_name),
+            // (Their values aren't in the entries: `sort_view_by` sorts by them, with what media.rs
+            // has read. Without them, A to Z.)
+            SortKey::Dimensions | SortKey::Length => by_name(),
         }
     });
+}
+
+/// Sorts `view` like [`sort_view`], by a value only some entries have (Picture size and Length,
+/// which media.rs reads in the background): `values` holds each entry's, by its index into
+/// `entries`. Items without one go last whichever way the column is sorted; ties stay A to Z.
+pub fn sort_view_by<K: Ord>(entries: &[Entry], view: &mut [u32], descending: bool, folders_first: bool, values: &[Option<K>]) {
+    view.sort_unstable_by(|&x, &y| {
+        let (a, b) = (&entries[x as usize], &entries[y as usize]);
+        if folders_first {
+            let group = b.is_container().cmp(&a.is_container());
+            if group != Ordering::Equal {
+                return group;
+            }
+        }
+        match (values.get(x as usize).and_then(Option::as_ref), values.get(y as usize).and_then(Option::as_ref)) {
+            (Some(p), Some(q)) => (if descending { q.cmp(p) } else { p.cmp(q) }).then_with(|| name_order(a, b)),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => name_order(a, b),
+        }
+    });
+}
+
+/// A to Z the way people count, then capitals, then (search results with the same name) by folder.
+fn name_order(a: &Entry, b: &Entry) -> Ordering {
+    natural_cmp(&a.lower, &b.lower).then_with(|| a.name.cmp(&b.name)).then_with(|| natural_cmp_ignore_case(result_folder(a), result_folder(b)))
 }
 
 /// The folder a search result is in (its full path without the name); "" for everything else.
@@ -570,17 +610,22 @@ fn number_with(v: f64, decimals: usize, thousands: &str, decimal: &str) -> Strin
 }
 
 /// A size in the automatic style ("auto"): "512 B", "13 KB" (rounded up, like Explorer), "3.1 MB",
-/// "41.7 GB", "1.82 TB".
+/// "41.7 GB", "1.82 TB". A size that would round to 1,024 of a unit is shown in the next one
+/// ("1.0 GB", not "1,024.0 MB").
 pub fn format_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     let b = bytes as f64;
+    // Rounded the way they're shown, to pick the unit.
+    let kb = (b / KB).ceil();
+    let mb = (b / (KB * KB) * 10.0).round() / 10.0;
+    let gb = (b / (KB * KB * KB) * 10.0).round() / 10.0;
     if bytes < 1024 {
         format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{} KB", format_number((b / KB).ceil(), 0))
-    } else if bytes < 1024 * 1024 * 1024 {
+    } else if kb < KB {
+        format!("{} KB", format_number(kb, 0))
+    } else if mb < KB {
         format!("{} MB", format_number(b / (KB * KB), 1))
-    } else if bytes < 1024 * 1024 * 1024 * 1024 {
+    } else if gb < KB {
         format!("{} GB", format_number(b / (KB * KB * KB), 1))
     } else {
         format!("{} TB", format_number(b / (KB * KB * KB * KB), 2))
@@ -716,8 +761,17 @@ fn windows_time(t: &SYSTEMTIME) -> String {
 /// What the filter box keeps: with `*` or `?` in it, a wildcard
 /// pattern for the whole name ("*.pdf", "report-??.txt"); otherwise every word must be somewhere
 /// in the name, in any order ("tax 2024" finds "2024 Tax return.pdf"). Capitals don't matter.
+/// `tag:red` keeps only the items with that colour tag, `tag:` alone every tagged item (tags.rs),
+/// and the rest goes for the name as before: "tag:red invoice".
+#[derive(Clone, Debug)]
+pub struct NameFilter {
+    name: NameRule,
+    tag: Option<crate::tags::TagFilter>,
+}
+
+/// The filter's part about the name.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NameFilter {
+enum NameRule {
     /// Nothing typed: everything shows.
     All,
     Words(Vec<String>),
@@ -727,22 +781,38 @@ pub enum NameFilter {
 
 impl NameFilter {
     pub fn new(text: &str) -> NameFilter {
-        let text = text.trim().to_lowercase();
-        if text.is_empty() {
-            NameFilter::All
-        } else if text.contains(['*', '?']) {
-            NameFilter::Pattern(text.chars().collect())
-        } else {
-            NameFilter::Words(text.split_whitespace().map(str::to_string).collect())
-        }
+        NameFilter::with_tags(text, crate::tags::shown)
     }
 
-    /// Whether a name in lower case (`Entry::lower`) is kept.
-    pub fn matches(&self, lower: &str) -> bool {
-        match self {
-            NameFilter::All => true,
-            NameFilter::Words(words) => words.iter().all(|w| lower.contains(w.as_str())),
-            NameFilter::Pattern(p) => {
+    /// As `new`, with the tags `tags` gives (asked only for a `tag:` word).
+    fn with_tags(text: &str, tags: impl FnOnce() -> Arc<crate::tags::Map>) -> NameFilter {
+        let text = text.trim().to_lowercase();
+        let (tag, text) = match crate::tags::TagFilter::take(&text, tags) {
+            Some((tag, rest)) => (Some(tag), rest),
+            None => (None, text),
+        };
+        let name = if text.is_empty() {
+            NameRule::All
+        } else if text.contains(['*', '?']) {
+            NameRule::Pattern(text.chars().collect())
+        } else {
+            NameRule::Words(text.split_whitespace().map(str::to_string).collect())
+        };
+        NameFilter { name, tag }
+    }
+
+    /// Whether an item is kept: by its name in lower case and, for a `tag:` filter, by its tag
+    /// (`path` gives its full path, asked only then).
+    pub fn keeps(&self, lower: &str, path: impl FnOnce() -> String) -> bool {
+        self.name_matches(lower) && self.tag.as_ref().is_none_or(|t| t.keeps(path))
+    }
+
+    /// Whether the words or the pattern keep a name in lower case.
+    fn name_matches(&self, lower: &str) -> bool {
+        match &self.name {
+            NameRule::All => true,
+            NameRule::Words(words) => words.iter().all(|w| lower.contains(w.as_str())),
+            NameRule::Pattern(p) => {
                 let name: Vec<char> = lower.chars().collect();
                 wildcard(p, &name)
             }
@@ -847,7 +917,8 @@ pub fn resolve(input: &str, base: &str) -> String {
 }
 
 /// Cleans up what a person typed into a folder path: quotes, `/`, `~` (the home folder, as in
-/// "~\Downloads"), `%VARIABLES%`, `..`, "c:", "This PC", "Recycle Bin". Returns "" for This PC.
+/// "~\Downloads"), `%VARIABLES%`, `..`, "c:", "This PC", "Recycle Bin", "Home". Returns "" for This
+/// PC.
 pub fn normalize(input: &str) -> String {
     let mut s = input.trim().trim_matches('"').trim().replace('/', "\\");
     if s.is_empty() || s.eq_ignore_ascii_case("this pc") || s.eq_ignore_ascii_case("computer") {
@@ -856,10 +927,15 @@ pub fn normalize(input: &str) -> String {
     if recycle::means_bin(&s) {
         return recycle::LOCATION.to_string();
     }
+    if crate::recent::means_home(&s) {
+        return crate::recent::LOCATION.to_string();
+    }
     if s == "~" || s.starts_with("~\\") {
         s = format!("{}{}", crate::shell::home(), &s[1..]);
     }
-    if s.contains('%') {
+    // (Not in the full path of something that's there, though: a folder really called %APPDATA% -
+    // left by a program that didn't fill the name in - opens as it is.)
+    if s.contains('%') && !(is_absolute(&s) && (is_dir(&s) || is_file(&s))) {
         let w = wide(&s);
         let mut buf = vec![0u16; 4096];
         // SAFETY: `w` is NUL-terminated; `buf` is writable and its length passed.
@@ -988,6 +1064,9 @@ mod tests {
         assert_eq!(resolve("d:/x/", "C:\\Users"), "D:\\x");
         assert_eq!(resolve("this pc", "C:\\Users"), "");
         assert_eq!(resolve("\\\\server\\share", "C:\\Users"), "\\\\server\\share");
+        // What the path box shows on Home goes back there, from anywhere.
+        assert_eq!(resolve("Home", crate::recent::LOCATION), crate::recent::LOCATION);
+        assert_eq!(resolve(" home ", "C:\\Users"), crate::recent::LOCATION);
     }
 
     #[test]
@@ -1026,6 +1105,13 @@ mod tests {
         assert!(gb.ends_with(" GB") && digits(&gb) == "53", "{gb}");
         let tb = format_size(2 * 1024u64.pow(4));
         assert!(tb.ends_with(" TB") && digits(&tb) == "200", "{tb}");
+        // Just under a unit is one of it, not 1,024 of the one below.
+        for (bytes, unit, shown) in [(1024 * 1024 - 1, " MB", "10"), (1024 * 1024 * 1024 - 1, " GB", "10"), (1024u64.pow(4) - 1, " TB", "100")] {
+            let s = format_size(bytes);
+            assert!(s.ends_with(unit) && digits(&s) == shown, "{s}");
+        }
+        let mb = format_size(1_073_636_966);
+        assert!(mb.ends_with(" MB") && digits(&mb) == "10239", "{mb}");
         // Always in KB.
         assert_eq!(format_size_as(512, SizeFormat::Kb), "1 KB");
         assert_eq!(format_size_as(0, SizeFormat::Kb), "0 KB");
@@ -1082,19 +1168,49 @@ mod tests {
     fn the_filter_keeps_names_with_every_word_or_matching_the_pattern() {
         // Several words: all of them, anywhere, in any order.
         let f = NameFilter::new("Tax 2024");
-        assert!(f.matches("2024 tax return.pdf"));
-        assert!(!f.matches("tax return.pdf"));
+        assert!(f.keeps("2024 tax return.pdf", String::new));
+        assert!(!f.keeps("tax return.pdf", String::new));
         // A pattern: the whole name.
         let p = NameFilter::new("*.PDF");
-        assert!(p.matches("report.pdf") && !p.matches("report.pdf.txt") && !p.matches("pdf"));
+        assert!(p.keeps("report.pdf", String::new) && !p.keeps("report.pdf.txt", String::new) && !p.keeps("pdf", String::new));
         let q = NameFilter::new("report-??.txt");
-        assert!(q.matches("report-12.txt") && !q.matches("report-123.txt"));
-        assert!(NameFilter::new("a*b*c").matches("axxbyyc") && !NameFilter::new("a*b*c").matches("axxbyy"));
-        assert!(NameFilter::new("  ").matches("anything"));
-        assert!(NameFilter::new("*").matches(""));
+        assert!(q.keeps("report-12.txt", String::new) && !q.keeps("report-123.txt", String::new));
+        assert!(NameFilter::new("a*b*c").keeps("axxbyyc", String::new) && !NameFilter::new("a*b*c").keeps("axxbyy", String::new));
+        assert!(NameFilter::new("  ").keeps("anything", String::new));
+        assert!(NameFilter::new("*").keeps("", String::new));
         // A long name against a pattern with many stars stays quick.
         let long = "a".repeat(5000);
-        assert!(!NameFilter::new("*a*a*a*a*b").matches(&long));
+        assert!(!NameFilter::new("*a*a*a*a*b").keeps(&long, String::new));
+    }
+
+    #[test]
+    fn the_filter_keeps_tagged_items_for_tag_words() {
+        use crate::tags::{map_of, Tag};
+        let tags = map_of(&[("C:\\x\\Invoice 3.pdf", Tag::Red), ("C:\\x\\notes.txt", Tag::Red), ("C:\\x\\Invoice 4.pdf", Tag::Blue)]);
+        let f = |text: &str| NameFilter::with_tags(text, || tags.clone());
+        let keeps = |filter: &NameFilter, name: &str| filter.keeps(&name.to_lowercase(), || join("C:\\x", name));
+        // tag:red (in any capitals): the red ones only.
+        for red in [f("tag:red"), f("TAG:Red"), f("  tag:red  ")] {
+            assert!(keeps(&red, "Invoice 3.pdf") && keeps(&red, "notes.txt"));
+            assert!(!keeps(&red, "Invoice 4.pdf") && !keeps(&red, "untagged.pdf"));
+        }
+        // tag: alone: everything tagged.
+        let any = f("tag:");
+        assert!(keeps(&any, "Invoice 4.pdf") && keeps(&any, "notes.txt") && !keeps(&any, "untagged.pdf"));
+        // With words, or a pattern: both must hold, in any order.
+        for both in [f("tag:red invoice"), f("invoice tag:red")] {
+            assert!(keeps(&both, "Invoice 3.pdf"));
+            assert!(!keeps(&both, "notes.txt") && !keeps(&both, "Invoice 4.pdf"));
+        }
+        let pattern = f("tag: *.pdf");
+        assert!(keeps(&pattern, "Invoice 3.pdf") && keeps(&pattern, "Invoice 4.pdf") && !keeps(&pattern, "notes.txt"));
+        // A colour no item has, or none at all: nothing.
+        assert!(!keeps(&f("tag:green"), "Invoice 3.pdf"));
+        let none = NameFilter::with_tags("tag:red", Default::default);
+        assert!(!keeps(&none, "Invoice 3.pdf"));
+        // Without a tag word nothing changes, and the path isn't even asked for.
+        assert!(f("invoice").keeps("invoice 4.pdf", || unreachable!()));
+        assert!(f("").keeps("anything", || unreachable!()));
     }
 
     #[test]
@@ -1137,5 +1253,10 @@ mod tests {
         assert_eq!(normalize("~x"), "~x", "only ~ on its own or before a backslash");
         std::env::set_var("GLINT_TEST_PLACE", "C:\\Somewhere");
         assert_eq!(normalize("%GLINT_TEST_PLACE%\\x"), "C:\\Somewhere\\x");
+        // A folder that is really called that keeps its name.
+        let real = std::env::temp_dir().join(format!("glint-{}-%GLINT_TEST_PLACE%", std::process::id()));
+        std::fs::create_dir_all(&real).unwrap();
+        assert!(normalize(&real.to_string_lossy()).ends_with("-%GLINT_TEST_PLACE%"));
+        let _ = std::fs::remove_dir(&real);
     }
 }

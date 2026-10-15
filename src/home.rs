@@ -157,7 +157,7 @@ pub fn step(l: &Layout, from: Option<usize>, dx: i32, dy: i32) -> Option<usize> 
 /// after it ("Downloads", "Pictures\Screenshots"), elsewhere the whole path.
 pub fn short_folder(dir: &str, user: &str) -> String {
     let user = user.trim_end_matches('\\');
-    if !user.is_empty() && dir.len() > user.len() + 1 && same_path(&dir[..user.len()], user) && dir[user.len()..].starts_with('\\') {
+    if !user.is_empty() && dir.len() > user.len() + 1 && dir.get(..user.len()).is_some_and(|h| same_path(h, user)) && dir[user.len()..].starts_with('\\') {
         return dir[user.len() + 1..].trim_end_matches('\\').to_string();
     }
     dir.to_string()
@@ -421,6 +421,8 @@ mod tests {
         assert_eq!(short_folder("C:\\Users\\mel\\Documents", user), "C:\\Users\\mel\\Documents");
         assert_eq!(short_folder("D:\\Work", user), "D:\\Work");
         assert_eq!(short_folder("C:\\Users\\me", user), "C:\\Users\\me");
+        // The user folder's length falls inside a character here.
+        assert_eq!(short_folder("D:\\文档\\报告", user), "D:\\文档\\报告");
     }
 
     /// Six tiles in three columns, then the pills and the Recent rows; Favorites swaps the rows; a

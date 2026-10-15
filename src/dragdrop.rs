@@ -37,14 +37,18 @@
 //! the drop does is done by that program; Glint never deletes anything afterwards.
 
 use std::cell::{Cell, RefCell};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use windows::core::{implement, w, Interface, Ref, BOOL, HRESULT, PCWSTR, Result as WinResult};
 use windows::Win32::Foundation::{
-    CloseHandle, GlobalFree, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, E_FAIL, HANDLE, HGLOBAL, HWND, LPARAM, POINT, POINTL,
-    S_OK, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
+    CloseHandle, GlobalFree, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, E_FAIL, E_POINTER, FILETIME, HANDLE, HGLOBAL, HWND, LPARAM,
+    POINT, POINTL, S_OK, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
 };
-use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, IBindCtx, IDataObject, CLSCTX_INPROC_SERVER, DVASPECT_CONTENT, FORMATETC, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL};
+use windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW;
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoTaskMemFree, CreateBindCtx, IBindCtx, IDataObject, CLSCTX_INPROC_SERVER, DVASPECT_CONTENT, FORMATETC, STGMEDIUM, STGMEDIUM_0,
+    TYMED_HGLOBAL,
+};
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT};
 use windows::Win32::System::Ole::{
@@ -53,11 +57,12 @@ use windows::Win32::System::Ole::{
 };
 use windows::Win32::System::SystemServices::{MODIFIERKEYS_FLAGS, MK_CONTROL, MK_LBUTTON, MK_RBUTTON, MK_SHIFT};
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, INFINITE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_LBUTTON, VK_RBUTTON};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    IDataObjectAsyncCapability, IDragSourceHelper, IDropTargetHelper, IShellFolder, SHBindToObject, SHCreateDataObject, SHDoDragDrop,
-    SHParseDisplayName, CLSID_DragDropHelper, DROPDESCRIPTION, DROPIMAGETYPE, DROPIMAGE_COPY, DROPIMAGE_INVALID, DROPIMAGE_LINK,
-    DROPIMAGE_MOVE, DROPIMAGE_NONE,
+    IDataObjectAsyncCapability, IDragSourceHelper, IDropTargetHelper, IFileSystemBindData, IFileSystemBindData_Impl, IShellFolder, SHBindToObject,
+    SHCreateDataObject, SHDoDragDrop, SHParseDisplayName, CLSID_DragDropHelper, DROPDESCRIPTION, DROPIMAGETYPE, DROPIMAGE_COPY, DROPIMAGE_INVALID,
+    DROPIMAGE_LINK, DROPIMAGE_MOVE, DROPIMAGE_NONE, STR_FILE_SYS_BIND_DATA,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, DispatchMessageW, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, PostQuitMessage,
@@ -149,18 +154,22 @@ pub fn folder_effect(sources: &[String], dest: &str, keys: u32, allowed: u32) ->
         return None;
     }
     let items: Vec<&String> = sources.iter().filter(|p| is_full_item_path(p)).collect();
-    let first = items.first()?;
+    if items.is_empty() {
+        return None;
+    }
     if items.iter().any(|s| is_same_or_inside(dest, s)) {
         return None; // a folder can't go into itself (or a folder inside it)
     }
     let same_folder = items.iter().all(|s| parent(s).is_some_and(|p| same_path(&p, dest)));
     let (ctrl, shift, alt) = (keys & MK_CONTROL.0 != 0, keys & MK_SHIFT.0 != 0, keys & MK_ALT != 0);
     let keyed = ctrl || shift || alt;
+    // (Items from several drives move only if they're all on the folder's: the others are copied.)
+    let here = volume(dest);
     let wanted = if alt || (ctrl && shift) {
         DropHow::Link
     } else if ctrl {
         DropHow::Copy
-    } else if shift || volume(first) == volume(dest) {
+    } else if shift || items.iter().all(|s| volume(s) == here) {
         DropHow::Move
     } else {
         DropHow::Copy
@@ -744,16 +753,40 @@ fn copy_text(buf: &mut [u16], text: &str) {
 
 // ---------------------------------------------------------------- dragging out of Glint
 
+/// What the file list read about an item it drags out (folder.rs `Entry`; times as FILETIMEs).
+pub struct Listed {
+    pub name: String,
+    pub attributes: u32,
+    pub size: u64,
+    pub modified: u64,
+    pub created: u64,
+}
+
+thread_local! {
+    /// The folder whose items the list is about to drag out, and what it read about them.
+    static LISTED: RefCell<Option<(String, Vec<Listed>)>> = const { RefCell::new(None) };
+}
+
+/// The file list is about to drag these items of `folder` out (its next [`drag_out`]): what it read
+/// about them, in the same order. Windows then needn't look each one up on disk again, which takes
+/// long for thousands of items on a network drive.
+pub fn about_to_drag(folder: &str, items: Vec<Listed>) {
+    LISTED.with(|l| *l.borrow_mut() = Some((folder.to_string(), items)));
+}
+
 /// Drags `names` (items of `folder`) out of Glint: into another program, another folder in Glint,
 /// or another Glint window. Runs Windows' drag loop, so it returns only when the drag is over.
 /// `right`: dragged with the right button (the program dropped into shows its menu). Returns what
 /// the drop did (DROPEFFECT) - the program dropped into did it; Glint has nothing left to do - or why
 /// the drag couldn't start.
 pub fn drag_out(hwnd: HWND, folder: &str, names: &[String], right: bool) -> Result<u32, String> {
+    // What the list read about these items, if it's about them (items out of a .zip are dragged
+    // from a temporary folder instead).
+    let listed = LISTED.with(|l| l.borrow_mut().take()).filter(|(f, items)| same_path(f, folder) && items.len() == names.len()).map(|(_, items)| items).unwrap_or_default();
     if WAITING.with(|w| w.get()) {
         return Err("Wait until the files dropped a moment ago are copied.".to_string());
     }
-    let Some(data) = data_object(hwnd, folder, names) else {
+    let Some(data) = data_object(hwnd, folder, names, &listed) else {
         return Err("Windows couldn't pick these items up to drag them.".to_string());
     };
     // SAFETY: COM calls on this (the UI) thread with live objects. The drop source lives until the
@@ -767,6 +800,12 @@ pub fn drag_out(hwnd: HWND, folder: &str, names: &[String], right: bool) -> Resu
         let allowed = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
         let effect = match SHDoDragDrop(Some(hwnd), &data, &source, allowed) {
             Ok(e) => e.0,
+            // The button is up, so the drag did run: what it was dropped on failed. (Dragging again
+            // now would drop the items a second time at once, wherever the mouse is.)
+            Err(e) if !button_down(right) => {
+                log::line(&format!("drag and drop: the drop failed ({e})"));
+                return Err(format!("The drop didn't go through: {}", fileops::explain(e.code())));
+            }
             Err(e) => {
                 // Not there (or refused): OLE's own drag loop does the same, without the extras.
                 log::line(&format!("drag and drop: SHDoDragDrop failed ({e}); using DoDragDrop"));
@@ -783,19 +822,35 @@ pub fn drag_out(hwnd: HWND, folder: &str, names: &[String], right: bool) -> Resu
     }
 }
 
+/// Whether the button a drag is made with (`right`: the right one) is still held down.
+fn button_down(right: bool) -> bool {
+    let button = if right { VK_RBUTTON } else { VK_LBUTTON };
+    // SAFETY: reads this thread's own key state.
+    unsafe { GetKeyState(button.0 as i32) < 0 }
+}
+
 /// Windows' data object for items of one folder: the one File Explorer makes for them (with the
-/// file list, shell ids and whatever else other programs ask for). None if Windows can't make one.
-fn data_object(hwnd: HWND, folder: &str, names: &[String]) -> Option<IDataObject> {
+/// file list, shell ids and whatever else other programs ask for). `listed`: what the list read
+/// about them, in the same order (or nothing). None if Windows can't make one.
+fn data_object(hwnd: HWND, folder: &str, names: &[String], listed: &[Listed]) -> Option<IDataObject> {
     let parent_id = parse(folder)?;
     // SAFETY: COM calls on this thread; every id list outlives the calls that use it and is freed
-    // once (Pidl). The data object keeps its own copies.
+    // once (Pidl). The data object keeps its own copies. The bind context keeps its own reference
+    // to `found`, and the find data passed lives across the call.
     unsafe {
         let shell_folder: IShellFolder = SHBindToObject(None::<&IShellFolder>, parent_id.0, None::<&IBindCtx>).ok()?;
+        // An item the list read is handed to the shell with its find data (STR_FILE_SYS_BIND_DATA),
+        // which makes its id from that; the others are looked up on disk, one by one.
+        let found: IFileSystemBindData = FindData(Mutex::new(WIN32_FIND_DATAW::default())).into();
+        let bind = if listed.is_empty() { None } else { CreateBindCtx(0).ok().filter(|b| b.RegisterObjectParam(STR_FILE_SYS_BIND_DATA, &found).is_ok()) };
         let mut children = Vec::with_capacity(names.len());
-        for name in names {
+        for (i, name) in names.iter().enumerate() {
             let w = wide(name);
+            // (No attributes at all: nothing was read for it.)
+            let known = listed.get(i).filter(|l| l.name == *name && l.attributes != 0);
+            let bind = bind.as_ref().filter(|_| known.is_some_and(|l| found.SetFindData(&find_data(l)).is_ok()));
             let mut child: *mut ITEMIDLIST = std::ptr::null_mut();
-            if shell_folder.ParseDisplayName(hwnd, None::<&IBindCtx>, PCWSTR(w.as_ptr()), None, &mut child, std::ptr::null_mut()).is_ok() && !child.is_null() {
+            if shell_folder.ParseDisplayName(hwnd, bind, PCWSTR(w.as_ptr()), None, &mut child, std::ptr::null_mut()).is_ok() && !child.is_null() {
                 children.push(Pidl(child));
             }
         }
@@ -828,6 +883,41 @@ fn parse(path: &str) -> Option<Pidl> {
     // SAFETY: `w` is NUL-terminated and outlives the call; `pidl` is a valid out-pointer.
     unsafe { SHParseDisplayName(PCWSTR(w.as_ptr()), None::<&IBindCtx>, &mut pidl, 0, None) }.ok()?;
     (!pidl.is_null()).then_some(Pidl(pidl))
+}
+
+/// An item's find data for the shell's ParseDisplayName (STR_FILE_SYS_BIND_DATA).
+#[implement(IFileSystemBindData)]
+struct FindData(Mutex<WIN32_FIND_DATAW>);
+
+impl IFileSystemBindData_Impl for FindData_Impl {
+    fn SetFindData(&self, pfd: *const WIN32_FIND_DATAW) -> WinResult<()> {
+        // SAFETY: the caller passes a valid find data, or null.
+        let data = unsafe { pfd.as_ref() }.ok_or(windows::core::Error::from(E_POINTER))?;
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = *data;
+        Ok(())
+    }
+
+    fn GetFindData(&self, pfd: *mut WIN32_FIND_DATAW) -> WinResult<()> {
+        // SAFETY: the caller passes room for one, or null.
+        let out = unsafe { pfd.as_mut() }.ok_or(windows::core::Error::from(E_POINTER))?;
+        *out = *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(())
+    }
+}
+
+/// The find data Windows would read from disk for an item, made from what the list read.
+fn find_data(item: &Listed) -> WIN32_FIND_DATAW {
+    let time = |t: u64| FILETIME { dwLowDateTime: t as u32, dwHighDateTime: (t >> 32) as u32 };
+    let mut data = WIN32_FIND_DATAW {
+        dwFileAttributes: item.attributes,
+        ftCreationTime: time(item.created),
+        ftLastWriteTime: time(item.modified),
+        nFileSizeHigh: (item.size >> 32) as u32,
+        nFileSizeLow: item.size as u32,
+        ..Default::default()
+    };
+    copy_text(&mut data.cFileName, &item.name);
+    data
 }
 
 /// Glint's side of its own drags: when the drag ends, and with what.
@@ -874,6 +964,10 @@ mod tests {
         let unc = paths(&["\\\\nas\\share\\a.txt"]);
         assert_eq!(folder_effect(&unc, "\\\\NAS\\Share\\b", 0, ALL), Some(DropHow::Move), "the same share");
         assert_eq!(folder_effect(&unc, "\\\\nas\\other", 0, ALL), Some(DropHow::Copy), "another share");
+        // Items from two drives (a search of both): copied, unless Shift says move.
+        let mixed = paths(&["C:\\a\\x.txt", "D:\\b\\y.txt"]);
+        assert_eq!(folder_effect(&mixed, "C:\\Backup", 0, ALL), Some(DropHow::Copy), "one of them is on another drive");
+        assert_eq!(folder_effect(&mixed, "C:\\Backup", MK_SHIFT.0, ALL), Some(DropHow::Move));
     }
 
     #[test]
@@ -948,6 +1042,15 @@ mod tests {
         assert_eq!(told_source(Action::Transfer(DropHow::Move)), 0, "Glint moved them itself");
         assert_eq!(told_source(Action::Recycle { permanent: false }), 0);
         assert_eq!(told_source(Action::Transfer(DropHow::Copy)), DROPEFFECT_COPY.0);
+    }
+
+    #[test]
+    fn the_shell_gets_what_the_list_read() {
+        let item = Listed { name: "a.txt".to_string(), attributes: 0x20, size: (5 << 32) | 7, modified: (1 << 32) | 2, created: 3 };
+        let d = find_data(&item);
+        assert_eq!((d.dwFileAttributes, d.nFileSizeHigh, d.nFileSizeLow), (0x20, 5, 7));
+        assert_eq!((d.ftLastWriteTime.dwHighDateTime, d.ftLastWriteTime.dwLowDateTime, d.ftCreationTime.dwLowDateTime), (1, 2, 3));
+        assert_eq!(&d.cFileName[..6], &[97, 46, 116, 120, 116, 0]);
     }
 
     #[test]

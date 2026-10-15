@@ -52,7 +52,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::folder::{self, wide};
 use crate::registry::{self, Places};
-use crate::settings::Settings;
+use crate::settings::{Settings, ZipIcon};
 use crate::shell::{self, Owner};
 use crate::{log, tray, winekey};
 
@@ -122,11 +122,12 @@ pub struct Target {
 }
 
 /// What a folder argument means: relative paths ("glint ." in a terminal) are taken from `cwd`, and
-/// a file opens its folder with the file selected. Looks at the disk (only at start, or in a new
+/// a file opens its folder with the file selected - but a zip or 7z file opens like a folder (they
+/// do when "Open with > Always" picked Glint for them). Looks at the disk (only at start, or in a new
 /// glint.exe that is about to hand over - never on the main window's thread).
 pub fn resolve_target(arg: &str, cwd: &str) -> Target {
     let path = folder::resolve(arg, cwd);
-    if !path.is_empty() && std::fs::metadata(&path).is_ok_and(|m| m.is_file()) {
+    if !path.is_empty() && !crate::archive::is_archive_name(&path) && std::fs::metadata(&path).is_ok_and(|m| m.is_file()) {
         if let Some(parent) = folder::parent(&path) {
             return Target { select: Some(folder::file_name(&path).to_string()), folder: parent };
         }
@@ -506,17 +507,19 @@ pub fn quit_hidden_main_too() {
 
 /// At the main Glint's start: Win+E is caught while Glint runs (if "Win+E opens Glint" is on), and
 /// what points at a glint.exe that was moved is repaired (on a thread of its own).
-pub fn main_started() {
+pub fn main_started(zip_icon: ZipIcon) {
     let Some(exe) = registry::this_exe() else { return };
     let Some(door) = door() else { return };
     if registry::win_e_on(&Places::current(), &exe) {
         winekey::start(door);
     }
     // Looking at the old place may wait on a network drive, so not on this thread. Win+E is looked
-    // at again afterwards: a repaired registry may point at this glint.exe now.
+    // at again afterwards: a repaired registry may point at this glint.exe now. Zip and 7z files that
+    // open in Glint get the icon "Zip icon" says, pointing at this glint.exe.
     let door = door.0 as isize;
     shell::background("repair registry", move || {
         registry::repair_if_moved(&Places::current(), &exe);
+        sync_zip_icon(zip_icon);
         // SAFETY: posting to a window handle is safe even if the window is gone.
         unsafe {
             let _ = PostMessageW(Some(HWND(door as *mut _)), WM_APP_WIN_E_CHANGED, WPARAM(0), LPARAM(0));
@@ -601,6 +604,27 @@ pub fn apply_start_with_windows(settings: &mut Settings, on: bool) -> Result<(),
     }
     settings.start_with_windows = on;
     Ok(())
+}
+
+/// "Zip icon" ("ZipIcon"): what zip and 7z files that open in this glint.exe look like in Windows
+/// (registry.rs), and in Glint's own lists, right away (icons.rs). Ok(false) when neither type opens
+/// in Glint yet: the icon shows once one does.
+pub fn apply_zip_icon(icon: ZipIcon) -> Result<bool, String> {
+    if testing_without_registry() {
+        return Ok(true);
+    }
+    let exe = registry::this_exe().ok_or("Glint couldn't find its own glint.exe")?;
+    let shows = registry::sync_archive_icon(&Places::current(), &exe, icon)?;
+    crate::icons::set_archive_icon(&shows.types, shows.icon);
+    Ok(!shows.types.is_empty())
+}
+
+/// The zip and 7z icon brought in step with the setting (at start, and when an archive is opened
+/// from outside, which may be the first time it opens in Glint). A refusal goes to the error log.
+pub fn sync_zip_icon(icon: ZipIcon) {
+    if let Err(e) = apply_zip_icon(icon) {
+        log::error(&e);
+    }
 }
 
 /// Whether "Win+E opens Glint" is on (for this glint.exe). It lives in Windows' registry, not in
@@ -711,6 +735,12 @@ mod tests {
         assert_eq!(t.select.as_deref(), Some("hello.txt"), "relative to the folder it was started in");
         let t = resolve_target(&d, "C:\\");
         assert_eq!(t.select, None);
+        // A zip or 7z file opens like a folder.
+        let zip = dir.join("Holiday.zip");
+        std::fs::write(&zip, "").unwrap();
+        let t = resolve_target(&zip.to_string_lossy(), "C:\\");
+        assert_eq!(t.select, None);
+        assert!(t.folder.ends_with("Holiday.zip"), "{}", t.folder);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

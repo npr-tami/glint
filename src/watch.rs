@@ -20,7 +20,8 @@
 //!   closes its handles at once. So the watch never makes "Safely remove" fail with "in use".
 //! - **What isn't watched.** This PC, network folders that don't support watching, and folders
 //!   that can't be opened: they simply aren't watched (one line in the log, no message). F5 still
-//!   works there.
+//!   works there. A watch that stops while its folder may still be there (the network dropped, the
+//!   computer slept) is tried again now and then (RETRY_FIRST).
 //! - **Idle means idle.** With nothing changing, the thread sleeps in WaitForMultipleObjects.
 //!
 //! The thread owns its handles. The UI thread only sends it orders (stop, let go, watch again)
@@ -35,7 +36,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, ERROR_IO_INCOMPLETE, ERROR_NOTIFY_ENUM_DIR, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, ERROR_IO_INCOMPLETE, ERROR_NOTIFY_ENUM_DIR, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FileStandardInfo, GetDriveTypeW, GetFileInformationByHandleEx, ReadDirectoryChangesW, FILE_STANDARD_INFO, FILE_ACTION_ADDED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
     FILE_ACTION_RENAMED_OLD_NAME, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE,
@@ -45,12 +46,11 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject, INFINITE};
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::UI::WindowsAndMessaging::{
-    PostMessageW, RegisterDeviceNotificationW, UnregisterDeviceNotification, DBT_DEVICEQUERYREMOVE, DBT_DEVICEQUERYREMOVEFAILED,
+    RegisterDeviceNotificationW, UnregisterDeviceNotification, DBT_DEVICEQUERYREMOVE, DBT_DEVICEQUERYREMOVEFAILED,
     DBT_DEVICEREMOVECOMPLETE, DBT_DEVICEREMOVEPENDING, DBT_DEVTYP_HANDLE, DEVICE_NOTIFY_WINDOW_HANDLE, DEV_BROADCAST_HANDLE,
     DEV_BROADCAST_HDR, HDEVNOTIFY,
 };
 
-use crate::app::WM_APP_LOADED;
 use crate::folder;
 use crate::log;
 use crate::shell;
@@ -69,6 +69,10 @@ const ARM_WAIT: Duration = Duration::from_millis(50);
 const RELEASE_WAIT: Duration = Duration::from_millis(1000);
 /// How long closing a watch waits for Windows to cancel its request (see `DirWatch`'s Drop).
 const CANCEL_WAIT_MS: u32 = 3000;
+/// A folder that stopped being watched is tried again this long after (`Worker::lost_folder`),
+/// then twice as long after each try that fails, up to RETRY_MAX.
+const RETRY_FIRST: Duration = Duration::from_secs(2);
+const RETRY_MAX: Duration = Duration::from_secs(60);
 /// Bytes of changes Windows may collect between two looks. 64 KB is the most a network folder
 /// allows. When more piles up, Windows says "overflow" and the folder is simply read again.
 const FOLDER_BUFFER: usize = 64 * 1024;
@@ -106,7 +110,8 @@ pub fn verbose() -> bool {
 /// Whether a path is something that can be watched: a folder path, not This PC ("").
 pub fn can_watch(path: &str) -> bool {
     let b = path.as_bytes();
-    path.starts_with("\\\\") || (b.get(1) == Some(&b':') && b.get(2) == Some(&b'\\'))
+    // (Not inside a .zip or .7z: archive.rs reads it, and nothing changes it while it's shown.)
+    (path.starts_with("\\\\") || (b.get(1) == Some(&b':') && b.get(2) == Some(&b'\\'))) && crate::archive::split(path).is_none()
 }
 
 // ---------------------------------------------------------------- the app's side
@@ -231,11 +236,13 @@ impl Watcher {
 
     /// WM_DEVICECHANGE: when Windows wants to eject the drive the watched folder is on, let go of
     /// it (and watch again if ejecting is called off). Other device events are none of its business.
-    pub fn device_event(&self, event: u32, data: isize) {
-        let Some(c) = &self.current else { return };
+    /// Gives the watched folder when its drive is about to be ejected, so whatever else is reading
+    /// that drive can stop too.
+    pub fn device_event(&self, event: u32, data: isize) -> Option<String> {
+        let c = self.current.as_ref()?;
         let mine = c.shared.notify.load(Ordering::SeqCst);
         if mine == 0 || data == 0 || !matches!(event, DBT_DEVICEQUERYREMOVE | DBT_DEVICEQUERYREMOVEFAILED | DBT_DEVICEREMOVEPENDING | DBT_DEVICEREMOVECOMPLETE) {
-            return;
+            return None;
         }
         // SAFETY: for these events Windows passes a DEV_BROADCAST_HDR in lparam. The handle fields
         // are read only when the header says it is a DEV_BROADCAST_HANDLE that is long enough, and
@@ -244,22 +251,24 @@ impl Watcher {
             let hdr = std::ptr::read_unaligned(data as *const DEV_BROADCAST_HDR);
             let needed = std::mem::offset_of!(DEV_BROADCAST_HANDLE, dbch_eventguid);
             if hdr.dbch_devicetype != DBT_DEVTYP_HANDLE || (hdr.dbch_size as usize) < needed {
-                return;
+                return None;
             }
             let at = (data as *const u8).add(std::mem::offset_of!(DEV_BROADCAST_HANDLE, dbch_hdevnotify));
             std::ptr::read_unaligned(at as *const HDEVNOTIFY)
         };
         if notify.0 as isize != mine {
-            return;
+            return None;
         }
         match event {
             DBT_DEVICEQUERYREMOVE => {
                 let done = c.shared.release(RELEASE_WAIT);
                 log::line(&format!("watch: a drive is being ejected; let go of \"{}\": {}", c.path, if done { "yes" } else { "not in time" }));
+                return Some(c.path.clone());
             }
             DBT_DEVICEQUERYREMOVEFAILED => c.shared.order(|o| o.reopen = true),
             _ => c.shared.order(|o| o.gone = true),
         }
+        None
     }
 }
 
@@ -405,17 +414,6 @@ impl Drop for Signal {
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     // A thread can't panic halfway (panics end the app), so a poisoned lock still holds sound data.
     m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Wakes the window: there is news in the channel (safe from any thread; a stale handle just fails).
-fn wake_window(hwnd: &AtomicIsize) {
-    let h = hwnd.load(Ordering::SeqCst);
-    if h != 0 {
-        // SAFETY: posting a message to a window handle; fails harmlessly if the window is gone.
-        unsafe {
-            let _ = PostMessageW(Some(HWND(h as *mut _)), WM_APP_LOADED, WPARAM(0), LPARAM(0));
-        }
-    }
 }
 
 /// Logs that a folder can't be watched - once per folder, so the log doesn't fill up.
@@ -649,6 +647,9 @@ struct Worker {
     old_name: Option<String>,
     /// The same for the parent's records: the old name was this folder's.
     old_was_mine: bool,
+    /// When to try watching the folder again after it stopped being watched, and how long the
+    /// wait was.
+    retry: Option<(Instant, Duration)>,
     sh: Arc<Shared>,
     tx: Sender<(u64, Event)>,
     hwnd: Arc<AtomicIsize>,
@@ -673,6 +674,7 @@ impl Worker {
             renamed: Vec::new(),
             old_name: None,
             old_was_mine: false,
+            retry: None,
             sh,
             tx,
             hwnd,
@@ -716,21 +718,26 @@ impl Worker {
                     return;
                 }
             }
+            self.retry_if_due();
             self.report_if_due();
         }
     }
 
-    /// Opens what isn't open yet: the folder and its parent.
-    fn open(&mut self) {
+    /// Opens what isn't open yet: the folder and its parent. Gives the Windows error when the
+    /// folder can't be watched.
+    fn open(&mut self) -> Option<u32> {
+        let mut error = None;
         if self.me.is_none() {
             match DirWatch::open(&self.path, FOLDER_CHANGES, FOLDER_BUFFER) {
                 Ok(d) => {
                     self.me = Some(d);
+                    self.retry = None;
                     self.sh.failed.store(false, Ordering::SeqCst);
                 }
                 Err(code) => {
                     self.sh.failed.store(true, Ordering::SeqCst);
                     log_once(&self.path, "can't be watched", code);
+                    error = Some(code);
                 }
             }
         }
@@ -739,12 +746,14 @@ impl Worker {
                 self.up = DirWatch::open(p, FILE_NOTIFY_CHANGE_DIR_NAME, PARENT_BUFFER).ok();
             }
         }
+        error
     }
 
-    /// Closes both handles (DirWatch's Drop cancels and waits).
+    /// Closes both handles (DirWatch's Drop cancels and waits), and tries nothing again.
     fn close(&mut self) {
         self.me = None;
         self.up = None;
+        self.retry = None;
     }
 
     /// Asks Windows to tell the window before the drive is ejected, so the handles can be closed
@@ -837,12 +846,35 @@ impl Worker {
 
     /// The folder can't be watched any more: it was deleted, its drive pulled out, the network
     /// went away. Let go of it (a folder being deleted is only really gone once nobody has it
-    /// open) and have it read again: the list then says what happened. The parent's watch tells
-    /// when it's back.
+    /// open) and have it read again: the list then says what happened. It may still be there (the
+    /// network dropped for a moment, the computer slept), so it's tried again in a while
+    /// (`retry_if_due`); once it's really gone, the parent's watch tells when it's back.
     fn lost_folder(&mut self, code: u32) {
         self.let_go_of_folder();
         log_once(&self.path, "stopped being watched", code);
         self.note_change();
+        self.retry = Some((Instant::now() + RETRY_FIRST, RETRY_FIRST));
+    }
+
+    /// Tries again to watch the folder after `lost_folder`, once it's time. A folder that isn't
+    /// there any more isn't tried again; anything else waits twice as long for the next try.
+    fn retry_if_due(&mut self) {
+        let Some((at, wait)) = self.retry else { return };
+        if Instant::now() < at {
+            return;
+        }
+        self.retry = None;
+        match self.open() {
+            None => {
+                self.register();
+                self.note_change(); // read again: what changed meanwhile wasn't seen
+            }
+            Some(2 | 3) => {} // ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
+            Some(_) => {
+                let wait = (wait * 2).min(RETRY_MAX);
+                self.retry = Some((Instant::now() + wait, wait));
+            }
+        }
     }
 
     /// Closes the folder's handle but keeps watching its parent. The eject notification may have
@@ -851,6 +883,7 @@ impl Worker {
     /// the parent's handle instead of finding it open and failing with "in use".
     fn let_go_of_folder(&mut self) {
         self.me = None;
+        self.retry = None;
         self.sh.failed.store(true, Ordering::SeqCst);
         if self.notify.is_some() {
             self.unregister();
@@ -943,11 +976,12 @@ impl Worker {
         Duration::from_millis(self.sh.gap_ms.load(Ordering::SeqCst) as u64)
     }
 
-    /// How long to wait for the next thing to happen: until changes are due to be reported, or
-    /// for ever when there are none.
+    /// How long to wait for the next thing to happen: until changes are due to be reported or the
+    /// folder is to be tried again, or for ever when neither is coming.
     fn timeout(&self) -> u32 {
-        let Some((first, last)) = self.pending else { return INFINITE };
-        let left = due(first, last, self.last_report, self.gap()).saturating_duration_since(Instant::now());
+        let report = self.pending.map(|(first, last)| due(first, last, self.last_report, self.gap()));
+        let Some(next) = report.into_iter().chain(self.retry.map(|(at, _)| at)).min() else { return INFINITE };
+        let left = next.saturating_duration_since(Instant::now());
         // Rounded up: waking a moment early would only wait again.
         left.as_micros().div_ceil(1000).min(60_000) as u32
     }
@@ -977,7 +1011,7 @@ impl Worker {
     fn send(&self, event: Event) {
         // Send first, then wake the window (if it doesn't exist yet, it picks the news up when it does).
         if self.tx.send((self.id, event)).is_ok() {
-            wake_window(&self.hwnd);
+            crate::app::wake(&self.hwnd);
         }
     }
 }

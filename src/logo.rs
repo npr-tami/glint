@@ -1,8 +1,9 @@
 //! The logo at the left of every title bar (the main window's, and those of Settings, the skin
 //! customiser and the update prompt): the word "glint" in chrome, with a sparkle as the dot on the
-//! i (res/logo). It is a picture, not text: one PNG per display scale, 100 % to 300 %, each in a
-//! version for dark skins and one for light skins (the sparkle is blue there, so it doesn't vanish
-//! on white), all baked into glint.exe.
+//! i (res/logo), or the same in capitals, "GLiNT" (the "Logo" setting's GLiNT; a little wider). It
+//! is a picture, not text: one PNG per display scale, 100 % to 300 %, each in a version for dark
+//! skins and one for light skins (the sparkle is blue there, so it doesn't vanish on white), all
+//! baked into glint.exe.
 //!
 //! - **Which picture.** The smallest one made for the window's scale or more (`pick`). At its own
 //!   scale it is copied pixel for pixel onto whole pixels, so it is crisp at 100, 125, 150, 175,
@@ -23,6 +24,7 @@ use windows::Win32::Graphics::Imaging::{
 };
 
 use crate::render::{Align, Renderer, TextStyle};
+use crate::settings::LogoStyle;
 use crate::theme::{size, Theme};
 use crate::thumbs::{self, Pixels};
 use crate::ui::{Point, Rect};
@@ -90,8 +92,71 @@ const WORDMARKS: [Wordmark; 7] = [
     },
 ];
 
-/// How many pictures there are of each version (dark, light).
+/// The same in capitals, GLiNT: wider (852:322), so its room in the title bar is too
+/// (`size::LOGO_W_CAPS`).
+const CAPS: [Wordmark; 7] = [
+    Wordmark {
+        percent: 100,
+        width: 103,
+        height: 39,
+        dark: include_bytes!("../res/logo/wordmark-caps-dark-100.png"),
+        light: include_bytes!("../res/logo/wordmark-caps-light-100.png"),
+    },
+    Wordmark {
+        percent: 125,
+        width: 130,
+        height: 49,
+        dark: include_bytes!("../res/logo/wordmark-caps-dark-125.png"),
+        light: include_bytes!("../res/logo/wordmark-caps-light-125.png"),
+    },
+    Wordmark {
+        percent: 150,
+        width: 156,
+        height: 59,
+        dark: include_bytes!("../res/logo/wordmark-caps-dark-150.png"),
+        light: include_bytes!("../res/logo/wordmark-caps-light-150.png"),
+    },
+    Wordmark {
+        percent: 175,
+        width: 180,
+        height: 68,
+        dark: include_bytes!("../res/logo/wordmark-caps-dark-175.png"),
+        light: include_bytes!("../res/logo/wordmark-caps-light-175.png"),
+    },
+    Wordmark {
+        percent: 200,
+        width: 206,
+        height: 78,
+        dark: include_bytes!("../res/logo/wordmark-caps-dark-200.png"),
+        light: include_bytes!("../res/logo/wordmark-caps-light-200.png"),
+    },
+    Wordmark {
+        percent: 250,
+        width: 259,
+        height: 98,
+        dark: include_bytes!("../res/logo/wordmark-caps-dark-250.png"),
+        light: include_bytes!("../res/logo/wordmark-caps-light-250.png"),
+    },
+    Wordmark {
+        percent: 300,
+        width: 310,
+        height: 117,
+        dark: include_bytes!("../res/logo/wordmark-caps-dark-300.png"),
+        light: include_bytes!("../res/logo/wordmark-caps-light-300.png"),
+    },
+];
+
+/// How many pictures there are of each version (glint and GLiNT, dark and light).
 pub const COUNT: usize = WORDMARKS.len();
+
+/// The pictures of glint, or of GLiNT (`caps`).
+fn set(caps: bool) -> &'static [Wordmark; COUNT] {
+    if caps {
+        &CAPS
+    } else {
+        &WORDMARKS
+    }
+}
 
 /// How high the wordmark is in a title bar of the standard height (`size::TITLE_H`), in DIPs; a
 /// lower bar gets it smaller in proportion.
@@ -116,12 +181,13 @@ pub fn pick(scale: f32) -> usize {
     WORDMARKS.iter().position(|w| w.percent as f32 / 100.0 >= scale - 0.005).unwrap_or(COUNT - 1)
 }
 
-/// Where the wordmark goes in the title bar `bar` at `scale`: the picture, its place (vertically
-/// centred, `PAD` in from the left, on whole pixels) and whether it is drawn at its own size.
-pub fn place(bar: Rect, scale: f32) -> Placed {
+/// Where the wordmark (`caps`: GLiNT) goes in the title bar `bar` at `scale`: the picture, its
+/// place (vertically centred, `PAD` in from the left, on whole pixels) and whether it is drawn at
+/// its own size.
+pub fn place(bar: Rect, scale: f32, caps: bool) -> Placed {
     let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
     let index = pick(scale);
-    let w = &WORDMARKS[index];
+    let w = &set(caps)[index];
     let wanted = (HEIGHT * bar.h / size::TITLE_H).min(bar.h).max(1.0);
     // Its own size at this scale, in DIPs (39.3 at 150 %, 38.9 at 175 %: the pixels were rounded).
     let own = w.height as f32 / scale;
@@ -133,12 +199,13 @@ pub fn place(bar: Rect, scale: f32) -> Placed {
     Placed { index, rect: Rect::new(x, y, pw, ph), exact }
 }
 
-/// The pixels of picture `index` (dark or light version), decoded the first time and then kept.
-/// None when WIC couldn't decode it (it isn't tried again: the title bar then shows no logo).
-pub fn pixels(dark: bool, index: usize) -> Option<&'static Pixels> {
-    static DECODED: [[OnceLock<Option<Pixels>>; COUNT]; 2] = [const { [const { OnceLock::new() }; COUNT] }; 2];
-    let w = WORDMARKS.get(index)?;
-    DECODED[usize::from(!dark)][index]
+/// The pixels of picture `index` (of glint or of GLiNT, dark or light version), decoded the first
+/// time and then kept. None when WIC couldn't decode it (it isn't tried again: the title bar then
+/// shows no logo).
+pub fn pixels(dark: bool, caps: bool, index: usize) -> Option<&'static Pixels> {
+    static DECODED: [[OnceLock<Option<Pixels>>; COUNT]; 4] = [const { [const { OnceLock::new() }; COUNT] }; 4];
+    let w = set(caps).get(index)?;
+    DECODED[2 * usize::from(caps) + usize::from(!dark)][index]
         .get_or_init(|| {
             let decoded = decode(if dark { w.dark } else { w.light });
             if decoded.is_none() {
@@ -173,26 +240,27 @@ fn decode(png: &'static [u8]) -> Option<Pixels> {
     }
 }
 
-/// Draws the skin's logo at the left of the title bar `bar`: the chrome wordmark (dark or light, as
-/// the skin is), or the skin's own word in a box. Returns where the logo's room ends (`size::LOGO_W`
-/// from the bar's left): the tabs, or the window's title, start after it.
 /// How wide the logo is in a title bar (0 when the "Logo" setting is None: the tabs start at the
-/// left edge then).
+/// left edge then; GLiNT is wider).
 pub fn width(theme: &Theme) -> f32 {
-    if theme.logo_style == crate::settings::LogoStyle::None {
-        0.0
-    } else {
-        size::LOGO_W
+    match theme.logo_style {
+        LogoStyle::None => 0.0,
+        LogoStyle::Caps => size::LOGO_W_CAPS,
+        LogoStyle::Box | LogoStyle::Chrome => size::LOGO_W,
     }
 }
 
+/// Draws the skin's logo at the left of the title bar `bar`: the chrome wordmark (dark or light, as
+/// the skin is), or the skin's own word in a box. Returns where the logo's room ends (`width` from
+/// the bar's left): the tabs, or the window's title, start after it.
 pub fn draw(r: &mut Renderer, theme: &Theme, bar: Rect) -> f32 {
-    if theme.logo_style == crate::settings::LogoStyle::None {
+    if theme.logo_style == LogoStyle::None {
         return bar.x;
     }
     if theme.chrome_logo() {
-        let p = place(bar, r.scale());
-        r.wordmark(theme.dark, p.index, p.rect, p.exact);
+        let caps = theme.logo_style == LogoStyle::Caps;
+        let p = place(bar, r.scale(), caps);
+        r.wordmark(theme.dark, caps, p.index, p.rect, p.exact);
     } else {
         // The box's right edge is cut at a slant (straight in a skin without slants).
         let (x, y, h, w) = (bar.x, bar.y, bar.h, size::LOGO_W);
@@ -212,7 +280,7 @@ pub fn draw(r: &mut Renderer, theme: &Theme, bar: Rect) -> f32 {
         let style = TextStyle::new(theme.logo_ink).size(size::FONT_LOGO).bold().align(Align::Center);
         r.text(&theme.logo_text, Rect::new(x, y, w - lean * 0.85, h), &style);
     }
-    bar.x + size::LOGO_W
+    bar.x + width(theme)
 }
 
 #[cfg(test)]
@@ -229,16 +297,20 @@ mod tests {
 
     #[test]
     fn the_pictures_are_the_sizes_the_list_says() {
-        let mut last = 0;
-        for w in &WORDMARKS {
-            assert_eq!(png_size(w.dark), (w.width, w.height), "dark {} %", w.percent);
-            assert_eq!(png_size(w.light), (w.width, w.height), "light {} %", w.percent);
-            // 39 pixels high at 100 %, in proportion at the others, the shape of the wordmark (660:322).
-            let own = w.height as f32 * 100.0 / w.percent as f32;
-            assert!((own - HEIGHT).abs() <= 0.5, "{} %: {own} DIPs high", w.percent);
-            assert!((w.width as f32 / w.height as f32 - 660.0 / 322.0).abs() < 0.03, "{} %", w.percent);
-            assert!(w.percent > last, "smallest first");
-            last = w.percent;
+        // glint is 660:322, GLiNT 852:322; both at the same scales.
+        for (caps, shape) in [(false, 660.0 / 322.0), (true, 852.0 / 322.0)] {
+            let mut last = 0;
+            for (w, plain) in set(caps).iter().zip(&WORDMARKS) {
+                assert_eq!(png_size(w.dark), (w.width, w.height), "dark {} %", w.percent);
+                assert_eq!(png_size(w.light), (w.width, w.height), "light {} %", w.percent);
+                // 39 pixels high at 100 %, in proportion at the others, the shape of the wordmark.
+                let own = w.height as f32 * 100.0 / w.percent as f32;
+                assert!((own - HEIGHT).abs() <= 0.5, "{} %: {own} DIPs high", w.percent);
+                assert!((w.width as f32 / w.height as f32 - shape).abs() < 0.03, "{} %", w.percent);
+                assert!(w.percent > last, "smallest first");
+                assert_eq!((w.percent, w.height), (plain.percent, plain.height), "the same scales as glint");
+                last = w.percent;
+            }
         }
     }
 
@@ -263,15 +335,19 @@ mod tests {
     #[test]
     fn the_wordmark_fits_the_title_bar_and_is_crisp_at_its_own_scales() {
         let bar = Rect::new(0.0, 0.0, 1000.0, size::TITLE_H);
-        // 100 %: the 80 x 39 picture, pixel for pixel, 8 DIPs in.
-        let p = place(bar, 1.0);
+        // 100 %: the 80 x 39 picture (GLiNT's 103 x 39), pixel for pixel, 8 DIPs in.
+        let p = place(bar, 1.0, false);
         assert!(p.exact);
         assert_eq!((p.rect.x, p.rect.w, p.rect.h), (8.0, 80.0, 39.0));
         assert!(p.rect.y == 0.0 || p.rect.y == 1.0);
-        for percent in [100, 125, 150, 175, 200, 250, 300, 110, 120, 133, 225, 350] {
+        let p = place(bar, 1.0, true);
+        assert!(p.exact);
+        assert_eq!((p.rect.x, p.rect.w, p.rect.h), (8.0, 103.0, 39.0));
+        for (percent, caps) in [100, 125, 150, 175, 200, 250, 300, 110, 120, 133, 225, 350].into_iter().flat_map(|p| [(p, false), (p, true)]) {
             let scale = percent as f32 / 100.0;
-            let p = place(bar, scale);
-            let w = &WORDMARKS[p.index];
+            let p = place(bar, scale, caps);
+            let w = &set(caps)[p.index];
+            let room = if caps { size::LOGO_W_CAPS } else { size::LOGO_W };
             assert_eq!(p.exact, w.percent == percent, "{percent} %");
             if p.exact {
                 // Its own pixels, on whole pixels.
@@ -284,18 +360,30 @@ mod tests {
             }
             // Inside the bar, and the tabs start after it.
             assert!(p.rect.y >= 0.0 && p.rect.bottom() <= bar.h + 0.01, "{percent} %: {:?}", p.rect);
-            assert!(p.rect.right() <= size::LOGO_W, "{percent} %: {:?}", p.rect);
+            assert!(p.rect.right() <= room, "{percent} %: {:?}", p.rect);
             assert!(p.rect.x >= 7.0, "{percent} %");
         }
         // A lower bar gets a smaller wordmark, shrunk.
-        let low = place(Rect::new(0.0, 0.0, 500.0, 30.0), 1.0);
+        let low = place(Rect::new(0.0, 0.0, 500.0, 30.0), 1.0, false);
         assert!(!low.exact && low.rect.h < 30.0);
+    }
+
+    #[test]
+    fn glint_and_glint_in_capitals_have_their_own_room() {
+        let mut theme = crate::theme::Theme::dark();
+        for (style, room) in [(LogoStyle::Box, size::LOGO_W), (LogoStyle::Chrome, size::LOGO_W), (LogoStyle::Caps, size::LOGO_W_CAPS), (LogoStyle::None, 0.0)] {
+            theme.logo_style = style;
+            assert_eq!(width(&theme), room, "{style:?}");
+            assert_eq!(theme.chrome_logo(), matches!(style, LogoStyle::Chrome | LogoStyle::Caps), "{style:?}");
+        }
+        // Saved as "caps" in settings.json.
+        assert_eq!(serde_json::to_string(&LogoStyle::Caps).unwrap(), "\"caps\"");
     }
 
     #[test]
     fn every_picture_decodes() {
         let _com = crate::shell::ComGuard::init();
-        for w in &WORDMARKS {
+        for w in WORDMARKS.iter().chain(&CAPS) {
             for (png, which) in [(w.dark, "dark"), (w.light, "light")] {
                 let p = decode(png).unwrap_or_else(|| panic!("{which} {} %", w.percent));
                 assert_eq!((p.width, p.height), (w.width, w.height));
@@ -306,5 +394,47 @@ mod tests {
                 assert!(p.pixels.chunks_exact(4).all(|px| px[0] <= px[3] && px[1] <= px[3] && px[2] <= px[3]));
             }
         }
+    }
+
+    #[test]
+    fn strange_scales_and_bars_still_give_a_picture_inside_the_bar() {
+        for scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -1.0, 0.01, 0.99, 3.01, 10.0, 1000.0] {
+            for caps in [false, true] {
+                for h in [0.0, 1.0, 10.0, size::TITLE_H, 400.0] {
+                    let bar = Rect::new(5.0, 3.0, 300.0, h);
+                    let p = place(bar, scale, caps);
+                    assert!(p.index < COUNT, "scale {scale}");
+                    assert!(p.rect.w.is_finite() && p.rect.h.is_finite() && p.rect.w > 0.0 && p.rect.h > 0.0, "scale {scale}, bar {h}: {:?}", p.rect);
+                    assert!(p.rect.h <= h.max(1.0) + 0.01, "scale {scale}, bar {h}: {:?}", p.rect);
+                }
+            }
+        }
+        // A picture that doesn't exist is none, not a panic.
+        assert!(pixels(true, false, COUNT).is_none() && pixels(false, true, 99).is_none());
+    }
+
+    #[test]
+    fn every_logo_choice_is_saved_by_name_and_an_unknown_one_is_refused() {
+        for (style, word) in [(LogoStyle::Box, "box"), (LogoStyle::Chrome, "chrome"), (LogoStyle::Caps, "caps"), (LogoStyle::None, "none")] {
+            let json = serde_json::to_string(&style).unwrap();
+            assert_eq!(json, format!("\"{word}\""));
+            assert_eq!(serde_json::from_str::<LogoStyle>(&json).unwrap(), style);
+        }
+        assert!(serde_json::from_str::<LogoStyle>("\"GLINT\"").is_err());
+        assert!(serde_json::from_str::<LogoStyle>("\"\"").is_err());
+        // The zip icon choices the same way.
+        use crate::settings::ZipIcon;
+        for (icon, word) in [(ZipIcon::Label, "label"), (ZipIcon::Folder, "folder"), (ZipIcon::Page, "page"), (ZipIcon::Glint, "glint")] {
+            assert_eq!(serde_json::to_string(&icon).unwrap(), format!("\"{word}\""));
+            assert_eq!(serde_json::from_str::<ZipIcon>(&format!("\"{word}\"")).unwrap(), icon);
+        }
+        assert!(serde_json::from_str::<ZipIcon>("\"red\"").is_err());
+        // Each choice has a width, and only none has none.
+        let mut theme = crate::theme::Theme::dark();
+        for style in [LogoStyle::Box, LogoStyle::Chrome, LogoStyle::Caps] {
+            theme.logo_style = style;
+            assert!(width(&theme) > 0.0);
+        }
+        assert!(size::LOGO_W_CAPS > size::LOGO_W);
     }
 }

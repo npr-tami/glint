@@ -14,6 +14,10 @@ impl AppState {
     /// starts nothing, so nothing is waited for.
     pub fn drop_files(&mut self, plan: &Plan, action: Action, signal: Option<Signal>) -> bool {
         match (action, &plan.dest) {
+            (Action::Transfer(_), Dest::Folder(dest)) if crate::archive::split(dest).is_some() => {
+                self.say(super::files::ARCHIVE_NOTE);
+                false
+            }
             (Action::Transfer(how), Dest::Folder(dest)) => {
                 let job = Job::Drop { sources: plan.files.clone(), dest: dest.clone(), how };
                 self.start_drop_job(job, AfterJob::new(plan.tab_id), signal)

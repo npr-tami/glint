@@ -79,10 +79,24 @@ pub fn open(path: &str) {
     });
 }
 
-/// Opens File Explorer at `path` - with the item selected when `select` is true.
+/// Opens a web page in the default browser (Settings > About's links).
+pub fn open_link(url: &str) {
+    let url = url.to_string();
+    background("open link", move || {
+        let _com = ComGuard::init();
+        let (url_w, verb) = (wide(&url), wide("open"));
+        // SAFETY: both strings are NUL-terminated and live across the call.
+        unsafe {
+            ShellExecuteW(None, PCWSTR(verb.as_ptr()), PCWSTR(url_w.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+        }
+    });
+}
+
+/// Opens File Explorer at `path` ("" for This PC) - with the item selected when `select` is true.
 pub fn show_in_explorer(path: &str, select: bool) {
     let args = if path.is_empty() {
-        String::new() // This PC: plain Explorer
+        // (Plain Explorer would open where the user set it to: mostly Home, not This PC.)
+        "shell:MyComputerFolder".to_string()
     } else if select {
         format!("/select,\"{path}\"")
     } else {
@@ -99,15 +113,21 @@ pub fn show_in_explorer(path: &str, select: bool) {
     });
 }
 
-/// Puts text on the clipboard. Returns false if the clipboard was busy.
+/// Puts text on the clipboard. Returns false if the clipboard was busy. Another program (a
+/// clipboard manager, Remote Desktop) may have it open for a moment, so it's tried a few times.
 pub fn copy_text(owner: HWND, text: &str) -> bool {
     let data = wide(text);
     let bytes = data.len() * 2;
     // SAFETY: the clipboard is opened and always closed; the global memory block is either handed
     // to the clipboard (which then owns it) or freed by us.
     unsafe {
-        if OpenClipboard(Some(owner)).is_err() {
-            return false;
+        let mut tries = 1;
+        while OpenClipboard(Some(owner)).is_err() {
+            if tries == 5 {
+                return false;
+            }
+            tries += 1;
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let mut ok = false;
         if EmptyClipboard().is_ok() {

@@ -266,6 +266,11 @@ impl PreviewPane {
 
     pub fn layout(&mut self, rect: Rect) {
         self.rect = rect;
+        // No room for the pane next to the list (side.rs), or it isn't showing: a video stops, and
+        // nothing repaints the window for it or a GIF meanwhile (the GIF goes on once it shows).
+        if rect.is_empty() {
+            self.stop_video();
+        }
     }
 
     /// The pane was closed: the full-size picture and whatever was waiting go.
@@ -398,12 +403,18 @@ impl PreviewPane {
             let need_full = picture && self.full.is_none();
             if (need_facts || need_full) && self.asked != o.key {
                 let pic = picture.then(|| (r.max_bitmap_size().min(16384), MAX_PIXELS));
-                self.peeker.ask(o.ask(Some(peek::PREVIEW_TEXT), pic, app.settings.show_hidden, app.settings.show_system), ctx.hwnd);
-                self.asked = o.key.clone();
+                // (Not asked, with no thread to be had: asked again at the next frame.)
+                if self.peeker.ask(o.ask(Some(peek::PREVIEW_TEXT), pic, app.settings.show_hidden, app.settings.show_system), ctx.hwnd) {
+                    self.asked = o.key.clone();
+                }
             }
         } else {
+            // Nothing selected (a click on empty space, a folder opened): a video stops too, and an
+            // item that comes back is asked about again.
             self.view_key.clear();
             self.full = None;
+            self.asked.clear();
+            self.stop_media();
         }
         let view = self.view_rect();
         self.shown = Some(Shown { view, picture: None, text: None, controls: None });
@@ -426,6 +437,18 @@ impl PreviewPane {
     /// The GIF and the video go (another item, or the pane closed): the video's sound fades out.
     fn stop_media(&mut self) {
         self.anim = None;
+        self.stop_video();
+    }
+
+    /// Something is about to delete, rename or move the selection, or a drive is being ejected: the
+    /// video lets go of its file now, without the fade (Windows refuses those while it's open).
+    pub fn release_files(&mut self) {
+        video::let_go(self.video.take());
+        self.stop_video();
+    }
+
+    /// The video goes (its sound fades out), and nothing repaints the window for it or a GIF.
+    fn stop_video(&mut self) {
         self.video = None;
         self.video_key.clear();
         self.video_failed = false;
@@ -447,7 +470,7 @@ impl PreviewPane {
         let waiting_for_text = by_name && facts.as_ref().is_none_or(|f| f.text.is_some());
         let thumb = if waiting_for_text { None } else { thumbs::request_versioned(&one.shell_path, one.version, thumb_px) };
         let real_thumb = thumb.as_ref().filter(|t| !t.is_icon()).cloned();
-        let is_video = one.is_file() && video::is_video(&one.entry.ext);
+        let is_video = self.plays(one);
         if (is_picture && !(full_failed && real_thumb.is_none())) || is_video {
             // The info strip and the video's controls go under the picture.
             let gif = self.anim.as_ref().filter(|a| a.key == one.key).map(|a| (a.frames.count, a.frames.total_ms()));
@@ -674,9 +697,16 @@ impl PreviewPane {
         slider(r, theme, c.volume, if self.muted { 0.0 } else { volume }, hover == Hit::Volume || self.dragging == Some(Drag::Volume));
     }
 
+    /// Whether the item is a video the pane offers to play. A .ts is a TV recording (an MPEG
+    /// transport stream) or TypeScript: it's a video once peek.rs has read its start and found no
+    /// text there (until then the pane waits, as for any text file).
+    fn plays(&self, one: &One) -> bool {
+        one.is_file() && video::is_video(&one.entry.ext) && (one.entry.ext != "ts" || self.facts.get(&one.key).is_some_and(|f| f.text.is_none()))
+    }
+
     /// Plays or pauses the video on screen (it's opened the first time).
     fn toggle_video(&mut self, app: &mut AppState) -> Effect {
-        let Some(one) = details::focused(app).filter(|o| o.is_file() && video::is_video(&o.entry.ext)) else { return Effect::None };
+        let Some(one) = details::focused(app).filter(|o| self.plays(o)) else { return Effect::None };
         if self.video_key != one.key || self.video.is_none() {
             self.video = None;
             self.video_key = one.key.clone();
@@ -1035,11 +1065,14 @@ impl PreviewPane {
         }
     }
 
-    /// A double-click on the picture (or text, or thumbnail) opens the file.
-    pub fn double_click(&mut self, e: &MouseEvent) -> Effect {
-        if e.button == MouseButton::Left && self.hit(e.pos) == Hit::View && self.shown.is_some() && !self.view_key.is_empty() {
-            self.panning = None;
-            return Effect::Command(Command::OpenSelected);
+    /// A double-click on the picture (or text, or thumbnail) opens the file - just the one shown,
+    /// whatever else is selected.
+    pub fn double_click(&mut self, e: &MouseEvent, app: &AppState) -> Effect {
+        if e.button == MouseButton::Left && self.hit(e.pos) == Hit::View && self.shown.is_some() {
+            if let Some(one) = details::focused(app).filter(|o| o.key == self.view_key) {
+                self.panning = None;
+                return Effect::Command(Command::OpenEntry(one.index));
+            }
         }
         Effect::None
     }

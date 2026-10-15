@@ -10,8 +10,8 @@
 //!            new tab instead (life.rs)
 //!   --light  start in the skin's light version this time (--dark: its dark one), whatever the
 //!            settings say
-//!   --bench  close as soon as the first folder is on screen (start-up timing; see the log in %TEMP%);
-//!            settings are read but not written
+//!   --bench  close as soon as the first folder is on screen (start-up timing, written to the log in
+//!            %TEMP%); settings are read but not written
 //! How Glint runs (life.rs):
 //!   --background          start hidden in the background (Start with Windows); nothing if Glint runs
 //!   --quit                ask the running Glint to quit completely
@@ -26,7 +26,9 @@
 //! glint.exe when that folder exists (portable); see settings.rs.
 //!
 //! For measuring and testing (environment variables):
-//!   GLINT_FRAME_LOG=1        write how long every frame took to the log (%TEMP%\glint.log)
+//!   GLINT_TIMING_LOG=1       write start-up and folder times to the log, %TEMP%\glint.log (off otherwise;
+//!                            the *_LOG switches below turn it on too)
+//!   GLINT_FRAME_LOG=1        write how long every frame took to the log
 //!   GLINT_RENDER=software    draw with Windows' software renderer instead of the graphics card
 //!   GLINT_SETTINGS_DIR=dir   keep settings, cache and logs in this folder instead
 //!   GLINT_TEST_CRASH=1       crash on purpose once the window is up, to see the crash report work
@@ -40,6 +42,7 @@
 #![windows_subsystem = "windows"]
 
 mod anim;
+mod archive;
 mod app;
 mod codebox;
 mod complete;
@@ -48,8 +51,11 @@ mod details;
 mod eraicons;
 mod oldmenu;
 mod dragdrop;
+mod dupes;
 mod fileops;
 mod folder;
+mod foldersize;
+mod form;
 mod frame;
 mod icons;
 mod life;
@@ -59,7 +65,9 @@ mod list;
 mod log;
 // The chrome logo in the title bars (its pictures are baked in from res/logo).
 mod logo;
+mod media;
 mod menu;
+mod palette;
 mod pathbar;
 mod peek;
 mod popup;
@@ -85,6 +93,7 @@ mod sortwin;
 mod side;
 mod sidebar;
 mod status;
+mod tags;
 mod textbox;
 mod theme;
 mod thumbs;
@@ -92,6 +101,9 @@ mod titlebar;
 mod toolbar;
 mod tray;
 mod ui;
+mod undo;
+mod copyqueue;
+mod queuebox;
 mod update;
 mod updatewin;
 // Where the file list puts its items in each view (details, list, icons, tree).
@@ -100,6 +112,7 @@ mod views;
 mod watch;
 mod window;
 mod winekey;
+mod winutil;
 
 use std::time::{Duration, Instant};
 
@@ -155,6 +168,10 @@ fn main() {
             _ => start = Some(arg),
         }
     }
+    if bench {
+        log::ask_for_timing_log();
+    }
+    log::tidy_timing_log();
     // "Make Glint default.bat" / "Restore File Explorer.bat": registry only, no settings needed.
     if let Some(code) = life::registry_switch(&switches) {
         std::process::exit(code);
@@ -197,12 +214,13 @@ fn main() {
         log::error(&problem);
     }
     let tray_icon = loaded.tray_icon;
+    let zip_icon = loaded.zip_icon;
     let dark = dark.unwrap_or_else(|| settings::dark_for(loaded.theme));
     // Just updated (update.rs): the same tabs as before, whatever "When Glint starts, open" says.
     let same_tabs = after_update.then(|| settings::Settings { startup: settings::Startup::Restore, ..loaded.clone() });
     let (tabs, active) = match &target {
         // An extra window (Ctrl+N) opens just its folder.
-        Some(t) if !main => (vec![settings::SavedTab { path: t.folder.clone(), sort_column: loaded.sort_column, sort_descending: loaded.sort_descending, view: None }], 0),
+        Some(t) if !main => (vec![settings::SavedTab { path: t.folder.clone(), sort_column: loaded.sort_column, sort_descending: loaded.sort_descending, view: None, pinned: false }], 0),
         _ => settings::initial_tabs(same_tabs.as_ref().unwrap_or(&loaded), target.as_ref().map(|t| t.folder.as_str()), &loaded.home_place()),
     };
     log::line(&format!(
@@ -215,7 +233,11 @@ fn main() {
     ));
 
     // Start reading the first folder now, while the window is being made.
+    let reopen_split = (main && loaded.remember_split).then(|| loaded.split_folder.clone()).flatten();
     let mut app = app::AppState::new(loaded, &tabs, active, dark);
+    if let Some(folder) = reopen_split {
+        app.reopen_split(folder);
+    }
     if let Some(name) = target.and_then(|t| t.select) {
         app.select_when_loaded(name);
     }
@@ -234,7 +256,7 @@ fn main() {
     if main {
         // From now on other glint.exe's, the tray icon and Win+E reach this window (life.rs).
         life::open_door(hwnd);
-        life::main_started();
+        life::main_started(zip_icon);
         if hidden {
             life::entered_background(tray_icon);
         }

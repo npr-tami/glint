@@ -116,7 +116,35 @@ impl StatusBar {
         let shown = tab.view.len();
         // Hidden files that aren't shown aren't counted (like Explorer); a filter shows "3 of 12".
         let total = tab.visible_total;
-        let mut s = if let Some(search) = &tab.search {
+        let mut s = if let Some(search) = tab.search.as_ref().filter(|s| s.is_dupes()) {
+            // Duplicates (dupes.rs): how many sets, and what deleting the extra copies would free.
+            let mut sets: std::collections::HashMap<u64, (usize, u64)> = std::collections::HashMap::new();
+            for &r in &tab.view {
+                let e = &tab.folder.entries[r as usize];
+                let set = sets.entry(e.free).or_default();
+                set.0 += 1;
+                set.1 = e.size;
+            }
+            let extra: u64 = sets.values().map(|&(n, size)| size * (n as u64).saturating_sub(1)).sum();
+            let mut s = match sets.len() {
+                0 if !search.done => "Looking for duplicates\u{2026}".to_string(),
+                0 => "No duplicates found".to_string(),
+                1 => "1 set of duplicates".to_string(),
+                n => format!("{} sets of duplicates", format_count(n)),
+            };
+            if extra > 0 {
+                s.push_str(&format!("  \u{00b7}  {} could be freed", format_size(extra)));
+            }
+            if !sets.is_empty() && !search.done {
+                s.push_str("  \u{00b7}  still looking\u{2026}");
+            } else if search.capped {
+                s.push_str(&format!("  \u{00b7}  showing the first {} files", format_count(crate::search::LIMIT)));
+            } else if let Some(d) = search.dupes.filter(|d| d.smallest_compared > 0) {
+                s.push_str(&format!("  \u{00b7}  files under {} skipped", format_size(d.smallest_compared)));
+            }
+            s.push_str("  \u{00b7}  Esc to go back");
+            s
+        } else if let Some(search) = &tab.search {
             // Searching subfolders (search.rs): how many found, and whether it's still looking.
             let mut s = if shown == 1 { "1 result".to_string() } else { format!("{} results", format_count(shown)) };
             if !search.done {
@@ -268,5 +296,41 @@ mod tests {
         assert!(text("in C:\\t (\n-newest_first\n)").ends_with("Custom sort (C:\\t)"));
         // Rules only for another folder: this one sorts by its column, and says nothing.
         assert!(!text("in C:\\elsewhere (\n-newest_first\n)").contains("Custom sort"));
+    }
+
+    /// The status line of a duplicate search that is `done`, `capped` and skipped files under
+    /// `smallest` bytes.
+    fn dupes_text(done: bool, capped: bool, smallest: u64) -> String {
+        let mut app = AppState::for_tests(Settings::default());
+        let mut search = crate::search::test_search("C:\\t");
+        (search.done, search.capped) = (done, capped);
+        search.dupes = Some(crate::dupes::Summary { smallest_compared: smallest, ..Default::default() });
+        app.tabs[0].search = Some(search);
+        StatusBar::left_text(&app)
+    }
+
+    #[test]
+    fn a_duplicate_search_that_skipped_small_files_says_so() {
+        let text = dupes_text(true, false, 4096);
+        assert!(text.contains("files under 4 KB skipped"), "{text}");
+        // Nothing skipped, nothing said; still looking, nothing yet; the cap note comes first.
+        assert!(!dupes_text(true, false, 0).contains("skipped"));
+        let capped = dupes_text(true, true, 4096);
+        assert!(capped.contains("showing the first 20,000 files") && !capped.contains("skipped"), "{capped}");
+        assert!(text.ends_with("Esc to go back"));
+    }
+
+    #[test]
+    fn a_name_search_says_it_stopped_only_when_it_was_capped() {
+        let text = |done: bool, capped: bool| {
+            let mut app = AppState::for_tests(Settings::default());
+            let mut search = crate::search::test_search("C:\\t");
+            (search.done, search.capped) = (done, capped);
+            app.tabs[0].search = Some(search);
+            StatusBar::left_text(&app)
+        };
+        assert_eq!(text(true, false), "0 results");
+        assert_eq!(text(true, true), "0 results  \u{00b7}  showing the first 20,000");
+        assert_eq!(text(false, false), "0 results  \u{00b7}  searching\u{2026}");
     }
 }

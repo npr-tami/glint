@@ -4,7 +4,8 @@
 //!
 //! The icon belongs to the door (life.rs), which gets its clicks as WM_APP_TRAY. If Explorer isn't
 //! running yet (Glint started with Windows a moment before the taskbar) or restarts, the icon is
-//! added again when Explorer broadcasts "TaskbarCreated".
+//! added again when Explorer broadcasts "TaskbarCreated". If the tray is there but too busy to take
+//! it (just after sign-in), it's asked again every few seconds for a minute.
 //!
 //! Everything here runs on the UI thread (the door's thread).
 
@@ -13,10 +14,12 @@ use std::cell::Cell;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Shell::{Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIN_SELECT, NOTIFYICONDATAW};
+use windows::Win32::UI::Shell::{
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIN_SELECT, NOTIFYICONDATAW,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, GetSystemMetrics, LoadImageW, PostMessageW,
-    SetForegroundWindow, SetMenuDefaultItem, TrackPopupMenu, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, MF_SEPARATOR, MF_STRING,
+    AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, GetSystemMetrics, KillTimer, LoadImageW, PostMessageW,
+    SetForegroundWindow, SetMenuDefaultItem, SetTimer, TrackPopupMenu, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, MF_SEPARATOR, MF_STRING,
     SM_CXSMICON, SM_CYSMICON, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, WM_CONTEXTMENU, WM_LBUTTONUP,
     WM_NULL, WM_RBUTTONUP,
 };
@@ -30,12 +33,19 @@ const PICK_OPEN: usize = 1;
 const PICK_QUIT: usize = 2;
 /// NIN_KEYSELECT: the icon chosen with the keyboard (Win+B, arrows, Enter).
 const NIN_KEYSELECT: u32 = NIN_SELECT + 1;
+/// Asking the tray again when it didn't take the icon: a timer on the door (its only one) that
+/// runs `retry` here, this often, this many times.
+const RETRY_TIMER: usize = 1;
+const RETRY_MS: u32 = 5000;
+const RETRIES: u32 = 12;
 
 thread_local! {
     /// The icon should be in the tray (it may be waiting for Explorer to come back).
     static WANTED: Cell<Option<HWND>> = const { Cell::new(None) };
     /// It is in the tray now.
     static SHOWN: Cell<bool> = const { Cell::new(false) };
+    /// Times left to ask the tray again (`retry`).
+    static TRIES: Cell<u32> = const { Cell::new(0) };
     /// The icon's picture, loaded once.
     static ICON: Cell<Option<HICON>> = const { Cell::new(None) };
     /// The tray menu is open (a second right-click meanwhile does nothing).
@@ -82,27 +92,51 @@ fn data(door: HWND) -> NOTIFYICONDATAW {
     d
 }
 
-/// Puts the icon in the tray (or keeps trying when Explorer comes back).
+/// Puts the icon in the tray (or keeps trying for a while, and when Explorer comes back).
 pub fn show(door: HWND) {
     WANTED.with(|w| w.set(Some(door)));
+    TRIES.with(|t| t.set(RETRIES));
+    add(door);
+}
+
+/// Asks the tray to take the icon, unless it has it; when it won't, again in a moment (`retry`).
+fn add(door: HWND) {
     if SHOWN.with(Cell::get) {
         return;
     }
     let d = data(door);
-    // SAFETY: `d` is a fully set-up NOTIFYICONDATAW that lives across the call.
-    let ok = unsafe { Shell_NotifyIconW(NIM_ADD, &d) }.as_bool();
+    // SAFETY: `d` is a fully set-up NOTIFYICONDATAW that lives across the calls. An add that timed
+    // out (the tray busy) can have gone in after all: then the icon is there to modify.
+    let ok = unsafe { Shell_NotifyIconW(NIM_ADD, &d).as_bool() || Shell_NotifyIconW(NIM_MODIFY, &d).as_bool() };
     SHOWN.with(|s| s.set(ok));
+    if !ok && TRIES.with(|t| t.replace(t.get().saturating_sub(1))) > 0 {
+        // SAFETY: a timer on our own window, handled by `retry` (the door's messages never see it).
+        unsafe {
+            SetTimer(Some(door), RETRY_TIMER, RETRY_MS, Some(retry));
+        }
+    }
+}
+
+/// The retry timer: the tray is asked again, if the icon is still wanted and not in yet.
+unsafe extern "system" fn retry(door: HWND, _msg: u32, id: usize, _time: u32) {
+    // SAFETY: stops our own timer (`add` starts it again when this try fails too).
+    unsafe {
+        let _ = KillTimer(Some(door), id);
+    }
+    if WANTED.with(Cell::get) == Some(door) {
+        add(door);
+    }
 }
 
 /// Takes the icon out of the tray.
 pub fn hide() {
     let Some(door) = WANTED.with(|w| w.take()) else { return };
-    if SHOWN.with(|s| s.replace(false)) {
-        let d = NOTIFYICONDATAW { cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: door, uID: ICON_ID, ..Default::default() };
-        // SAFETY: names our icon; nothing else is read.
-        unsafe {
-            let _ = Shell_NotifyIconW(NIM_DELETE, &d);
-        }
+    // Even when adding it seemed to fail: an add that timed out can have gone in after all.
+    SHOWN.with(|s| s.set(false));
+    let d = NOTIFYICONDATAW { cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: door, uID: ICON_ID, ..Default::default() };
+    // SAFETY: names our icon; nothing else is read.
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_DELETE, &d);
     }
     if let Some(i) = ICON.with(|c| c.take()) {
         // SAFETY: the icon was loaded by `icon` (not shared) and the tray no longer uses it.

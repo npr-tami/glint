@@ -2,8 +2,9 @@
 //! the Settings window's style (kit.rs), for changing a skin in plain words and seeing it at once.
 //!
 //! - **Left:** every skin - the built-in ones, then the person's own - and the buttons NEW,
-//!   DUPLICATE, RENAME, DELETE (own skins only, after a question; the file goes to the Recycle Bin),
-//!   IMPORT…, EXPORT… and OPEN SKINS FOLDER (in a new tab; this window stays open). Clicking a
+//!   DUPLICATE, RENAME, DELETE (own skins only, after a question; the file goes to the Recycle Bin,
+//!   or is deleted for good on a drive without one), IMPORT…, EXPORT… and OPEN SKINS FOLDER (in a
+//!   new tab; this window stays open). Clicking a
 //!   skin uses it, like Settings' drop-down.
 //! - **Right:** the skin in use, in plain words: the button shape, the slant, the row height, the
 //!   text size, how thick the tab's and the toolbar's lines are, the logo (empty: the chrome
@@ -41,7 +42,6 @@ use std::time::Instant;
 
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteObject, GetMonitorInfoW, InvalidateRect, MonitorFromWindow, RedrawWindow, ScreenToClient,
     SetBkColor, SetTextColor, ValidateRect, COLOR_WINDOW, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, RDW_ALLCHILDREN,
@@ -62,7 +62,7 @@ use windows::Win32::UI::Shell::{
     FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindow, GetWindowRect, IsIconic, KillTimer, LoadCursorW, LoadIconW, PostMessageW, RegisterClassExW, SetForegroundWindow,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindow, IsIconic, KillTimer, LoadCursorW, LoadIconW, PostMessageW, RegisterClassExW, SetForegroundWindow,
     SetTimer, SetWindowPos, ShowWindow, GW_OWNER,
     HTCLIENT, IDC_ARROW, MINMAXINFO, SIZE_MINIMIZED, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE, SW_SHOW, WA_INACTIVE, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_CHAR,
     WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_KEYDOWN,
@@ -85,6 +85,7 @@ use crate::textbox::{self, TextBox, TextEvent, TextEventKind, WM_APP_TEXT};
 use crate::settings::LogoStyle;
 use crate::theme::{size, ButtonStyle, CaptionStyle, Color, Era, IconSet, Paint, Shape, SidebarStyle, Stop, TabStyle, Theme};
 use crate::ui::{Command, Menu, MenuItem, Point, Rect};
+use crate::winutil::{hi_word, lo_word, place_visible, visible_rect};
 
 /// The window's title (Alt+Tab, the taskbar's thumbnails).
 pub const TITLE: &str = "Glint skins";
@@ -141,7 +142,7 @@ const UNDO_STEPS: usize = 200;
 const TYPING_PAUSE: f64 = 1.5;
 /// The undo group for typing in the skin's text (a box being edited has its own number).
 const TEXT_GROUP: u64 = u64::MAX;
-/// The skin's text is kept below this (EM_LIMITTEXT), like the files Glint reads.
+/// The skin's text is kept to this, like the files Glint reads (bytes).
 const MAX_TEXT: usize = 256 * 1024;
 
 /// Every colour a skin has (skin::COLOURS), by the skin's name for it, with its title here, in
@@ -267,7 +268,7 @@ const SIDEBAR_STYLES: [(SidebarStyle, &str, &str); 2] = [(SidebarStyle::Plain, "
 const ERAS: [(Era, &str, &str); 5] = [(Era::None, "none", "None"), (Era::Win98, "98", "Windows 98"), (Era::Win2000, "2000", "Windows 2000"), (Era::Xp, "xp", "Windows XP"), (Era::Win7, "7", "Windows 7")];
 const ICON_SETS: [(IconSet, &str, &str); 4] = [(IconSet::Windows, "windows", "Windows"), (IconSet::Classic, "classic", "Classic"), (IconSet::Xp, "xp", "XP"), (IconSet::Aero, "aero", "Aero")];
 /// The Logo setting (as Settings > Appearance offers it).
-const LOGOS: [(LogoStyle, &str); 3] = [(LogoStyle::Box, "Box"), (LogoStyle::Chrome, "Chrome"), (LogoStyle::None, "None")];
+const LOGOS: [(LogoStyle, &str); 4] = [(LogoStyle::Box, "Box"), (LogoStyle::Chrome, "Chrome"), (LogoStyle::Caps, "GLiNT"), (LogoStyle::None, "None")];
 /// DIPs in a point (9 pt = 12 DIPs).
 const PT: f32 = 96.0 / 72.0;
 /// A colour row's note when the colour follows another: the row shows which ("follows Accent").
@@ -533,6 +534,9 @@ pub struct SkinWindow {
     code: CodeBox,
     /// What the text view was last given (a change from elsewhere is shown when it's not being typed in).
     text_shown: String,
+    /// The skin that text is of. Another skin in use (its light or dark twin, after Ctrl+Shift+L)
+    /// is shown even while the text is being typed in, and the old text never goes into it.
+    text_for: String,
     /// The guide under the skin's text shows (GUIDE), and how tall it was last drawn.
     guide: bool,
     guide_h: f32,
@@ -555,12 +559,17 @@ pub struct SkinWindow {
     status_mine: bool,
     /// The drop-down whose list is open.
     menu_for: Option<Ctl>,
+    /// The skin the colour picker or the Save dialog was opened for (the one in use can change
+    /// meanwhile, from the main window).
+    dialog_for: Option<String>,
     /// "Delete this skin?": the question (drawn by ask.rs) and the skin it's about.
     ask: AskBox,
     asking: Option<(u64, String)>,
     next_question: u64,
     /// Space or Enter on a drop-down: its list opens when that key's character arrives.
     act_on_char: Option<Spot>,
+    /// The first half of a character typed in two (an emoji, say), waiting for the second.
+    half_char: Option<u16>,
     /// Under Wine a hidden text box stays on screen until a later frame: paint until then.
     repaint_until: f64,
     /// The switches the person just flipped ("Show as text", "Dark skin"), gliding to their new
@@ -662,6 +671,7 @@ pub fn create(owner: HWND, theme: &Theme) -> Option<SkinWindow> {
             advanced: false,
             code: CodeBox::default(),
             text_shown: String::new(),
+            text_for: String::new(),
             guide: false,
             guide_h: 0.0,
             note_rects: Vec::new(),
@@ -674,10 +684,12 @@ pub fn create(owner: HWND, theme: &Theme) -> Option<SkinWindow> {
             status: None,
             status_mine: false,
             menu_for: None,
+            dialog_for: None,
             ask: AskBox::default(),
             asking: None,
             next_question: 1,
             act_on_char: None,
+            half_char: None,
             repaint_until: 0.0,
             flips: kit::Flips::default(),
             bar: kit::Bar::default(),
@@ -873,32 +885,6 @@ fn beside(owner: HWND, w: i32) -> (i32, i32, i32, i32) {
     (x, y, w, h)
 }
 
-/// The part of `hwnd` you can see (screen pixels): Windows 10 / 11 add invisible borders round a
-/// window's rectangle, which left a gap between the two windows.
-fn visible_rect(hwnd: HWND) -> RECT {
-    let mut r = RECT::default();
-    // SAFETY: plain queries on our own windows with valid out-structs.
-    unsafe {
-        if DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &mut r as *mut _ as *mut _, std::mem::size_of::<RECT>() as u32).is_err() || r.right <= r.left {
-            let _ = GetWindowRect(hwnd, &mut r);
-        }
-    }
-    r
-}
-
-/// Places `hwnd` so the part of it you can see is `x, y, w, h`, its invisible borders outside that.
-fn place_visible(hwnd: HWND, (x, y, w, h): (i32, i32, i32, i32)) {
-    let mut whole = RECT::default();
-    // SAFETY: a plain query and a move of our own window.
-    unsafe {
-        let _ = GetWindowRect(hwnd, &mut whole);
-        let seen = visible_rect(hwnd);
-        let (l, t) = (seen.left - whole.left, seen.top - whole.top);
-        let (r, b) = (whole.right - seen.right, whole.bottom - seen.bottom);
-        let _ = SetWindowPos(hwnd, None, x - l, y - t, w + l + r, h + t + b, SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-}
-
 /// WM_NCHITTEST: the edges resize, the rest is ours. The title bar doesn't move the window: it
 /// stays docked to the main window (`follow_owner`).
 fn hit_test(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -930,14 +916,6 @@ fn edit_colors(hdc: HDC) -> LRESULT {
         return LRESULT(COLOR_WINDOW.0 as isize + 1);
     }
     LRESULT(brush)
-}
-
-fn lo_word(v: usize) -> u32 {
-    (v & 0xffff) as u32
-}
-
-fn hi_word(v: usize) -> u32 {
-    ((v >> 16) & 0xffff) as u32
 }
 
 /// The skin's colours as the customiser shows them, in COLOURS's order (skin text `text`).
@@ -1431,7 +1409,7 @@ impl SkinWindow {
                 &theme,
                 *id,
                 &format!("Delete the skin \u{201c}{name}\u{201d}?"),
-                "Its file goes to the Recycle Bin.",
+                if app.skins.recycles(skin_id) { "Its file goes to the Recycle Bin." } else { "Its file is deleted for good: this drive has no Recycle Bin." },
                 "DELETE",
                 area,
             );
@@ -1826,18 +1804,21 @@ impl SkinWindow {
     }
 
     /// Shows the skin's text in the text view, unless someone is typing there (then their text is
-    /// the truth); a built-in skin's text can't be changed.
+    /// the truth) - but always when another skin is in use now; a built-in skin's text can't be
+    /// changed.
     fn sync_text(&mut self, app: &AppState) {
         let entry = app.skins.find(&app.settings.skin);
         self.code.read_only = entry.is_none_or(Entry::built_in);
-        if self.focus == Spot::Text && self.advanced {
+        let same_skin = self.text_for.eq_ignore_ascii_case(&app.settings.skin);
+        if self.focus == Spot::Text && self.advanced && same_skin {
             return;
         }
         let text = entry.map(|e| e.text.replace("\r\n", "\n")).unwrap_or_default();
-        if text != self.text_shown {
+        if text != self.text_shown || !same_skin {
             self.code.set_text(&text);
             self.text_shown = text;
         }
+        self.text_for = app.settings.skin.clone();
     }
 
     // ------------------------------------------------------------ the mouse
@@ -1944,8 +1925,9 @@ impl SkinWindow {
     fn mouse_down(&mut self, p: Point, double: bool, app: &mut AppState) -> Vec<Ask> {
         self.cues = false;
         self.act_on_char = None;
-        if self.asking.is_some() {
-            let a = self.ask.mouse_down(p);
+        if let Some(id) = self.asking.as_ref().map(|q| q.0) {
+            // (Not before the question is drawn: a click meant for something else mustn't answer it.)
+            let a = if self.ask.shown(id) { self.ask.mouse_down(p) } else { Answer::Nothing };
             return self.answer(a, app);
         }
         // An older Windows' scroll bars: an arrow button moves a list or the page a line, the
@@ -2014,8 +1996,8 @@ impl SkinWindow {
     }
 
     fn mouse_up(&mut self, p: Point, app: &mut AppState) -> Vec<Ask> {
-        if self.asking.is_some() {
-            let a = self.ask.mouse_up(p);
+        if let Some(id) = self.asking.as_ref().map(|q| q.0) {
+            let a = if self.ask.shown(id) { self.ask.mouse_up(p) } else { Answer::Nothing };
             return self.answer(a, app);
         }
         if self.holding.release(self.hwnd) {
@@ -2113,14 +2095,19 @@ impl SkinWindow {
     }
 
     /// A key, when the window (not a text box) has the keyboard. Returns whether it was used.
-    fn key(&mut self, vk: u16, app: &mut AppState, asks: &mut Vec<Ask>) -> bool {
+    /// `repeat`: the key is held down and this is Windows repeating it.
+    fn key(&mut self, vk: u16, repeat: bool, app: &mut AppState, asks: &mut Vec<Ask>) -> bool {
         // SAFETY: plain key-state queries.
         let (ctrl, shift, alt) = unsafe { (GetKeyState(VK_CONTROL.0 as i32) < 0, GetKeyState(VK_SHIFT.0 as i32) < 0, GetKeyState(VK_MENU.0 as i32) < 0) };
         let is = |k: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| vk == k.0;
         self.act_on_char = None;
-        if self.asking.is_some() {
-            let a = self.ask.key(vk);
-            asks.extend(self.answer(a, app));
+        if let Some(id) = self.asking.as_ref().map(|q| q.0) {
+            // Enter held a moment too long on DELETE, or a key pressed before the question was even
+            // drawn, must not answer it.
+            if !repeat && self.ask.shown(id) {
+                let a = self.ask.key(vk);
+                asks.extend(self.answer(a, app));
+            }
             return true;
         }
         // The skin's text has the keyboard: its keys first.
@@ -2176,10 +2163,14 @@ impl SkinWindow {
             }
             _ if self.focus == Spot::List && is(VK_F2) => asks.extend(self.press(Btn::Rename, app)),
             _ if self.focus == Spot::List && is(VK_DELETE) => asks.extend(self.press(Btn::Delete, app)),
-            _ if is(VK_UP) || is(VK_DOWN) => self.move_focus(if is(VK_UP) { -1 } else { 1 }, app),
+            // (Alt+Down opens a drop-down, below.)
+            _ if !alt && (is(VK_UP) || is(VK_DOWN)) => self.move_focus(if is(VK_UP) { -1 } else { 1 }, app),
             _ if is(VK_SPACE) || is(VK_RETURN) || is(VK_F4) || (alt && is(VK_DOWN)) => {
                 self.cues = true;
-                let dropdown = matches!(self.focus, Spot::Ctl(Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize, _));
+                let dropdown = matches!(
+                    self.focus,
+                    Spot::Ctl(Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Era | Ctl::Icons | Ctl::Logo, _)
+                );
                 if dropdown && (is(VK_SPACE) || is(VK_RETURN)) {
                     // Opened when the key's character has come (it would close the menu again).
                     self.act_on_char = Some(self.focus);
@@ -2365,7 +2356,10 @@ impl SkinWindow {
         let styles = |labels: &[(&str, bool)]| labels.iter().enumerate().map(|(n, (l, on))| MenuItem::new(n as u32 + 1, l).checked(*on)).collect::<Vec<_>>();
         match (ctl, part) {
             // A gradient's swatch: the picker changes its first colour.
-            (Ctl::Colour(i), Part::Main) => vec![Ask::Job(Job::Colour { at: i, initial: self.colour(app, i).paint.first().to_colorref() })],
+            (Ctl::Colour(i), Part::Main) => {
+                self.dialog_for = Some(app.settings.skin.clone());
+                vec![Ask::Job(Job::Colour { at: i, initial: self.colour(app, i).paint.first().to_colorref() })]
+            }
             (Ctl::Colour(i), Part::Clear) => {
                 if self.colour(app, i).text == "none" {
                     return Vec::new();
@@ -2644,7 +2638,10 @@ impl SkinWindow {
             }
             Btn::Import => vec![Ask::Job(Job::Import)],
             Btn::Export => match current {
-                Some(e) => vec![Ask::Job(Job::Export(format!("{}.{}", skin::file_stem(&e.name), skin::EXTENSION)))],
+                Some(e) => {
+                    self.dialog_for = Some(e.id.clone());
+                    vec![Ask::Job(Job::Export(format!("{}.{}", skin::file_stem(&e.name), skin::EXTENSION)))]
+                }
                 None => Vec::new(),
             },
             Btn::Folder => {
@@ -2693,12 +2690,15 @@ impl SkinWindow {
                 self.save_due.retain(|d| *d != id);
                 self.undo.retain(|s| s.0 != id);
                 self.redo.retain(|s| s.0 != id);
-                app.skins.delete(&id);
+                let recycled = app.skins.delete(&id);
                 // Glint goes back to AMD Radeon (light or dark as it was).
                 if app.settings.skin == id {
                     app.pick_skin(if dark { skin::DEFAULT } else { skin::DEFAULT_LIGHT });
                 }
-                self.say(format!("Moved {name} to the Recycle Bin"), false);
+                self.say(if recycled { format!("Moved {name} to the Recycle Bin") } else { format!("Deleted {name}") }, false);
+                // The file worker's word on it comes next and takes over (where the Recycle Bin is
+                // switched off for the drive, Windows asks, then deletes it for good).
+                self.status_mine = false;
                 self.layout_dirty = true;
                 self.focus = Spot::List;
                 self.invalidate();
@@ -2777,7 +2777,7 @@ impl SkinWindow {
                 self.end_editing(app, false)
             }
             TextEventKind::LostFocus => self.end_editing(app, true),
-            TextEventKind::Down => Vec::new(),
+            TextEventKind::Down | TextEventKind::Tab => Vec::new(),
         }
     }
 
@@ -2785,10 +2785,21 @@ impl SkinWindow {
     /// be typed in: their box is read-only).
     fn text_typed(&mut self, app: &mut AppState) -> Vec<Ask> {
         let id = app.settings.skin.clone();
-        if app.skins.find(&id).is_none_or(Entry::built_in) {
+        // (Typed into the text of a skin no longer in use, before the one in use now is shown: the
+        // next frame shows it, and nothing is written.)
+        if !self.text_for.eq_ignore_ascii_case(&id) || app.skins.find(&id).is_none_or(Entry::built_in) {
             return Vec::new();
         }
         let typed = self.code.text.clone();
+        // Glint doesn't read a bigger file: the skin would drop out of the list.
+        if typed.len() > MAX_TEXT {
+            let text = app.skins.find(&id).map(|e| e.text.replace("\r\n", "\n")).unwrap_or_default();
+            self.code.set_text(&text);
+            self.text_shown = text;
+            self.say("That's too big for a skin (256 KB at most)", true);
+            self.invalidate();
+            return Vec::new();
+        }
         self.text_shown = typed.clone();
         if let Some(old) = app.skins.find(&id).map(|e| e.text.clone()).filter(|t| *t != typed) {
             self.remember(&id, old, Some(TEXT_GROUP));
@@ -2812,6 +2823,10 @@ impl SkinWindow {
                 }
             }
             JobDone::Colour(i, colorref) => {
+                // Another skin was picked while the picker was open: the colour isn't put in it.
+                if self.dialog_for.take().is_some_and(|id| !id.eq_ignore_ascii_case(&app.settings.skin)) {
+                    return Vec::new();
+                }
                 // Windows' picker has no see-through: the colour keeps the strength it had (a clear
                 // one becomes solid). On a gradient it changes the first colour.
                 let old = self.colour(app, i).paint;
@@ -2834,7 +2849,8 @@ impl SkinWindow {
                 Vec::new()
             }
             JobDone::Export(path) => {
-                let id = app.settings.skin.clone();
+                // The skin the dialog was opened for, even if another was picked meanwhile.
+                let id = self.dialog_for.take().unwrap_or_else(|| app.settings.skin.clone());
                 self.say(format!("Exporting to {}\u{2026}", path.display()), false);
                 app.skins.export(&id, path);
                 self.invalidate();
@@ -2952,9 +2968,20 @@ impl SkinWindow {
                 self.wheel(Point::new(pt.x as f32 / s - self.border(), pt.y as f32 / s - self.border()), hi_word(wparam.0) as u16 as i16 as f32 / 120.0);
                 Some(LRESULT(0))
             }
-            WM_KEYDOWN | WM_SYSKEYDOWN => self.key(wparam.0 as u16, app, &mut asks).then_some(LRESULT(0)),
+            WM_KEYDOWN | WM_SYSKEYDOWN => self.key(wparam.0 as u16, lparam.0 & 0x4000_0000 != 0, app, &mut asks).then_some(LRESULT(0)),
             WM_CHAR if self.focus == Spot::Text && self.advanced && self.asking.is_none() => {
-                if let Some(c) = char::from_u32(wparam.0 as u32) {
+                // A character past the first 65,536 (an emoji, say) comes in two halves, one
+                // message each: the first waits for the second.
+                let unit = wparam.0 as u32;
+                let c = match (self.half_char.take(), unit) {
+                    (_, 0xD800..=0xDBFF) => {
+                        self.half_char = Some(unit as u16);
+                        None
+                    }
+                    (Some(first), 0xDC00..=0xDFFF) => char::decode_utf16([first, unit as u16]).next().and_then(Result::ok),
+                    _ => char::from_u32(unit),
+                };
+                if let Some(c) = c {
                     if self.code.char(c, &SkinLang) == Done::Changed {
                         asks.extend(self.text_typed(app));
                     }
@@ -3068,7 +3095,7 @@ fn swatch(r: &mut Renderer, theme: &Theme, rect: Rect, p: &Paint, look: Look) {
     r.fill_paint(rect, 0.0, p);
     r.stroke_rect(rect, 1.0, if look.hover { theme.text } else { theme.line });
     if look.focused {
-        kit::focus_ring(r, theme, rect, 0.0);
+        kit::focus_ring_round(r, theme, rect, 0.0, 0.0);
     }
 }
 

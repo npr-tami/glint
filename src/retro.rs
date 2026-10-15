@@ -228,28 +228,13 @@ fn fill_glass(r: &mut Renderer, theme: &Theme, rect: Rect, area: Rect, paint: &P
             let left = x - fade + i as f32 * w;
             if left + w > see.x {
                 let slice = Rect::new(left.max(see.x), see.y, left + w - left.max(see.x), see.h);
-                r.fill_paint_down(slice, 0.0, &faded(paint, (i + 1) as f32 / (steps + 1) as f32), area.y, area.bottom());
+                r.fill_paint_down(slice, 0.0, &paint.with_strength((i + 1) as f32 / (steps + 1) as f32), area.y, area.bottom());
             }
         }
         r.fill_paint_down(Rect::new(x, see.y, see.right() - x, see.h), 0.0, paint, area.y, area.bottom());
     }
     if bottom < rect.bottom() {
         r.fill_paint_down(Rect::new(rect.x, bottom, rect.w, rect.bottom() - bottom), 0.0, paint, area.y, area.bottom());
-    }
-}
-
-/// `paint` with every colour `k` times as solid.
-fn faded(paint: &Paint, k: f32) -> Paint {
-    match paint {
-        Paint::Flat(c) => Paint::Flat(c.with_alpha(c.a * k)),
-        Paint::Gradient(g) => {
-            let mut stops = [Stop { at: 0.0, color: Color::rgba(0, 0, 0, 0.0) }; MAX_STOPS];
-            let n = g.stops().len().min(MAX_STOPS);
-            for (out, s) in stops.iter_mut().zip(g.stops()) {
-                *out = Stop { at: s.at, color: s.color.with_alpha(s.color.a * k) };
-            }
-            Paint::from_stops(&stops[..n])
-        }
     }
 }
 

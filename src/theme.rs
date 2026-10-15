@@ -71,7 +71,6 @@ impl Color {
     }
 
     /// The grey of the same lightness (a disabled button's marble).
-    #[allow(dead_code)]
     pub fn grey(self) -> Color {
         let l = self.lightness();
         Color { r: l, g: l, b: l, a: self.a }
@@ -170,8 +169,6 @@ impl From<Color> for Paint {
     }
 }
 
-// (Not every part draws with all of these yet.)
-#[allow(dead_code)]
 impl Paint {
     /// Nothing: a fill with it draws nothing.
     pub const CLEAR: Paint = Paint::Flat(Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 });
@@ -583,8 +580,8 @@ pub struct Theme {
     /// Show the whole picture, as big as fits, at `wallpaper_at`'s side, instead of filling the
     /// list with it (`wallpaper-fit: whole`). Best for a picture on a plain background.
     pub wallpaper_whole: bool,
-    /// Which edge stays in view up and down: 0 its top, 0.5 its middle, 1 its bottom (the second
-    /// word of `wallpaper-position`); None: the top when filling, the bottom when whole.
+    /// Which edge stays in view up and down: 0 its top, 0.5 its middle, 1 its bottom (the top,
+    /// middle or bottom word of `wallpaper-position`, in either order); None: the top when filling, the bottom when whole.
     pub wallpaper_at_y: Option<f32>,
     /// How big it is next to its fitted size, 1/6 to 6 (`wallpaper-zoom`: -500 to 500, 0 for 1).
     pub wallpaper_zoom: f32,
@@ -653,7 +650,6 @@ impl Theme {
     }
 
     /// How wide a scrollbar's lane is: the thumb and the space on both sides of it.
-    #[allow(dead_code)]
     pub fn scrollbar_lane(&self) -> f32 {
         self.scrollbar_w + 2.0 * self.scrollbar_margin()
     }
@@ -698,7 +694,7 @@ impl Theme {
 
     /// Whether the title bars show the chrome wordmark (rather than the skin's word in a box).
     pub fn chrome_logo(&self) -> bool {
-        self.logo_style == crate::settings::LogoStyle::Chrome
+        matches!(self.logo_style, crate::settings::LogoStyle::Chrome | crate::settings::LogoStyle::Caps)
     }
 
     /// How far the right edge of a logo word's box is cut, for a title bar `h` DIPs high (35 % of
@@ -719,6 +715,8 @@ pub mod size {
     /// The logo's room at the left of a title bar: the chrome wordmark (80 DIPs wide, 8 in from
     /// the left), or the box of a skin's logo word.
     pub const LOGO_W: f32 = 90.0;
+    /// The same for the wordmark in capitals (GLiNT), which is wider.
+    pub const LOGO_W_CAPS: f32 = 114.0;
     pub const CAPTION_BUTTON_W: f32 = 46.0;
     /// Caption glyphs (minimise, maximise, close) are 10 DIPs across.
     pub const CAPTION_GLYPH: f32 = 10.0;

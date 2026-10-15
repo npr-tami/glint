@@ -138,6 +138,12 @@ impl Side {
         self.preview.key_down(vk, mods, app)
     }
 
+    /// Something is about to delete, rename or move the selection, or a drive is being ejected: the
+    /// preview lets go of the video file it has open (see `PreviewPane::release_files`).
+    pub fn release_files(&mut self) {
+        self.preview.release_files();
+    }
+
     /// Typed characters while the preview is open (+ and - zoom).
     pub fn preview_char(&mut self, ch: char) -> Effect {
         if !self.preview_open || self.rect.is_empty() {
@@ -201,7 +207,10 @@ impl Component for Side {
 
     fn mouse_move(&mut self, _ctx: &Ctx, e: &MouseEvent, app: &mut AppState) -> Effect {
         if let Some(s) = self.split {
-            let w = s.start_w + (s.start_x - e.pos.x);
+            // Dragged past the narrowest the pane gets, it stays that narrow (0 would be the
+            // standard width, which only a double-click asks for).
+            let min = if self.showing == Showing::Preview { PREVIEW_MIN } else { DETAILS_MIN };
+            let w = (s.start_w + (s.start_x - e.pos.x)).max(min);
             let now = self.pane().w;
             return if (w - now).abs() >= 0.5 { Effect::Command(Command::SideWidth(w)) } else { Effect::None };
         }
@@ -258,7 +267,7 @@ impl Component for Side {
         }
         match self.showing {
             Showing::Details => self.details.double_click(e, app),
-            Showing::Preview => self.preview.double_click(e),
+            Showing::Preview => self.preview.double_click(e, app),
             Showing::Nothing => Effect::None,
         }
     }

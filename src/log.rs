@@ -1,7 +1,9 @@
 //! Two logs. Writing either one never fails loudly.
 //!
 //! - **The timing log**, %TEMP%\glint.log: start-up and folder-load times, so speed can be
-//!   checked without a debugger (`line`).
+//!   checked without a debugger (`line`). Off unless asked for when Glint starts: GLINT_TIMING_LOG=1
+//!   (or another logging switch from main.rs, or --bench). It names the folders that were opened,
+//!   so the one an older Glint wrote (it was always on then) is deleted at start (`tidy_timing_log`).
 //! - **The error log**, error.log in the logs folder (settings.rs): unexpected problems and crashes,
 //!   with the date and time, Glint's version, what happened and where in the code (`error`, and the
 //!   panic hook from `install_panic_hook`). It can be switched off (SETTINGS > Error log; on by
@@ -13,6 +15,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::core::{w, PCWSTR};
@@ -35,15 +38,45 @@ fn path() -> Option<std::path::PathBuf> {
     std::env::var_os("TEMP").or_else(|| std::env::var_os("TMP")).map(|t| std::path::Path::new(&t).join("glint.log"))
 }
 
-/// Appends one line to the timing log, stamped with seconds since 1970 (milliseconds precision).
+/// The switches that turn the timing log on (each of the others adds its own details to it).
+const TIMING_SWITCHES: [&str; 4] = ["GLINT_TIMING_LOG", "GLINT_FRAME_LOG", "GLINT_WATCH_LOG", "GLINT_THUMB_LOG"];
+/// --bench asked for the timing log.
+static TIMING_ASKED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the timing log is written: only when a switch or --bench asks for it.
+pub fn timing_on() -> bool {
+    static SWITCHED: OnceLock<bool> = OnceLock::new();
+    TIMING_ASKED.load(Ordering::Relaxed) || *SWITCHED.get_or_init(|| TIMING_SWITCHES.iter().any(|s| std::env::var_os(s).is_some()))
+}
+
+/// --bench: start-up timing is what it's for.
+pub fn ask_for_timing_log() {
+    TIMING_ASKED.store(true, Ordering::Relaxed);
+}
+
+/// At start: the timing log goes unless it's wanted, so the folders an older Glint wrote down
+/// don't stay in the temp folder.
+pub fn tidy_timing_log() {
+    if !timing_on() {
+        if let Some(p) = path() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// Appends one line to the timing log (when it's on), stamped with seconds since 1970
+/// (milliseconds precision).
 pub fn line(text: &str) {
+    if !timing_on() {
+        return;
+    }
     let Some(p) = path() else { return };
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-        // It starts again once it's big, so it never piles up in the temp folder.
-        if f.metadata().is_ok_and(|m| m.len() > TIMING_LOG_MAX) {
-            let _ = f.set_len(0);
-        }
+    // It starts again once it's big, so it never piles up in the temp folder: as a new, empty file
+    // (a file opened for appending can't be cut short on Windows).
+    let big = std::fs::metadata(&p).is_ok_and(|m| m.len() > TIMING_LOG_MAX);
+    let file = if big { std::fs::File::create(&p) } else { std::fs::OpenOptions::new().create(true).append(true).open(&p) };
+    if let Ok(mut f) = file {
         let _ = writeln!(f, "{stamp:.3} {text}");
     }
 }

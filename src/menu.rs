@@ -8,9 +8,10 @@
 //! whole menu straight away, with its extra items. shellmenu.rs gets Windows' items, popup.rs
 //! shows the menu.
 //!
-//! Items for working with files (cut, copy, paste, rename, delete, new folder) send the commands
-//! app/files.rs carries out. The same commands picked from Windows' own menu are done by Glint too
-//! (`command_for_verb`), so they get Glint's question, selection and name box.
+//! Items for working with files (cut, copy, paste, rename, delete, new folder, extract, compress,
+//! the colour tags) send the commands app/files.rs carries out. The same commands picked from
+//! Windows' own menu are done by Glint too (`command_for_verb`), so they get Glint's question,
+//! selection and name box.
 //!
 //! The Recycle Bin has menus of its own: Restore, Delete permanently, Go to
 //! where it was, Copy where it was on items; Restore all and Empty Recycle Bin on the empty space.
@@ -22,6 +23,7 @@ use crate::folder::EntryKind;
 use crate::recycle;
 use crate::settings::ViewMode;
 use crate::shellmenu::{ShellItem, PICTURE_UNKNOWN};
+use crate::tags::Tag;
 use crate::ui::{Command, Effect, FilesMenu, Menu, MenuAbout, MenuItem, Point, ShellRequest, ShellTarget, MORE_OPTIONS, SHELL_SLOT};
 
 /// More items than this, and Windows isn't asked (its menu for 50,000 files takes long to build).
@@ -76,6 +78,31 @@ const PICK_SORT_CREATED: u32 = 49;
 const PICK_FAVORITE: u32 = 50;
 // Added with the views: View › (from PICK_VIEW, in `ViewMode::ALL`'s order).
 const PICK_VIEW: u32 = 60;
+// Ctrl+Z and Ctrl+Y (undo.rs).
+const PICK_UNDO: u32 = 80;
+const PICK_REDO: u32 = 81;
+// Renaming many at once (app/forms.rs).
+const PICK_RENAME_ALL: u32 = 82;
+const PICK_DUPES: u32 = 83;
+const PICK_EXTRA_COPIES: u32 = 84;
+// Split view's other side (app/split.rs).
+const PICK_OTHER_SIDE: u32 = 85;
+const PICK_COPY_OTHER: u32 = 86;
+const PICK_MOVE_OTHER: u32 = 87;
+// Zip and 7z files (archive.rs).
+const PICK_EXTRACT_HERE: u32 = 88;
+const PICK_EXTRACT_TO: u32 = 89;
+const PICK_ZIP: u32 = 90;
+const PICK_7Z: u32 = 91;
+// Colour tags (tags.rs): Tag › (from PICK_TAG, in `Tag::ALL`'s order), and Remove tag.
+const PICK_TAG: u32 = 92;
+const PICK_UNTAG: u32 = 98;
+// The Picture size and Length columns (media.rs).
+const PICK_SORT_DIMENSIONS: u32 = 99;
+const PICK_SORT_LENGTH: u32 = 100;
+
+/// The longest folder name "Extract to “…”" shows in full.
+const EXTRACT_LABEL_MAX: usize = 40;
 
 /// Windows' items Glint already has (or that make no sense in Glint), by their verb: left out when
 /// Windows' items are merged into Glint's menu. Windows' whole menu still has them.
@@ -112,11 +139,18 @@ pub fn for_items(app: &AppState, at: Point, how: How) -> Effect {
     let first = &t.folder.entries[first_index];
     let single = chosen.len() == 1;
     let folders = chosen.iter().filter(|&&i| t.folder.entries[i].is_container()).count();
-    // This PC lists drives: nothing to cut, rename or delete there.
-    let files = !t.folder.path.is_empty() && first.kind != EntryKind::Drive;
+    // This PC lists drives: nothing to cut, rename or delete there. (What its search finds on
+    // every drive are files, though.)
+    let files = (!t.folder.path.is_empty() || t.is_searching()) && first.kind != EntryKind::Drive;
+    // Inside a .zip or .7z (archive.rs): open and copy out, nothing that would change it.
+    let inside = crate::archive::split(&t.folder.path).is_some();
     let mut items = vec![MenuItem::new(PICK_OPEN, "Open\tEnter")];
     if folders > 0 {
         items.push(MenuItem::new(PICK_NEW_TABS, if folders > 1 { "Open in new tabs\tCtrl+Enter" } else { "Open in new tab\tCtrl+Enter" }));
+    }
+    let split = app.split_index().is_some();
+    if split && single && first.is_container() {
+        items.push(MenuItem::new(PICK_OTHER_SIDE, "Open in other side"));
     }
     if single && !first.is_container() {
         items.push(MenuItem::new(PICK_OPEN_WITH, "Open with\u{2026}"));
@@ -125,27 +159,54 @@ pub fn for_items(app: &AppState, at: Point, how: How) -> Effect {
         // A search result (or one of Home's): go to the folder it's in, with it selected.
         items.push(MenuItem::new(PICK_LOCATION, "Open file location"));
     }
-    if files {
+    if files && !inside {
         // Home's Favorites (app/places.rs): "Remove" when they're all in already.
         let all_in = chosen.iter().all(|&i| app.is_favorite(&t.folder.entries[i].path_in(&t.folder.path)));
         items.push(MenuItem::new(PICK_FAVORITE, if all_in { "Remove from Favorites" } else { "Add to Favorites" }));
+        // (Not on Home: its rows come from all over, and change as files are opened.)
+        if !crate::recent::is_recent(&t.folder.path) {
+            items.push(tag_menu(app, &chosen));
+        }
     }
     items.push(MenuItem::separator());
     if files {
-        items.push(MenuItem::new(PICK_CUT, "Cut\tCtrl+X"));
+        if !inside {
+            items.push(MenuItem::new(PICK_CUT, "Cut\tCtrl+X"));
+        }
         items.push(MenuItem::new(PICK_COPY, "Copy\tCtrl+C"));
-        if single && first.is_container() && clipboard_has_files() {
+        if single && first.is_container() && clipboard_has_files() && !inside {
             items.push(MenuItem::new(PICK_PASTE_INTO, "Paste into folder"));
+        }
+        if split && !inside {
+            items.push(MenuItem::new(PICK_COPY_OTHER, "Copy to other side"));
+            items.push(MenuItem::new(PICK_MOVE_OTHER, "Move to other side"));
         }
     }
     items.push(MenuItem::new(PICK_COPY_PATH, if single { "Copy path\tCtrl+Shift+C" } else { "Copy paths\tCtrl+Shift+C" }));
-    if files {
+    let home = crate::recent::is_recent(&t.folder.path);
+    if files && !inside && !home {
         items.push(MenuItem::separator());
-        items.push(MenuItem::new(PICK_RENAME, "Rename\tF2").disabled(!single || crate::recent::is_recent(&t.folder.path)));
+        if single && first.kind == EntryKind::File && crate::archive::is_archive_name(&first.name) {
+            items.push(MenuItem::new(PICK_EXTRACT_HERE, "Extract here"));
+            items.push(MenuItem::new(PICK_EXTRACT_TO, &format!("Extract to \u{201c}{}\u{201d}", extract_label(app).replace('&', "&&"))));
+        }
+        items.push(MenuItem::new(PICK_ZIP, "Compress to zip"));
+        items.push(MenuItem::new(PICK_7Z, "Compress to 7z"));
+    }
+    if files && !inside {
+        items.push(MenuItem::separator());
+        if single || home {
+            items.push(MenuItem::new(PICK_RENAME, "Rename\tF2").disabled(!single || home));
+        } else {
+            items.push(MenuItem::new(PICK_RENAME_ALL, "Rename all\u{2026}\tF2"));
+        }
         items.push(MenuItem::new(PICK_DELETE, "Delete\tDel"));
         items.push(MenuItem::new(PICK_DELETE_FOREVER, "Delete permanently\tShift+Del"));
     }
     items.push(MenuItem::separator());
+    if inside {
+        return finish(items, MENU_ITEMS, PICK_OPEN, at, how, app, || None);
+    }
     if single && first.is_container() {
         let path = first.path_in(&t.folder.path);
         items.push(MenuItem::new(PICK_PIN, if app.is_pinned(&path) { "Unpin from sidebar" } else { "Pin to sidebar" }));
@@ -167,13 +228,44 @@ pub fn for_items(app: &AppState, at: Point, how: How) -> Effect {
     })
 }
 
+/// Tag › for the chosen items (entries of the tab's listing): the six colours, each with its dot and
+/// ticked when every one of them has it, then Remove tag, greyed when none has a tag (tags.rs).
+fn tag_menu(app: &AppState, chosen: &[usize]) -> MenuItem {
+    let t = app.tab();
+    let mut lookup = app.tags.lookup(&t.folder.path);
+    let tags: Vec<Option<Tag>> = chosen.iter().map(|&i| lookup.of(&t.folder.entries[i])).collect();
+    let mut items: Vec<MenuItem> = Tag::ALL
+        .iter()
+        .enumerate()
+        .map(|(n, &tag)| MenuItem::new(PICK_TAG + n as u32, tag.name()).checked(tags.iter().all(|&had| had == Some(tag))).dot(tag.color()))
+        .collect();
+    items.push(MenuItem::separator());
+    items.push(MenuItem::new(PICK_UNTAG, "Remove tag").disabled(tags.iter().all(Option::is_none)));
+    MenuItem::submenu("Tag", items)
+}
+
+/// The folder name Extract to will use for the one selected archive: numbered when the listing on
+/// screen has that name already (where the listing is the archive's own folder), cut short when long.
+fn extract_label(app: &AppState) -> String {
+    let t = app.tab();
+    let Some(e) = t.selected_entries().first().map(|&i| &t.folder.entries[i]) else { return String::new() };
+    let own_folder = e.target.is_none() && !t.is_searching();
+    let name = crate::archive::extract_folder_name(&e.name, |n| own_folder && t.folder.entries.iter().any(|x| x.name.eq_ignore_ascii_case(n)));
+    if name.chars().count() > EXTRACT_LABEL_MAX {
+        format!("{}\u{2026}", name.chars().take(EXTRACT_LABEL_MAX - 1).collect::<String>())
+    } else {
+        name
+    }
+}
+
 /// The menu for the folder's empty space, at `at`.
 pub fn for_background(app: &AppState, at: Point, how: How) -> Effect {
     if recycle::is_bin(&app.tab().folder.path) {
         return bin_background(app, at);
     }
     let t = app.tab();
-    let real = !t.path.is_empty();
+    // (Inside a .zip or .7z nothing can be made or pasted: archive.rs only reads it.)
+    let real = !t.path.is_empty() && crate::archive::split(&t.path).is_none();
     // While the custom sort order decides here, no column is checked (as in the SORT menu).
     let custom = t.custom_here().is_some();
     let key = |id, label, k| MenuItem::new(id, label).checked(t.sort == k && !custom);
@@ -183,15 +275,32 @@ pub fn for_background(app: &AppState, at: Point, how: How) -> Effect {
         key(PICK_SORT_CREATED, "Date created", SortKey::Created),
         key(PICK_SORT_TYPE, "Type", SortKey::Type),
         key(PICK_SORT_SIZE, "Size", SortKey::Size),
+        key(PICK_SORT_DIMENSIONS, "Picture size", SortKey::Dimensions),
+        key(PICK_SORT_LENGTH, "Length", SortKey::Length),
         MenuItem::separator(),
         MenuItem::new(PICK_ASCENDING, "Ascending").checked(!t.descending && !custom),
         MenuItem::new(PICK_DESCENDING, "Descending").checked(t.descending && !custom),
     ];
     let mut items = vec![view_menu(app), MenuItem::submenu("Sort by", sort), MenuItem::new(PICK_REFRESH, "Refresh\tF5"), MenuItem::separator()];
+    // (Only when there is something: as Explorer's "Undo" is.)
+    if app.history.can_undo() {
+        items.push(MenuItem::new(PICK_UNDO, "Undo\tCtrl+Z"));
+    }
+    if app.history.can_redo() {
+        items.push(MenuItem::new(PICK_REDO, "Redo\tCtrl+Y"));
+    }
     if real {
         items.push(MenuItem::new(PICK_PASTE, "Paste\tCtrl+V").disabled(!clipboard_has_files()));
         items.push(MenuItem::new(PICK_NEW_FOLDER, "New folder\tCtrl+Shift+N"));
         items.push(MenuItem::new(PICK_NEW_TEXT, "New text file"));
+        items.push(MenuItem::separator());
+    }
+    let dupes = t.search.as_ref().is_some_and(|s| s.is_dupes());
+    if dupes {
+        items.push(MenuItem::new(PICK_EXTRA_COPIES, "Select extra copies").disabled(t.view.is_empty()));
+        items.push(MenuItem::separator());
+    } else if real {
+        items.push(MenuItem::new(PICK_DUPES, "Find duplicates"));
         items.push(MenuItem::separator());
     }
     items.push(MenuItem::new(PICK_HIDDEN, "Show hidden files\tCtrl+H").checked(app.settings.show_hidden));
@@ -208,7 +317,8 @@ pub fn for_background(app: &AppState, at: Point, how: How) -> Effect {
     if real {
         items.push(MenuItem::new(PICK_PROPERTIES, "Properties\tAlt+Enter"));
     }
-    finish(items, MENU_BACKGROUND, 0, at, how, app, || Some(ShellTarget::Background(t.path.clone())))
+    let inside = crate::archive::split(&t.path).is_some();
+    finish(items, MENU_BACKGROUND, 0, at, how, app, || (!inside).then(|| ShellTarget::Background(t.path.clone())))
 }
 
 /// "View ›": the six views, the tab's checked, with Explorer's keys (Ctrl+Shift+1 to 6).
@@ -337,6 +447,18 @@ pub fn pick(id: u32, app: &mut AppState) -> Effect {
         PICK_PROPERTIES => Command::Properties,
         PICK_REFRESH => Command::Refresh,
         PICK_PASTE => Command::Paste,
+        PICK_RENAME_ALL => Command::RenameMany,
+        PICK_UNDO => Command::Undo,
+        PICK_DUPES => Command::FindDuplicates,
+        PICK_EXTRA_COPIES => Command::SelectExtraCopies,
+        PICK_OTHER_SIDE => Command::OpenInOtherSide,
+        PICK_COPY_OTHER => Command::SendToOtherSide { moving: false },
+        PICK_MOVE_OTHER => Command::SendToOtherSide { moving: true },
+        PICK_EXTRACT_HERE => Command::Extract { own_folder: false },
+        PICK_EXTRACT_TO => Command::Extract { own_folder: true },
+        PICK_ZIP => Command::Compress(crate::archive::Format::Zip),
+        PICK_7Z => Command::Compress(crate::archive::Format::SevenZ),
+        PICK_REDO => Command::Redo,
         PICK_NEW_FOLDER => Command::NewFolder,
         PICK_NEW_TEXT => Command::NewTextFile,
         PICK_HIDDEN => Command::ToggleHidden,
@@ -348,6 +470,8 @@ pub fn pick(id: u32, app: &mut AppState) -> Effect {
             return Effect::Redraw;
         }
         n if (PICK_VIEW..PICK_VIEW + ViewMode::ALL.len() as u32).contains(&n) => Command::SetView(ViewMode::ALL[(n - PICK_VIEW) as usize].0),
+        n if (PICK_TAG..PICK_TAG + Tag::ALL.len() as u32).contains(&n) => Command::TagSelected(Tag::ALL[(n - PICK_TAG) as usize]),
+        PICK_UNTAG => Command::UntagSelected,
         PICK_SORT_NAME => Command::SetSort(SortKey::Name, app.tab().descending),
         PICK_SORT_DATE => Command::SetSort(SortKey::Date, app.tab().descending),
         PICK_SORT_CREATED => Command::SetSort(SortKey::Created, app.tab().descending),
@@ -355,6 +479,8 @@ pub fn pick(id: u32, app: &mut AppState) -> Effect {
         PICK_FAVORITE => Command::ToggleFavorites,
         PICK_SORT_TYPE => Command::SetSort(SortKey::Type, app.tab().descending),
         PICK_SORT_SIZE => Command::SetSort(SortKey::Size, app.tab().descending),
+        PICK_SORT_DIMENSIONS => Command::SetSort(SortKey::Dimensions, app.tab().descending),
+        PICK_SORT_LENGTH => Command::SetSort(SortKey::Length, app.tab().descending),
         PICK_ASCENDING => Command::SetSort(app.tab().sort, false),
         PICK_DESCENDING => Command::SetSort(app.tab().sort, true),
         PICK_PIN => match selected_folder(app) {
@@ -409,8 +535,9 @@ pub fn command_for_verb(verb: &str, app: &AppState, shift: bool) -> Option<Comma
     let t = app.tab();
     let chosen = t.selected_entries();
     let all_folders = !chosen.is_empty() && chosen.iter().all(|&i| t.folder.entries[i].is_container());
-    // Files Glint can work on: in a real folder, and not drives.
-    let files = !t.path.is_empty() && chosen.iter().all(|&i| t.folder.entries[i].kind != EntryKind::Drive);
+    // Files Glint can work on: in a real folder (or found on every drive from This PC), and not
+    // drives.
+    let files = (!t.path.is_empty() || t.is_searching()) && chosen.iter().all(|&i| t.folder.entries[i].kind != EntryKind::Drive);
     match verb.to_ascii_lowercase().as_str() {
         "rename" if chosen.len() == 1 && files => Some(Command::BeginRename),
         "open" | "explore" if all_folders => Some(Command::OpenSelected),
@@ -529,6 +656,62 @@ mod tests {
         assert!(checked(true, Some("in C:\\t (\n-newest_first\n)")).is_empty(), "its rules for this folder decide");
         // Rules only for another folder: this one sorts by its column.
         assert_eq!(checked(true, Some("in C:\\elsewhere (\n-newest_first\n)")), ["Name", "Ascending"]);
+    }
+
+    #[test]
+    fn tag_ticks_a_colour_all_have_and_shows_only_where_files_are_kept() {
+        use crate::folder::{Entry, Folder};
+        let entry = |name: &str| Entry {
+            name: name.into(),
+            lower: name.to_lowercase(),
+            kind: EntryKind::File,
+            size: 0,
+            modified: 0,
+            created: 0,
+            attributes: 0x20,
+            ext: String::new(),
+            type_name: std::sync::Arc::from(""),
+            target: None,
+            free: 0,
+        };
+        // Tag › with all of `names` in `folder` selected, if the menu has it.
+        let tag_menu = |app: &mut AppState, folder: &str, names: &[&str]| -> Option<Vec<MenuItem>> {
+            let t = &mut app.tabs[0];
+            t.path = folder.to_string();
+            crate::app::apply_listing(t, Folder { path: folder.to_string(), entries: names.iter().map(|n| entry(n)).collect(), ..Default::default() });
+            t.selected = vec![true; names.len()];
+            let Effect::FilesMenu(m) = for_items(app, Point::new(0.0, 0.0), How::default()) else { panic!("no menu") };
+            m.menu.items.into_iter().find(|i| i.label == "Tag").map(|i| i.submenu)
+        };
+        let ticked = |items: &[MenuItem]| items.iter().filter(|i| i.checked).map(|i| i.label.clone()).collect::<Vec<_>>();
+        let remove_greyed = |items: &[MenuItem]| items.iter().find(|i| i.label == "Remove tag").expect("Remove tag").disabled;
+        let mut app = AppState::for_tests(crate::settings::Settings::default());
+        // Nothing tagged: no colour ticked, Remove tag greyed. Each colour has its dot.
+        let items = tag_menu(&mut app, "C:\\x", &["a.txt", "b.txt"]).expect("Tag");
+        let dotted: Vec<&str> = items.iter().filter(|i| i.dot.is_some()).map(|i| i.label.as_str()).collect();
+        assert_eq!(dotted, ["Red", "Orange", "Yellow", "Green", "Blue", "Purple"]);
+        assert!(ticked(&items).is_empty() && remove_greyed(&items));
+        // One of the two red: nothing ticked, but a tag to remove.
+        app.tags.set(&["C:\\x\\a.txt".to_string()], Some(Tag::Red));
+        let items = tag_menu(&mut app, "C:\\x", &["a.txt", "b.txt"]).unwrap();
+        assert!(ticked(&items).is_empty() && !remove_greyed(&items));
+        // Both red: Red is ticked.
+        app.tags.set(&["C:\\X\\B.TXT".to_string()], Some(Tag::Red));
+        assert_eq!(ticked(&tag_menu(&mut app, "C:\\x", &["a.txt", "b.txt"]).unwrap()), ["Red"]);
+        // What the picks do.
+        assert!(matches!(pick(PICK_TAG + 4, &mut app), Effect::Command(Command::TagSelected(Tag::Blue))));
+        assert!(matches!(pick(PICK_UNTAG, &mut app), Effect::Command(Command::UntagSelected)));
+        // Not in This PC, on Home, in the Recycle Bin, or inside a zip file.
+        assert!(tag_menu(&mut app, "", &["a.txt"]).is_none());
+        assert!(tag_menu(&mut app, crate::recent::LOCATION, &["a.txt"]).is_none());
+        assert!(tag_menu(&mut app, crate::recycle::LOCATION, &["a.txt"]).is_none());
+        let dir = std::env::temp_dir().join(format!("glint-menu-test-tags-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zip = dir.join("box.zip");
+        std::fs::write(&zip, b"").unwrap();
+        let inside = tag_menu(&mut app, &zip.to_string_lossy(), &["a.txt"]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(inside.is_none());
     }
 
     #[test]

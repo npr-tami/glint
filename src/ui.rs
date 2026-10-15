@@ -10,7 +10,7 @@
 use crate::app::{AppState, SortKey};
 use crate::render::Renderer;
 use crate::settings::{ThemeMode, ViewMode};
-use crate::theme::Theme;
+use crate::theme::{Color, Theme};
 use crate::textbox::TextEvent;
 use windows::Win32::Foundation::HWND;
 
@@ -232,7 +232,21 @@ pub enum Command {
     NewTab,
     /// Open a new tab showing this folder (middle-click in the sidebar, say).
     NewTabAt(String),
+    /// Close tab `i` (×, Ctrl+W, a middle-click). A pinned tab stays open, and the status bar says why.
     CloseTab(usize),
+    /// Close tab `i` even when it's pinned (its right-click menu's "Close tab").
+    ForceCloseTab(usize),
+    /// Pin tab `i`, or unpin it ("Pin tab" / "Unpin tab").
+    TogglePinTab(usize),
+    /// Save the open tabs as a set, under a name asked for (app/forms.rs).
+    SaveTabSet,
+    /// Open the tabs of saved set `i`, after the ones open now.
+    OpenTabSet(usize),
+    /// Forget saved set `i`.
+    DeleteTabSet(usize),
+    /// Rename the selected items all at once (F2 with several selected, "Rename all…"): a form asks
+    /// how (app/forms.rs).
+    RenameMany,
     /// Open a copy of this tab (same folder, history and sort) right after it.
     DuplicateTab(usize),
     /// Close every tab except this one.
@@ -279,6 +293,17 @@ pub enum Command {
     BeginRename,
     /// Rename `from` in folder `dir` to `to` (what was typed in the name box).
     Rename { dir: String, from: String, to: String },
+    /// Look for files with the same content in the folder on screen and its subfolders (dupes.rs).
+    FindDuplicates,
+    /// In each set of duplicates, select every file but the first.
+    SelectExtraCopies,
+    /// Back from the duplicates to the folder (Esc).
+    EndDuplicates,
+    /// Undo the last file action: a move, copy, rename, new item or delete to the Recycle Bin
+    /// (Ctrl+Z; undo.rs).
+    Undo,
+    /// Do again what Ctrl+Z undid (Ctrl+Y, Ctrl+Shift+Z).
+    Redo,
     /// Make "New folder" here, select it and open its name box (Ctrl+Shift+N).
     NewFolder,
     /// The same for "New Text Document.txt".
@@ -294,6 +319,14 @@ pub enum Command {
     SetSort(SortKey, bool),
     /// Turn the custom sort order on or off (SORT > Custom order).
     SetCustomSort(bool),
+    /// Folders' own views from the rules on or off (VIEW > Custom views).
+    SetCustomViews(bool),
+    /// The selected folder opens in split view's other half (right-click > Open in other side).
+    OpenInOtherSide,
+    /// Move the tab at the first place to the second (dragging it along the tab row).
+    MoveTab(usize, usize),
+    /// The selected items are copied or moved into split view's other half's folder.
+    SendToOtherSide { moving: bool },
     /// Open the custom sort order's editor (SORT > Edit custom order…, Settings), or bring it to
     /// the front. Handled by the window.
     OpenSortEditor,
@@ -324,6 +357,10 @@ pub enum Command {
     ShowStatusBar(bool),
     /// Show the tab on screen this way (the VIEW button, Ctrl+Shift+1 to 6, right-click > View).
     SetView(ViewMode),
+    /// Split view on or off: two folders side by side (Ctrl+\; app/split.rs).
+    ToggleSplit,
+    /// Split view: work in the other half (F6).
+    OtherPane,
     /// Switch between the skin's dark and light versions (Ctrl+Shift+L).
     ToggleTheme,
     /// Light, dark, or following Windows' app mode. Handled by the window.
@@ -352,6 +389,17 @@ pub enum Command {
     /// Look for a new version of Glint now (Settings > About > CHECK FOR UPDATES), and show what
     /// was found. Handled by the window (update.rs).
     CheckForUpdates,
+    /// Unpack the selected .zip or .7z here (right-click > Extract here), or into a new folder
+    /// named after it (`own_folder`: Extract to "Name"). In the copy queue (app/files.rs).
+    Extract { own_folder: bool },
+    /// Pack the selected items into a new archive next to them (right-click > Compress to zip /
+    /// Compress to 7z). In the copy queue (app/files.rs).
+    Compress(crate::archive::Format),
+    /// Put this colour tag on the selected items, or take it off when they all have it already
+    /// (right-click > Tag; tags.rs, app/files.rs).
+    TagSelected(crate::tags::Tag),
+    /// Take the colour tags off the selected items (right-click > Tag > Remove tag).
+    UntagSelected,
 }
 
 /// A native popup menu a part wants shown.
@@ -377,6 +425,8 @@ pub struct MenuItem {
     /// When not empty, the item opens this submenu (and `id` is not used). Picks in it come back
     /// through `menu_pick` like any other, so give its items ids unique within the whole menu.
     pub submenu: Vec<MenuItem>,
+    /// A round dot of this colour beside the text (Tag ›'s colours), where Windows draws the menu.
+    pub dot: Option<Color>,
 }
 
 impl MenuItem {
@@ -394,6 +444,11 @@ impl MenuItem {
     /// Greyed out (and can't be picked) when `off`.
     pub fn disabled(mut self, off: bool) -> MenuItem {
         self.disabled = off;
+        self
+    }
+    /// With a dot of `color` beside the text.
+    pub fn dot(mut self, color: Color) -> MenuItem {
+        self.dot = Some(color);
         self
     }
     pub fn separator() -> MenuItem {

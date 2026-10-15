@@ -12,6 +12,50 @@ Each new number counts as newer than the one before it (1.0.12-beta.1, 1.0.12-be
 1.0.13-beta.1, ...), so the updater offers them in that order. Versions up to 0.11.0 used
 MAJOR.MINOR.PATCH, where a new feature bumped the middle number.
 
+## 1.0.19-beta.1 · 15/10/2026
+
+- Added undo and redo: Ctrl+Z undoes your last move, copy, rename, new folder or delete, Ctrl+Y brings it back
+- Added a command box: press Ctrl+U and type what you want to do, a folder to go to, or a word to search for (type ? for help)
+- Added Find duplicates: right-click the empty space in a folder
+- Added Rename many: select several files and press F2 to number them or swap words in their names
+- Added folder sizes in the Size column
+- Added Picture size and Length columns for pictures, videos and songs (right-click the column titles)
+- Added colour tags: right-click > Tag. Type tag:red in the filter to see only red ones
+- Added searching every drive at once: type in the filter on This PC
+- Added a copy queue: big copies run one at a time, in a list with Pause and Cancel
+- Added opening zip and 7z files like folders
+- Added Extract and Compress to zip or 7z in the right-click menu
+- Added pinned tabs and saved sets of tabs (right-click a tab)
+- Added dragging a tab to move it
+- Added split view: VIEW > Split view (Ctrl+\) shows two folders side by side
+- Added Ctrl + scroll wheel to change the view, like File Explorer (Settings > Mouse and keyboard)
+- Added Report a bug in Settings > About
+- Added a second logo and a choice of zip icon in Settings > Appearance
+
+- Improved searching subfolders: Glint now looks in several folders at once, so results come in faster
+
+- Changed VIEW > Views for folders… to VIEW > Edit custom views…, and VIEW > Custom views turns them on or off
+- Changed double-clicking a program in the Recycle Bin: Glint asks you to restore it first
+- Changed Glint to stop saving a speed-test log in Windows' temp folder (the old one is deleted)
+
+- Fixed Glint closing when a broken or huge GIF was previewed
+- Fixed Glint closing when typing AltGr letters (like @)
+- Fixed Home crashing on folder names with Chinese, Japanese or accented letters
+- Fixed two Glint windows erasing each other's settings
+- Fixed settings being lost while a virus scanner was checking them
+- Fixed pinned folders past 200, and tabs past 100, being lost after a restart
+- Fixed Glint saying files went to the Recycle Bin when Windows deleted them for good
+- Fixed deleting a skin removing it for good without asking when the Recycle Bin is off
+- Fixed Delete, Copy and Move saying everything worked when one item failed
+- Fixed dropping files from two drives moving them instead of copying
+- Fixed a video in the preview stopping you deleting, renaming or moving it
+- Fixed the right-click menu sometimes not opening
+- Fixed Home opening slowly when a network drive is offline
+- Fixed pinned drives not showing in Home
+- Fixed Settings opening off-screen after unplugging a monitor
+
+- Some other improvements and bugfixes
+
 ## 1.0.18-beta.2 (2026-10-13): Quick fix
 
 ### Fixes

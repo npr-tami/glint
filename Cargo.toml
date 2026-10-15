@@ -1,6 +1,6 @@
 [package]
 name = "glint"
-version = "1.0.18-beta.2"
+version = "1.0.19-beta.1"
 edition = "2021"
 description = "A fast, lightweight file explorer for Windows that draws everything itself"
 license = "MIT"
@@ -22,6 +22,14 @@ serde_json = "1.0.145"
 # Needed by name for `#[implement]` (fileops.rs: the copy engine's progress reports). Already part of
 # the `windows` crate, so nothing new is downloaded or built.
 windows-core = "=0.62.2"
+# .zip files (archive.rs): browsing and unpacking (Deflate and Deflate64), and making them
+# (Compress to zip, with Deflate).
+zip = { version = "=9.0.3", default-features = false, features = ["deflate-flate2", "deflate64"] }
+# The Deflate packer and unpacker the zip code uses, in its small pure-Rust form.
+flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
+# .7z files (archive.rs): browsing and unpacking (LZMA and LZMA2), and making them (Compress to 7z,
+# with LZMA2: "compress" adds the LZMA2 packer of the lzma-rust2 crate it already uses).
+sevenz-rust2 = { version = "=0.24.0", default-features = false, features = ["compress"] }
 
 [dependencies.windows]
 version = "=0.62.2"
@@ -41,6 +49,8 @@ features = [
     "Win32_Media_MediaFoundation",
     "Win32_Networking_WinHttp",
     "Win32_Security",
+    # Working out a file's fingerprint (SHA-256, MD5, SHA-1) in the details panel (details.rs).
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",

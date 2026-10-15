@@ -1,5 +1,7 @@
 //! The file commands of the app state: copy, cut, paste, delete, rename, new folder and new text
-//! file (Ctrl+C / Ctrl+X / Ctrl+V, Del, Shift+Del, F2, Ctrl+Shift+N, and the right-click menu).
+//! file (Ctrl+C / Ctrl+X / Ctrl+V, Del, Shift+Del, F2, Ctrl+Shift+N, and the right-click menu), and
+//! the right-click menu's Extract, Compress and Tag (colour tags, which follow what Glint moves and
+//! renames: tags.rs).
 //!
 //! The work itself is done by fileops.rs on background threads. This part decides what to do -
 //! nothing in This PC, a question first before deleting for good - and when a job is done, reads
@@ -16,10 +18,13 @@ use windows::Win32::Foundation::HWND;
 use super::{wake, AppState, Loaded, Tab};
 use crate::fileops::{self, check_name, dotted_extension, items_text, same_path, Job, NameCheck, Outcome};
 use crate::folder::{file_name, join, parent, EntryKind};
+use crate::tags::Tag;
 use crate::ui::MenuAbout;
 
 /// The status-bar note for file commands in This PC.
 pub const THIS_PC_NOTE: &str = "This PC only holds drives. Open a drive or folder first.";
+/// The status-bar note for changes inside a .zip or .7z (archive.rs only reads them).
+pub const ARCHIVE_NOTE: &str = "Glint only looks inside zip and 7z files. Copy things out (Ctrl+C) to change them.";
 
 /// How long a name box waits for its item to turn up in the list (a new folder being read).
 const RENAME_WAIT: Duration = Duration::from_secs(3);
@@ -47,11 +52,16 @@ pub(super) struct AfterJob {
     select_next: Option<String>,
     /// After a rename: the old name.
     renamed_from: Option<String>,
+    /// The job is Ctrl+Z (false) or Ctrl+Y (true) for this step (undo.rs): once it worked, the step
+    /// goes on the other list.
+    history: Option<(bool, crate::undo::Step)>,
+    /// A delete for good: what it deletes, whose colour tags go once it's done (tags.rs).
+    deleted: Vec<String>,
 }
 
 impl AfterJob {
     pub(super) fn new(tab_id: u64) -> AfterJob {
-        AfterJob { tab_id, select_next: None, renamed_from: None }
+        AfterJob { tab_id, select_next: None, renamed_from: None, history: None, deleted: Vec::new() }
     }
 }
 
@@ -104,7 +114,7 @@ impl RenameRequest {
 
 impl AppState {
     /// The selected items' full paths, to work on. Never the folder itself, never drives.
-    fn chosen(&self) -> Vec<String> {
+    pub(super) fn chosen(&self) -> Vec<String> {
         let t = self.tab();
         t.selected_entries()
             .into_iter()
@@ -116,27 +126,153 @@ impl AppState {
 
     /// File commands work in real folders only: This PC holds drives, and the Recycle Bin's rows are
     /// deleted items (app/bin.rs deals with those). Nothing happens either while the list says
-    /// "Loading…" (the rows on screen aren't the folder's).
-    fn files_here(&mut self) -> bool {
-        if self.tab().path.is_empty() {
+    /// "Loading…" (the rows on screen aren't the folder's). What a search of every drive found in
+    /// This PC is real files, worked on like any search results.
+    pub(super) fn files_here(&mut self) -> bool {
+        if self.tab().path.is_empty() && !self.tab().is_searching() {
             self.say(THIS_PC_NOTE);
             return false;
         }
         if crate::folder::is_place(&self.tab().path) || crate::folder::is_place(&self.tab().folder.path) {
             return false;
         }
+        if crate::archive::split(&self.tab().path).is_some() {
+            self.say(ARCHIVE_NOTE);
+            return false;
+        }
         !self.tab().waiting_long()
     }
 
-    /// Ctrl+C / Ctrl+X: the selected items go on the clipboard as files, to be pasted here, in
-    /// another folder or in File Explorer.
-    pub(super) fn copy_files(&mut self, cut: bool) {
+    /// Home's items (recent.rs) are real files and folders, so Ctrl+C, Ctrl+X and Del work on them
+    /// there too - but its Quick access folders (Desktop, Documents…) are only ever copied from
+    /// Home, never cut or deleted. The selected ones that can be, or None when the tab isn't Home.
+    fn home_chosen(&mut self, copying: bool) -> Option<Vec<String>> {
+        let t = self.tab();
+        let parts = t.folder.home.as_deref().filter(|_| same_path(&t.path, &t.folder.path) && !t.waiting_long())?;
+        let chosen = t.selected_entries();
+        let paths: Vec<String> = chosen.iter().filter(|&&i| copying || i >= parts.recent).map(|&i| t.folder.entries[i].path_in(&t.folder.path)).collect();
+        if paths.is_empty() && !chosen.is_empty() {
+            self.say("Folders in Quick access can only be copied from Home.");
+        }
+        Some(paths)
+    }
+
+    /// The selected items inside the archive on screen, as (archive file, their paths inside it),
+    /// when the tab is inside a .zip or .7z.
+    fn archive_chosen(&self) -> Option<(String, Vec<String>)> {
+        let t = self.tab();
+        let (archive, inner) = crate::archive::split(&t.folder.path)?;
+        let items = t.selected_entries().iter().map(|&i| join_inner(&inner, &t.folder.entries[i].name)).collect();
+        Some((archive, items))
+    }
+
+    /// Takes `items` out of `archive` into Glint's temporary folder for it, on a background thread,
+    /// then opens the first (or shows "Open with" for it) or puts them all on the clipboard.
+    pub(super) fn extract_then(&mut self, archive: String, items: Vec<String>, then: super::Then) -> bool {
+        let (tx, hwnd) = (self.tx.clone(), self.hwnd.clone());
+        let started = crate::shell::background("take out of archive", move || {
+            let _com = crate::shell::ComGuard::init();
+            let result = crate::archive::temp_dir_for(&archive).and_then(|dir| crate::archive::extract(&archive, &items, &dir));
+            if tx.send(Loaded::Extracted { result, then }).is_ok() {
+                wake(&hwnd);
+            }
+        });
+        if !started {
+            self.say("Windows couldn't start this right now. Try again.");
+        }
+        started
+    }
+
+    /// Items taken out of an archive arrived (see `extract_then`).
+    pub(super) fn extracted(&mut self, result: Result<Vec<String>, String>, then: super::Then) {
+        if let super::Then::Copy(turn) = then {
+            // (Copied or cut again meanwhile: that's what's on the clipboard now.)
+            if turn != self.clip_turn {
+                return;
+            }
+            self.taking_out = false;
+        }
+        let paths = match result {
+            Ok(p) if !p.is_empty() => p,
+            Ok(_) => return self.say("There was nothing to take out."),
+            Err(why) => return self.say(why),
+        };
+        if then == super::Then::OpenWith {
+            return crate::shell::open_with(self.owner(), &paths[0]);
+        }
+        if then == super::Then::Open {
+            if crate::archive::is_archive_name(&paths[0]) {
+                self.navigate(&paths[0]);
+            } else {
+                crate::shell::open(&paths[0]);
+            }
+            return;
+        }
+        let hwnd = HWND(self.hwnd.load(Ordering::SeqCst) as *mut _);
+        match fileops::put_files(hwnd, &paths, false) {
+            Some(_) => self.say(format!("Copied {}. Paste it in a folder (Ctrl+V)", items_text(&paths))),
+            None => self.say("The clipboard is busy. Try again."),
+        }
+    }
+
+    /// Right-click > Extract here / Extract to "Name": the selected .zip or .7z is unpacked into its
+    /// folder (`own_folder`: into a new folder named after it there), in the copy queue. What it
+    /// made is selected once it's done, and Ctrl+Z sends it to the Recycle Bin.
+    pub(super) fn extract_archive(&mut self, own_folder: bool) {
+        if !self.files_here() {
+            return;
+        }
+        let t = self.tab();
+        let archive = match t.selected_entries().as_slice() {
+            [i] => Some(&t.folder.entries[*i]).filter(|e| e.kind == EntryKind::File && crate::archive::is_archive_name(&e.name)).map(|e| e.path_in(&t.folder.path)),
+            _ => None,
+        };
+        let Some(archive) = archive else { return self.say("Select one zip or 7z file first.") };
+        let after = AfterJob::new(self.tab().id);
+        self.start_job(Job::Extract { archive, own_folder }, after);
+    }
+
+    /// Right-click > Compress to zip / Compress to 7z: the selected items go into one new archive
+    /// next to them, in the copy queue. It's selected once it's made, and Ctrl+Z sends it to the
+    /// Recycle Bin.
+    pub(super) fn compress(&mut self, format: crate::archive::Format) {
         if !self.files_here() {
             return;
         }
         let paths = self.chosen();
         if paths.is_empty() {
-            self.say(if cut { "Select what to cut first." } else { "Select what to copy first." });
+            return self.say("Select what to compress first.");
+        }
+        let after = AfterJob::new(self.tab().id);
+        self.start_job(Job::Compress { paths, format }, after);
+    }
+
+    /// Ctrl+C / Ctrl+X: the selected items go on the clipboard as files, to be pasted here, in
+    /// another folder or in File Explorer.
+    pub(super) fn copy_files(&mut self, cut: bool) {
+        // Inside a .zip or .7z: copying takes the items out first (they're files on the clipboard
+        // only once they're real files); cutting would change the archive.
+        if let Some((archive, items)) = self.archive_chosen().filter(|_| !cut) {
+            if items.is_empty() {
+                self.say("Select what to copy first.");
+            } else {
+                // Meanwhile the clipboard is empty: Ctrl+V mustn't paste (or move) what was on it.
+                fileops::clear_clipboard(HWND(self.hwnd.load(Ordering::SeqCst) as *mut _));
+                self.cut = None;
+                self.clip_turn = self.clip_turn.wrapping_add(1);
+                self.taking_out = self.extract_then(archive, items, super::Then::Copy(self.clip_turn));
+            }
+            return;
+        }
+        let paths = match self.home_chosen(!cut) {
+            Some(paths) => paths,
+            None if self.files_here() => self.chosen(),
+            None => return,
+        };
+        if paths.is_empty() {
+            if self.tab().selected_entries().is_empty() {
+                self.say(if cut { "Select what to cut first." } else { "Select what to copy first." });
+            }
             return;
         }
         let hwnd = HWND(self.hwnd.load(Ordering::SeqCst) as *mut _);
@@ -144,11 +280,13 @@ impl AppState {
             self.say("The clipboard is busy. Try again.");
             return;
         };
+        self.clip_turn = self.clip_turn.wrapping_add(1);
+        self.taking_out = false;
         let t = self.tab();
         // Faded by name in their folder - not search results, whose names can repeat across the
         // folders they come from, nor items of folders open in the tree view (app/tree.rs).
         let own = t.selected_entries().iter().all(|&i| !t.tree.is_open() || t.folder.entries[i].target.is_none());
-        self.cut = (cut && !t.is_searching() && own).then(|| CutMark {
+        self.cut = (cut && !t.is_searching() && own && t.folder.home.is_none()).then(|| CutMark {
             seq,
             folder: t.folder.path.clone(),
             names: t.selected_entries().iter().map(|&i| t.folder.entries[i].lower.clone()).collect(),
@@ -159,7 +297,15 @@ impl AppState {
     /// Ctrl+V: the files on the clipboard (from Glint or File Explorer) are copied here - or moved,
     /// when they were cut. `into`: a folder in the list instead (right-click > Paste into folder).
     pub(super) fn paste(&mut self, into: Option<String>) {
+        if self.taking_out {
+            return self.say("Still taking it out of the archive. Try again in a moment.");
+        }
         if !self.files_here() {
+            return;
+        }
+        // (In This PC's search results only into a folder among them: This PC itself holds drives.)
+        if into.is_none() && self.tab().path.is_empty() {
+            self.say(THIS_PC_NOTE);
             return;
         }
         if !fileops::clipboard_has_files() {
@@ -174,10 +320,11 @@ impl AppState {
     /// Del (to the Recycle Bin) and Shift+Del (`permanent`), asking first as the "Ask before
     /// deleting" setting says.
     pub(super) fn delete(&mut self, permanent: bool) {
-        if !self.files_here() {
-            return;
-        }
-        let paths = self.chosen();
+        let paths = match self.home_chosen(false) {
+            Some(paths) => paths,
+            None if self.files_here() => self.chosen(),
+            None => return,
+        };
         if paths.is_empty() {
             return;
         }
@@ -193,6 +340,7 @@ impl AppState {
         let no_bin = !permanent && paths.iter().any(|p| !fileops::has_recycle_bin(p));
         // (Some on this PC's drive, some not: the ones that can still go to the Recycle Bin.)
         let recycle = !permanent && !paths.iter().all(|p| !fileops::has_recycle_bin(p));
+        let after = AfterJob { deleted: if recycle { Vec::new() } else { paths.clone() }, ..after };
         let job = Job::Delete { paths, recycle };
         if !self.settings.ask_before_deleting(permanent || no_bin) {
             self.start_job(job, after);
@@ -219,6 +367,10 @@ impl AppState {
     /// Ctrl+Shift+N (`folder`) and New text file: made here, then selected with its name box open.
     pub(super) fn new_item(&mut self, folder: bool) {
         if !self.files_here() {
+            return;
+        }
+        if self.tab().path.is_empty() {
+            self.say(THIS_PC_NOTE); // search results of every drive: no folder of its own to make it in
             return;
         }
         // The new item must be in sight to be named, and the filter might hide it (or search
@@ -281,6 +433,32 @@ impl AppState {
         }
     }
 
+    /// Ctrl+Z (`redo` false) turns the last file action around; Ctrl+Y (`redo`) does again what was
+    /// undone. Works from any folder: the step knows where its items are.
+    pub(super) fn undo(&mut self, redo: bool) {
+        if self.history.busy {
+            return self.say("Wait for the last one to finish.");
+        }
+        let step = if redo { self.history.take_redo() } else { self.history.take_undo() };
+        let Some(step) = step else {
+            self.say(if redo { "Nothing to redo" } else { "Nothing to undo" });
+            return;
+        };
+        let job = if redo { step.redo_job() } else { step.undo_job() };
+        // A rename turned around: tabs inside a renamed folder follow it, and the item stays selected.
+        let renamed_from = match &step {
+            crate::undo::Step::Renamed { from, to, .. } => Some(if redo { from.clone() } else { to.clone() }),
+            _ => None,
+        };
+        let kept = step.clone();
+        let after = AfterJob { renamed_from, history: Some((redo, step)), ..AfterJob::new(self.tab().id) };
+        self.history.busy = self.start_job(job, after);
+        // Not started: the step goes back where it was (the next Ctrl+Z mustn't skip it).
+        if !self.history.busy {
+            if redo { self.history.undone(kept) } else { self.history.redone(kept) }
+        }
+    }
+
     pub(super) fn ask(&mut self, title: String, text: String, yes: &'static str, job: Job, after: AfterJob) {
         self.next_question += 1;
         self.question = Some(Question { id: self.next_question, title, text, yes, job, after });
@@ -294,7 +472,7 @@ impl AppState {
         }
     }
 
-    pub(super) fn start_job(&mut self, job: Job, after: AfterJob) {
+    pub(super) fn start_job(&mut self, job: Job, after: AfterJob) -> bool {
         let (tx, hwnd) = (self.tx.clone(), self.hwnd.clone());
         let started = fileops::start(job, move |outcome| {
             if tx.send(Loaded::FileOp { after, outcome }).is_ok() {
@@ -304,16 +482,18 @@ impl AppState {
         if !started {
             self.say("Windows couldn't start this right now. Try again.");
         }
+        started
     }
 
     /// A job finished: read the changed folders again (in every tab showing them), with what was
     /// made selected in the tab that asked.
-    pub(super) fn after_file_op(&mut self, after: AfterJob, outcome: Outcome) {
+    pub(super) fn after_file_op(&mut self, after: AfterJob, mut outcome: Outcome) {
         if outcome.moved_cut {
             self.cut = None;
         }
         // A folder Glint renamed or moved (cut and paste): tabs inside it (and Back / Forward)
-        // follow it, as they do when it's renamed elsewhere (watch.rs).
+        // follow it, as they do when it's renamed elsewhere (watch.rs). Done before this job's own step
+        // is recorded, so only older steps follow it (the new one already has the right paths).
         if let (Some(from), Some((dir, names))) = (&after.renamed_from, &outcome.created) {
             if let [to] = names.as_slice() {
                 self.folder_moved(&join(dir, from), &join(dir, to));
@@ -322,18 +502,76 @@ impl AppState {
         for (from, to) in &outcome.moved_folders {
             self.folder_moved(from, to);
         }
+        // Colour tags (tags.rs) go along with what was moved or renamed - Ctrl+Z and Ctrl+Y's moves
+        // too, and what was in a folder merged into one already there. Copies get none; what went
+        // to the Recycle Bin keeps its tag for when it comes back; what was deleted for good (all
+        // of it: nothing was refused) loses it.
+        let mut moves = outcome.undo.as_ref().map(crate::undo::Step::moves).unwrap_or_default();
+        // (Folders the step doesn't hold - merged into one there - but not again those it does:
+        // Rename all's went through a temporary name on the way.)
+        let merged: Vec<(String, String)> = outcome.moved_folders.iter().filter(|(from, _)| !moves.iter().any(|(m, _)| same_path(m, from))).cloned().collect();
+        moves.extend(merged);
+        self.tags_follow(&moves);
+        if let Some(crate::undo::Step::Recycled { paths }) = &outcome.undo {
+            self.tags.recycled(paths);
+        }
+        if outcome.ok && self.tags.deleted(&after.deleted) {
+            self.tags_changed();
+        }
+        // Ctrl+Z and Ctrl+Y (undo.rs): a new action can be undone; an undo or redo that worked moves
+        // its step to the other list. (One that didn't work leaves it off both: what's on disk is no
+        // longer what the step says.)
+        if after.history.is_some() {
+            self.history.busy = false;
+        }
+        match after.history.clone() {
+            None => {
+                if let Some(step) = outcome.undo.take() {
+                    self.history.done(step);
+                }
+            }
+            Some((redo, step)) if outcome.ok => {
+                outcome.note = Some(format!("{} {}", if redo { "Redid" } else { "Undid" }, step.describe()));
+                if redo {
+                    self.history.redone(step);
+                } else {
+                    self.history.undone(step);
+                }
+            }
+            Some(_) => {}
+        }
+        // Folder sizes (foldersize.rs) holding what changed are worked out again.
+        for f in &outcome.changed {
+            self.sizer.iter().for_each(|s| s.forget(f));
+        }
+        if !outcome.changed.is_empty() {
+            for t in &mut self.tabs {
+                t.sizes_asked = false;
+            }
+        }
         let mut reread = Vec::new();
+        let mut dupes = Vec::new();
         for (i, t) in self.tabs.iter_mut().enumerate() {
             // Search results of a folder in which something changed (anywhere below it): the search
             // runs again (start_load does that). Nothing is selected by name there - names repeat.
+            // (This PC's search, of every drive, has everything below it.)
             if let Some(s) = &t.search {
-                if outcome.changed.iter().any(|f| fileops::is_same_or_inside(f, &s.root)) {
+                let below = |f: &String| s.root.is_empty() || fileops::is_same_or_inside(f, &s.root);
+                if s.is_dupes() {
+                    // Duplicates: what's gone leaves the list (and a set left with one file goes
+                    // too), without looking through every file again.
+                    if outcome.changed.iter().any(below) {
+                        dupes.push(t.id);
+                    }
+                } else if outcome.changed.iter().any(below) {
                     reread.push(i);
                 }
                 continue;
             }
-            // (Also when it changed a folder open in the tab's tree view: it's read again with it.)
-            if !outcome.changed.iter().any(|f| same_path(f, &t.path) || t.tree.has(f)) {
+            // (Also when it changed a folder open in the tab's tree view: it's read again with it. And
+            // Home, when it changed a folder that holds something Home lists.)
+            let in_home = |f: &String| t.folder.home.is_some() && t.folder.entries.iter().any(|e| e.target.as_deref().and_then(parent).is_some_and(|d| same_path(&d, f)));
+            if !outcome.changed.iter().any(|f| same_path(f, &t.path) || t.tree.has(f) || in_home(f)) {
                 continue;
             }
             if t.id == after.tab_id {
@@ -343,6 +581,9 @@ impl AppState {
         }
         for i in reread {
             self.start_load(i);
+        }
+        for id in dupes {
+            self.check_duplicates(id);
         }
         if !outcome.changed.is_empty() {
             self.refresh_drives(); // free space changed
@@ -355,6 +596,20 @@ impl AppState {
         if let Some(note) = outcome.note {
             self.say(note); // after the reading, which clears notes
         }
+    }
+
+    /// Which files of a duplicates list are still there, looked at on a background thread: a list of
+    /// thousands, on a network drive, would hold the window up.
+    fn check_duplicates(&mut self, tab_id: u64) {
+        let Some(t) = self.tabs.iter().find(|t| t.id == tab_id) else { return };
+        let files: Vec<String> = t.folder.entries.iter().filter_map(|e| e.target.clone()).collect();
+        let (tx, hwnd) = (self.tx.clone(), self.hwnd.clone());
+        crate::shell::background("check duplicates", move || {
+            let gone = files.into_iter().filter(|p| !std::path::Path::new(p).exists()).collect();
+            if tx.send(Loaded::DupesGone { tab_id, gone }).is_ok() {
+                wake(&hwnd);
+            }
+        });
     }
 
     /// Windows' own "New ›" was picked (window.rs): the one item it makes here in the next few
@@ -400,6 +655,64 @@ impl AppState {
         }
         false
     }
+
+    /// Right-click > Tag (tags.rs): puts `tag` on the selected items - or takes it off again when
+    /// they all have it already - or takes their tags off (None). Written at once.
+    pub(super) fn tag_selected(&mut self, tag: Option<Tag>) {
+        if !self.files_here() {
+            return;
+        }
+        let paths = self.chosen();
+        if paths.is_empty() {
+            return;
+        }
+        let what = items_text(&paths);
+        match tag {
+            Some(tag) if paths.iter().all(|p| self.tags.of(p) == Some(tag)) => {
+                self.tags.set(&paths, None);
+                self.say(format!("Removed the {} tag from {what}", tag.word()));
+            }
+            Some(tag) => {
+                self.tags.set(&paths, Some(tag));
+                self.say(format!("Tagged {what} {}", tag.word()));
+            }
+            None => {
+                if self.tags.set(&paths, None) {
+                    self.say(format!("Removed the tag from {what}"));
+                }
+            }
+        }
+        self.tags_changed();
+    }
+
+    /// The window came to the front: tags another Glint window changed meanwhile show here too.
+    pub fn tags_refresh(&mut self) {
+        if self.tags.refresh() {
+            self.tags_changed();
+        }
+    }
+
+    /// Colour tags go along with items a job moved or renamed (see `after_file_op`).
+    fn tags_follow(&mut self, moves: &[(String, String)]) {
+        if self.tags.moved(moves) {
+            self.tags_changed();
+        }
+    }
+
+    /// The colour tags changed: tabs filtered by a tag (`tag:red`) show what has it now. (The rows
+    /// get their new dots anyway, the next time they're drawn.)
+    fn tags_changed(&mut self) {
+        for t in &mut self.tabs {
+            if crate::tags::in_filter(&t.filter) {
+                t.rebuild_view();
+            }
+        }
+    }
+}
+
+/// The path inside an archive of `name` in its folder `inner` ("" for the archive's root).
+fn join_inner(inner: &str, name: &str) -> String {
+    if inner.is_empty() { name.to_string() } else { format!("{inner}\\{name}") }
 }
 
 /// Decides what the tab that started a job selects when its folder has been read again.
@@ -624,5 +937,198 @@ mod tests {
         let picked: Vec<&str> = t.selected_entries().iter().map(|&i| t.folder.entries[i].name.as_str()).collect();
         assert_eq!(picked, vec!["a.txt"], "the hidden copy must not be selected (Del would delete it unseen)");
         assert_eq!(t.focus.map(|i| t.folder.entries[i].name.as_str()), Some("a.txt"));
+    }
+
+    #[test]
+    fn a_moved_folder_can_be_moved_back() {
+        use crate::undo::Step;
+        let mut a = AppState::for_tests(crate::settings::Settings::default());
+        let pair = ("C:\\x\\F".to_string(), "D:\\y\\F".to_string());
+        let moved = Step::Moved { pairs: vec![pair.clone()] };
+        let id = a.tab().id;
+        a.after_file_op(AfterJob::new(id), Outcome { ok: true, moved_folders: vec![pair.clone()], undo: Some(moved.clone()), ..Default::default() });
+        // (Following the folder must not turn the step just made into "D:\y\F to D:\y\F".)
+        assert_eq!(a.history.next_undo(), Some(&moved));
+    }
+
+    #[test]
+    fn tags_go_along_with_moves_and_renames_but_not_with_copies() {
+        use crate::undo::Step;
+        let mut a = AppState::for_tests(crate::settings::Settings::default());
+        a.tags.set(&["C:\\x\\a.txt".to_string(), "C:\\x\\F".to_string(), "C:\\x\\F\\in.txt".to_string()], Some(Tag::Red));
+        let id = a.tab().id;
+        let done = |a: &mut AppState, history: Option<(bool, Step)>, step: Step, folders: Vec<(String, String)>| {
+            let after = AfterJob { history, ..AfterJob::new(id) };
+            a.after_file_op(after, Outcome { ok: true, moved_folders: folders, undo: Some(step), ..Default::default() });
+        };
+        // F2.
+        let rename = Step::Renamed { dir: "C:\\x".into(), from: "a.txt".into(), to: "b.txt".into() };
+        done(&mut a, None, rename.clone(), vec![]);
+        assert_eq!((a.tags.of("C:\\x\\a.txt"), a.tags.of("C:\\x\\b.txt")), (None, Some(Tag::Red)));
+        // Cut and paste (or a drop, or Move to other side) of a folder: what's inside goes along.
+        let pair = ("C:\\x\\F".to_string(), "D:\\y\\F".to_string());
+        done(&mut a, None, Step::Moved { pairs: vec![pair.clone()] }, vec![pair]);
+        assert_eq!((a.tags.of("D:\\y\\F"), a.tags.of("D:\\y\\F\\in.txt")), (Some(Tag::Red), Some(Tag::Red)));
+        assert_eq!(a.tags.of("C:\\x\\F\\in.txt"), None);
+        // A copy gets no tag.
+        done(&mut a, None, Step::Made { paths: vec!["C:\\x\\b - Copy.txt".into()], what: "copy" }, vec![]);
+        assert_eq!((a.tags.of("C:\\x\\b - Copy.txt"), a.tags.of("C:\\x\\b.txt")), (None, Some(Tag::Red)));
+        // Ctrl+Z of the rename: the job renames it back, and the tag goes back with it.
+        let back = Step::Renamed { dir: "C:\\x".into(), from: "b.txt".into(), to: "a.txt".into() };
+        done(&mut a, Some((false, rename)), back, vec![]);
+        assert_eq!((a.tags.of("C:\\x\\a.txt"), a.tags.of("C:\\x\\b.txt")), (Some(Tag::Red), None));
+        // To the Recycle Bin (and back with Ctrl+Z): the tag stays put meanwhile.
+        done(&mut a, None, Step::Recycled { paths: vec!["C:\\x\\a.txt".into()] }, vec![]);
+        assert_eq!(a.tags.of("C:\\x\\a.txt"), Some(Tag::Red));
+        // Deleted for good (Shift+Del): the tag goes - once all of it went.
+        let for_good = || AfterJob { deleted: vec!["C:\\x\\a.txt".into()], ..AfterJob::new(id) };
+        a.after_file_op(for_good(), Outcome { ok: false, ..Default::default() });
+        assert_eq!(a.tags.of("C:\\x\\a.txt"), Some(Tag::Red), "something was refused: it may be there still");
+        a.after_file_op(for_good(), Outcome { ok: true, ..Default::default() });
+        assert_eq!(a.tags.of("C:\\x\\a.txt"), None);
+    }
+
+    #[test]
+    fn tagging_the_selection_and_seeing_only_tagged_items() {
+        let mut a = AppState::for_tests(crate::settings::Settings::default());
+        a.tabs[0].path = "C:\\x".into();
+        apply_listing(&mut a.tabs[0], listing(&["a.txt", "b.txt", "c.txt"]));
+        let select = |a: &mut AppState, names: &[&str]| {
+            let t = a.tab_mut();
+            t.selected = t.folder.entries.iter().map(|e| names.contains(&e.name.as_str())).collect();
+        };
+        let tag = |a: &AppState, name: &str| a.tags.of(&join("C:\\x", name));
+        select(&mut a, &["a.txt", "b.txt"]);
+        a.tag_selected(Some(Tag::Red));
+        assert_eq!((tag(&a, "a.txt"), tag(&a, "b.txt"), tag(&a, "c.txt")), (Some(Tag::Red), Some(Tag::Red), None));
+        // Red again while both are red: off again.
+        a.tag_selected(Some(Tag::Red));
+        assert_eq!((tag(&a, "a.txt"), tag(&a, "b.txt")), (None, None));
+        // One red, one blue: Red makes both red.
+        select(&mut a, &["a.txt"]);
+        a.tag_selected(Some(Tag::Blue));
+        select(&mut a, &["a.txt", "b.txt"]);
+        a.tag_selected(Some(Tag::Red));
+        assert_eq!((tag(&a, "a.txt"), tag(&a, "b.txt")), (Some(Tag::Red), Some(Tag::Red)));
+        // The filter: only the red ones; a tag taken off takes the item out of the list at once.
+        a.set_filter("tag:red".into());
+        let shown = |a: &AppState| a.tab().view.iter().map(|&i| a.tab().folder.entries[i as usize].name.clone()).collect::<Vec<_>>();
+        assert_eq!(shown(&a), ["a.txt", "b.txt"]);
+        select(&mut a, &["b.txt"]);
+        a.tag_selected(None);
+        assert_eq!(shown(&a), ["a.txt"]);
+        // In This PC there's nothing to tag.
+        a.tabs[0].path = String::new();
+        a.tag_selected(Some(Tag::Green));
+        assert_eq!(a.note(), Some(THIS_PC_NOTE));
+    }
+
+    /// A fresh folder under the temp folder for a test's real files, removed when it ends.
+    struct Scratch(String);
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            let dir = std::env::temp_dir().join(format!("glint-files-test-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir.to_string_lossy().into_owned())
+        }
+        fn at(&self, name: &str) -> String {
+            join(&self.0, name)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Waits for the file job just started, and takes in what it did as the window does - but
+    /// without the folders to read again: that reads every drive again too, network drives as well.
+    fn finish_job(a: &mut AppState) {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            match a.rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                Ok(Loaded::FileOp { after, outcome }) => return a.after_file_op(after, Outcome { changed: Vec::new(), ..outcome }),
+                Ok(_) => {}
+                Err(_) => panic!("the file job never finished"),
+            }
+        }
+    }
+
+    /// Renames `from` to `to` in `dir` for real, as an earlier F2 did: the step Ctrl+Z undoes.
+    fn renamed(dir: &str, from: &str, to: &str) -> crate::undo::Step {
+        std::fs::write(join(dir, from), from).unwrap();
+        std::fs::rename(join(dir, from), join(dir, to)).unwrap();
+        crate::undo::Step::Renamed { dir: dir.to_string(), from: from.into(), to: to.into() }
+    }
+
+    #[test]
+    fn ctrl_z_waits_for_the_last_undo_and_works_from_any_folder() {
+        use crate::ui::Command;
+        let s = Scratch::new("undo-wait");
+        let mut a = AppState::for_tests(crate::settings::Settings::default());
+        a.hidden = true; // (no folder watch in a test)
+        // Two renames done earlier, in a folder the tab isn't showing.
+        let first = renamed(&s.0, "1.txt", "2.txt");
+        let second = renamed(&s.0, "x.txt", "y.txt");
+        a.history.done(first.clone());
+        a.history.done(second.clone());
+        a.run(Command::Undo);
+        assert!(a.history.busy);
+        // Pressed again (or Ctrl+Y) before it's done: nothing more is taken off the lists.
+        a.run(Command::Undo);
+        assert_eq!(a.note(), Some("Wait for the last one to finish."));
+        a.run(Command::Redo);
+        assert_eq!(a.note(), Some("Wait for the last one to finish."));
+        finish_job(&mut a);
+        assert!(!a.history.busy);
+        assert_eq!(a.note(), Some("Undid the rename of \u{201c}x.txt\u{201d}"));
+        assert!(fileops::exists(&s.at("x.txt")) && !fileops::exists(&s.at("y.txt")));
+        assert_eq!(a.history.next_undo(), Some(&first), "only one was undone");
+        // Redo, undo after redo, then the one before: each lands as it was.
+        a.run(Command::Redo);
+        finish_job(&mut a);
+        assert_eq!(a.note(), Some("Redid the rename of \u{201c}x.txt\u{201d}"));
+        assert!(fileops::exists(&s.at("y.txt")));
+        for _ in 0..2 {
+            a.run(Command::Undo);
+            finish_job(&mut a);
+        }
+        assert!(fileops::exists(&s.at("1.txt")) && fileops::exists(&s.at("x.txt")));
+        a.run(Command::Undo);
+        assert_eq!(a.note(), Some("Nothing to undo"));
+        assert!(!a.history.busy);
+        a.run(Command::Redo);
+        finish_job(&mut a);
+        assert_eq!(a.note(), Some("Redid the rename of \u{201c}1.txt\u{201d}"));
+        assert!(fileops::exists(&s.at("2.txt")));
+        assert_eq!(a.history.next_undo(), Some(&first));
+    }
+
+    #[test]
+    fn an_undo_that_cannot_be_done_is_dropped_and_the_next_one_goes_on() {
+        use crate::ui::Command;
+        let s = Scratch::new("undo-dropped");
+        let mut a = AppState::for_tests(crate::settings::Settings::default());
+        a.hidden = true; // (no folder watch in a test)
+        let first = renamed(&s.0, "1.txt", "2.txt");
+        a.history.done(first.clone());
+        a.history.done(renamed(&s.0, "x.txt", "y.txt"));
+        // Something else took the old name meanwhile.
+        std::fs::write(s.at("x.txt"), "someone else's").unwrap();
+        a.run(Command::Undo);
+        finish_job(&mut a);
+        assert!(!a.history.busy, "Ctrl+Z works again");
+        assert_eq!(a.note(), Some("There's already an item called \u{201c}x.txt\u{201d} here."));
+        assert_eq!(std::fs::read_to_string(s.at("x.txt")).unwrap(), "someone else's", "never replaced");
+        assert!(fileops::exists(&s.at("y.txt")));
+        // On neither list now: what's on disk isn't what the step says.
+        assert!(!a.history.can_redo());
+        assert_eq!(a.history.next_undo(), Some(&first));
+        a.run(Command::Undo);
+        finish_job(&mut a);
+        assert!(fileops::exists(&s.at("1.txt")) && !fileops::exists(&s.at("2.txt")));
     }
 }

@@ -1,15 +1,20 @@
-// Resources baked into glint.exe: the app icon (the chrome star, logo/glint.ico), the manifest and
-// the version info Explorer shows. Plain numbers instead of #include <winver.h>, so it compiles
-// without any SDK headers - with MinGW's windres as well as Microsoft's rc.exe. File names are
-// relative to this file's folder (both run in it).
+// Resources baked into glint.exe: the app icon (the chrome star, logo/glint.ico), the zip and 7z file
+// icons (Settings > Appearance > Zip icon; registry.rs points Windows at them by these numbers), the
+// manifest and the version info Explorer shows. Plain numbers instead of #include <winver.h>, so it
+// compiles without any SDK headers - with MinGW's windres as well as Microsoft's rc.exe. File names
+// are relative to this file's folder (both run in it).
 
 1 ICON "logo/glint.ico"
+2 ICON "zip/zip-label.ico"
+3 ICON "zip/zip-label-7z.ico"
+4 ICON "zip/zip-folder.ico"
+5 ICON "zip/zip-page.ico"
 1 24 "glint.manifest"
 
 // 1 VERSIONINFO = VS_VERSION_INFO; FILEOS 0x40004 = VOS_NT_WINDOWS32; FILETYPE 1 = VFT_APP.
 1 VERSIONINFO
-FILEVERSION 1,0,18,2
-PRODUCTVERSION 1,0,18,2
+FILEVERSION 1,0,19,1
+PRODUCTVERSION 1,0,19,1
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -20,9 +25,9 @@ BEGIN
       VALUE "FileDescription", "Glint"
       VALUE "ProductName", "Glint"
       VALUE "CompanyName", "tamara"
-      VALUE "FileVersion", "1.0.18-beta.2"
+      VALUE "FileVersion", "1.0.19-beta.1"
       VALUE "LegalCopyright", "Copyright (c) 2026 tamara. MIT License."
-      VALUE "ProductVersion", "1.0.18-beta.2"
+      VALUE "ProductVersion", "1.0.19-beta.1"
       VALUE "OriginalFilename", "glint.exe"
     END
   END

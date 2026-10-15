@@ -16,7 +16,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_LEFT, VK_RETURN,
 
 use crate::app::Question;
 use crate::kit::{self, Look};
-use crate::pathbar::{box_contains, fill_box, outline_box};
+use crate::pathbar::{box_contains, fill_box};
 use crate::render::{Align, Renderer, TextStyle};
 use crate::theme::{Color, Theme};
 use crate::ui::{Point, Rect};
@@ -196,7 +196,7 @@ impl AskBox {
 
         // The keyboard's button gets a thin outline (Enter or Space presses it).
         let focused = if self.focus == Button::Yes { self.yes } else { self.no };
-        outline_box(r, theme, focused.inset(-2.5, -2.5), self.lean, 1.0, theme.text.with_alpha(0.65));
+        kit::focus_ring(r, theme, focused, self.lean);
     }
 
     pub fn mouse_move(&mut self, p: Point) -> Answer {

@@ -22,7 +22,8 @@ impl AppState {
         // Another row height: the same rows stay on screen (as when the "Size" setting changes).
         let (old, new) = (self.row_height(), row_height(self.settings.size, theme.row_h));
         if old != new && old > 0.0 {
-            for t in &mut self.tabs {
+            // (Only where items are rows: icons and the List view don't change with it.)
+            for t in self.tabs.iter_mut().filter(|t| matches!(t.view_mode, settings::ViewMode::Details | settings::ViewMode::Tree)) {
                 t.scroll = t.scroll / old * new;
             }
             self.tab_mut().reveal_focus = true;
@@ -60,7 +61,11 @@ impl AppState {
         match event {
             skin::EVENT_CHANGED => self.skins.refresh(),
             skin::EVENT_LISTED => {
-                if self.skins.take_listing() {
+                // A picture the skin names that wasn't there when the skin was read (copied in next
+                // to it just now, say) is found by reading the skin again.
+                let picture = std::path::Path::new(&self.theme.wallpaper);
+                let picture_due = !self.theme.wallpaper.is_empty() && picture.starts_with(skin::folder()) && !picture.exists();
+                if self.skins.take_listing() || picture_due {
                     // The skin in use by its id as the folder now has it (a file whose name changed
                     // only in capitals is the same skin; Settings compares ids exactly).
                     if let Some(id) = self.skins.find(&self.settings.skin).map(|e| e.id.clone()).filter(|id| *id != self.settings.skin) {

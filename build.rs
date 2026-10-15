@@ -1,4 +1,4 @@
-//! Build step: bakes res/glint.rc (icon, manifest, version info) into glint.exe. The manifest is what
+//! Build step: bakes res/glint.rc (icons, manifest, version info) into glint.exe. The manifest is what
 //! makes Glint sharp on high-DPI screens (per-monitor v2) and gives it the modern (v6) common
 //! controls, which the "Filter" hint in the filter box needs.
 //!
@@ -19,6 +19,7 @@ fn main() {
     println!("cargo:rerun-if-changed=res/glint.rc");
     println!("cargo:rerun-if-changed=res/glint.manifest");
     println!("cargo:rerun-if-changed=res/logo/glint.ico");
+    println!("cargo:rerun-if-changed=res/zip");
     println!("cargo:rerun-if-env-changed=RC");
     println!("cargo:rerun-if-env-changed=WINDRES");
 

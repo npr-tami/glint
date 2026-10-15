@@ -62,6 +62,11 @@ const PICK_DUPLICATE: u32 = 1;
 const PICK_CLOSE: u32 = 2;
 const PICK_CLOSE_OTHERS: u32 = 3;
 const PICK_REOPEN: u32 = 4;
+const PICK_PIN: u32 = 5;
+const PICK_SAVE_SET: u32 = 6;
+/// "Tab sets ›": open set n (PICK_OPEN_SET + n), or remove it (PICK_REMOVE_SET + n).
+const PICK_OPEN_SET: u32 = 100;
+const PICK_REMOVE_SET: u32 = 200;
 
 /// One clickable thing in the title bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +109,9 @@ pub struct TitleBar {
     /// Something dragged rests on this tab (window/drag.rs switches to it after a moment): it's
     /// outlined in red.
     drop_tab: Option<usize>,
+    /// A tab held down with the left button, by its id, and where the mouse went down: dragged
+    /// sideways, it moves along the tab row.
+    held_tab: Option<(u64, f32)>,
     /// The skin's older Windows (its window buttons are that Windows' size, where it had them).
     era: Era,
 }
@@ -138,7 +146,8 @@ impl TitleBar {
                 return Some(part);
             }
         }
-        if self.plus.contains(p) {
+        // Only where it's drawn: with many tabs it has no room left of the caption buttons.
+        if self.plus.right() <= self.button(2).x && self.plus.contains(p) {
             return Some(Part::NewTab);
         }
         for (i, t) in self.tabs.iter().enumerate() {
@@ -266,8 +275,11 @@ impl TitleBar {
                 r.stroke_rect(rect, 1.0, theme.accent);
             }
 
-            // The last tab has its × too: closing it closes the window, as in File Explorer.
-            let show_close = (active || hot) && rect.w >= 52.0;
+            // The last tab has its × too: closing it closes the window, as in File Explorer. A
+            // pinned tab has a pin there instead (it closes from its right-click menu).
+            let pinned = tab.is_some_and(|t| t.pinned);
+            let show_close = (active || hot) && rect.w >= 52.0 && !pinned;
+            let pin_at = slot.close;
             if !show_close {
                 slot.close = Rect::default();
             }
@@ -280,7 +292,7 @@ impl TitleBar {
                 tab_icon(r, theme, app, &tab.path, at);
                 x += size::ICON + TAB_ICON_GAP;
             }
-            let right = if show_close { close.x - 4.0 } else { rect.right() - TAB_PAD * 0.75 };
+            let right = if show_close || pinned { pin_at.x - 4.0 } else { rect.right() - TAB_PAD * 0.75 };
             let color = if active {
                 theme.tab_active_text
             } else if hot && theme.era != Era::Xp {
@@ -297,6 +309,9 @@ impl TitleBar {
                 r.text(&title, Rect::new(words.x + 1.0, words.y + 1.0, words.w, words.h), &style.color(theme.title_shadow));
             }
             r.text(&title, words, &style);
+            if pinned && rect.w >= 52.0 {
+                pin_mark(r, Point::new(pin_at.x + pin_at.w / 2.0, pin_at.y + pin_at.h / 2.0), if active { color } else { theme.tab_text });
+            }
 
             if show_close {
                 let close_hot = self.hover == Some(Part::TabClose(i));
@@ -343,19 +358,35 @@ impl TitleBar {
         self.menu_tab = app.tabs.get(i).map(|t| t.id);
         // "Close tab" on the last tab closes the window (window.rs); there are no others to close.
         let one = app.tabs.len() <= 1;
-        Effect::Menu(Menu {
-            tag: MENU_TAB,
-            at,
-            items: vec![
-                MenuItem::new(PICK_DUPLICATE, "Duplicate tab"),
-                MenuItem::separator(),
-                MenuItem::new(PICK_CLOSE, "Close tab\tCtrl+W"),
-                MenuItem::new(PICK_CLOSE_OTHERS, "Close other tabs").disabled(one),
-                MenuItem::separator(),
-                MenuItem::new(PICK_REOPEN, "Reopen closed tab\tCtrl+Shift+T").disabled(!app.can_reopen_tab()),
-            ],
-            right_aligned: false,
-        })
+        let pinned = app.tabs.get(i).is_some_and(|t| t.pinned);
+        // Saved sets: each opens with a click; "Remove" lists them again to forget one.
+        let sets = &app.settings.tab_sets;
+        let name = |s: &crate::settings::TabSet| s.name.replace('&', "&&");
+        let mut set_items: Vec<MenuItem> = sets.iter().enumerate().take(99).map(|(n, s)| MenuItem::new(PICK_OPEN_SET + n as u32, &name(s))).collect();
+        if !sets.is_empty() {
+            set_items.push(MenuItem::separator());
+            set_items.push(MenuItem::submenu(
+                "Remove a set",
+                sets.iter().enumerate().take(99).map(|(n, s)| MenuItem::new(PICK_REMOVE_SET + n as u32, &name(s))).collect(),
+            ));
+        }
+        let mut items = vec![
+            MenuItem::new(PICK_PIN, if pinned { "Unpin tab" } else { "Pin tab" }),
+            MenuItem::new(PICK_DUPLICATE, "Duplicate tab"),
+            MenuItem::separator(),
+            MenuItem::new(PICK_SAVE_SET, "Save tabs as a set\u{2026}"),
+        ];
+        if !sets.is_empty() {
+            items.push(MenuItem::submenu("Tab sets", set_items));
+        }
+        items.extend([
+            MenuItem::separator(),
+            MenuItem::new(PICK_CLOSE, "Close tab\tCtrl+W"),
+            MenuItem::new(PICK_CLOSE_OTHERS, "Close other tabs").disabled(one),
+            MenuItem::separator(),
+            MenuItem::new(PICK_REOPEN, "Reopen closed tab\tCtrl+Shift+T").disabled(!app.can_reopen_tab()),
+        ]);
+        Effect::Menu(Menu { tag: MENU_TAB, at, items, right_aligned: false })
     }
 
     fn paint_caption_buttons(&self, r: &mut Renderer, theme: &Theme, ctx: &Ctx) {
@@ -508,6 +539,15 @@ fn tab_icon(r: &mut Renderer, theme: &Theme, app: &AppState, path: &str, at: Rec
     }
 }
 
+/// The little pin a pinned tab shows where its × would be: a round head with its needle slanting
+/// down to the left.
+fn pin_mark(r: &mut Renderer, c: Point, color: Color) {
+    let head = Point::new(c.x + 1.5, c.y - 1.5);
+    r.line(Point::new(c.x - 3.5, c.y + 3.5), head, 1.2, color);
+    r.line(Point::new(head.x - 3.0, head.y - 1.0), Point::new(head.x + 1.0, head.y + 3.0), 1.4, color);
+    r.fill_ellipse(Point::new(head.x + 1.0, head.y - 1.0), 2.2, 2.2, color);
+}
+
 impl TitleBar {
     /// 98 / 2000: the tabs as a property sheet's, standing on the toolbar: grey, raised, the top
     /// corners cut; the current one 2 taller and 2 wider each side, joined to the toolbar under it
@@ -530,7 +570,9 @@ impl TitleBar {
             if dropping {
                 crate::retroctl::dotted(r, shape.inset(3.0, 3.0), theme.text);
             }
-            let show_close = (active || hot) && rect.w >= 52.0;
+            let pinned = tab.is_some_and(|t| t.pinned);
+            let show_close = (active || hot) && rect.w >= 52.0 && !pinned;
+            let pin_at = slot.close;
             if !show_close {
                 slot.close = Rect::default();
             }
@@ -542,10 +584,13 @@ impl TitleBar {
                 tab_icon(r, theme, app, &tab.path, Rect::new(x, mid - size::ICON / 2.0, size::ICON, size::ICON));
                 x += size::ICON + 6.0;
             }
-            let right = if show_close { close.x - 3.0 } else { rect.right() - 6.0 };
+            let right = if show_close || pinned { pin_at.x - 3.0 } else { rect.right() - 6.0 };
             let color = if active { theme.tab_active_text } else { theme.tab_text };
             let title = tab.map_or_else(|| SETTINGS_TAB.to_string(), |t| app.display_name(&t.path));
             r.text(&title, Rect::new(x, mid - 10.0, (right - x).max(0.0), 20.0), &TextStyle::new(color));
+            if pinned && rect.w >= 52.0 {
+                pin_mark(r, Point::new(pin_at.x + pin_at.w / 2.0, mid), color);
+            }
             if show_close {
                 let close_hot = self.hover == Some(Part::TabClose(i));
                 let down = close_hot && self.pressed.is_some_and(|(p, _)| p == Part::TabClose(i));
@@ -585,7 +630,9 @@ impl TitleBar {
         if !theme.era.classic() {
             return;
         }
-        let Some(slot) = self.tabs.get(app.active) else { return };
+        // The same current tab as paint_classic_tabs: Settings' own when it is open as a tab.
+        let current = if app.settings_tab { app.tabs.len() } else { app.active };
+        let Some(slot) = self.tabs.get(current) else { return };
         let shape = classic_tab_shape(slot.rect, true);
         let clip_right = self.button(2).x;
         if shape.x >= clip_right {
@@ -722,7 +769,25 @@ impl Component for TitleBar {
         }
     }
 
-    fn mouse_move(&mut self, _ctx: &Ctx, e: &MouseEvent, _app: &mut AppState) -> Effect {
+    fn mouse_move(&mut self, _ctx: &Ctx, e: &MouseEvent, app: &mut AppState) -> Effect {
+        if let Some((id, x)) = self.held_tab {
+            // Dragged sideways: the tab moves past the tabs whose middle the mouse has passed (not
+            // as soon as it's over one: a narrow tab passing a wide one would land with the mouse
+            // still over that one, and the two would swap back and forth).
+            if (e.pos.x - x).abs() >= 6.0 {
+                self.pressed = None;
+                if let Some(from) = app.tabs.iter().position(|t| t.id == id) {
+                    let n = app.tabs.len().min(self.tabs.len());
+                    let mid = |i: usize| self.tabs[i].rect.x + self.tabs[i].rect.w / 2.0;
+                    let right = (from + 1..n).take_while(|&i| e.pos.x >= mid(i)).last();
+                    let left = (0..from.min(n)).rev().take_while(|&i| e.pos.x < mid(i)).last();
+                    if let Some(to) = right.or(left) {
+                        return Effect::Command(Command::MoveTab(from, to));
+                    }
+                }
+            }
+            return Effect::None;
+        }
         let hover = self.part_at(e.pos);
         if hover != self.hover {
             self.hover = hover;
@@ -740,7 +805,11 @@ impl Component for TitleBar {
 
     fn mouse_down(&mut self, _ctx: &Ctx, e: &MouseEvent, app: &mut AppState) -> Effect {
         self.pressed = None;
+        self.held_tab = None;
         let Some(part) = self.part_at(e.pos) else { return Effect::None };
+        if let (Part::Tab(i), MouseButton::Left) = (part, e.button) {
+            self.held_tab = app.tabs.get(i).map(|t| (t.id, e.pos.x));
+        }
         match (part, e.button) {
             // Switching happens on the way down, so it feels instant.
             // Settings' own tab is already the current one.
@@ -756,6 +825,7 @@ impl Component for TitleBar {
     }
 
     fn mouse_up(&mut self, _ctx: &Ctx, e: &MouseEvent, app: &mut AppState) -> Effect {
+        self.held_tab = None;
         let Some((part, button)) = self.pressed.take() else { return Effect::None };
         if button != e.button || Some(part) != self.part_at(e.pos) {
             return Effect::Redraw;
@@ -786,8 +856,13 @@ impl Component for TitleBar {
         }
         let Some(i) = self.menu_tab.take().and_then(|id| app.tabs.iter().position(|t| t.id == id)) else { return Effect::None };
         match item {
+            PICK_SAVE_SET => Effect::Command(Command::SaveTabSet),
+            n if (PICK_OPEN_SET..PICK_REMOVE_SET).contains(&n) => Effect::Command(Command::OpenTabSet((n - PICK_OPEN_SET) as usize)),
+            n if (PICK_REMOVE_SET..PICK_REMOVE_SET + 100).contains(&n) => Effect::Command(Command::DeleteTabSet((n - PICK_REMOVE_SET) as usize)),
             PICK_DUPLICATE => Effect::Command(Command::DuplicateTab(i)),
-            PICK_CLOSE => Effect::Command(Command::CloseTab(i)),
+            // The menu's "Close tab" closes a pinned tab too (it's the way to close one).
+            PICK_CLOSE => Effect::Command(Command::ForceCloseTab(i)),
+            PICK_PIN => Effect::Command(Command::TogglePinTab(i)),
             PICK_CLOSE_OTHERS => Effect::Command(Command::CloseOtherTabs(i)),
             PICK_REOPEN => Effect::Command(Command::ReopenClosedTab),
             _ => Effect::None,

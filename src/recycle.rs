@@ -33,8 +33,7 @@ use std::sync::{Arc, OnceLock};
 use windows::core::{w, Interface, GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{FILETIME, HANDLE, HWND, LPARAM, LRESULT, PROPERTYKEY, WPARAM};
 use windows::Win32::Storage::FileSystem::{
-    GetFileAttributesW, MoveFileExW, SetFileAttributesW, FILE_ATTRIBUTE_READONLY, FILE_FLAGS_AND_ATTRIBUTES, INVALID_FILE_ATTRIBUTES,
-    MOVEFILE_COPY_ALLOWED, MOVE_FILE_FLAGS,
+    MoveFileExW, SetFileAttributesW, FILE_ATTRIBUTE_READONLY, FILE_FLAGS_AND_ATTRIBUTES, MOVEFILE_COPY_ALLOWED, MOVE_FILE_FLAGS,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
@@ -53,7 +52,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassExW, SetTimer, HWND_MESSAGE, MSG, PM_NOREMOVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_QUIT, WM_TIMER, WNDCLASSEXW,
 };
 
-use crate::fileops::{self, same_path, unique_name, Outcome};
+use crate::fileops::{self, attributes, exists, same_path, unique_name, Outcome};
 use crate::folder::{extension, file_name, format_count, format_size, join, parent, wide, wide_path, Entry, EntryKind, Folder};
 use crate::icons;
 use crate::log;
@@ -380,17 +379,6 @@ fn filetime_u64(f: FILETIME) -> u64 {
     ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64
 }
 
-fn attributes(path: &str) -> Option<u32> {
-    let w = wide_path(path);
-    // SAFETY: `w` is NUL-terminated and outlives the call.
-    let a = unsafe { GetFileAttributesW(PCWSTR(w.as_ptr())) };
-    (a != INVALID_FILE_ATTRIBUTES).then_some(a)
-}
-
-fn exists(path: &str) -> bool {
-    attributes(path).is_some()
-}
-
 /// "C:\..." or "\\server\share\...".
 fn is_full_path(path: &str) -> bool {
     let b = path.as_bytes();
@@ -516,6 +504,59 @@ pub fn run(job: BinJob) -> Outcome {
                 saw_full(n > 0);
             }
         }
+    }
+    out
+}
+
+/// Puts back the items last deleted from these full paths (Ctrl+Z after a delete, Ctrl+Y after
+/// undoing a copy or a new folder): for each path, the newest item in the bin that came from there.
+/// Restored items are reported as made, so the list selects them. An item whose name is taken now
+/// stays in the bin (not put back with a number, as the bin's own Restore does): the undo step
+/// would then point at the other item.
+pub fn restore_paths(paths: &[String]) -> Outcome {
+    let test = test_dir();
+    let listed = match test {
+        Some(dir) => read_pairs(dir),
+        None => read_shell(),
+    };
+    let pairs = match listed {
+        Ok(p) => p,
+        Err(why) => return Outcome { note: Some(why), ..Default::default() },
+    };
+    let mut items: Vec<BinItem> = Vec::new();
+    let mut missing = 0;
+    let mut taken: Vec<String> = Vec::new();
+    for p in paths {
+        if exists(p) {
+            taken.push(p.clone());
+            continue;
+        }
+        match pairs.iter().map(|(_, item)| item).filter(|item| same_path(&item.original, p)).max_by_key(|item| item.deleted) {
+            Some(item) => items.push(item.clone()),
+            None => missing += 1,
+        }
+    }
+    let mut out = run(BinJob::Restore(items));
+    if missing > 0 {
+        out.ok = false;
+        out.note = Some(if missing == paths.len() {
+            "It isn't in the Recycle Bin any more.".to_string()
+        } else {
+            format!("{} of them aren't in the Recycle Bin any more.", format_count(missing))
+        });
+    }
+    if !taken.is_empty() {
+        out.ok = false;
+        out.note = Some(format!("{} stayed in the Recycle Bin: something with that name is there now.", fileops::items_text(&taken)));
+    }
+    // Restored into one folder (nearly always): select them there.
+    if let [dir] = out.changed.iter().filter(|c| !is_bin(c)).collect::<Vec<_>>().as_slice() {
+        let names = paths
+            .iter()
+            .filter(|p| !taken.contains(p) && parent(p).is_some_and(|d| same_path(&d, dir)))
+            .map(|p| file_name(p).to_string())
+            .collect();
+        out.created = Some((dir.to_string(), names));
     }
     out
 }

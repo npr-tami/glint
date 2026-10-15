@@ -43,6 +43,8 @@ pub enum TextEventKind {
     /// The down arrow (the filter box sends the keyboard on to the list). The box still handles the
     /// key as usual (Windows' path suggestions use it).
     Down,
+    /// Tab (Shift+Tab sends it too): a box in a form of several hands the keyboard on (form.rs).
+    Tab,
 }
 
 impl TextEventKind {
@@ -52,6 +54,7 @@ impl TextEventKind {
             2 => TextEventKind::Escape,
             3 => TextEventKind::LostFocus,
             4 => TextEventKind::Down,
+            5 => TextEventKind::Tab,
             _ => TextEventKind::Changed,
         }
     }
@@ -62,6 +65,7 @@ impl TextEventKind {
             TextEventKind::Escape => 2,
             TextEventKind::LostFocus => 3,
             TextEventKind::Down => 4,
+            TextEventKind::Tab => 5,
         }
     }
 }
@@ -363,6 +367,12 @@ fn delete_word_before(hwnd: HWND) {
     }
 }
 
+/// Whether Ctrl is held without Alt: AltGr, which types letters, holds both.
+fn ctrl_only() -> bool {
+    // SAFETY: plain key-state queries.
+    unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 && GetKeyState(VK_MENU.0 as i32) >= 0 }
+}
+
 /// Whether a key pressed in a box is one of the window's shortcuts the box has no use for (see
 /// `TextBox::pass_shortcuts`).
 fn is_window_shortcut(vk: u16, ctrl: bool, alt: bool) -> bool {
@@ -419,17 +429,23 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             post(TextEventKind::Escape);
             return LRESULT(0);
         }
-        // Ctrl+A selects everything (old EDIT controls don't).
+        // Ctrl+A selects everything (old EDIT controls don't). Not AltGr+A, which holds Ctrl and
+        // Alt down to type a letter (Polish ą).
         // SAFETY: plain key-state query and a message to this same control.
-        WM_KEYDOWN if wparam.0 == 'A' as usize && unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 => {
+        WM_KEYDOWN if wparam.0 == 'A' as usize && ctrl_only() => {
             unsafe { SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1))) };
             return LRESULT(0);
         }
         // The down arrow: told (the filter hands the keyboard to the list), and handled as usual.
         WM_KEYDOWN if wparam.0 == VK_DOWN.0 as usize => post(TextEventKind::Down),
+        // Tab: told (a form moves to its next box). (Ctrl+Tab is a window shortcut, above.)
+        WM_KEYDOWN if wparam.0 == VK_TAB.0 as usize => {
+            post(TextEventKind::Tab);
+            return LRESULT(0);
+        }
+        WM_CHAR if wparam.0 == 0x09 => return LRESULT(0),
         // Ctrl+Backspace takes away the word before the cursor (old EDIT controls type a box).
-        // SAFETY: plain key-state query.
-        WM_KEYDOWN if wparam.0 == VK_BACK.0 as usize && unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 => {
+        WM_KEYDOWN if wparam.0 == VK_BACK.0 as usize && ctrl_only() => {
             delete_word_before(hwnd);
             return LRESULT(0);
         }

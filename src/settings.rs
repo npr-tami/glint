@@ -22,12 +22,13 @@
 //!   the window.
 //! - Two Glint windows at once: each one writes its own tabs and window position (the last one to
 //!   close wins), but a choice changed in one (Show hidden files, say) is not
-//!   undone by the other: when writing, a choice this window didn't change is taken from the file.
+//!   undone by the other: when writing, a choice this window didn't change is taken from the file,
+//!   and lists both change (pinned folders, tab sets...) are merged item by item.
 //!   Values this version of Glint doesn't know (from a newer version) are kept as they are.
 //! - An extra window (Ctrl+N, life.rs) writes only choices: the tabs and the window's place in the
 //!   file stay the main window's (`set_extra_window`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -39,14 +40,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use windows::Win32::UI::Shell::{FOLDERID_LocalAppData, FOLDERID_RoamingAppData};
 
+use crate::fileops::same_path;
 use crate::folder::SortKey;
 use crate::log;
 use crate::shell;
+use crate::skin::decode;
 
 /// The settings file's name, in the config folder.
 pub const FILE_NAME: &str = "settings.json";
-/// How many tabs a settings file may bring back (a hand-edited file with thousands would only hurt).
-const MAX_TABS: usize = 100;
+/// How many tabs a settings file may bring back: far more than anyone opens (a hand-edited file
+/// with tens of thousands would only hurt).
+const MAX_TABS: usize = 1000;
 /// Column widths outside this range (DIPs) are ignored.
 const COLUMN_MIN: f32 = 24.0;
 const COLUMN_MAX: f32 = 2000.0;
@@ -59,7 +63,6 @@ pub struct Folders {
     /// settings.json and the skins folder (skin.rs).
     pub config: PathBuf,
     /// Things Glint can always make again; safe to delete.
-    #[allow(dead_code)] // nothing is cached on disk yet (thumbnails, later)
     pub cache: PathBuf,
     /// error.log.
     pub logs: PathBuf,
@@ -126,10 +129,10 @@ fn older_portable(exe_dir: &Path) -> bool {
 /// Keys every settings.json Glint writes has, and other programs' hardly would.
 const GLINT_KEYS: [&str; 6] = ["\"ActiveTab\"", "\"Startup\"", "\"ShowHidden\"", "\"ConfirmDelete\"", "\"HiddenPlaces\"", "\"StayRunning\""];
 
-/// Whether a `config` folder next to glint.exe is Glint's: it holds no settings.json yet (made empty
-/// to make Glint portable), or Glint's own. A folder of that name that belongs to another program
-/// (glint.exe put in a folder with other tools) must not make Glint portable: Glint would rewrite that
-/// program's settings.json as its own.
+/// Whether a `config` folder next to glint.exe is Glint's: it is empty (made to make Glint
+/// portable), or holds Glint's own settings.json. A folder of that name that belongs to another
+/// program (glint.exe put in a folder with other tools) must not make Glint portable: Glint would
+/// rewrite that program's settings.json as its own, and `settle` would move the folder away.
 fn glint_config(dir: &Path) -> bool {
     match std::fs::read(dir.join(FILE_NAME)) {
         Ok(bytes) => {
@@ -137,8 +140,10 @@ fn glint_config(dir: &Path) -> bool {
             // (By its words, not by reading it: a Glint settings.json with a typo in it is still Glint's.)
             text.trim().trim_start_matches('\u{feff}').is_empty() || GLINT_KEYS.iter().any(|k| text.contains(k))
         }
-        // Not there; or there but unreadable right now, which load() handles (no saving then).
-        Err(_) => true,
+        // No settings.json: only an empty folder is Glint's (another program's has its own files in it).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::read_dir(dir).is_ok_and(|mut left| left.next().is_none()),
+        // There but unreadable right now: whose it is can't be told, so the folder is left alone.
+        Err(_) => false,
     }
 }
 
@@ -212,6 +217,13 @@ fn settle_in(exe_dir: &Path, home: &Path, local: &Path) -> Vec<String> {
                 if let Err(e) = move_folder(&from.join(part), &to.join(part)) {
                     problems.push(format!("Glint's {part} folder couldn't be moved from {} to {} ({e}).", from.display(), to.display()));
                 }
+            }
+            // A link, or a file in use, can't move and keeps the old config folder in `Glint data`.
+            // Once settings.json has gone, that folder would make Glint portable again, with none of
+            // its settings: it's renamed, and its things are kept.
+            let config = from.join("config");
+            if !to_portable && config.is_dir() && !config.join(FILE_NAME).exists() {
+                let _ = std::fs::rename(&config, from.join("config.old"));
             }
             // What's left of the old place goes when nothing else is in it.
             let _ = std::fs::remove_dir(&from);
@@ -338,12 +350,16 @@ pub fn set_portable(on: bool) -> Result<String, String> {
     }
     let to = if on { exe_dir.join(PORTABLE_FOLDER) } else { installed_dirs().0 };
     if on && !to.exists() {
-        // Can Glint write next to glint.exe? (The folder itself would make Glint portable already,
-        // so it goes again: the move makes it.)
-        if let Err(e) = std::fs::create_dir(&to) {
+        // Can Glint write next to glint.exe? A test file says: Windows deletes it as it's closed,
+        // so nothing can keep it there. (Not a test `Glint data` folder: if a sync tool held that
+        // for a moment and it stayed, the next start would be portable without the settings. The
+        // move makes the folder.)
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+        let test = exe_dir.join(format!("glint-{}.tmp", std::process::id()));
+        if let Err(e) = std::fs::OpenOptions::new().write(true).create_new(true).share_mode(0).custom_flags(FILE_FLAG_DELETE_ON_CLOSE).open(test) {
             return Err(format!("Glint can't write to {} ({e}). Move Glint to a folder you can write to.", exe_dir.display()));
         }
-        let _ = std::fs::remove_dir(&to);
     }
     let what = if on { "portable" } else { "installed" };
     let text = format!("{what}\r\nGlint moves its files to {} when it next starts.\r\n", to.display());
@@ -618,18 +634,38 @@ impl ViewMode {
     }
 }
 
-/// The extra columns next to Name, by their names in settings.json ("Columns"), in the list's order.
-pub const COLUMN_NAMES: [&str; 4] = ["modified", "created", "type", "size"];
+/// The extra columns next to Name, by their names in settings.json ("Columns"), in the list's order:
+/// "dimensions" is Picture size, "length" how long a video or song plays (both read by media.rs).
+pub const COLUMN_NAMES: [&str; 6] = ["modified", "created", "type", "size", "dimensions", "length"];
 
 /// What the title bars show at the left: the skin's word in its slanted box (GLINT unless the skin
-/// says otherwise), the chrome wordmark (logo.rs), or nothing (the tabs start at the left edge).
+/// says otherwise), the chrome wordmark (logo.rs) in small letters ("glint") or in capitals
+/// ("GLiNT"), or nothing (the tabs start at the left edge).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogoStyle {
     #[default]
     Box,
     Chrome,
+    /// The chrome wordmark in capitals, GLiNT (a little wider).
+    Caps,
     None,
+}
+
+/// The icon zip and 7z files show while they open in Glint ("ZipIcon", registry.rs): label | folder |
+/// page | glint.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ZipIcon {
+    /// A white page with a red label saying ZIP (or 7Z).
+    #[default]
+    Label,
+    /// A chrome folder with a zipper.
+    Folder,
+    /// A chrome page with a zipper.
+    Page,
+    /// Glint's own icon, the chrome star (what Windows shows for them without one of the others).
+    Glint,
 }
 
 /// The sidebar group Glint Minimal's icon rail shows: quick | pinned | pc.
@@ -662,7 +698,22 @@ pub struct SavedTab {
     /// there were views, or a value this Glint doesn't know).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub view: Option<ViewMode>,
+    /// A pinned tab ("Pin tab"): it sits at the left, doesn't close by accident, and comes back
+    /// when Glint starts whatever "When Glint starts, open" says.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
+
+/// Tabs saved together under a name ("Save tabs as a set…"), opened again with one click.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct TabSet {
+    pub name: String,
+    pub tabs: Vec<SavedTab>,
+}
+
+/// How many tab sets are kept.
+pub const MAX_TAB_SETS: usize = 30;
 
 /// A saved tab is written as {"Path": ..., "SortColumn": ..., "SortDescending": ..., "View": ...};
 /// a plain "C:\\folder" (an older file, or a hand edit) is read too.
@@ -680,15 +731,17 @@ enum SavedTabForm {
         // Read as text, so a view a newer Glint wrote (or a typo) loses only itself, not the tab.
         #[serde(rename = "View", default)]
         view: Option<String>,
+        #[serde(rename = "Pinned", default)]
+        pinned: bool,
     },
 }
 
 impl From<SavedTabForm> for SavedTab {
     fn from(form: SavedTabForm) -> SavedTab {
         match form {
-            SavedTabForm::Path(path) => SavedTab { path, sort_column: 0, sort_descending: false, view: None },
-            SavedTabForm::Full { path, sort_column, sort_descending, view } => {
-                SavedTab { path, sort_column, sort_descending, view: view.as_deref().and_then(ViewMode::from_key) }
+            SavedTabForm::Path(path) => SavedTab { path, sort_column: 0, sort_descending: false, view: None, pinned: false },
+            SavedTabForm::Full { path, sort_column, sort_descending, view, pinned } => {
+                SavedTab { path, sort_column, sort_descending, view: view.as_deref().and_then(ViewMode::from_key), pinned }
             }
         }
     }
@@ -742,6 +795,13 @@ pub struct Settings {
     /// Sort by the rules the person wrote (`sort_recipe`) instead of the columns (comes with
     /// custom sort orders).
     pub custom_sort: bool,
+    /// Folders the rules give a view of their own (-large_icons…) are shown that way (VIEW >
+    /// Custom views). Off: every folder shows its tab's view.
+    pub custom_views: bool,
+    /// Split view comes back after a restart, with the same folder on the other side.
+    pub remember_split: bool,
+    /// Ctrl + the scroll wheel over the files changes the view, as in File Explorer.
+    pub ctrl_wheel_view: bool,
     /// The custom sort order's rules; None: the starter rules.
     pub sort_recipe: Option<String>,
     /// The folders pinned to the sidebar (Ctrl+D, right-click > Pin to sidebar), in their order.
@@ -755,6 +815,12 @@ pub struct Settings {
     /// Files and folders marked with right-click > Add to Favorites (full paths, newest last):
     /// Home's Favorites list (home.rs).
     pub favorites: Vec<String>,
+    /// Groups of tabs saved under a name (a tab's right-click > Save tabs as a set…), to open
+    /// again with one click.
+    pub tab_sets: Vec<TabSet>,
+    /// Folders show how big they are in the Size column, worked out in the background
+    /// (foldersize.rs).
+    pub folder_sizes: bool,
 
     // ----- the file list (list.rs)
     /// Row and text size: small | medium | large.
@@ -765,7 +831,8 @@ pub struct Settings {
     /// extensions for known file types". The Settings window shows it the other way round, as
     /// "Show file name extensions".
     pub hide_known_extensions: bool,
-    /// The columns next to Name: any of "modified", "created", "type", "size".
+    /// The columns next to Name: any of "modified", "created", "type", "size", "dimensions"
+    /// (Picture size), "length".
     pub columns: Vec<String>,
     /// Folders above files (otherwise they're sorted together).
     pub folders_first: bool,
@@ -814,6 +881,10 @@ pub struct Settings {
     /// The open tabs, left to right.
     pub tabs: Vec<SavedTab>,
     pub active_tab: usize,
+    /// The folder split view's other side showed; None when split view was off.
+    pub split_folder: Option<String>,
+    /// How much of the files' width split view's left side takes (0.2 to 0.8).
+    pub split_ratio: f32,
     /// The window's position and size when not maximised: left, top, width, height in screen
     /// pixels.
     pub bounds: Option<[i32; 4]>,
@@ -850,8 +921,10 @@ pub struct Settings {
     pub theme_guide_hidden: bool,
     /// The group Glint Minimal's icon rail shows: quick | pinned | pc.
     pub rail_group: RailGroup,
-    /// "Logo": box | chrome | none.
+    /// "Logo": box | chrome | caps | none.
     pub logo: LogoStyle,
+    /// "ZipIcon": what zip and 7z files that open in Glint look like in Windows.
+    pub zip_icon: ZipIcon,
     /// The Settings window's size in DIPs (width, height), when it was last resized.
     pub settings_size: Option<[f32; 2]>,
     /// Where Settings was (screen pixels: x, y, width, height) when it opens where it was left.
@@ -885,6 +958,11 @@ impl Default for Settings {
             show_details: false,
             show_status_bar: true,
             custom_sort: false,
+            custom_views: true,
+            remember_split: false,
+            ctrl_wheel_view: false,
+            split_folder: None,
+            split_ratio: 0.5,
             sort_recipe: None,
             size: ListSize::Small,
             show_sidebar: true,
@@ -901,6 +979,8 @@ impl Default for Settings {
             pin_names: BTreeMap::new(),
             hidden_places: Vec::new(),
             favorites: Vec::new(),
+            tab_sets: Vec::new(),
+            folder_sizes: true,
             stay_running: true,
             tray_icon: true,
             start_with_windows: false,
@@ -926,6 +1006,7 @@ impl Default for Settings {
             theme_guide_hidden: false,
             rail_group: RailGroup::Quick,
             logo: LogoStyle::Box,
+            zip_icon: ZipIcon::Label,
             settings_size: None,
             settings_bounds: None,
             details_width: 0.0,
@@ -957,6 +1038,9 @@ const CHOICES: &[&str] = &[
     "ShowDetails",
     "ShowStatusBar",
     "CustomSort",
+    "CustomViews",
+    "RememberSplit",
+    "CtrlWheelView",
     "SortRecipe",
     // The file list's (list.rs).
     "Size",
@@ -977,12 +1061,17 @@ const CHOICES: &[&str] = &[
     "HiddenPlaces",
     // Home's Favorites (home.rs).
     "Favorites",
+    // Saved groups of tabs (app/forms.rs), and folder sizes (foldersize.rs).
+    "TabSets",
+    "FolderSizes",
     // How Glint runs (life.rs).
     "StayRunning",
     "TrayIcon",
     "StartWithWindows",
     // The title bars (logo.rs).
     "Logo",
+    // Zip and 7z files' icon in Windows (registry.rs).
+    "ZipIcon",
     // Updates (update.rs).
     "CheckForUpdates",
     "UpdateRepo",
@@ -993,8 +1082,9 @@ const CHOICES: &[&str] = &[
     "PreviewVolume",
 ];
 
-/// How many pinned folders a settings file may bring back.
-const MAX_PINS: usize = 200;
+/// How many pinned folders, and how many favorites, a settings file may bring back: far more than
+/// anyone adds (nothing stops adding, so what's past this would be lost at the next start).
+const MAX_PINS: usize = 5000;
 
 /// Set in an extra window (Ctrl+N, life.rs): it writes only choices; the remembered state (tabs,
 /// window place, column widths...) in the file stays the main window's.
@@ -1037,6 +1127,8 @@ impl Settings {
         let d = Settings::default();
         self.tabs = d.tabs;
         self.active_tab = d.active_tab;
+        self.split_folder = d.split_folder;
+        self.split_ratio = d.split_ratio;
         self.bounds = d.bounds;
         self.bounds_dpi = d.bounds_dpi;
         self.maximized = d.maximized;
@@ -1075,6 +1167,7 @@ impl Settings {
             }
         }
         self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
+        self.split_ratio = if self.split_ratio.is_finite() { self.split_ratio.clamp(0.2, 0.8) } else { 0.5 };
         if !known_sort_number(self.sort_column) {
             self.sort_column = 0;
         }
@@ -1092,29 +1185,47 @@ impl Settings {
         columns.sort_by_key(|c| COLUMN_NAMES.iter().position(|n| n == c));
         self.columns = columns;
         self.column_width_map.retain(|key, w| {
-            matches!(key.as_str(), "modified" | "created" | "type" | "size" | "folder" | "free" | "location") && w.is_finite() && (COLUMN_MIN..=COLUMN_MAX).contains(w)
+            matches!(key.as_str(), "modified" | "created" | "type" | "size" | "dimensions" | "length" | "folder" | "free" | "location")
+                && w.is_finite()
+                && (COLUMN_MIN..=COLUMN_MAX).contains(w)
         });
         if self.startup_folder.as_deref().is_some_and(|f| f.trim().is_empty()) {
             self.startup_folder = None;
         }
-        // Pins: no blanks, no folder twice (Windows paths ignore case), a sane number.
+        // Pins: no blanks, no folder twice (Windows paths ignore case, as same_path compares them;
+        // a set, so thousands don't slow the start), a sane number (the newest, last, kept).
+        let key = |p: &str| p.trim_end_matches('\\').to_lowercase();
+        let mut seen = HashSet::new();
         let mut pinned: Vec<String> = Vec::new();
         for p in self.pinned.drain(..).map(|p| p.trim().to_string()) {
-            if !p.is_empty() && !pinned.iter().any(|q| same_path(q, &p)) {
+            if !p.is_empty() && seen.insert(key(&p)) {
                 pinned.push(p);
             }
         }
-        pinned.truncate(MAX_PINS);
+        pinned.drain(..pinned.len().saturating_sub(MAX_PINS));
         self.pinned = pinned;
         // Favorites the same way.
+        let mut seen = HashSet::new();
         let mut favorites: Vec<String> = Vec::new();
         for p in self.favorites.drain(..).map(|p| p.trim().to_string()) {
-            if !p.is_empty() && !favorites.iter().any(|q| same_path(q, &p)) {
+            if !p.is_empty() && seen.insert(key(&p)) {
                 favorites.push(p);
             }
         }
-        favorites.truncate(MAX_PINS);
+        favorites.drain(..favorites.len().saturating_sub(MAX_PINS));
         self.favorites = favorites;
+        // Tab sets: each with a name and tabs, each name once (the newest kept), not too many.
+        let mut sets: Vec<TabSet> = Vec::new();
+        for mut set in self.tab_sets.drain(..).rev() {
+            set.name = set.name.trim().to_string();
+            if !set.name.is_empty() && !set.tabs.is_empty() && !sets.iter().any(|s| s.name.eq_ignore_ascii_case(&set.name)) {
+                sets.push(set);
+            }
+        }
+        sets.reverse();
+        let extra = sets.len().saturating_sub(MAX_TAB_SETS);
+        sets.drain(..extra);
+        self.tab_sets = sets;
         // A name only for a folder that is pinned, and only a name that says something.
         let pinned = &self.pinned;
         self.pin_names.retain(|path, name| !name.trim().is_empty() && pinned.iter().any(|p| same_path(p, path)));
@@ -1162,7 +1273,7 @@ impl Settings {
 }
 
 /// A sort column as the number saved in settings.json (0 Name, 1 Date
-/// modified, 2 Type, 3 Size, 4 Folder (search results), 5 Date created).
+/// modified, 2 Type, 3 Size, 4 Folder (search results), 5 Date created, 6 Picture size, 7 Length).
 pub fn sort_number(key: SortKey) -> u32 {
     match key {
         SortKey::Name => 0,
@@ -1171,6 +1282,8 @@ pub fn sort_number(key: SortKey) -> u32 {
         SortKey::Size => 3,
         SortKey::Folder => 4,
         SortKey::Created => 5,
+        SortKey::Dimensions => 6,
+        SortKey::Length => 7,
     }
 }
 
@@ -1182,13 +1295,15 @@ pub fn sort_key(n: u32) -> SortKey {
         2 => SortKey::Type,
         3 => SortKey::Size,
         5 => SortKey::Created,
+        6 => SortKey::Dimensions,
+        7 => SortKey::Length,
         _ => SortKey::Name,
     }
 }
 
 /// Whether a saved sort column number is one Glint knows.
 fn known_sort_number(n: u32) -> bool {
-    matches!(n, 0..=5)
+    matches!(n, 0..=7)
 }
 
 /// Whether a light/dark choice means dark right now ("Follow Windows" asks Windows; dark when
@@ -1201,26 +1316,28 @@ pub fn dark_for(mode: ThemeMode) -> bool {
     }
 }
 
-/// Whether two folder paths are the same folder (Windows paths ignore case).
-fn same_path(a: &str, b: &str) -> bool {
-    a.trim_end_matches('\\').to_lowercase() == b.trim_end_matches('\\').to_lowercase()
-}
-
 /// The tabs to open at start and which one is active, from "When Glint starts, open" and the folder
 /// given on the command line (if any). A folder from outside opens on its own,
 /// except with "Tabs from last time", where last time's tabs come back too (like a browser), so
 /// they aren't lost; the folder is then the active tab (an already open tab for it is reused).
 pub fn initial_tabs(s: &Settings, opened: Option<&str>, home: &str) -> (Vec<SavedTab>, usize) {
-    let plain = |path: &str| SavedTab { path: path.to_string(), sort_column: s.sort_column, sort_descending: s.sort_descending, view: None };
+    let plain = |path: &str| SavedTab { path: path.to_string(), sort_column: s.sort_column, sort_descending: s.sort_descending, view: None, pinned: false };
     let restore = s.startup == Startup::Restore;
-    let mut tabs = match s.startup {
+    // Pinned tabs come back whatever the start says, first in the row as they were.
+    let mut tabs: Vec<SavedTab> = if restore { Vec::new() } else { s.tabs.iter().filter(|t| t.pinned).cloned().collect() };
+    let pinned = tabs.len();
+    tabs.extend(match s.startup {
         _ if opened.is_some() && !restore => Vec::new(),
         Startup::Restore => s.tabs.clone(),
         Startup::Home => vec![plain(home)],
         Startup::ThisPc => vec![plain("")],
         Startup::Folder => vec![plain(s.startup_folder.as_deref().unwrap_or(home))],
+    });
+    let mut active = if restore {
+        s.active_tab.min(tabs.len().saturating_sub(1))
+    } else {
+        pinned.min(tabs.len().saturating_sub(1))
     };
-    let mut active = if restore { s.active_tab.min(tabs.len().saturating_sub(1)) } else { 0 };
     if let Some(dir) = opened {
         match tabs.iter().position(|t| same_path(&t.path, dir)) {
             Some(i) => active = i,
@@ -1281,15 +1398,6 @@ fn parse(text: &str) -> Parsed {
             }
         }
     }
-}
-
-/// The text of a file: UTF-8, or UTF-16 when it starts with that marker (Notepad's "Unicode").
-fn decode(bytes: &[u8]) -> String {
-    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        let units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        return String::from_utf16_lossy(&units);
-    }
-    String::from_utf8_lossy(bytes).into_owned()
 }
 
 /// Saving is switched off for this run when the file is there but couldn't be read: writing would
@@ -1372,6 +1480,8 @@ struct Writer {
 
 static WRITER: Mutex<Writer> = Mutex::new(Writer { written: 0, synced: None, last_problem: None });
 static NEXT_SAVE: AtomicU64 = AtomicU64::new(1);
+/// `Writer::written`, for `needs_saving` (which mustn't wait for a save under way).
+static WRITTEN: AtomicU64 = AtomicU64::new(0);
 
 fn writer() -> std::sync::MutexGuard<'static, Writer> {
     // panic = abort, so the lock can't be left poisoned - but never panic over it either way.
@@ -1397,11 +1507,25 @@ fn merge(ours: &Settings, synced: Option<&Map<String, Value>>, disk: Option<Map<
     let mut extra = Map::new();
     let (Some(disk), Ok(Value::Object(mut fields))) = (disk, serde_json::to_value(ours)) else { return (out, extra) };
     let mine = choices_of(ours);
+    let mut combined = false;
     for (key, value) in disk {
         let choice = CHOICES.contains(&key.as_str());
         if !fields.contains_key(&key) {
             extra.insert(key, value);
-        } else if (choice && synced.is_some_and(|s| s.get(&key) == mine.get(&key))) || (!choice && state_from_disk) {
+            continue;
+        }
+        let base = synced.and_then(|s| s.get(&key));
+        let take = if (choice && synced.is_some_and(|s| s.get(&key) == mine.get(&key))) || (!choice && state_from_disk) {
+            Some(value)
+        } else if let (true, Some(base), Some(m)) = (choice && LIST_CHOICES.contains(&key.as_str()), base, mine.get(&key)) {
+            // Changed here and maybe in the other window too: both windows' changes are kept.
+            let v = combine(m, base, &value).filter(|v| v != m);
+            combined |= v.is_some();
+            v
+        } else {
+            None
+        };
+        if let Some(value) = take {
             let mut trial = fields.clone();
             trial.insert(key, value);
             if let Ok(s) = serde_json::from_value::<Settings>(Value::Object(trial.clone())) {
@@ -1409,7 +1533,39 @@ fn merge(ours: &Settings, synced: Option<&Map<String, Value>>, disk: Option<Map<
             }
         }
     }
+    if combined {
+        out.tidy(); // (a folder pinned in both windows: once)
+    }
     (out, extra)
+}
+
+/// Choices that are lists or maps both windows add to and take from (pins, tab sets...): merged item
+/// by item, not taken whole.
+const LIST_CHOICES: &[&str] = &["Pinned", "PinNames", "HiddenPlaces", "Favorites", "TabSets", "FolderViews"];
+
+/// `ours` with the changes the file got since `base` made to it too (what the other window added or
+/// removed); an item both changed keeps ours.
+fn combine(ours: &Value, base: &Value, disk: &Value) -> Option<Value> {
+    match (ours, base, disk) {
+        (Value::Array(o), Value::Array(b), Value::Array(d)) => {
+            let mut out: Vec<Value> = o.iter().filter(|v| !b.contains(v) || d.contains(v)).cloned().collect();
+            out.extend(d.iter().filter(|v| !b.contains(v) && !o.contains(v)).cloned());
+            Some(Value::Array(out))
+        }
+        (Value::Object(o), Value::Object(b), Value::Object(d)) => {
+            let mut out = o.clone();
+            for key in b.keys().chain(d.keys()) {
+                if d.get(key) != b.get(key) && o.get(key) == b.get(key) {
+                    match d.get(key) {
+                        Some(v) => out.insert(key.clone(), v.clone()),
+                        None => out.remove(key),
+                    };
+                }
+            }
+            Some(Value::Object(out))
+        }
+        _ => None,
+    }
 }
 
 /// The settings with values from a newer Glint after them, as they're written.
@@ -1469,6 +1625,7 @@ fn write_in_order(s: &Settings, number: u64) -> bool {
     match write_atomically(&path, &text) {
         Ok(()) => {
             w.written = number;
+            WRITTEN.store(number, Ordering::SeqCst);
             w.synced = Some(choices_of(s));
             if w.last_problem.take().is_some() {
                 log::error(&format!("The settings could be saved again ({}).", path.display()));
@@ -1488,14 +1645,31 @@ fn write_in_order(s: &Settings, number: u64) -> bool {
 
 /// Saves on a background thread (the window calls this a moment after something changed).
 /// Returns false if the save couldn't even start (saving is off, or no thread could be had).
+/// The window counts the settings as saved once this starts, so a file that couldn't be written (a
+/// sync tool holding it longer than `write_atomically` waits) is tried again a little later, until
+/// a newer save takes over - and once more when the window closes (`needs_saving`).
 pub fn save_in_background(s: Settings) -> bool {
     if SAVING_OFF.load(Ordering::SeqCst) {
         return false;
     }
     let number = NEXT_SAVE.fetch_add(1, Ordering::SeqCst);
     shell::background("save settings", move || {
-        write_in_order(&s, number);
+        let mut waits = [2, 10, 60].into_iter();
+        while !write_in_order(&s, number) {
+            let Some(secs) = waits.next() else { return };
+            std::thread::sleep(Duration::from_secs(secs));
+            if NEXT_SAVE.load(Ordering::SeqCst) > number + 1 {
+                return; // a newer save has all of this
+            }
+        }
     })
+}
+
+/// Whether `s` has to be written when the window closes: it isn't what was last handed over to be
+/// saved (`last_saved`), or a save handed over hasn't reached the disk (it failed and waits to be
+/// tried again, which the process ending would stop - or it's still under way).
+pub fn needs_saving(s: &Settings, last_saved: &Settings) -> bool {
+    s != last_saved || WRITTEN.load(Ordering::SeqCst) + 1 < NEXT_SAVE.load(Ordering::SeqCst)
 }
 
 /// Saves and waits until it's on disk, but no longer than `limit` (closing, Windows shutting down):
@@ -1548,7 +1722,7 @@ mod tests {
             terminal: Terminal::GitBash,
             ..Default::default()
         };
-        s.tabs = vec![SavedTab { path: "C:\\Users".into(), sort_column: 1, sort_descending: true, view: None }, SavedTab { path: "".into(), sort_column: 0, sort_descending: false, view: None }];
+        s.tabs = vec![SavedTab { path: "C:\\Users".into(), sort_column: 1, sort_descending: true, view: None, pinned: false }, SavedTab { path: "".into(), sort_column: 0, sort_descending: false, view: None, pinned: false }];
         s.active_tab = 1;
         s.bounds = Some([10, 20, 1000, 700]);
         s.column_width_map.insert("size".into(), 120.0);
@@ -1636,7 +1810,7 @@ mod tests {
         let (tabs, active) = initial_tabs(&s, None, home);
         assert_eq!((tabs.len(), tabs[0].path.as_str(), tabs[0].sort_column, active), (1, home, 2, 0));
         // By default (Home) the saved tabs stay saved, but Glint starts in the home folder.
-        s.tabs = ["C:\\a", "C:\\b"].iter().map(|p| SavedTab { path: p.to_string(), sort_column: 1, sort_descending: false, view: None }).collect();
+        s.tabs = ["C:\\a", "C:\\b"].iter().map(|p| SavedTab { path: p.to_string(), sort_column: 1, sort_descending: false, view: None, pinned: false }).collect();
         s.active_tab = 1;
         let (tabs, active) = initial_tabs(&s, None, home);
         assert_eq!((tabs.len(), tabs[0].path.as_str(), active), (1, home, 0));
@@ -1659,13 +1833,23 @@ mod tests {
         assert_eq!(initial_tabs(&s, None, home).0[0].path, home, "no folder chosen: home");
         s.startup_folder = Some("E:\\Work".into());
         assert_eq!(initial_tabs(&s, None, home).0[0].path, "E:\\Work");
+        // Pinned tabs come back first whatever the start says; the fresh tab is the one shown.
+        s.tabs[1].pinned = true;
+        let (tabs, active) = initial_tabs(&s, None, home);
+        assert_eq!(tabs.iter().map(|t| t.path.as_str()).collect::<Vec<_>>(), vec!["C:\\b", "E:\\Work"]);
+        assert_eq!(active, 1);
+        assert!(tabs[0].pinned);
+        // And a pinned tab is saved as one.
+        let text = serde_json::to_string(&tabs[0]).unwrap();
+        assert!(text.contains("\"Pinned\":true"));
+        assert!(serde_json::from_str::<SavedTab>(&text).unwrap().pinned);
     }
 
     #[test]
     fn two_windows_dont_undo_each_others_choices() {
         // This window read the file with hidden files off and dark, then changed only the theme.
         let synced = choices_of(&Settings::default());
-        let ours = Settings { theme: ThemeMode::Light, tabs: vec![SavedTab { path: "C:\\ours".into(), sort_column: 0, sort_descending: false, view: None }], ..Default::default() };
+        let ours = Settings { theme: ThemeMode::Light, tabs: vec![SavedTab { path: "C:\\ours".into(), sort_column: 0, sort_descending: false, view: None, pinned: false }], ..Default::default() };
         // Meanwhile the other window turned hidden files on, and a newer Glint added a value.
         let mut disk = choices_of(&Settings { show_hidden: true, ..Default::default() });
         disk.insert("Tabs".into(), serde_json::json!(["C:\\theirs"]));
@@ -1734,6 +1918,7 @@ mod tests {
             ("Skin", serde_json::json!("amd-radeon")),
             ("Upgraded", serde_json::json!(0)),
             ("CustomSort", serde_json::json!(false)),
+            ("CustomViews", serde_json::json!(true)),
             ("SortRecipe", Value::Null),
             ("SortGuideShown", serde_json::json!(false)),
             ("ThemeGuideHidden", serde_json::json!(false)),
@@ -1896,6 +2081,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(glint_config(&dir), "an empty config folder: made to make Glint portable");
+        std::fs::write(dir.join("app.ini"), "[window]").unwrap();
+        assert!(!glint_config(&dir), "another program's files, and no settings.json");
         std::fs::write(dir.join(FILE_NAME), "{\"theme\": \"blue\", \"servers\": [1, 2]}").unwrap();
         assert!(!glint_config(&dir), "another program's settings");
         std::fs::write(dir.join(FILE_NAME), serde_json::to_string_pretty(&Settings::default()).unwrap()).unwrap();
@@ -1936,11 +2123,37 @@ mod tests {
         assert_eq!(s.pin_names.len(), 1);
         assert_eq!(s.pin_names.get("C:\\A").map(String::as_str), Some("Alpha"));
         assert_eq!(s.hidden_places, vec!["recycle"]);
+        // More favorites than a file brings back: the newest (last) stay.
+        let many: Vec<String> = (0..MAX_PINS + 2).map(|i| format!("C:\\f{i}")).collect();
+        let Parsed::Good(s) = parse(&Settings { favorites: many.clone(), ..Default::default() }.to_json()) else { panic!() };
+        assert_eq!(s.favorites, many[2..]);
         // Pins are choices: a pin made in another window isn't undone by this one.
         let synced = choices_of(&Settings::default());
         let disk = choices_of(&Settings { pinned: vec!["E:\\Theirs".into()], ..Default::default() });
         let (out, _) = merge(&Settings::default(), Some(&synced), Some(disk), false);
         assert_eq!(out.pinned, vec!["E:\\Theirs"]);
+        // Both windows pinned, unpinned and named folders since: neither's changes are lost.
+        let base = Settings { pinned: vec!["C:\\A".into(), "C:\\B".into()], ..Default::default() };
+        let synced = choices_of(&base);
+        let mut ours = Settings { pinned: vec!["C:\\A".into(), "C:\\Ours".into(), "C:\\Both".into()], ..Default::default() };
+        ours.pin_names.insert("C:\\A".into(), "Alpha".into());
+        let mut theirs = Settings { pinned: vec!["C:\\B".into(), "C:\\A".into(), "c:\\both".into(), "C:\\Theirs".into()], ..Default::default() };
+        theirs.pin_names.insert("C:\\B".into(), "Beta".into());
+        let (out, _) = merge(&ours, Some(&synced), Some(choices_of(&theirs)), false);
+        assert_eq!(out.pinned, vec!["C:\\A", "C:\\Ours", "C:\\Both", "C:\\Theirs"]);
+        assert_eq!(out.pin_names.len(), 1, "B was unpinned here, so its name goes");
+        assert_eq!(out.pin_names.get("C:\\A").map(String::as_str), Some("Alpha"));
+    }
+
+    /// A tab set saved in each window: both are kept.
+    #[test]
+    fn tab_sets_saved_in_two_windows_are_both_kept() {
+        let set = |name: &str| TabSet { name: name.into(), tabs: vec![SavedTab { path: format!("C:\\{name}"), sort_column: 0, sort_descending: false, view: None, pinned: false }] };
+        let synced = choices_of(&Settings::default());
+        let ours = Settings { tab_sets: vec![set("Home")], ..Default::default() };
+        let disk = choices_of(&Settings { tab_sets: vec![set("Work")], ..Default::default() });
+        let (out, _) = merge(&ours, Some(&synced), Some(disk), false);
+        assert_eq!(out.tab_sets.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["Home", "Work"]);
     }
 
     #[test]
@@ -1960,7 +2173,7 @@ mod tests {
     fn an_extra_window_writes_only_choices() {
         // The extra window read the file, then turned hidden files on; its own tabs don't count.
         let synced = choices_of(&Settings::default());
-        let mut ours = Settings { show_hidden: true, tabs: vec![SavedTab { path: "C:\\extra".into(), sort_column: 0, sort_descending: false, view: None }], ..Default::default() };
+        let mut ours = Settings { show_hidden: true, tabs: vec![SavedTab { path: "C:\\extra".into(), sort_column: 0, sort_descending: false, view: None, pinned: false }], ..Default::default() };
         ours.forget_window_state();
         assert!(ours.tabs.is_empty() && ours.show_hidden);
         // Meanwhile the main window saved its tabs and place.
@@ -1980,7 +2193,7 @@ mod tests {
 
     #[test]
     fn sort_numbers() {
-        for key in [SortKey::Name, SortKey::Date, SortKey::Type, SortKey::Size, SortKey::Created] {
+        for key in [SortKey::Name, SortKey::Date, SortKey::Type, SortKey::Size, SortKey::Created, SortKey::Dimensions, SortKey::Length] {
             assert_eq!(sort_key(sort_number(key)), key);
         }
         assert_eq!(sort_key(9), SortKey::Name);
@@ -2031,5 +2244,60 @@ mod tests {
         s.set_column("type", true);
         assert_eq!(s.columns, vec!["created", "type", "size"]);
         assert!(!s.shows_column("modified") && s.shows_column("CREATED"));
+        // Picture size and Length (off unless asked for) go after Size, and are read back.
+        assert!(!Settings::default().shows_column("dimensions") && !Settings::default().shows_column("length"));
+        s.set_column("length", true);
+        s.set_column("dimensions", true);
+        assert_eq!(s.columns, vec!["created", "type", "size", "dimensions", "length"]);
+        s.column_width_map.insert("length".into(), 90.0);
+        let Parsed::Good(back) = parse(&s.to_json()) else { panic!() };
+        assert_eq!((back.columns, back.column_width_map.get("length")), (s.columns.clone(), Some(&90.0)));
+    }
+
+    fn saved(path: &str, pinned: bool) -> SavedTab {
+        SavedTab { path: path.into(), sort_column: 0, sort_descending: false, view: None, pinned }
+    }
+
+    #[test]
+    fn pinned_tabs_come_back_first_whatever_the_start_says() {
+        let s = Settings { startup: Startup::Home, tabs: vec![saved("C:\\a", false), saved("C:\\p", true), saved("C:\\q", true)], ..Default::default() };
+        let (tabs, active) = initial_tabs(&s, None, "C:\\home");
+        assert_eq!(tabs.iter().map(|t| t.path.as_str()).collect::<Vec<_>>(), ["C:\\p", "C:\\q", "C:\\home"]);
+        assert_eq!(active, 2, "the home tab, not a pinned one");
+        // A folder from outside that a pinned tab shows is that tab; any other opens after them.
+        let (tabs, active) = initial_tabs(&s, Some("c:\\q\\"), "C:\\home");
+        assert_eq!((tabs.len(), active), (2, 1));
+        let (tabs, active) = initial_tabs(&s, Some("C:\\new"), "C:\\home");
+        assert_eq!((tabs.len(), active), (3, 2));
+        // Restoring keeps the saved order and the active tab; a wrong number is held in.
+        let s = Settings { startup: Startup::Restore, tabs: vec![saved("C:\\p", true), saved("C:\\a", false)], active_tab: 40, ..Default::default() };
+        assert_eq!(initial_tabs(&s, None, "C:\\home").1, 1);
+    }
+
+    #[test]
+    fn a_pinned_tab_and_the_wheel_setting_survive_saving_and_reading() {
+        let mut s = Settings { ctrl_wheel_view: true, tabs: vec![saved("Z:\\gone \u{1F600}", true), saved("C:\\a", false)], ..Default::default() };
+        s.split_folder = Some("Z:\\gone \u{1F600}".into());
+        let Parsed::Good(back) = parse(&s.to_json()) else { panic!("not understood") };
+        assert!(back.ctrl_wheel_view);
+        assert_eq!(back.tabs, s.tabs);
+        assert_eq!(back.split_folder, s.split_folder);
+        // Off is the default, and an old file without the names reads fine.
+        assert!(!Settings::default().ctrl_wheel_view);
+        let Parsed::Good(old) = parse(r#"{"Tabs": ["C:\\a"]}"#) else { panic!("not understood") };
+        assert!(!old.tabs[0].pinned && !old.ctrl_wheel_view);
+    }
+
+    #[test]
+    fn tab_sets_read_from_a_hand_edited_file_are_tidied() {
+        let set = |name: &str, n: usize| TabSet { name: name.into(), tabs: (0..n).map(|i| saved(&format!("C:\\{i}"), false)).collect() };
+        let mut s = Settings { tab_sets: vec![set("A", 1), set(" ", 1), set("empty", 0), set("a ", 2), set("B", 1)], ..Default::default() };
+        s.tidy();
+        // No empty names, no empty sets, each name once (the later one wins, in capitals or not).
+        assert_eq!(s.tab_sets.iter().map(|t| (t.name.as_str(), t.tabs.len())).collect::<Vec<_>>(), [("a", 2), ("B", 1)]);
+        let mut many = Settings { tab_sets: (0..MAX_TAB_SETS + 10).map(|n| set(&format!("s{n}"), 1)).collect(), ..Default::default() };
+        many.tidy();
+        assert_eq!(many.tab_sets.len(), MAX_TAB_SETS);
+        assert_eq!(many.tab_sets.last().map(|t| t.name.as_str()), Some("s39"));
     }
 }

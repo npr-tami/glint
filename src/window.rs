@@ -16,7 +16,9 @@
 //! messages come through `settings_message`, under the same BUSY guard, so it can change the app's
 //! settings directly and they are saved like any other change.
 
+use crate::winutil::{hi_word, lo_word};
 use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use windows::core::{w, Result, PCWSTR};
@@ -25,7 +27,7 @@ use windows::Win32::Graphics::Gdi::{
     ClientToScreen, CreateSolidBrush, DeleteObject, InvalidateRect, RedrawWindow, ScreenToClient, SetBkColor, SetTextColor, ValidateRect,
     COLOR_WINDOW, HDC, HGDIOBJ, RDW_ALLCHILDREN, RDW_INVALIDATE,
 };
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromRect, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime;
 use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
@@ -34,7 +36,7 @@ use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT,
-    VK_BACK, VK_CONTROL, VK_F3, VK_F4, VK_F5, VK_LEFT, VK_MENU, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
+    VK_BACK, VK_OEM_5, VK_CONTROL, VK_F3, VK_F4, VK_F5, VK_F6, VK_LEFT, VK_MENU, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, GetClientRect, GetCursorPos,
@@ -54,6 +56,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 // Remembering the window (settings.rs) and submenus.
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic, HMENU, MF_POPUP, SIZE_MAXIMIZED, WM_ENDSESSION, WM_MOVE, WM_SETTINGCHANGE};
+use windows::Win32::UI::WindowsAndMessaging::{GetWindowPlacement, DBT_DEVICEQUERYREMOVE, WINDOWPLACEMENT};
 
 use windows::Win32::System::DataExchange::{AddClipboardFormatListener, RemoveClipboardFormatListener};
 use windows::Win32::UI::WindowsAndMessaging::WM_CLIPBOARDUPDATE;
@@ -63,7 +66,7 @@ use crate::ask::{Answer, AskBox};
 use crate::frame;
 use crate::list::{ListView, BAR_REPEAT_TIMER, SLOW_CLICK_TIMER};
 use crate::log;
-use crate::render::{FrameResult, Renderer};
+use crate::render::{FrameResult, Renderer, TextStyle};
 use crate::settings::{self, Backspace, Settings, ThemeMode, ViewMode};
 use crate::sidebar::Sidebar;
 use crate::status::StatusBar;
@@ -123,6 +126,8 @@ const RETRY_TIMER: usize = 3;
 /// reset can take a few seconds; trying every frame meanwhile would only burn CPU).
 const FAST_RETRIES: u32 = 3;
 const RETRY_MS: u32 = 500;
+/// Split view: the strip with each half's folder name (DIPs).
+const SPLIT_STRIP_H: f32 = 24.0;
 /// The timer that saves the settings a moment after something worth remembering changed (a tab,
 /// a choice, the window's place), so a burst of changes is one write.
 const SAVE_TIMER: usize = 4;
@@ -132,9 +137,19 @@ const SAVE_DELAY_MS: u32 = 1500;
 const EXIT_SAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Called by the panic hook (log.rs) just before it shows its message: from then on the window
-/// gets only Windows' default handling, since a panic may have left its state half changed.
+/// gets only Windows' default handling, since a panic may have left its state half changed. The
+/// panic may be a background job's, on another thread, so this is for every thread (`busy`).
 pub fn freeze_for_crash() {
-    BUSY.with(|b| b.set(true));
+    FROZEN.store(true, Ordering::SeqCst);
+}
+
+/// Glint crashed (`freeze_for_crash`).
+static FROZEN: AtomicBool = AtomicBool::new(false);
+
+/// Whether the window's state must be left alone: a message is being handled (BUSY), or Glint
+/// crashed.
+fn busy() -> bool {
+    BUSY.with(|b| b.get()) || FROZEN.load(Ordering::SeqCst)
 }
 
 thread_local! {
@@ -160,6 +175,8 @@ enum Part {
     Toolbar,
     Sidebar,
     List,
+    /// Split view's other half (`list2`).
+    List2,
     Status,
     /// The details panel or the Space preview, right of the list (side.rs).
     Side,
@@ -202,9 +219,28 @@ pub struct Window {
     toolbar: Toolbar,
     sidebar: Sidebar,
     list: ListView,
+    /// Split view's other half (see `follow_split`).
+    list2: ListView,
+    /// Split view: the half Glint works in is the left one.
+    split_left: bool,
+    /// The tabs the two halves showed at the last check: (the active tab, the other half's).
+    split_shown: (u64, Option<u64>),
+    /// Split view's strips with each half's folder name, over `list` and over `list2`.
+    split_strips: [Rect; 2],
+    /// The line between the halves (wider than it looks, to grab), and the room both halves share.
+    split_divider: Rect,
+    split_area: Rect,
+    /// The line between the halves is being dragged.
+    split_drag: bool,
     status: StatusBar,
     /// Shows `app.question` ("Delete permanently?"); while one is open it gets all input.
     ask: AskBox,
+    /// Shows `app.form` (a set's name, how to rename many); while one is open it gets the mouse.
+    form: crate::form::FormBox,
+    /// The copy queue's list, bottom right (queuebox.rs).
+    queue: crate::queuebox::QueueBox,
+    /// The command box (Ctrl+U, palette.rs); while it's open it gets the mouse and the keys.
+    palette: crate::palette::CommandBox,
     dpi: u32,
     /// Client size in DIPs.
     size: (f32, f32),
@@ -230,6 +266,8 @@ pub struct Window {
     /// Where the window sits when it's neither maximised nor minimised, in screen pixels - what
     /// settings.json remembers, and where it comes back to from maximised.
     normal_rect: RECT,
+    /// The DPI `normal_rect` was taken at (a maximised window's scale can change since).
+    normal_dpi: u32,
     /// Maximised (or minimised from maximised, so it comes back maximised), from WM_SIZE.
     maximized: bool,
     /// Whether settings are written this run (not for --bench, nor when the file couldn't be read).
@@ -343,6 +381,8 @@ pub fn create(app: AppState, options: Options) -> Result<HWND> {
         textbox::set_font_family(&renderer.font_family());
         let mut list = ListView::new();
         list.set_column_widths(&app.settings.column_width_map);
+        let mut list2 = ListView::new();
+        list2.set_column_widths(&app.settings.column_width_map);
         let mut normal_rect = RECT::default();
         let _ = GetWindowRect(hwnd, &mut normal_rect);
         let saving = !options.bench && settings::saving_allowed();
@@ -354,8 +394,18 @@ pub fn create(app: AppState, options: Options) -> Result<HWND> {
             toolbar: Toolbar::new(hwnd),
             sidebar: Sidebar::new(),
             list,
+            list2,
+            split_left: true,
+            split_shown: (0, None),
+            split_strips: [Rect::default(); 2],
+            split_divider: Rect::default(),
+            split_area: Rect::default(),
+            split_drag: false,
             status: StatusBar::default(),
             ask: AskBox::default(),
+            form: Default::default(),
+            queue: Default::default(),
+            palette: Default::default(),
             dpi,
             size: (0.0, 0.0),
             hover: None,
@@ -373,6 +423,7 @@ pub fn create(app: AppState, options: Options) -> Result<HWND> {
             focus_on_return: None,
             deferred: Vec::new(),
             normal_rect,
+            normal_dpi: dpi,
             maximized,
             saving,
             last_saved: Settings::default(),
@@ -499,14 +550,6 @@ fn ms_since_process_start() -> Option<f64> {
     }
 }
 
-fn lo_word(v: usize) -> u32 {
-    (v & 0xffff) as u32
-}
-
-fn hi_word(v: usize) -> u32 {
-    ((v >> 16) & 0xffff) as u32
-}
-
 /// Signed x/y from an LPARAM (they are negative on monitors left of / above the main one).
 fn point_from(lparam: LPARAM) -> POINT {
     POINT { x: (lparam.0 & 0xffff) as i16 as i32, y: ((lparam.0 >> 16) & 0xffff) as i16 as i32 }
@@ -565,7 +608,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         return LRESULT(0);
     }
-    if ptr.is_null() || BUSY.with(|b| b.get()) {
+    if ptr.is_null() || busy() {
         if !ptr.is_null() && (msg == WM_CLOSE || msg == WM_APP_LIFE || (msg == WM_SYSCOMMAND && (wparam.0 & 0xFFF0) == SC_CLOSE as usize)) {
             // Closing (which may only hide the window) and requests from the door are decided by
             // the state: posted again once the message being handled is done (see below).
@@ -578,11 +621,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
         }
         if msg == WM_PAINT {
-            // Re-entered while busy: paint on the next turn of the loop instead.
+            // Re-entered while busy: paint on the next turn of the loop instead. (Not after a
+            // crash: it would only come back at once, again and again, while the message is up.)
             // SAFETY: plain invalidate of our own window.
             unsafe {
                 let _ = ValidateRect(Some(hwnd), None);
-                let _ = InvalidateRect(Some(hwnd), None, false);
+                if !FROZEN.load(Ordering::SeqCst) {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
             }
             return LRESULT(0);
         }
@@ -881,7 +927,7 @@ pub fn skin_message(owner: HWND, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
     }
     // SAFETY: the pointer was put there by `create` and is cleared in WM_NCDESTROY (see wndproc).
     let ptr = unsafe { GetWindowLongPtrW(owner, GWLP_USERDATA) } as *mut Window;
-    if ptr.is_null() || BUSY.with(|b| b.get()) {
+    if ptr.is_null() || busy() {
         return None;
     }
     // SAFETY: not BUSY, so no other reference exists; a short borrow.
@@ -909,7 +955,7 @@ pub fn settings_message(owner: HWND, hwnd: HWND, msg: u32, wparam: WPARAM, lpara
     }
     // SAFETY: the pointer was put there by `create` and is cleared in WM_NCDESTROY (see wndproc).
     let ptr = unsafe { GetWindowLongPtrW(owner, GWLP_USERDATA) } as *mut Window;
-    if ptr.is_null() || BUSY.with(|b| b.get()) {
+    if ptr.is_null() || busy() {
         return None;
     }
     // SAFETY: not BUSY, so no other reference exists; a short borrow.
@@ -1116,20 +1162,28 @@ impl Window {
     }
 
     /// Calls `f` with one part and the app state (two separate borrows of self).
+    /// (Split view's other half sees its own tab as the active one meanwhile.)
     fn with_part<R>(&mut self, part: Part, f: impl FnOnce(&mut dyn Component, &mut AppState) -> R) -> R {
-        let Window { titlebar, toolbar, sidebar, list, status, side, app, .. } = self;
+        let Window { titlebar, toolbar, sidebar, list, list2, status, side, app, .. } = self;
         let c: &mut dyn Component = match part {
             Part::Title => titlebar,
             Part::Toolbar => toolbar,
             Part::Sidebar => sidebar,
             Part::List => list,
+            Part::List2 => {
+                let Some(other) = app.split_index() else { return f(list2, app) };
+                let keep = std::mem::replace(&mut app.active, other);
+                let r = f(list2, app);
+                app.active = keep;
+                return r;
+            }
             Part::Status => status,
             Part::Side => side,
         };
         f(c, app)
     }
 
-    const PARTS: [Part; 6] = [Part::Title, Part::Toolbar, Part::Sidebar, Part::List, Part::Status, Part::Side];
+    const PARTS: [Part; 7] = [Part::Title, Part::Toolbar, Part::Sidebar, Part::List, Part::List2, Part::Status, Part::Side];
 
     fn part_at(&self, p: Point) -> Option<Part> {
         let rect = |part| match part {
@@ -1137,6 +1191,8 @@ impl Window {
             Part::Toolbar => self.toolbar.rect(),
             Part::Sidebar => self.sidebar.rect(),
             Part::List => self.list.rect(),
+            Part::List2 if self.app.split.is_some() => self.list2.rect(),
+            Part::List2 => Rect::default(),
             Part::Status => self.status.rect(),
             Part::Side => self.side.rect(),
         };
@@ -1164,17 +1220,43 @@ impl Window {
         let list_w = if pane > 0.0 { room - pane - gap } else { room };
         let list = Rect::new(b + sidebar_w + gap, body_y, list_w, body_h);
         let side = if pane > 0.0 { Rect::new(list.right(), body_y, gap + pane, body_h) } else { Rect::default() };
+        // Split view: two halves (the left one as wide as dragged), the gap between them, and a
+        // strip with its folder's name over each (the half Glint works in on its side).
+        let split_gap = gap.max(4.0);
+        self.split_area = list;
+        let (mine, other) = if self.app.split_index().is_some() {
+            let ratio = self.app.settings.split_ratio.clamp(0.2, 0.8);
+            let left_w = ((list.w - split_gap) * ratio).floor().max(0.0);
+            let strip = |x: f32, w: f32| Rect::new(x, list.y, w, SPLIT_STRIP_H);
+            let body = |x: f32, w: f32| Rect::new(x, list.y + SPLIT_STRIP_H, w, (list.h - SPLIT_STRIP_H).max(0.0));
+            let right_x = list.x + left_w + split_gap;
+            let right_w = (list.w - left_w - split_gap).max(0.0);
+            self.split_divider = Rect::new(list.x + left_w - 3.0, list.y, split_gap + 6.0, list.h);
+            let (left, right) = ((strip(list.x, left_w), body(list.x, left_w)), (strip(right_x, right_w), body(right_x, right_w)));
+            let (mine, other) = if self.split_left { (left, right) } else { (right, left) };
+            self.split_strips = [mine.0, other.0];
+            (mine.1, other.1)
+        } else {
+            self.split_strips = [Rect::default(); 2];
+            self.split_divider = Rect::default();
+            (list, Rect::default())
+        };
         let rects = [
             (Part::Title, Rect::new(b, b, w, size::TITLE_H)),
             (Part::Toolbar, Rect::new(b, b + size::TITLE_H, w, size::TOOLBAR_H)),
             (Part::Sidebar, Rect::new(b, body_y, sidebar_w, body_h)),
-            (Part::List, list),
+            (Part::List, mine),
+            (Part::List2, other),
             (Part::Status, status),
             (Part::Side, side),
         ];
         for (part, rect) in rects {
             self.with_part(part, |c, app| c.layout(rect, &ctx, app));
         }
+        // Split view: one wallpaper across both halves.
+        let wall = self.app.split_index().is_some().then_some(list);
+        self.list.set_wall_area(wall);
+        self.list2.set_wall_area(wall);
     }
 
     /// Follows the skin: its font and text size, the text boxes' colours, the frame and Windows'
@@ -1241,6 +1323,69 @@ impl Window {
                 }
             }
         }
+    }
+
+    /// What the form box said: yes does what it's about (if what's typed is fine), no closes it.
+    fn form_answered(&mut self, a: Answer) {
+        match a {
+            Answer::Nothing => {}
+            Answer::Redraw => self.invalidate(),
+            Answer::Yes | Answer::No => {
+                let values = (a == Answer::Yes).then(|| self.form.values());
+                if self.app.form_answer(values) {
+                    self.form.close(self.hwnd);
+                }
+                self.invalidate();
+            }
+        }
+    }
+
+    /// While a form is open: whether it has been drawn yet (see `question_shown`).
+    fn form_shown(&self) -> bool {
+        self.app.form.as_ref().is_some_and(|f| self.form.shown(f.id))
+    }
+
+    /// What the command box said: close it, or close it and do what was picked.
+    fn palette_chose(&mut self, c: crate::palette::Choice) {
+        use crate::palette::{Action, Choice};
+        let action = match c {
+            Choice::Nothing => return,
+            Choice::Redraw => return self.invalidate(),
+            // Gone to another window (Alt+Tab): it stays open, and gets the keyboard back after.
+            Choice::LostFocus if !self.active => return,
+            Choice::Close | Choice::LostFocus => {
+                self.palette.close(self.hwnd);
+                return self.invalidate();
+            }
+            Choice::Run(a) => a,
+        };
+        self.palette.close(self.hwnd);
+        match action {
+            Action::Run(cmd) => self.apply(Part::List, Effect::Command(cmd)),
+            Action::Skin(id) => {
+                self.app.pick_skin(&id);
+                self.sync_theme();
+            }
+            Action::SelectAll => self.app.tab_mut().select_all(),
+            Action::SelectPattern(pattern) => {
+                if crate::palette::select_matching(self.app.tab_mut(), &pattern) == 0 {
+                    self.app.say(format!("Nothing here matches {pattern}"));
+                }
+            }
+            // (The box keeps these itself.)
+            Action::Fill(_) => {}
+            Action::FolderSizes(on) => self.app.set_folder_sizes(on),
+            Action::RenameMany if self.app.tab().selected_entries().len() < 2 => self.app.say("Select two or more items to rename them all at once"),
+            Action::RenameMany => self.apply(Part::List, Effect::Command(Command::RenameMany)),
+            Action::Search(text) => {
+                // As Ctrl+F and typing: the text in the filter box, and the cursor there.
+                self.apply(Part::List, Effect::Command(Command::SetFilter(text)));
+                let now = self.now();
+                self.toolbar.tick(now, &mut self.app);
+                self.apply(Part::List, Effect::Command(Command::FocusFilter));
+            }
+        }
+        self.invalidate();
     }
 
     /// What the question box said: yes runs the job asked about.
@@ -1315,13 +1460,20 @@ impl Window {
 
     fn run_command(&mut self, cmd: Command) {
         let ctx = self.ctx();
+        // Deleting, renaming or moving the selection (cut, it's pasted elsewhere): a video the
+        // preview plays from it lets go of its file first - Windows won't touch a file that's open.
+        if matches!(cmd, Command::Delete { .. } | Command::Rename { .. } | Command::RenameMany | Command::CutFiles | Command::SendToOtherSide { moving: true }) {
+            self.side.release_files();
+        }
         match cmd {
             Command::Minimize => self.deferred.push(Deferred::Show(SW_MINIMIZE)),
             Command::ToggleMaximize => self.deferred.push(Deferred::Show(if ctx.maximized { SW_RESTORE } else { SW_MAXIMIZE })),
             Command::Close => self.close_asked(true),
             // Closing the last tab (Ctrl+W, its ×, middle-click, its menu) closes the window, as in
             // File Explorer - which in background mode hides it.
-            Command::CloseTab(_) if self.app.tabs.len() <= 1 => self.close_asked(true),
+            // (A pinned last tab stays: app.rs says why.)
+            Command::CloseTab(_) if self.app.tabs.len() <= 1 && !self.app.tab().pinned => self.close_asked(true),
+            Command::ForceCloseTab(_) if self.app.tabs.len() <= 1 => self.close_asked(true),
             Command::Quit => self.quit(),
             Command::NewWindow => life::open_new_window(shell::Owner::new(self.hwnd), &self.app.tab().path),
             Command::ToggleTheme => {
@@ -1395,6 +1547,36 @@ impl Window {
             other => {
                 self.app.run(other);
             }
+        }
+        self.follow_split();
+    }
+
+    /// Split view (app/split.rs): `list` is always the half Glint works in, `list2` the other
+    /// half. When the app swapped the halves' tabs (a click in the other half, F6, its tab picked
+    /// in the tab row), the two lists change places too, so each half keeps its tab, its scroll
+    /// and where it sits; split view on or off lays the window out again.
+    fn follow_split(&mut self) {
+        let now = (self.app.tab().id, self.app.split_index().map(|i| self.app.tabs[i].id));
+        // The halves sit in the tabs' order: the tab further left in the tab row on the left.
+        let left = self.app.split_index().is_none_or(|other| self.app.active < other);
+        if now == self.split_shown && left == self.split_left {
+            return;
+        }
+        match (now, self.split_shown) {
+            ((a, Some(b)), (old_a, Some(old_b))) if a == old_b && b == old_a => {
+                std::mem::swap(&mut self.list, &mut self.list2);
+                // Column widths set in the half just left carry over (they're saved from `list`).
+                let widths = self.list2.column_widths();
+                self.list.set_column_widths(&widths);
+            }
+            _ => {}
+        }
+        self.split_left = left;
+        let relayout = now.1.is_some() != self.split_shown.1.is_some() || now.1.is_some();
+        self.split_shown = now;
+        if relayout {
+            self.layout();
+            self.invalidate();
         }
     }
 
@@ -1589,12 +1771,21 @@ impl Window {
 
     /// WM_APP_LIFE: requests from the door (another glint.exe, the tray icon, Win+E).
     fn life_requests(&mut self) {
+        // Once one of them has brought the window back, the others open their folders as on screen
+        // (`ever_shown` changes only once it's shown, after this).
+        let mut came_back = false;
         for r in life::take_requests() {
             log::line(&format!("request from outside: {r:?} (hidden: {})", self.app.in_background()));
             match r {
                 Request::Open(open) => {
-                    if self.app.in_background() || !self.ever_shown {
+                    // A zip or 7z file opened from outside may have just been set to open in Glint
+                    // ("Open with > Always"): its icon follows "Zip icon" from now on.
+                    if open.as_ref().is_some_and(|t| crate::archive::is_archive_name(&t.folder)) {
+                        life::sync_zip_icon(self.app.settings.zip_icon);
+                    }
+                    if !came_back && (self.app.in_background() || !self.ever_shown) {
                         self.come_back(open);
+                        came_back = true;
                     } else {
                         if let Some(t) = &open {
                             self.app.open_from_outside(t);
@@ -1643,7 +1834,7 @@ impl Window {
         let r = self.normal_rect;
         if r.right > r.left && r.bottom > r.top {
             s.bounds = Some([r.left, r.top, r.right - r.left, r.bottom - r.top]);
-            s.bounds_dpi = self.dpi;
+            s.bounds_dpi = self.normal_dpi;
         }
         s.maximized = self.maximized;
         if !self.main {
@@ -1698,20 +1889,50 @@ impl Window {
             return;
         }
         let s = self.snapshot();
-        if s != self.last_saved {
+        // (Also when the last save didn't reach the disk: something held the file.)
+        if settings::needs_saving(&s, &self.last_saved) {
             settings::save_and_wait(s.clone(), EXIT_SAVE_WAIT);
             self.last_saved = s;
         }
     }
 
     /// The window moved or changed size: remember where it is when it's neither maximised nor
-    /// minimised (an Aero-snapped window counts as its snapped place).
+    /// minimised (an Aero-snapped window counts as its snapped place). A maximised window taken to
+    /// another screen (Win+Shift+Arrow) takes the place Windows would put it back to on that
+    /// screen, so the next start maximises it there.
     fn remember_normal_rect(&mut self) {
         let mut r = RECT::default();
-        // SAFETY: plain queries on our own window; `r` is a valid out-struct.
+        // SAFETY: plain queries on our own window and its screen, with valid out-structs.
         unsafe {
-            if !IsZoomed(self.hwnd).as_bool() && !IsIconic(self.hwnd).as_bool() && GetWindowRect(self.hwnd, &mut r).is_ok() && r.right > r.left && r.bottom > r.top {
+            if IsIconic(self.hwnd).as_bool() {
+                return;
+            }
+            if !IsZoomed(self.hwnd).as_bool() {
+                if GetWindowRect(self.hwnd, &mut r).is_ok() && r.right > r.left && r.bottom > r.top {
+                    self.normal_rect = r;
+                    self.normal_dpi = self.dpi;
+                }
+                return;
+            }
+            let here = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
+            if MonitorFromRect(&self.normal_rect, MONITOR_DEFAULTTONEAREST) == here {
+                return;
+            }
+            let mut place = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+            let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            if GetWindowPlacement(self.hwnd, &mut place).is_err() || !GetMonitorInfoW(here, &mut info).as_bool() {
+                return;
+            }
+            // Windows keeps that place in "workspace" pixels, which start at the corner of the
+            // screen's work area (past a taskbar at the top or on the left).
+            let (dx, dy) = (info.rcWork.left - info.rcMonitor.left, info.rcWork.top - info.rcMonitor.top);
+            let n = place.rcNormalPosition;
+            r = RECT { left: n.left + dx, top: n.top + dy, right: n.right + dx, bottom: n.bottom + dy };
+            if r.right > r.left && r.bottom > r.top && MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST) == here {
                 self.normal_rect = r;
+                // Its size is what un-maximising gives there: at that screen's scale.
+                let (mut dpi, mut dpi_y) = (0u32, 0u32);
+                self.normal_dpi = if GetDpiForMonitor(here, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y).is_ok() && dpi >= 96 { dpi } else { self.dpi };
             }
         }
     }
@@ -1739,13 +1960,17 @@ impl Window {
         self.app.icons.begin_frame();
         // A new generation for the thumbnails: what isn't asked for again in this frame or the next
         // isn't on screen any more (thumbs.rs).
+        self.follow_split();
         thumbs::begin_frame();
         let mut more = false;
         for part in Self::PARTS {
             more |= self.with_part(part, |c, app| c.tick(ctx.now, app));
         }
+        if self.palette.is_open() && (self.app.question.is_some() || self.app.form.is_some()) {
+            self.palette.close(self.hwnd);
+        }
         let shown = self.renderer.begin() && {
-            let Window { renderer, app, titlebar, toolbar, sidebar, list, status, side, ask, size: client, maximized, .. } = self;
+            let Window { renderer, app, titlebar, toolbar, sidebar, list, list2, split_strips, split_area, status, side, ask, form, queue, palette, hwnd, size: client, maximized, .. } = self;
             // (7's panes are parted by thin pale lines: all that shows of the window there.)
             let seven = app.theme.era == crate::theme::Era::Win7;
             renderer.clear(if seven { crate::theme::Color::hex(0xd5dfe5) } else { app.theme.window });
@@ -1760,7 +1985,29 @@ impl Window {
                 sidebar.paint(renderer, &app.theme, app, &ctx);
             }
             list.paint(renderer, &app.theme, app, &ctx);
+            if let Some(other) = app.split_index() {
+                // Split view: the other half shows its own tab; a line in the skin's colour across
+                // the top of the half Glint works in.
+                let keep = std::mem::replace(&mut app.active, other);
+                list2.paint(renderer, &app.theme, app, &ctx);
+                app.active = keep;
+                // Each half's folder name over it; the half Glint works in has the skin's colour.
+                for (strip, i, mine) in [(split_strips[0], app.active, true), (split_strips[1], other, false)] {
+                    let t = &app.theme;
+                    renderer.fill_rect(strip, t.panel);
+                    renderer.fill_rect(Rect::new(strip.x, strip.bottom() - 2.0, strip.w, 2.0), if mine { t.accent } else { t.line });
+                    let style = if mine { TextStyle::new(t.text_strong).bold() } else { TextStyle::new(t.muted) };
+                    let name = app.display_name(&app.tabs[i].path);
+                    renderer.text(&name, Rect::new(strip.x + 8.0, strip.y, (strip.w - 16.0).max(0.0), strip.h - 2.0), &style);
+                }
+            }
             side.paint(renderer, &app.theme, app, &ctx);
+            // The copy queue's list: over the bottom right of the files (in split view, of both).
+            let files = match app.split_index() {
+                Some(_) => { let (a, b) = (list.rect(), list2.rect()); if a.x > b.x { a } else { b } }
+                None => list.rect(),
+            };
+            queue.paint(renderer, &app.theme, files);
             if app.settings.show_status_bar {
                 status.paint(renderer, &app.theme, app, &ctx);
             } else {
@@ -1772,6 +2019,14 @@ impl Window {
                 // Over everything below the toolbar (see ask.rs for why not the toolbar too).
                 let top = b + size::TITLE_H + size::TOOLBAR_H;
                 ask.paint(renderer, &app.theme, q, Rect::new(b, top, (client.0 - 2.0 * b).max(0.0), (client.1 - top - b).max(0.0)));
+            } else if let Some(f) = &app.form {
+                let top = b + size::TITLE_H + size::TOOLBAR_H;
+                let preview = app.form_preview(&form.values());
+                let area = Rect::new(b, top, (client.0 - 2.0 * b).max(0.0), (client.1 - top - b).max(0.0));
+                form.paint(renderer, &app.theme, *hwnd, ctx.scale, f, &preview, area);
+            } else {
+                // The command box: at the top of the files (both halves in split view).
+                palette.paint(renderer, &app.theme, ctx.scale, *split_area);
             }
             if b > 0.0 {
                 frame::paint_classic_border(renderer, &app.theme, Rect::new(0.0, 0.0, client.0, client.1));
@@ -1891,12 +2146,39 @@ impl Window {
 
     fn mouse_move(&mut self, p: Point) {
         self.last_mouse = p;
+        if self.split_drag {
+            let a = self.split_area;
+            if a.w > 0.0 {
+                self.app.settings.split_ratio = ((p.x - a.x) / a.w).clamp(0.2, 0.8);
+                self.layout();
+                self.invalidate();
+            }
+            return;
+        }
         if self.app.question.is_some() && self.capture.is_none() {
             if !self.question_shown() {
                 return;
             }
             let a = self.ask.mouse_move(p);
             self.answered(a);
+            return;
+        }
+        if self.app.form.is_some() && self.capture.is_none() {
+            if self.form_shown() {
+                let a = self.form.mouse_move(p);
+                self.form_answered(a);
+            }
+            return;
+        }
+        if self.palette.is_open() && self.capture.is_none() {
+            let c = self.palette.mouse_move(p);
+            self.palette_chose(c);
+            return;
+        }
+        if self.queue.mouse_move(p) {
+            self.invalidate();
+        }
+        if self.capture.is_none() && self.queue.contains(p) {
             return;
         }
         let e = MouseEvent { pos: p, button: MouseButton::Left, mods: mods(), wheel: 0.0 };
@@ -1934,8 +2216,56 @@ impl Window {
             self.answered(a);
             return;
         }
-        let Some(part) = self.part_at(p) else { return };
+        if self.app.form.is_some() {
+            let a = if button == MouseButton::Left && self.form_shown() { self.form.mouse_down(p) } else { Answer::Nothing };
+            self.form_answered(a);
+            return;
+        }
+        if self.palette.is_open() {
+            // A click on a row runs it; one outside closes the box (and does nothing else).
+            let c = self.palette.mouse_down(p, button == MouseButton::Left);
+            self.palette_chose(c);
+            return;
+        }
+        if self.queue.contains(p) {
+            if button == MouseButton::Left {
+                self.queue.click(p);
+                self.invalidate();
+            }
+            return;
+        }
+        if self.app.split_index().is_some() && button == MouseButton::Left {
+            if self.split_divider.contains(p) {
+                // The line between the halves: drag it to share the room; a double-click evens them.
+                if double {
+                    self.app.settings.split_ratio = 0.5;
+                    self.layout();
+                    self.invalidate();
+                } else {
+                    self.split_drag = true;
+                    // SAFETY: capturing the mouse for our own window.
+                    unsafe {
+                        SetCapture(self.hwnd);
+                    }
+                }
+                return;
+            }
+            if self.split_strips[1].contains(p) {
+                self.app.run(Command::OtherPane);
+                self.follow_split();
+                self.invalidate();
+                return;
+            }
+        }
+        let Some(mut part) = self.part_at(p) else { return };
         self.drop_pending_menu();
+        if part == Part::List2 {
+            // A click in split view's other half: Glint works there now (and the click goes on).
+            self.app.run(Command::OtherPane);
+            self.follow_split();
+            self.hover = None;
+            part = Part::List;
+        }
         // Clicking our own drawing takes the keyboard back from a text box.
         // SAFETY: focus queries/changes on our own windows.
         unsafe {
@@ -1957,9 +2287,25 @@ impl Window {
 
     fn mouse_up(&mut self, p: Point, button: MouseButton) {
         self.last_mouse = p;
+        if self.split_drag {
+            self.split_drag = false;
+            // SAFETY: releasing our own capture.
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+            return;
+        }
         if self.app.question.is_some() && self.capture.is_none() {
             let a = if button == MouseButton::Left && self.question_shown() { self.ask.mouse_up(p) } else { Answer::Nothing };
             self.answered(a);
+            return;
+        }
+        if self.app.form.is_some() && self.capture.is_none() {
+            let a = if button == MouseButton::Left && self.form_shown() { self.form.mouse_up(p) } else { Answer::Nothing };
+            self.form_answered(a);
+            return;
+        }
+        if self.palette.is_open() && self.capture.is_none() {
             return;
         }
         let target = self.capture.take().or_else(|| self.part_at(p));
@@ -1981,7 +2327,12 @@ impl Window {
     }
 
     fn wheel(&mut self, p: Point, notches: f32) {
-        if self.app.question.is_some() {
+        // The command box's guide scrolls; nothing else does while the box is open.
+        if self.palette.is_open() {
+            let c = self.palette.wheel(p, notches);
+            return self.palette_chose(c);
+        }
+        if self.app.question.is_some() || self.app.form.is_some() {
             return;
         }
         let Some(part) = self.part_at(p) else { return };
@@ -1992,12 +2343,19 @@ impl Window {
     }
 
     fn cursor(&self, p: Point) -> CursorKind {
+        if self.split_drag || (self.capture.is_none() && self.app.split_index().is_some() && self.split_divider.contains(p)) {
+            return CursorKind::SizeWE;
+        }
+        if self.capture.is_none() && self.palette.contains(p) {
+            return CursorKind::Arrow;
+        }
         let part = self.capture.or_else(|| self.part_at(p));
         match part {
             Some(Part::Title) => self.titlebar.cursor(p, &self.app),
             Some(Part::Toolbar) => self.toolbar.cursor(p, &self.app),
             Some(Part::Sidebar) => self.sidebar.cursor(p, &self.app),
             Some(Part::List) => self.list.cursor(p, &self.app),
+            Some(Part::List2) => CursorKind::Arrow,
             Some(Part::Status) => self.status.cursor(p, &self.app),
             Some(Part::Side) => self.side.cursor(p, &self.app),
             None => CursorKind::Arrow,
@@ -2023,43 +2381,78 @@ impl Window {
             self.answered(a);
             return true;
         }
+        if self.app.form.is_some() {
+            if m.alt {
+                return false;
+            }
+            if !repeat && self.form_shown() {
+                let a = self.form.key(vk);
+                self.form_answered(a);
+            }
+            return true;
+        }
+        if self.palette.is_open() {
+            if m.alt {
+                return false;
+            }
+            let c = self.palette.key(vk, m);
+            self.palette_chose(c);
+            return true;
+        }
         let key = |k: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| vk == k.0;
         let letter = |c: char| vk == c as u16;
-        self.drop_pending_menu();
-        let cmd = if m.ctrl && m.shift && letter('L') {
+        // Shift, Ctrl or Alt on its own does nothing, so it leaves a right-click menu that waits for
+        // Windows' items alone (Shift held for Shift+right-click keeps coming, repeated by Windows).
+        if !(key(VK_SHIFT) || key(VK_CONTROL) || key(VK_MENU)) {
+            self.drop_pending_menu();
+        }
+        // AltGr (the right Alt on German, Polish... keyboards) comes as Ctrl+Alt: AltGr+Q is @, not
+        // Ctrl+Q. So the Ctrl shortcuts want Ctrl without Alt, and the Alt+letter ones Alt without Ctrl.
+        let ctrl = m.ctrl && !m.alt;
+        if ctrl && !m.shift && letter('U') {
+            // The command box (palette.rs).
+            self.palette.open(self.hwnd, &self.app);
+            self.invalidate();
+            return true;
+        }
+        let cmd = if ctrl && m.shift && letter('L') {
             Some(Command::ToggleTheme)
-        } else if m.ctrl && m.shift && letter('T') {
+        } else if ctrl && m.shift && letter('T') {
             Some(Command::ReopenClosedTab)
-        } else if m.ctrl && !m.shift && letter('H') {
+        } else if ctrl && !m.shift && letter('H') {
             Some(Command::ToggleHidden)
-        } else if m.ctrl && !m.shift && letter('D') {
+        } else if ctrl && !m.shift && letter('D') {
             // Pin the folder on screen to the sidebar, or unpin it.
             Some(Command::TogglePin(self.app.tab().path.clone()))
-        } else if m.ctrl && letter('T') {
+        } else if ctrl && letter('T') {
             Some(Command::NewTab)
-        } else if m.ctrl && letter('W') {
+        } else if ctrl && letter('W') {
             Some(Command::CloseTab(self.app.active))
-        } else if m.ctrl && !m.shift && letter('N') {
+        } else if ctrl && !m.shift && letter('N') {
             Some(Command::NewWindow) // (Ctrl+Shift+N is New folder, in the list)
-        } else if m.ctrl && !m.shift && letter('Q') {
+        } else if ctrl && !m.shift && letter('Q') {
             Some(Command::Quit)
-        } else if m.ctrl && key(VK_TAB) {
+        } else if ctrl && key(VK_TAB) {
             Some(if m.shift { Command::PrevTab } else { Command::NextTab })
-        } else if let Some(view) = (m.ctrl && m.shift && !m.alt && (b'1'..=b'6').contains(&(vk as u8)) && vk < 0x100).then(|| ViewMode::for_key((vk as u8 - b'0') as u32)).flatten() {
+        } else if let Some(view) = (ctrl && m.shift && (b'1'..=b'6').contains(&(vk as u8)) && vk < 0x100).then(|| ViewMode::for_key((vk as u8 - b'0') as u32)).flatten() {
             // Ctrl+Shift+1 to 6: the views, with Explorer's numbers (extra large icons ... details).
             Some(Command::SetView(view))
-        } else if m.ctrl && (b'1'..=b'9').contains(&(vk as u8)) && vk < 0x100 {
+        } else if ctrl && (b'1'..=b'9').contains(&(vk as u8)) && vk < 0x100 {
             Some(Command::SwitchTab((vk as u8 - b'1') as usize))
-        } else if (m.ctrl && letter('L')) || (m.alt && letter('D')) || key(VK_F4) && !m.alt {
+        } else if (ctrl && letter('L')) || (m.alt && !m.ctrl && letter('D')) || key(VK_F4) && !m.alt {
             Some(Command::EditPath)
-        } else if m.ctrl && m.shift && letter('F') {
+        } else if ctrl && !m.shift && key(VK_OEM_5) {
+            Some(Command::ToggleSplit)
+        } else if key(VK_F6) && !m.ctrl && !m.alt && self.app.split.is_some() {
+            Some(Command::OtherPane)
+        } else if ctrl && m.shift && letter('F') {
             // The filter searches subfolders too (or not any more).
             Some(Command::ToggleSubfolders)
-        } else if (m.ctrl && letter('F')) || (key(VK_F3) && !m.ctrl && !m.alt) {
+        } else if (ctrl && letter('F')) || (key(VK_F3) && !m.ctrl && !m.alt) {
             Some(Command::FocusFilter)
-        } else if m.ctrl && !m.shift && letter('B') {
+        } else if ctrl && !m.shift && letter('B') {
             Some(Command::ToggleSidebar)
-        } else if key(VK_F5) || (m.ctrl && letter('R')) {
+        } else if key(VK_F5) || (ctrl && letter('R')) {
             Some(Command::Refresh)
         } else if key(VK_BACK) && !m.alt && !m.ctrl {
             // Up, or back like a web browser ("Backspace" setting).
@@ -2072,9 +2465,9 @@ impl Window {
             Some(Command::Forward)
         } else if m.alt && key(VK_RETURN) {
             Some(Command::Properties)
-        } else if m.ctrl && !m.shift && key(VK_OEM_COMMA) {
+        } else if ctrl && !m.shift && key(VK_OEM_COMMA) {
             Some(Command::OpenSettings(None))
-        } else if m.ctrl && key(VK_OEM_3) {
+        } else if ctrl && key(VK_OEM_3) {
             // Ctrl+` (the key left of 1): a terminal in the folder on screen.
             Some(Command::OpenTerminal(self.app.tab().path.clone()))
         } else if m.alt && !m.ctrl && !m.shift && letter('P') {
@@ -2257,8 +2650,9 @@ impl Window {
                 Some(LRESULT(0))
             }
             WM_CAPTURECHANGED => {
-                // Someone else took the mouse (a menu, Alt+Tab): finish any drag.
-                if self.capture.is_some() {
+                // Someone else took the mouse (a menu, Alt+Tab): finish any drag (the split view's
+                // divider too).
+                if self.capture.is_some() || self.split_drag {
                     let p = self.last_mouse;
                     self.mouse_up(p, MouseButton::Left);
                 }
@@ -2271,9 +2665,9 @@ impl Window {
                 Some(LRESULT(0))
             }
             WM_XBUTTONUP => {
-                // (Not while a question is open: like every other click, the box takes it, and the
-                // folder it asks about stays on screen.)
-                if self.app.question.is_none() {
+                // (Not while a question or form is open: like every other click, the box takes it,
+                // and the folder it asks about stays on screen.)
+                if self.app.question.is_none() && self.app.form.is_none() {
                     let cmd = if hi_word(wparam.0) == 1 { Command::Back } else { Command::Forward };
                     self.apply(Part::List, Effect::Command(cmd));
                 }
@@ -2293,7 +2687,9 @@ impl Window {
             // in the list. (Alt+Space comes with the space in lparam and still works.)
             WM_SYSCOMMAND if (wparam.0 & 0xFFF0) == SC_KEYMENU as usize && lparam.0 == 0 => Some(LRESULT(0)),
             // While a question is open, typed letters don't jump around in the list behind it.
-            WM_CHAR if self.app.question.is_some() => Some(LRESULT(0)),
+            WM_CHAR if self.app.question.is_some() || self.app.form.is_some() => Some(LRESULT(0)),
+            // (While the command box is open, typing is for it, not for jumping to a name.)
+            WM_CHAR if self.palette.is_open() => Some(LRESULT(0)),
             WM_CHAR => {
                 if let Some(ch) = char::from_u32(wparam.0 as u32) {
                     // + and - zoom the Space preview's picture (instead of jumping to a name).
@@ -2310,6 +2706,10 @@ impl Window {
             }
             WM_ACTIVATE => {
                 self.active = lo_word(wparam.0) != WA_INACTIVE;
+                if self.active {
+                    // Colour tags another Glint window changed meanwhile (tags.rs).
+                    self.app.tags_refresh();
+                }
                 self.invalidate();
                 // SAFETY: focus queries and changes on our own windows.
                 unsafe {
@@ -2401,6 +2801,10 @@ impl Window {
                 Some(LRESULT(0))
             }
             WM_APP_LOADED => {
+                // The copy queue's list follows its copies (copyqueue.rs wakes the window).
+                if self.queue.shown || crate::copyqueue::busy() {
+                    self.invalidate();
+                }
                 if self.app.receive() {
                     if self.list.wine_nudge(self.now()) {
                         ANIMATING.with(|a| a.set(true));
@@ -2474,8 +2878,11 @@ impl Window {
             }
             WM_DEVICECHANGE => {
                 // A drive or card came or went (the drive list is read again), or a drive is about
-                // to be ejected and the folder watch lets go of it (app.rs, watch.rs). TRUE: yes,
-                // Windows may go ahead.
+                // to be ejected and the folder watch lets go of it (app.rs, watch.rs) - and so does
+                // a video in the preview. TRUE: yes, Windows may go ahead.
+                if wparam.0 as u32 == DBT_DEVICEQUERYREMOVE {
+                    self.side.release_files();
+                }
                 self.app.device_change(wparam.0 as u32, lparam.0);
                 Some(LRESULT(1))
             }
@@ -2538,6 +2945,18 @@ impl Window {
     }
 
     fn text_event(&mut self, ev: TextEvent) {
+        // The command box's (palette.rs).
+        if let Some(c) = self.palette.text_event(&ev) {
+            self.palette_chose(c);
+            return;
+        }
+        // The form's own boxes (form.rs).
+        if let Some(a) = self.form.text_event(&ev) {
+            if self.app.form.is_some() {
+                self.form_answered(a);
+            }
+            return;
+        }
         let ctx = self.ctx();
         for part in Self::PARTS {
             let effect = self.with_part(part, |c, app| c.text_event(&ctx, &ev, app));
@@ -2658,8 +3077,8 @@ impl Window {
     /// Windows has none). `session`: only if it's the one waiting for that session; None: whichever
     /// waits (the timer ran out).
     fn open_pending_menu(&mut self, session: Option<u64>, built: Option<Built>) {
-        let waiting = self.pending_menu.as_ref().is_some_and(|p| session.is_none_or(|s| s == p.session));
-        let Some(p) = self.pending_menu.take().filter(|_| waiting) else {
+        // (Windows' items for an older menu, one that was dropped, leave the one waiting now alone.)
+        let Some(p) = self.pending_menu.take_if(|p| session.is_none_or(|s| s == p.session)) else {
             if let Some(b) = built {
                 shellmenu::release(b.session);
             }
