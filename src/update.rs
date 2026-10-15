@@ -236,6 +236,7 @@ pub fn changelog_since(md: &str, ours: &Version, theirs: &Version) -> String {
     let mut taking = false;
     for line in md.lines() {
         if let Some(heading) = line.strip_prefix("## ") {
+            let heading = heading.strip_prefix("Glint ").unwrap_or(heading);
             let v = heading.split(|c: char| c.is_whitespace() || c == ':').next().and_then(Version::parse);
             taking = v.is_some_and(|v| &v > ours && &v <= theirs);
         }
@@ -1268,9 +1269,11 @@ mod tests {
         assert_eq!(changelog_since(md, &v("0.3.2"), &v("0.3.2")), "");
         // Glint's own changelog has a section for its own version.
         let own = include_str!("../CHANGELOG.md");
-        assert!(changelog_since(own, &v("0.0.1"), &v(log::VERSION)).starts_with(&format!("## {}", log::VERSION)));
+        let since = changelog_since(own, &v("0.0.1"), &v(log::VERSION));
+        assert!(since.starts_with(&format!("## {}", log::VERSION)) || since.starts_with(&format!("## Glint {}", log::VERSION)));
         // What's new: the changelog's sections, or the release's own text when there are none.
         assert_eq!(whats_new(Some(md), "text", &v("0.3.1"), &v("0.3.2")), "## 0.3.2 (2026-10-20): more\n\n- c");
+        assert_eq!(changelog_since("## Glint 0.3.2 20/10/2026 17:21\n\n- c\n## Glint 0.3.1 12/10/2026 09:00\n\n- b\n", &v("0.3.1"), &v("0.3.2")), "## Glint 0.3.2 20/10/2026 17:21\n\n- c");
         assert_eq!(whats_new(Some("# nothing here\n"), "text", &v("0.3.1"), &v("0.3.2")), "text");
         assert_eq!(whats_new(None, "text", &v("0.3.1"), &v("0.3.2")), "text");
     }

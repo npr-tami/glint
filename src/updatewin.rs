@@ -201,6 +201,8 @@ fn blocks(md: &str) -> Vec<Block> {
         let indent = line.len() - text.len();
         if let Some(h) = text.strip_prefix("## ") {
             let h = plain(h.trim());
+            // "## Glint 1.0.19-beta.1 15/10/2026 17:21" too.
+            let h = h.strip_prefix("Glint ").map(str::to_string).unwrap_or(h);
             let (version, aside) = h.split_once(char::is_whitespace).unwrap_or((&h, ""));
             let aside = aside.trim().trim_start_matches(['·', ':']).trim().to_string();
             let text = if version.starts_with(|c: char| c.is_ascii_digit()) { format!("Glint {version}") } else { version.to_string() };
@@ -1257,6 +1259,8 @@ mod tests {
         let b = blocks("## 1.0.19-beta.1 · 15/10/2026\n\n- Added split view\n- Fixed the outline\n");
         assert_eq!((b[0].text.as_str(), b[0].aside.as_str()), ("Glint 1.0.19-beta.1", "15/10/2026"));
         assert_eq!(b.len(), 3);
+        let b = blocks("## Glint 1.0.19-beta.1 15/10/2026 17:21\n\n- Added split view\n");
+        assert_eq!((b[0].text.as_str(), b[0].aside.as_str()), ("Glint 1.0.19-beta.1", "15/10/2026 17:21"));
     }
 
     #[test]

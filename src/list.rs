@@ -2837,6 +2837,11 @@ impl Component for ListView {
     }
 
     fn tick(&mut self, now: f64, app: &mut AppState) -> bool {
+        // A list with no room (split view's second half while it's closed) leaves the tab alone:
+        // its zero height would scroll it back to the top.
+        if self.rect.w <= 0.0 || self.rect.h <= 0.0 {
+            return false;
+        }
         self.take_size(app);
         let geo = self.geo(app.tab());
         let tab = app.tab_mut();
@@ -2969,6 +2974,36 @@ mod tests {
         assert_eq!(name(&tab).as_deref(), Some("cherry.txt"), "no \"bec\": c on its own");
         assert!(list.jump_to_typed(&mut tab, 'h', 0.6));
         assert_eq!(name(&tab).as_deref(), Some("cherry.txt"), "and on from there: \"ch\"");
+    }
+
+    /// Home's page scrolls with the wheel (its height is the page's, not the rows').
+    #[test]
+    fn home_scrolls() {
+        let _turn = media::test_turn(); // (ticking forgets the media values another test reads)
+        let mut app = AppState::for_tests(crate::settings::Settings::default());
+        let names: Vec<String> = (0..65).map(|i| format!("f{i}.txt")).collect();
+        let entries = names.iter().map(|n| Entry { target: Some(format!("C:\\x\\{n}")), ..file(n) }).collect();
+        let parts = crate::recent::Parts { pinned: 6, recent: 6, favorites: 65 };
+        let folder = crate::folder::Folder { path: crate::recent::LOCATION.into(), entries, home: Some(Box::new(parts)), ..Default::default() };
+        crate::app::apply_listing(&mut app.tabs[0], folder);
+        let mut list = ListView::new();
+        let ctx = Ctx { hwnd: HWND::default(), scale: 1.0, now: 0.0, maximized: false, active: true };
+        list.layout(Rect::new(0.0, 0.0, 600.0, 300.0), &ctx, &app);
+        list.tick(0.0, &mut app);
+        assert!(list.home_on, "Home's page shows");
+        let tab = &app.tabs[0];
+        list.home.layout = home::layout(592.0, parts, tab.folder.entries.len(), &list.home, |i| tab.row_of(i).is_some());
+        assert!(list.home.layout.height > 600.0, "the page is taller than the list: {}", list.home.layout.height);
+        let e = MouseEvent { pos: Point::new(100.0, 100.0), button: MouseButton::Middle, mods: crate::ui::Mods::default(), wheel: -3.0 };
+        let _ = list.wheel(&Ctx { now: 1.0, ..ctx }, &e, &mut app);
+        list.tick(2.0, &mut app);
+        let scrolled = app.tabs[0].scroll;
+        assert!(scrolled > 0.0, "scrolled down");
+        // A list that was never given room (split view's hidden half) doesn't scroll it back.
+        let mut hidden = ListView::new();
+        hidden.tick(3.0, &mut app);
+        list.tick(3.0, &mut app);
+        assert_eq!(app.tabs[0].scroll, scrolled, "still scrolled");
     }
 
     #[test]

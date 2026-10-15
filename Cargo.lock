@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "glint"
-version = "1.0.19-beta.1"
+version = "1.0.19-beta.2"
 dependencies = [
  "flate2",
  "serde",

@@ -294,6 +294,14 @@ pub fn stop(list: u32) {
 }
 
 /// Forgets the values of every listing but these folders' (the ones the tabs show).
+/// Tests that read the values (or tick a list, which forgets them) take turns: the values are
+/// shared by the whole program.
+#[cfg(test)]
+pub(crate) fn test_turn() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: Mutex<()> = Mutex::new(());
+    TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn keep<'a>(folders: impl IntoIterator<Item = &'a str>) {
     let open: Vec<String> = folders.into_iter().map(str::to_lowercase).collect();
     state().kept.retain(|listing, _| open.contains(listing));
@@ -589,6 +597,7 @@ mod tests {
 
     #[test]
     fn the_thread_reads_what_is_asked_and_keeps_it_by_last_change() {
+        let _turn = test_turn();
         let dir = std::env::temp_dir().join(format!("glint-media-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(dir.join("photo.bmp"), bmp(7, 5)).unwrap();

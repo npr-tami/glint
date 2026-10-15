@@ -1185,6 +1185,14 @@ impl Window {
 
     const PARTS: [Part; 7] = [Part::Title, Part::Toolbar, Part::Sidebar, Part::List, Part::List2, Part::Status, Part::Side];
 
+    /// The parts on screen: split view's second half only while split view is open. (Closed, the
+    /// hidden half would act on the tab Glint works in: with no size of its own it scrolled Home
+    /// back to the top every frame.)
+    fn parts_on(&self) -> Vec<Part> {
+        let split = self.app.split_index().is_some();
+        Self::PARTS.into_iter().filter(|&p| p != Part::List2 || split).collect()
+    }
+
     fn part_at(&self, p: Point) -> Option<Part> {
         let rect = |part| match part {
             Part::Title => self.titlebar.rect(),
@@ -1963,7 +1971,7 @@ impl Window {
         self.follow_split();
         thumbs::begin_frame();
         let mut more = false;
-        for part in Self::PARTS {
+        for part in self.parts_on() {
             more |= self.with_part(part, |c, app| c.tick(ctx.now, app));
         }
         if self.palette.is_open() && (self.app.question.is_some() || self.app.form.is_some()) {
@@ -2958,7 +2966,7 @@ impl Window {
             return;
         }
         let ctx = self.ctx();
-        for part in Self::PARTS {
+        for part in self.parts_on() {
             let effect = self.with_part(part, |c, app| c.text_event(&ctx, &ev, app));
             self.apply(part, effect);
         }

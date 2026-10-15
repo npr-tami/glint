@@ -12,6 +12,10 @@ Each new number counts as newer than the one before it (1.0.12-beta.1, 1.0.12-be
 1.0.13-beta.1, ...), so the updater offers them in that order. Versions up to 0.11.0 used
 MAJOR.MINOR.PATCH, where a new feature bumped the middle number.
 
+## 1.0.19-beta.2 · 15/10/2026 18:19
+
+- Fixed Home not scrolling with the mouse wheel or the scroll bar
+
 ## 1.0.19-beta.1 · 15/10/2026
 
 - Added undo and redo: Ctrl+Z undoes your last move, copy, rename, new folder or delete, Ctrl+Y brings it back
