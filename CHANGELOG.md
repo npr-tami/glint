@@ -7,8 +7,7 @@ The newest version is at the top.
 - Added a settings search to the command box (Ctrl+U)
 - Added more wallpaper options for skins: blur, fade, zoom and size
 
-- Changed the skin list to show Glint's skins and yours in two groups
-- Changed hotfixes to be required updates
+- Changed the skin list into groups
 
 - Fixed pictures flickering in the big preview
 - Fixed phone photos showing sideways as a wallpaper

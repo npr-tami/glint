@@ -244,6 +244,14 @@ impl Component for StatusBar {
     }
 
     fn paint(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState, _ctx: &Ctx) {
+        // A required fix that couldn't be installed: red, whatever the skin, until the next start.
+        if let Some(version) = &app.update_needed {
+            r.fill_rect(self.rect, crate::theme::Color::hex(0xc42b1c));
+            let style = TextStyle::new(crate::theme::Color::hex(0xffffff)).semibold();
+            let text = format!("Update needed: Glint {version} fixes a problem in your version. Glint tries again at the next start.");
+            r.text(&text, self.rect.inset(PAD, 0.0), &style);
+            return;
+        }
         if theme.era.old() {
             // An older Windows' status bar (retrolist.rs): its panes, the text in them.
             let style = TextStyle::new(crate::retrolist::status_text(theme));

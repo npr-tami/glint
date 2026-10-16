@@ -16,7 +16,9 @@
 //!   hidden and lets it show itself (WM_APP_PROMPT_SHOW), and closes it with a posted message, so
 //!   the activation moving between the two never arrives while the main window is busy.
 //! - **Closing it** (×, Esc, Alt+F4) is "Remind me again later" - or, with the box ticked, "Don't
-//!   remind me about this update". "Stop checking for updates" closes it too, and Glint stops
+//!   remind me about this update". A required fix can't be closed: it has no ×, and Esc and Alt+F4
+//!   do nothing; UPDATE NOW is the only way on. Only once installing it failed can it be closed,
+//!   and then the main window's status bar stays red ("Update needed") until the next start. "Stop checking for updates" closes it too, and Glint stops
 //!   looking by itself ("CheckForUpdates" off; Settings > About can still look, and turn it on
 //!   again). While installing it stays open, says so, and shows what went wrong if it did (the
 //!   window quits and the new Glint starts when it went well).
@@ -788,13 +790,17 @@ impl Prompt {
 
     fn paint_caption(&mut self, theme: &Theme) {
         let close = self.close_rect();
+        let closable = self.closable();
         let bar = Rect::new(0.0, 0.0, self.size.0, size::TITLE_H);
         let r = &mut self.renderer;
         kit::title_bar(r, theme, bar, self.active);
         let x = kit::logo(r, theme, bar);
         crate::retro::title(r, theme, Rect::new(x + 10.0, 0.0, (self.size.0 - x - 10.0 - ksize::CLOSE_W).max(0.0), size::TITLE_H), "Update", self.active);
-        let hot = self.hover == Some(Hot::Close);
-        kit::close_button(r, theme, close, hot, hot && self.pressed == Some(Hot::Close), self.active);
+        // (A required fix has no × until installing it has failed.)
+        if closable {
+            let hot = self.hover == Some(Hot::Close);
+            kit::close_button(r, theme, close, hot, hot && self.pressed == Some(Hot::Close), self.active);
+        }
         // The line under the title bar, like the toolbar's (as the skin draws it, or none; a skin
         // with a shine on its bars has its edge there already).
         if theme.toolbar_line_w > 0.0 && theme.highlight.a <= 0.0 {
@@ -895,7 +901,7 @@ impl Prompt {
 
     fn target_at(&mut self, p: Point) -> Option<Hot> {
         if p.y < size::TITLE_H {
-            return self.close_rect().contains(p).then_some(Hot::Close);
+            return (self.closable() && self.close_rect().contains(p)).then_some(Hot::Close);
         }
         let track = self.track();
         if let Some(thumb) = self.scroller.thumb(track) {
@@ -1052,10 +1058,21 @@ impl Prompt {
         }
     }
 
+    /// Whether ×, Esc and Alt+F4 close it. A required fix fixes something critical, so it can't be
+    /// closed - until installing it has failed (no internet, GitHub down, antivirus): then it
+    /// closes, and the main window's status bar says the update is still needed.
+    fn closable(&self) -> bool {
+        !self.required || (self.problem.is_some() && !self.installing)
+    }
+
     /// Closed without updating: remind later - or never about this version, with the box ticked.
     fn dismiss(&mut self, acts: &mut Vec<Act>) {
-        // (A required fix remembers nothing: it asks again at the next check.)
-        if !self.installing && !self.required {
+        if !self.closable() {
+            return;
+        }
+        if self.required {
+            acts.push(Act::Answer(ANSWER_LATER));
+        } else if !self.installing {
             acts.push(Act::Answer(if self.skip { ANSWER_SKIP } else { ANSWER_LATER }));
         }
         acts.push(Act::Destroy);

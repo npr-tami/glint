@@ -505,6 +505,9 @@ pub struct AppState {
     /// A short note for the status bar ("Path copied") and when it was said. It shows for
     /// NOTE_SECONDS, or until the next navigation.
     note: Option<(String, Instant)>,
+    /// A required fix (hotfix) that couldn't be installed: the version. The status bar stays red
+    /// until Glint is restarted, when it looks again.
+    pub update_needed: Option<String>,
     /// A question waiting for an answer before a file job runs (ask.rs shows it).
     pub question: Option<Question>,
     next_question: u64,
@@ -605,6 +608,7 @@ impl AppState {
             branch_watch: Vec::new(),
             startup_ms: None,
             note: None,
+            update_needed: None,
             watcher: Watcher::new(hwnd.clone()),
             split: None,
             split_last: 0,
@@ -678,6 +682,7 @@ impl AppState {
             branch_watch: Vec::new(),
             startup_ms: None,
             note: None,
+            update_needed: None,
             watcher: Watcher::new(hwnd.clone()),
             split: None,
             split_last: 0,

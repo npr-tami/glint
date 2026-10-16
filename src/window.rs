@@ -1742,8 +1742,18 @@ impl Window {
                     }
                     self.refresh_settings();
                 } else {
-                    updatewin::remember_answer(detail, &release, &mut self.app.settings);
+                    // (A closed required fix remembers nothing: no "later" that would also hold
+                    // back a newer ordinary release.)
+                    if !release.required {
+                        updatewin::remember_answer(detail, &release, &mut self.app.settings);
+                    }
                     self.prompted = None;
+                    if release.required {
+                        // Its install failed and the prompt was closed: Glint stays usable, the
+                        // status bar says the fix is still needed, and it's asked again at the next start.
+                        self.app.update_needed = Some(release.version.clone());
+                        self.invalidate();
+                    }
                     if detail == update::ANSWER_OFF {
                         // Saved like any choice; checking by hand in Settings > About still works.
                         log::line("update: automatic checks turned off (in the prompt)");
