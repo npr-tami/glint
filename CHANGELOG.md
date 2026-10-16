@@ -2,7 +2,7 @@
 
 The newest version is at the top.
 
-## 1.0.20-beta.1 · 16/10/2026 21:25
+## 1.0.20-beta.1 · 17/10/2026 00:14
 
 - Added a settings search to the command box (Ctrl+U)
 - Added more wallpaper options for skins: blur, fade, zoom and size
