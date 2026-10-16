@@ -60,6 +60,34 @@ pub(super) struct DragState {
     has_folder: Option<bool>,
     /// A drag out of the list is under way: Glint's own drag loop is running.
     out: bool,
+    /// The last folder's effect (see `EffectCache`); forgotten whenever the dragged files change.
+    effects: EffectCache,
+}
+
+/// What dropping the dragged files into a folder does, remembered for the last folder, keys and
+/// allowed effects: it depends on nothing else while the files stay the same, and working it out
+/// looks at every dragged path - for a big drag, too slow to do on each step of the mouse (Windows
+/// asks on every move, and every little while when it rests).
+#[derive(Default)]
+struct EffectCache {
+    last: Option<(String, u32, u32, u32)>,
+}
+
+impl EffectCache {
+    fn get(&mut self, path: &str, keys: u32, allowed: u32, work_out: impl FnOnce() -> u32) -> u32 {
+        if let Some((p, k, a, effect)) = &self.last {
+            if p == path && *k == keys && *a == allowed {
+                return *effect;
+            }
+        }
+        let effect = work_out();
+        self.last = Some((path.to_string(), keys, allowed, effect));
+        effect
+    }
+
+    fn forget(&mut self) {
+        self.last = None;
+    }
 }
 
 impl Window {
@@ -73,6 +101,7 @@ impl Window {
             Phase::Enter => {
                 self.drag_ended();
                 self.drag.files = Some(std::mem::take(&mut msg.files));
+                self.drag.effects.forget();
                 self.drag.allowed = msg.allowed;
                 self.drag_moved(msg);
             }
@@ -178,7 +207,7 @@ impl Window {
         let Some(files) = self.drag.files.as_ref() else { return (0, None) };
         let allowed = self.drag.allowed;
         let effect = match &dest {
-            Dest::Folder(path) => dragdrop::folder_effect(files, path, keys, allowed).map_or(0, dragdrop::effect_of),
+            Dest::Folder(path) => self.drag.effects.get(path, keys, allowed, || dragdrop::folder_effect(files, path, keys, allowed).map_or(0, dragdrop::effect_of)),
             Dest::RecycleBin => dragdrop::bin_effect(files, allowed),
             Dest::Pin if self.has_folder() => DROPEFFECT_LINK.0 & allowed,
             Dest::Pin => 0,
@@ -329,6 +358,7 @@ impl Window {
         // The files as the drag holds them now (read again at the drop), else as at the start.
         if !msg.files.is_empty() {
             self.drag.files = Some(std::mem::take(&mut msg.files));
+            self.drag.effects.forget();
         }
         let spot = self.drop_spot(self.drag.at);
         let on_other = matches!(spot, Some((Part::List2, _)));
@@ -384,6 +414,7 @@ impl Window {
         self.show_drop(None);
         self.drag.shown_dest = None;
         self.drag.files = None;
+        self.drag.effects.forget();
         self.drag.has_folder = None;
         self.drag.waiting_tab = None;
         self.drag.scrolling = None;
@@ -426,13 +457,9 @@ impl Window {
             let items: Vec<String> = d.names.iter().map(|n| if inner.is_empty() { n.clone() } else { format!("{inner}\\{n}") }).collect();
             // Counted from the archive, not the list: a folder there shows 0 bytes, and a 7z unpacks
             // what's packed before an item too.
-            let taken = crate::archive::unpack_size(&archive, &items).and_then(|bytes| {
-                if bytes > MOST {
-                    return Err("That's a lot to drag out of an archive. Copy it (Ctrl+C) and paste it instead.".to_string());
-                }
-                let dir = crate::archive::temp_dir_for(&archive)?;
-                crate::archive::extract(&archive, &items, &dir).map(|paths| (dir, paths))
-            });
+            // (The archive is read once for both.)
+            let too_much = "That's a lot to drag out of an archive. Copy it (Ctrl+C) and paste it instead.";
+            let taken = crate::archive::extract_at_most(&archive, &items, MOST, too_much);
             match taken {
                 Ok((dir, paths)) => {
                     d.names = paths.iter().map(|p| crate::folder::file_name(p).to_string()).collect();
@@ -472,4 +499,39 @@ pub(super) fn run_drag_out(hwnd: HWND, ptr: *mut Window, d: DragOut) {
         w.note_changes();
     }
     BUSY.with(|b| b.set(false));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_effect_is_worked_out_once_per_place_and_keys() {
+        let mut c = EffectCache::default();
+        let asked = std::cell::Cell::new(0);
+        let get = |c: &mut EffectCache, path: &str, keys: u32, allowed: u32, effect: u32| {
+            c.get(path, keys, allowed, || {
+                asked.set(asked.get() + 1);
+                effect
+            })
+        };
+        assert_eq!(get(&mut c, "D:\\Fotos 📷", 0, 7, 2), 2);
+        for _ in 0..100 {
+            assert_eq!(get(&mut c, "D:\\Fotos 📷", 0, 7, 99), 2, "the mouse moved within the same folder");
+        }
+        assert_eq!(asked.get(), 1);
+        // Ctrl held: worked out again; another folder, or other allowed effects, too.
+        assert_eq!(get(&mut c, "D:\\Fotos 📷", 8, 7, 1), 1);
+        assert_eq!(get(&mut c, "D:\\Fotos 📸", 8, 7, 4), 4);
+        assert_eq!(get(&mut c, "D:\\Fotos 📸", 8, 1, 1), 1);
+        assert_eq!(asked.get(), 4);
+        // Back to an earlier one: worked out again (only the last is kept), and 0 is kept too.
+        assert_eq!(get(&mut c, "C:\\", 0, 7, 0), 0);
+        assert_eq!(get(&mut c, "C:\\", 0, 7, 5), 0);
+        assert_eq!(asked.get(), 5);
+        // Other files dragged: forgotten.
+        c.forget();
+        assert_eq!(get(&mut c, "C:\\", 0, 7, 5), 5);
+        assert_eq!(asked.get(), 6);
+    }
 }

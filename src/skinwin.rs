@@ -3,7 +3,8 @@
 //!
 //! - **Left:** every skin - the built-in ones, then the person's own - and the buttons NEW,
 //!   DUPLICATE, RENAME, DELETE (own skins only, after a question; the file goes to the Recycle Bin,
-//!   or is deleted for good on a drive without one), IMPORT…, EXPORT… and OPEN SKINS FOLDER (in a
+//!   or is deleted for good on a drive without one), IMPORT… (with the skin's pictures and its
+//!   light or dark other half; what didn't come is said), EXPORT… and OPEN SKINS FOLDER (in a
 //!   new tab; this window stays open). Clicking a
 //!   skin uses it, like Settings' drop-down.
 //! - **Right:** the skin in use, in plain words: the button shape, the slant, the row height, the
@@ -63,7 +64,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindow, IsIconic, KillTimer, LoadCursorW, LoadIconW, PostMessageW, RegisterClassExW, SetForegroundWindow,
-    SetTimer, SetWindowPos, ShowWindow, GW_OWNER,
+    SetTimer, SetWindowPos, ShowWindow, CS_DBLCLKS, GW_OWNER,
     HTCLIENT, IDC_ARROW, MINMAXINFO, SIZE_MINIMIZED, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE, SW_SHOW, WA_INACTIVE, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_CHAR,
     WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_KEYDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT,
@@ -73,7 +74,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::app::AppState;
 use crate::ask::{Answer, AskBox};
-use crate::codebox::{CodeBox, Done, Mark};
+use crate::codebox::{CodeBox, Done, Mark, PROBLEM_RED};
 use crate::skincode::SkinLang;
 use crate::frame;
 use crate::kit::{self, size as ksize, Look, Scroller};
@@ -117,10 +118,54 @@ const LOGO_FIELD_W: f32 = 140.0;
 const LOGO_HINT: &str = "GLINT";
 /// What Glint couldn't understand in the skin's text, under the text.
 const NOTES_H: f32 = 86.0;
+/// At most this many problems are listed under the skin's text (then "and N more").
+const MAX_NOTES: usize = 8;
+/// The skin's text box keeps at least this much height when the problems' list grows.
+const MIN_TEXT_H: f32 = 160.0;
 /// The GUIDE button under the skin's text, and the guide's lines.
 const GUIDE_W: f32 = 104.0;
 const GUIDE_LINE: f32 = 16.0;
 const GUIDE_MONO: f32 = 11.5;
+/// The guide is in two columns from this wide, this far apart.
+const GUIDE_TWO_COLUMNS: f32 = 620.0;
+const GUIDE_GAP: f32 = 24.0;
+
+/// The guide's first column: an example first (lines starting with "|", shown as typed), then the
+/// words. Short lines, plain words.
+const GUIDE: &[&str] = &[
+    "For example:",
+    "|name: My skin       // its name in Settings",
+    "|dark: true          // a dark skin",
+    "|accent: #ff8ad8     // a colour, as #hex",
+    "|tab-line: accent    // the same colour as accent",
+    "|shape: rounded      // one of a few words",
+    "Each line is one setting: its name, a colon, then what it is.",
+    "Start typing a name and a list shows what fits. Tab or Enter takes one.",
+    "Ctrl+Space shows the list wherever the cursor is.",
+    "A colour is #hex, another colour's name to copy it, or none.",
+    "Anything left out stays as in the standard skin.",
+    "A line starting with // is a note. Ctrl+/ makes one, and back.",
+    "Alt+Up and Alt+Down move a line.",
+];
+
+/// The guide's second column: gradients, numbers and wallpapers.
+const GUIDE_PICTURES: &[&str] = &[
+    "A gradient: colours with commas between.",
+    "|title-bar: #ff0000, #0000ff",
+    "Numbers have a smallest and a biggest. The faint words after the line say them.",
+    "A wallpaper is a picture behind the files. Put it next to the skin.",
+    "|wallpaper: beach.jpg",
+    "|wallpaper-opacity: 40     // 0 to 100",
+    "|wallpaper-fit: tile       // fill, whole, stretch...",
+    "|wallpaper-position: 30% 70%",
+    "|wallpaper-zoom: 50        // -500 to 500",
+    "|wallpaper-size: 50%       // of the list's width",
+    "|wallpaper-offset: 20 -10  // across, down",
+    "|wallpaper-blur: 8         // 0 to 50",
+    "|wallpaper-fade: 10        // soft edges",
+    "Fit is fill, whole, stretch, tile or actual.",
+    "Position is left, middle or right, then top, middle or bottom. Or two %.",
+];
 const NOTE_LINE: f32 = 17.0;
 /// The window's size, and the smallest it gets (DIPs).
 const DEFAULT_W: f32 = 780.0;
@@ -452,8 +497,9 @@ pub enum Ask {
 /// Results of background work.
 #[derive(Debug)]
 enum Bg {
-    /// A skin file read for IMPORT…: its path and its text (or why it couldn't be read).
-    Imported(PathBuf, Result<String, String>),
+    /// A skin file read for IMPORT…, with the pictures and the other half it needs brought in (or
+    /// why it couldn't be read).
+    Imported(Result<skin::Import, String>),
     /// The skins folder exists now: open it in a tab.
     Open(PathBuf),
 }
@@ -542,6 +588,10 @@ pub struct SkinWindow {
     guide_h: f32,
     /// The problems under the skin's text, as last drawn: (where, its line).
     note_rects: Vec<(Rect, usize)>,
+    /// What Glint couldn't understand in the skin's text, read once a paint, and how tall the
+    /// list of them under the text was last drawn.
+    notes: Vec<skin::Note>,
+    notes_h: f32,
     /// Skins changed and waiting for SAVE_TIMER to save them.
     save_due: Vec<String>,
     /// Undo and redo: a skin's text before a change, with its id; newest last.
@@ -593,6 +643,8 @@ fn register_class() {
         let Ok(instance) = GetModuleHandleW(None) else { return };
         let class = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            // (Double-clicks come as such: a double-click in the text picks a word.)
+            style: CS_DBLCLKS,
             lpfnWndProc: Some(wndproc),
             hInstance: instance.into(),
             hIcon: LoadIconW(Some(instance.into()), PCWSTR(std::ptr::without_provenance(1))).unwrap_or_default(),
@@ -675,6 +727,8 @@ pub fn create(owner: HWND, theme: &Theme) -> Option<SkinWindow> {
             guide: false,
             guide_h: 0.0,
             note_rects: Vec::new(),
+            notes: Vec::new(),
+            notes_h: NOTES_H,
             save_due: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -980,6 +1034,47 @@ fn typed_value(key: &str, typed: &str) -> Option<String> {
     (parsed.notes.is_empty() && skin::value_in(&line, key).as_deref() == Some(typed.as_str())).then_some(typed)
 }
 
+/// How a line under the skin's text is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Said {
+    /// In the text colour.
+    Plain,
+    /// Faint.
+    Quiet,
+    /// In red: something Glint couldn't understand.
+    Problem,
+}
+
+/// The lines under the skin's text, in at most `room` lines: what Glint couldn't understand (up to
+/// MAX_NOTES, then "and N more"), each with its line in the text (0: none).
+fn note_lines(notes: &[skin::Note], built_in: bool, room: usize) -> Vec<(String, Said, usize)> {
+    let mut lines = Vec::new();
+    if built_in {
+        lines.push(("Built-in skins can't be edited here. DUPLICATE makes a copy you can edit.".to_string(), Said::Plain, 0));
+    }
+    if notes.is_empty() {
+        lines.push(("Every line is understood.".to_string(), Said::Quiet, 0));
+        lines.truncate(room.max(1));
+        return lines;
+    }
+    let left = room.saturating_sub(lines.len());
+    let shown = if notes.len() <= left.min(MAX_NOTES) { notes.len() } else { left.saturating_sub(1).min(MAX_NOTES) };
+    for n in &notes[..shown] {
+        let at = if n.line > 0 { format!("Line {}: ", n.line) } else { String::new() };
+        lines.push((format!("{at}{}", n.text), Said::Problem, n.line));
+    }
+    let more = notes.len() - shown;
+    if more > 0 {
+        let line = if shown == 0 { format!("{more} line(s) Glint couldn't understand: see the red marks.") } else { format!("\u{2026}and {more} more.") };
+        lines.push((line, if shown == 0 { Said::Problem } else { Said::Quiet }, 0));
+    }
+    // (A window too short for even one problem: the problems before the built-in line.)
+    if lines.len() > room.max(1) {
+        lines.drain(..lines.len() - room.max(1));
+    }
+    lines
+}
+
 /// The paint a typed value makes in colour `key`'s place (names followed in the standard skins).
 #[cfg(test)]
 fn typed_paint(key: &str, typed: &str) -> Option<Paint> {
@@ -1233,7 +1328,7 @@ impl SkinWindow {
     /// The skin's text box (on screen), while "Show as text" is on.
     fn text_rect(&self) -> Rect {
         let p = self.page_rect();
-        Rect::new(p.x + PAD_X, p.y + 4.0, (p.w - 2.0 * PAD_X).max(80.0), (p.h - NOTES_H - 16.0 - self.guide_h).max(60.0))
+        Rect::new(p.x + PAD_X, p.y + 4.0, (p.w - 2.0 * PAD_X).max(80.0), (p.h - self.notes_h - 16.0 - self.guide_h).max(60.0))
     }
 
     /// GUIDE, at the right of the line under the skin's text.
@@ -1443,7 +1538,7 @@ impl SkinWindow {
         let dy = list.y - self.list.offset;
         self.renderer.push_clip(list);
         let heading = TextStyle::new(if theme.era.old() { theme.sidebar_text } else { theme.muted }).size(ksize::NOTE_FONT).semibold();
-        self.renderer.text("BUILT IN", Rect::new(18.0, 6.0 + dy, LIST_W - 26.0, GROUP_H), &heading);
+        self.renderer.text("DEFAULT", Rect::new(18.0, 6.0 + dy, LIST_W - 26.0, GROUP_H), &heading);
         let own_heading_y = self.items.iter().filter(|i| !i.id.starts_with(skin::FILE_PREFIX)).map(|i| i.rect.bottom()).fold(6.0 + GROUP_H, f32::max) + 10.0;
         self.renderer.text("YOUR SKINS", Rect::new(18.0, own_heading_y + dy, LIST_W - 26.0, GROUP_H), &heading);
         if !self.items.iter().any(|i| i.id.starts_with(skin::FILE_PREFIX)) {
@@ -1507,7 +1602,7 @@ impl SkinWindow {
         let r = &mut self.renderer;
         kit::page_title(r, theme, Rect::new(x, h.y + 14.0, w, 30.0), &name);
         let note = match entry {
-            Some(e) if e.built_in() => "Built in. Changes go into your own copy.",
+            Some(e) if e.built_in() => "A default skin. Changes go into your own copy.",
             Some(_) => "",
             None => "Its file is missing, so AMD Radeon is shown.",
         };
@@ -1530,11 +1625,17 @@ impl SkinWindow {
     /// The skin's text, typed like code, and the guide under it (GUIDE).
     fn paint_code(&mut self, theme: &Theme, app: &AppState) {
         let width = (self.page_rect().w - 2.0 * PAD_X).max(80.0);
-        let lines = if self.guide { self.guide_lines(width) } else { Vec::new() };
+        let (columns, column_w) = if self.guide { self.guide_lines(width) } else { (Vec::new(), width) };
+        let tallest = columns.iter().map(Vec::len).max().unwrap_or(0);
         let page_h = self.page_rect().h;
-        self.guide_h = if lines.is_empty() { 0.0 } else { (30.0 + lines.len() as f32 * GUIDE_LINE).min((page_h * 0.5).max(120.0)) };
-        let notes = app.skins.notes(&app.settings.skin);
-        self.code.set_marks(notes.iter().filter(|n| n.line > 0).map(|n| Mark { line: n.line, text: n.text.clone() }).collect());
+        self.guide_h = if tallest == 0 { 0.0 } else { (30.0 + tallest as f32 * GUIDE_LINE).min((page_h * 0.5).max(120.0)) };
+        self.notes = app.skins.notes(&app.settings.skin);
+        // The problems' list grows to show up to MAX_NOTES of them, while the text keeps room.
+        let built_in = app.skins.find(&app.settings.skin).is_some_and(Entry::built_in);
+        let wanted = note_lines(&self.notes, built_in, usize::MAX).len() as f32 * NOTE_LINE + 1.0;
+        let spare = page_h - self.guide_h - 16.0 - MIN_TEXT_H;
+        self.notes_h = wanted.min(spare).max(NOTES_H);
+        self.code.set_marks(self.notes.iter().filter(|n| n.line > 0).map(|n| Mark { line: n.line, text: n.text.clone() }).collect());
         self.code.focused = self.focus == Spot::Text && self.active;
         let t = self.text_rect();
         let room = Rect::new(0.0, size::TITLE_H, self.size.0, (self.size.1 - size::TITLE_H).max(0.0));
@@ -1546,21 +1647,24 @@ impl SkinWindow {
             r.text("Guide", Rect::new(g.x, g.y, 100.0, 18.0), &TextStyle::new(theme.text).semibold());
             let style = TextStyle::new(theme.muted).size(ksize::NOTE_FONT);
             let cw = r.mono_char_width(GUIDE_MONO);
-            for (i, (line, example)) in lines.iter().enumerate() {
-                let at = Rect::new(g.x, g.y + 22.0 + i as f32 * GUIDE_LINE, g.w, GUIDE_LINE);
-                if *example {
-                    // As in the text: the name in the accent colour, the note after // muted.
-                    let (code, note) = line.split_at(line.find("//").unwrap_or(line.len()));
-                    let (name, value) = code.split_at(code.find(':').map_or(0, |i| i + 1));
-                    r.mono_text(name, Rect::new(at.x + 8.0, at.y, at.w, at.h), GUIDE_MONO, theme.accent);
-                    let x = at.x + 8.0 + name.chars().count() as f32 * cw;
-                    r.mono_text(value, Rect::new(x, at.y, (at.right() - x).max(0.0), at.h), GUIDE_MONO, theme.text);
-                    if !note.is_empty() {
-                        let x = at.x + 8.0 + code.chars().count() as f32 * cw;
-                        r.mono_text(note, Rect::new(x, at.y, (at.right() - x).max(0.0), at.h), GUIDE_MONO, theme.muted);
+            for (c, lines) in columns.iter().enumerate() {
+                let x0 = g.x + c as f32 * (column_w + GUIDE_GAP);
+                for (i, (line, example)) in lines.iter().enumerate() {
+                    let at = Rect::new(x0, g.y + 22.0 + i as f32 * GUIDE_LINE, column_w, GUIDE_LINE);
+                    if *example {
+                        // As in the text: the name in the accent colour, the note after // muted.
+                        let (code, note) = line.split_at(line.find("//").unwrap_or(line.len()));
+                        let (name, value) = code.split_at(code.find(':').map_or(0, |i| i + 1));
+                        r.mono_text(name, Rect::new(at.x + 8.0, at.y, at.w, at.h), GUIDE_MONO, theme.accent);
+                        let x = at.x + 8.0 + name.chars().count() as f32 * cw;
+                        r.mono_text(value, Rect::new(x, at.y, (at.right() - x).max(0.0), at.h), GUIDE_MONO, theme.text);
+                        if !note.is_empty() {
+                            let x = at.x + 8.0 + code.chars().count() as f32 * cw;
+                            r.mono_text(note, Rect::new(x, at.y, (at.right() - x).max(0.0), at.h), GUIDE_MONO, theme.muted);
+                        }
+                    } else {
+                        r.text(line, at, &style);
                     }
-                } else {
-                    r.text(line, at, &style);
                 }
             }
             r.pop_clip();
@@ -1571,30 +1675,28 @@ impl SkinWindow {
         kit::button(&mut self.renderer, theme, b, if self.guide { "HIDE GUIDE" } else { "GUIDE" }, look);
     }
 
-    /// The guide: an example first (lines starting with "|", shown as typed), then the words.
-    fn guide_lines(&mut self, width: f32) -> Vec<(String, bool)> {
-        const GUIDE: &[&str] = &[
-            "For example:",
-            "|name: My skin          // its name in Settings",
-            "|dark: true             // a dark skin",
-            "|accent: #ff8ad8        // a colour, as #hex",
-            "|tab-line: accent       // the same colour as accent",
-            "|shape: rounded         // one of a few words",
-            "Each line is one setting: its name, a colon, then what it is.",
-            "Start typing a name and a list shows what fits. Tab or Enter takes one, then the list shows what it can be.",
-            "A colour is #hex, the name of another colour to copy it, or none.",
-            "Anything left out stays as in the standard skin. A line starting with // is a note.",
-            "Ctrl+/ turns a line into a note and back. Alt+Up and Alt+Down move a line.",
-        ];
+    /// The guide, in two columns side by side when there's room (else one under the other): each
+    /// line with whether it's an example (written "|..." here, shown as typed), and how wide a
+    /// column is.
+    fn guide_lines(&mut self, width: f32) -> (Vec<Vec<(String, bool)>>, f32) {
+        let side_by_side = width >= GUIDE_TWO_COLUMNS;
+        let column_w = if side_by_side { (width - GUIDE_GAP) / 2.0 } else { width };
         let style = TextStyle::new(Color::hex(0)).size(ksize::NOTE_FONT);
-        let mut out = Vec::new();
-        for g in GUIDE {
-            match g.strip_prefix('|') {
-                Some(code) => out.push((code.to_string(), true)),
-                None => out.extend(kit::wrap(&mut self.renderer, g, &style, width).into_iter().map(|l| (l, false))),
+        let mut columns: Vec<Vec<(String, bool)>> = Vec::new();
+        for part in [GUIDE, GUIDE_PICTURES] {
+            let mut out = Vec::new();
+            for g in part {
+                match g.strip_prefix('|') {
+                    Some(code) => out.push((code.to_string(), true)),
+                    None => out.extend(kit::wrap(&mut self.renderer, g, &style, column_w).into_iter().map(|l| (l, false))),
+                }
+            }
+            match columns.last_mut() {
+                Some(first) if !side_by_side => first.extend(out),
+                _ => columns.push(out),
             }
         }
-        out
+        (columns, column_w)
     }
 
     /// Under the skin's text: what Glint couldn't understand in it.
@@ -1603,29 +1705,21 @@ impl SkinWindow {
         let y0 = t.bottom() + self.guide_h + 12.0;
         let t = Rect::new(t.x, t.y, (t.w - GUIDE_W - 12.0).max(40.0), t.h);
         let style = TextStyle::new(theme.muted).size(ksize::NOTE_FONT);
-        let entry = app.skins.find(&app.settings.skin);
-        // (Each problem with a line: clicking it goes there.)
-        let mut lines: Vec<(String, Color, usize)> = Vec::new();
-        if entry.is_some_and(Entry::built_in) {
-            lines.push(("Built-in skins can't be edited here. DUPLICATE makes a copy you can edit.".into(), theme.text, 0));
-        }
-        let notes = app.skins.notes(&app.settings.skin);
-        if notes.is_empty() {
-            lines.push(("Every line is understood.".into(), theme.muted, 0));
-        } else {
-            for n in notes.iter().take(4) {
-                let at = if n.line > 0 { format!("Line {}: ", n.line) } else { String::new() };
-                lines.push((format!("{at}{}", n.text), theme.accent, n.line));
-            }
-            if notes.len() > 4 {
-                lines.push((format!("\u{2026}and {} more.", notes.len() - 4), theme.muted, 0));
-            }
-        }
+        let built_in = app.skins.find(&app.settings.skin).is_some_and(Entry::built_in);
+        let room = (((self.notes_h - 1.0) / NOTE_LINE).floor() as usize).max(1);
+        let lines = note_lines(&self.notes, built_in, room);
         self.note_rects.clear();
-        for (i, (line, color, n)) in lines.iter().enumerate().take(5) {
+        // (Each problem with a line: clicking it goes there.)
+        for (i, (line, said, n)) in lines.iter().enumerate() {
             let at = Rect::new(t.x, y0 + i as f32 * NOTE_LINE, t.w, NOTE_LINE);
             let hot = *n > 0 && self.hover == Some(Hot::Note(*n));
-            self.renderer.text(line, at, &style.color(if hot { theme.text_strong } else { *color }));
+            let color = match said {
+                Said::Plain => theme.text,
+                Said::Quiet => theme.muted,
+                // The red of the marks in the text (codebox.rs).
+                Said::Problem => PROBLEM_RED,
+            };
+            self.renderer.text(line, at, &style.color(if hot { theme.text_strong } else { color }));
             if *n > 0 {
                 self.note_rects.push((at, *n));
             }
@@ -2555,8 +2649,8 @@ impl SkinWindow {
                 if !keep || name.is_empty() || app.skins.find(&id).is_none_or(|e| e.name == name) {
                     return Vec::new();
                 }
-                let free = app.skins.free_name(&name);
-                if !free.eq_ignore_ascii_case(&name) && !skin::id_for(&name).eq_ignore_ascii_case(&id) {
+                // (Its own name in other capitals - in any letters, "élan" to "Élan" - is fine.)
+                if !app.skins.may_rename(&id, &name) {
                     self.say(format!("There's a skin called \u{201c}{name}\u{201d} already"), true);
                     return Vec::new();
                 }
@@ -2718,20 +2812,12 @@ impl SkinWindow {
         let mut asks = Vec::new();
         for bg in results {
             match bg {
-                Bg::Imported(path, Ok(text)) => {
-                    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Imported skin".into());
-                    let wanted = skin::parse(&text, &stem).name;
-                    let name = app.skins.free_name(&wanted);
-                    let text = if name == wanted && skin::value_in(&text, "name").is_some() { text } else { skin::with_value(&text, "name", &name) };
-                    let notes = skin::parse(&text, &name).notes.len();
-                    let id = app.skins.add(&name, &text);
-                    match notes {
-                        0 => self.say(format!("Imported {name}"), false),
-                        n => self.say(format!("Imported {name}. Skipped {n} line(s): see Show as text"), true),
-                    }
+                Bg::Imported(Ok(import)) => {
+                    let (id, said, problem) = app.skins.take_import(import);
+                    self.say(said, problem);
                     asks.extend(self.after_new(app, &id));
                 }
-                Bg::Imported(_, Err(why)) => self.say(why, true),
+                Bg::Imported(Err(why)) => self.say(why, true),
                 Bg::Open(dir) => {
                     // The folder exists now: watch it (a skin copied in shows at once).
                     app.skins.watch_folder();
@@ -2840,11 +2926,8 @@ impl SkinWindow {
             JobDone::Import(path) => {
                 let (hwnd, serial) = (self.hwnd.0 as isize, self.serial);
                 shell::background("skins: import", move || {
-                    let read = match std::fs::metadata(&path) {
-                        Ok(m) if m.len() > MAX_TEXT as u64 => Err(format!("{} is too big to be a skin", path.display())),
-                        _ => std::fs::read(&path).map(|b| skin::decode(&b)).map_err(|e| format!("Couldn't read {}: {e}", path.display())),
-                    };
-                    post(hwnd, serial, Bg::Imported(path, read));
+                    // (Its pictures and its other half are copied into the skins folder here too.)
+                    post(hwnd, serial, Bg::Imported(skin::prepare_import(&path, &skin::folder())));
                 });
                 Vec::new()
             }
@@ -3135,6 +3218,22 @@ fn size_label(pt: f32) -> String {
 mod tests {
     use super::*;
 
+    /// The customiser's class asks Windows for double-clicks (a double-click in the text picks a
+    /// word): without CS_DBLCLKS the second click is just another click. Registering twice is fine.
+    #[test]
+    fn the_skin_window_hears_double_clicks() {
+        register_class();
+        register_class();
+        let mut info = WNDCLASSEXW { cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32, ..Default::default() };
+        // SAFETY: a class lookup by name into a struct we own.
+        let found = unsafe {
+            let instance = GetModuleHandleW(None).unwrap();
+            windows::Win32::UI::WindowsAndMessaging::GetClassInfoExW(Some(instance.into()), w!("GlintSkinWindow"), &mut info).is_ok()
+        };
+        assert!(found);
+        assert!(info.style.contains(CS_DBLCLKS), "{:?}", info.style);
+    }
+
     #[test]
     fn labels_and_numbers() {
         assert_eq!(number(8.0), "8");
@@ -3232,6 +3331,65 @@ mod tests {
         }
         for v in ROW_HEIGHTS {
             assert_eq!(skin::parse(&format!("row-height: {}", number(v)), "x").theme.row_h, v);
+        }
+    }
+
+    fn some_notes(n: usize) -> Vec<skin::Note> {
+        (1..=n).map(|i| skin::Note { line: i, text: format!("problem {i}") }).collect()
+    }
+
+    #[test]
+    fn up_to_eight_problems_are_listed_in_red() {
+        let said = |lines: &[(String, Said, usize)]| lines.iter().map(|l| l.1).collect::<Vec<_>>();
+        // None: one faint line.
+        let lines = note_lines(&[], false, 5);
+        assert_eq!((lines.len(), lines[0].1), (1, Said::Quiet));
+        // A few: each in red, by its line.
+        let lines = note_lines(&some_notes(3), false, usize::MAX);
+        assert_eq!(said(&lines), [Said::Problem; 3]);
+        assert_eq!(lines[2], ("Line 3: problem 3".to_string(), Said::Problem, 3));
+        // Eight fit; a ninth is "and 1 more".
+        assert_eq!(note_lines(&some_notes(8), false, usize::MAX).len(), 8);
+        let lines = note_lines(&some_notes(9), false, usize::MAX);
+        assert_eq!(lines.len(), 9);
+        assert_eq!(lines[8], ("\u{2026}and 1 more.".to_string(), Said::Quiet, 0));
+        // Built in: its line first, then the problems.
+        let lines = note_lines(&some_notes(12), true, usize::MAX);
+        assert_eq!((lines.len(), lines[0].1, lines[9].0.as_str()), (10, Said::Plain, "\u{2026}and 4 more."));
+        // Less room than problems: as many as fit, then how many more.
+        let lines = note_lines(&some_notes(12), false, 5);
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[4].0, "\u{2026}and 8 more.");
+        let lines = note_lines(&some_notes(5), false, 5);
+        assert_eq!(said(&lines), [Said::Problem; 5], "exactly fits: no \"more\"");
+        // Room for one line: the count, in red.
+        let lines = note_lines(&some_notes(3), true, 1);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].1, Said::Problem);
+        assert!(lines[0].0.starts_with('3'), "{}", lines[0].0);
+        // A problem with no line (the skin as a whole) says no "Line 0".
+        let lines = note_lines(&[skin::Note { line: 0, text: "whole".into() }], false, 5);
+        assert_eq!(lines[0], ("whole".to_string(), Said::Problem, 0));
+        // No room asked: still one line.
+        assert_eq!(note_lines(&[], true, 0).len(), 1);
+    }
+
+    #[test]
+    fn the_guide_shows_every_wallpaper_setting_in_short_lines() {
+        for (key, _) in skin::OTHERS.iter().filter(|(k, _)| k.starts_with("wallpaper")) {
+            assert!(GUIDE_PICTURES.iter().any(|l| l.starts_with(&format!("|{key}:"))), "{key} isn't in the guide");
+        }
+        // Each example is understood as it's written.
+        for g in GUIDE.iter().chain(GUIDE_PICTURES) {
+            if let Some(code) = g.strip_prefix('|') {
+                let line = code.split(" //").next().unwrap_or(code);
+                let p = skin::parse(line, "x");
+                // (The example picture isn't there.)
+                assert!(p.notes.iter().all(|n| n.text.contains("Can't find the wallpaper")), "{line}: {:?}", p.notes);
+                assert!(code.chars().count() <= 52, "too long for a column: {code}");
+            } else {
+                assert!(g.chars().count() <= 80, "too long: {g}");
+            }
         }
     }
 }

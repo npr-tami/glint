@@ -201,12 +201,14 @@ impl AppState {
             return crate::shell::open_with(self.owner(), &paths[0]);
         }
         if then == super::Then::Open {
-            if crate::archive::is_archive_name(&paths[0]) {
-                self.navigate(&paths[0]);
-            } else {
-                crate::shell::open(&paths[0]);
-            }
-            return;
+            // (An archive in the archive isn't taken out to be opened: it's looked into at its
+            // path there, see `open_entry`.)
+            return crate::shell::open(&paths[0]);
+        }
+        // Something was copied in another program meanwhile (Glint left the clipboard empty): that
+        // stays on the clipboard, it isn't replaced.
+        if !fileops::clipboard_is_empty() {
+            return self.say(format!("Didn't copy {}: something else was copied meanwhile.", items_text(&paths)));
         }
         let hwnd = HWND(self.hwnd.load(Ordering::SeqCst) as *mut _);
         match fileops::put_files(hwnd, &paths, false) {
@@ -257,7 +259,10 @@ impl AppState {
                 self.say("Select what to copy first.");
             } else {
                 // Meanwhile the clipboard is empty: Ctrl+V mustn't paste (or move) what was on it.
-                fileops::clear_clipboard(HWND(self.hwnd.load(Ordering::SeqCst) as *mut _));
+                // (And when they're out, they only go on it if it's still empty: see `extracted`.)
+                if !fileops::clear_clipboard(HWND(self.hwnd.load(Ordering::SeqCst) as *mut _)) {
+                    return self.say("The clipboard is busy. Try again.");
+                }
                 self.cut = None;
                 self.clip_turn = self.clip_turn.wrapping_add(1);
                 self.taking_out = self.extract_then(archive, items, super::Then::Copy(self.clip_turn));

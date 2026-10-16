@@ -264,8 +264,9 @@ pub fn for_background(app: &AppState, at: Point, how: How) -> Effect {
         return bin_background(app, at);
     }
     let t = app.tab();
-    // (Inside a .zip or .7z nothing can be made or pasted: archive.rs only reads it.)
-    let real = !t.path.is_empty() && crate::archive::split(&t.path).is_none();
+    // (Inside a .zip or .7z nothing can be made or pasted: archive.rs only reads it. Home is a
+    // page, not a folder: no path to copy, nothing to make or paste there.)
+    let real = !t.path.is_empty() && !crate::folder::is_place(&t.path) && crate::archive::split(&t.path).is_none();
     // While the custom sort order decides here, no column is checked (as in the SORT menu).
     let custom = t.custom_here().is_some();
     let key = |id, label, k| MenuItem::new(id, label).checked(t.sort == k && !custom);
@@ -553,11 +554,50 @@ pub fn command_for_verb(verb: &str, app: &AppState, shift: bool) -> Option<Comma
     }
 }
 
-/// A menu label reduced for comparing: no '&', no accelerator text after a tab, no "…", lower case.
-/// "&Open with…\tCtrl+O" -> "open with".
+/// A menu label reduced for comparing: no '&', no accelerator text after a tab, no "…", lower case,
+/// and spelt the American way, as Glint's own labels are. "&Open with…\tCtrl+O" -> "open with";
+/// "Add to Favourites" (Windows in British English) -> "add to favorites".
 pub fn label_key(label: &str) -> String {
     let text = label.split('\t').next().unwrap_or("");
-    text.replace("&&", "\u{1}").replace('&', "").replace('\u{1}', "&").replace('\u{2026}', "").replace("...", "").trim().to_lowercase()
+    let key = text.replace("&&", "\u{1}").replace('&', "").replace('\u{1}', "&").replace('\u{2026}', "").replace("...", "").trim().to_lowercase();
+    american(&key)
+}
+
+/// British spellings Windows' menus use in English (United Kingdom, Australia...), as American
+/// English writes them: the same item either way. Whole words, in lower case.
+const SPELLINGS: &[(&str, &str)] = &[
+    ("favourite", "favorite"),
+    ("favourites", "favorites"),
+    ("colour", "color"),
+    ("colours", "colors"),
+    ("customise", "customize"),
+    ("personalise", "personalize"),
+    ("organise", "organize"),
+    ("optimise", "optimize"),
+    ("synchronise", "synchronize"),
+    ("centre", "center"),
+    ("licence", "license"),
+    ("catalogue", "catalog"),
+];
+
+/// `key` (lower case) with each British spelling in SPELLINGS swapped for the American one.
+fn american(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        out.push_str(SPELLINGS.iter().find(|(gb, _)| *gb == word.as_str()).map_or(word.as_str(), |(_, us)| us));
+        word.clear();
+    };
+    for c in key.chars() {
+        if c.is_alphanumeric() {
+            word.push(c);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
 }
 
 /// Whether one of Windows' items goes into Glint's menu: not a separator, not something Glint has
@@ -578,8 +618,17 @@ pub fn merge_item(item: &ShellItem, glint_keys: &[String]) -> bool {
         return true; // no text to compare (and rare)
     }
     let key = label_key(&item.text);
+    // Windows' Add to / Remove from Favorites (its Home's) beside Glint's own, whichever of the two
+    // each shows: one Favorites item in the menu, Glint's.
+    let favorites = |k: &str| FAVORITES_TEXTS.contains(&k);
+    if favorites(&key) && glint_keys.iter().any(|k| favorites(k)) {
+        return false;
+    }
     !key.is_empty() && !glint_keys.contains(&key) && !SKIP_TEXTS.contains(&key.as_str())
 }
+
+/// The Favorites items, Glint's and Windows', as `label_key` gives them.
+const FAVORITES_TEXTS: [&str; 2] = ["add to favorites", "remove from favorites"];
 
 /// Glint's own "Open in terminal", as `label_key` gives it.
 const GLINT_TERMINAL: &str = "open in terminal";
@@ -638,6 +687,31 @@ mod tests {
         // Search results from two folders: Windows would look for the second in the first's folder.
         assert!(!one_folder(&paths(&["C:\\a\\notes.txt", "C:\\b\\notes.txt"])));
         assert!(!one_folder(&[]));
+    }
+
+    #[test]
+    fn home_background_menu_has_no_folder_items() {
+        let labels = |path: &str| {
+            let mut app = AppState::for_tests(crate::settings::Settings::default());
+            app.tabs[0].path = path.into();
+            app.tabs[0].folder.path = path.into();
+            let Effect::FilesMenu(m) = for_background(&app, Point::new(0.0, 0.0), How::default()) else { panic!("no menu") };
+            m.menu.items.into_iter().map(|i| i.label).collect::<Vec<_>>()
+        };
+        let folder_only = ["Copy folder path", "Open in terminal", "New folder", "New text file", "Paste", "Find duplicates", "Properties"];
+        let has = |v: &[String], l: &str| v.iter().any(|x| x.split('\t').next() == Some(l));
+        for home in [crate::recent::LOCATION.to_string(), crate::recent::LOCATION.to_lowercase()] {
+            let v = labels(&home);
+            for l in folder_only {
+                assert!(!has(&v, l), "{l} on Home: {v:?}");
+            }
+            assert!(has(&v, "Refresh"), "{v:?}");
+        }
+        // A real folder still has them all.
+        let v = labels("C:\\Work \u{1F600}");
+        for l in folder_only {
+            assert!(has(&v, l), "{l} missing: {v:?}");
+        }
     }
 
     #[test]
@@ -721,6 +795,13 @@ mod tests {
         assert_eq!(label_key("Fish && Chips..."), "fish & chips");
         assert_eq!(label_key("  Send to "), "send to");
         assert_eq!(label_key(""), "");
+        // British and American spellings are the same item; only whole words count.
+        assert_eq!(label_key("Add to &Favourites"), "add to favorites");
+        assert_eq!(label_key("Remove from Favourites\tCtrl+D"), "remove from favorites");
+        assert_eq!(label_key("Customise this folder\u{2026}"), "customize this folder");
+        assert_eq!(label_key("FAVOURITE colours"), "favorite colors");
+        assert_eq!(label_key("Favouritesque, unfavourite"), "favouritesque, unfavourite");
+        assert_eq!(label_key("Åpne i Favourites-mappe"), "åpne i favorites-mappe");
     }
 
     #[test]
@@ -736,6 +817,17 @@ mod tests {
         // File Explorer's view items.
         assert!(!merge_item(&item("&View", ""), &glint));
         assert!(!merge_item(&item("Line up Icons", ""), &glint));
+        // Spelt the British way (Windows in English (United Kingdom)): the same item.
+        let fav: Vec<String> = ["Open\tEnter", "Add to Favorites"].iter().map(|l| label_key(l)).collect();
+        assert!(!merge_item(&item("Add to &Favourites", ""), &fav));
+        assert!(!merge_item(&item("Add to Favorites", "pintohome"), &fav));
+        // Glint says Remove (the items are in its Favorites): Windows' Add or Remove still goes.
+        let remove: Vec<String> = ["Open\tEnter", "Remove from Favorites"].iter().map(|l| label_key(l)).collect();
+        assert!(!merge_item(&item("Add to Favourites", ""), &remove));
+        assert!(!merge_item(&item("Remove from Favourites", ""), &remove));
+        // Without Glint's own (in a zip file, say), Windows' stays.
+        assert!(merge_item(&item("Add to Favourites", ""), &glint));
+        assert!(merge_item(&item("Favourites manager", ""), &fav));
         // Other apps' items stay.
         assert!(merge_item(&item("Open with Code", ""), &glint));
         assert!(merge_item(&item("Send to", ""), &glint));

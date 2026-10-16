@@ -167,11 +167,21 @@ pub struct FactsCache {
     map: std::collections::HashMap<String, Facts>,
     order: std::collections::VecDeque<String>,
     cap: usize,
+    /// At most about this many bytes of text kept (None: no limit but `cap`), and how many are.
+    budget: Option<usize>,
+    bytes: usize,
 }
 
 impl FactsCache {
     pub fn new(cap: usize) -> FactsCache {
-        FactsCache { map: std::collections::HashMap::new(), order: std::collections::VecDeque::new(), cap: cap.max(1) }
+        FactsCache { map: std::collections::HashMap::new(), order: std::collections::VecDeque::new(), cap: cap.max(1), budget: None, bytes: 0 }
+    }
+
+    /// At most `cap` items, and the oldest go too while the text kept takes more than about
+    /// `budget` bytes (the newest always stays, however big). For the Space preview, whose text
+    /// files are read 200 KB at a time.
+    pub fn with_budget(cap: usize, budget: usize) -> FactsCache {
+        FactsCache { budget: Some(budget), ..FactsCache::new(cap) }
     }
 
     pub fn get(&self, key: &str) -> Option<&Facts> {
@@ -179,12 +189,16 @@ impl FactsCache {
     }
 
     pub fn insert(&mut self, key: String, facts: Facts) {
-        if self.map.insert(key.clone(), facts).is_none() {
-            self.order.push_back(key);
-            while self.order.len() > self.cap {
-                if let Some(old) = self.order.pop_front() {
-                    self.map.remove(&old);
-                }
+        self.bytes += text_bytes(&facts);
+        match self.map.insert(key.clone(), facts) {
+            Some(old) => self.bytes = self.bytes.saturating_sub(text_bytes(&old)),
+            None => self.order.push_back(key.clone()),
+        }
+        while self.order.len() > self.cap || self.budget.is_some_and(|b| self.bytes > b) {
+            // The oldest that isn't the one just put in.
+            let Some(at) = self.order.iter().position(|k| *k != key) else { break };
+            if let Some(old) = self.order.remove(at).and_then(|k| self.map.remove(&k)) {
+                self.bytes = self.bytes.saturating_sub(text_bytes(&old));
             }
         }
     }
@@ -192,7 +206,20 @@ impl FactsCache {
     pub fn clear(&mut self) {
         self.map.clear();
         self.order.clear();
+        self.bytes = 0;
     }
+
+    /// About how many bytes the text kept takes.
+    #[cfg(test)]
+    pub fn text_bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+/// About how much memory the start of a text file kept in `facts` takes: its characters, and a
+/// line's own bookkeeping (a String and its heap block) for each line.
+fn text_bytes(facts: &Facts) -> usize {
+    facts.text.as_ref().map_or(0, |t| t.lines.iter().map(|l| l.capacity() + 40).sum())
 }
 
 /// One panel's way to the thread (see the top of this file).
@@ -421,6 +448,12 @@ pub fn size_and_length_of(path: &str, picture: bool, wic: Option<&windows::Win32
         dims = wic.and_then(|w| thumbs::picture_size(w, path));
     }
     (dims, length)
+}
+
+/// A photo's EXIF orientation (1-8) as Windows' property handlers know it; 0 when they don't.
+pub fn photo_orientation(path: &str) -> u32 {
+    // SAFETY: a plain property read on a live item; the key is a constant.
+    shell_item(path).and_then(|item| unsafe { item.GetUInt32(&PHOTO_ORIENTATION) }.ok()).filter(|o| (1..=8).contains(o)).unwrap_or(0)
 }
 
 /// What Windows' property handlers know: picture and video size, length, a photo's orientation.

@@ -136,21 +136,35 @@ impl History {
         self.undo.last()
     }
 
-    /// A folder was renamed or moved (by Glint or elsewhere): steps about items inside it follow it,
-    /// so Ctrl+Z still finds them.
+    /// A folder (or file) was renamed or moved (by Glint or elsewhere): steps about it and the items
+    /// inside it follow it, so Ctrl+Z still finds them.
+    ///
+    /// Only paths of items that are there now follow: what a copy made (or what came back from the
+    /// Recycle Bin) and where moved items are now. A place an item was moved away from follows only
+    /// when a folder above it moves: what has that very name now is something else. What is in the
+    /// Recycle Bin never follows: the bin knows it by the path it was deleted from, and what has
+    /// that name now is something else too (Del on "report.docx", then "report (2).docx" renamed to
+    /// "report.docx" and back: Ctrl+Z still brings the deleted one back).
     pub fn folder_moved(&mut self, from: &str, to: &str) {
-        let fix = |p: &mut String| {
+        // (`own`: the item is there, so the path that is exactly `from` is the item itself.)
+        let fix = |p: &mut String, own: bool| {
             if let Some(m) = crate::app::moved_path(p, from, to) {
-                *p = m;
+                if own || !crate::fileops::same_path(p, from) {
+                    *p = m;
+                }
             }
         };
-        for s in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+        let undo = self.undo.iter_mut().map(|s| (s, false));
+        for (s, undone) in undo.chain(self.redo.iter_mut().map(|s| (s, true))) {
             match s {
-                Step::Renamed { dir, .. } => fix(dir),
-                Step::Made { paths, .. } | Step::Recycled { paths } => paths.iter_mut().for_each(fix),
+                Step::Renamed { dir, .. } => fix(dir, true),
+                // Made and not undone, or deleted and brought back: there.
+                Step::Made { paths, .. } if !undone => paths.iter_mut().for_each(|p| fix(p, true)),
+                Step::Recycled { paths } if undone => paths.iter_mut().for_each(|p| fix(p, true)),
+                Step::Made { .. } | Step::Recycled { .. } => {} // in the Recycle Bin
                 Step::Moved { pairs } => pairs.iter_mut().for_each(|(a, b)| {
-                    fix(a);
-                    fix(b);
+                    fix(a, undone);
+                    fix(b, !undone);
                 }),
             }
         }
@@ -267,6 +281,68 @@ mod tests {
         // Both ends of a move, in any capitals; the item that came from elsewhere keeps that.
         let moved = vec![("C:\\x\\a.txt".to_string(), "E:\\new\\in\\a.txt".to_string()), ("C:\\x2\\b.txt".to_string(), "E:\\new\\b.txt".to_string())];
         assert_eq!(h.take_undo(), Some(Step::Moved { pairs: moved }));
+    }
+
+    /// Del on report.docx, then "report (2).docx" renamed to "report.docx", Ctrl+Z (the rename back
+    /// follows the item: app/files.rs) and Ctrl+Z again: that still brings back the deleted one. And
+    /// Ctrl+Y, Ctrl+Y and Ctrl+Z, Ctrl+Z again, back and forth.
+    #[test]
+    fn a_rename_back_doesnt_move_what_is_in_the_recycle_bin() {
+        let mut h = History::default();
+        let deleted = Step::Recycled { paths: vec!["C:\\x\\report.docx".into(), "C:\\x\\report.docx\\in.txt".into()] };
+        let rename = Step::Renamed { dir: "C:\\x".into(), from: "report (2).docx".into(), to: "report.docx".into() };
+        h.done(deleted.clone());
+        h.done(rename.clone());
+        for _ in 0..2 {
+            // Ctrl+Z of the rename.
+            let s = h.take_undo().unwrap();
+            h.folder_moved("C:\\x\\report.docx", "C:\\x\\report (2).docx");
+            h.undone(s);
+            assert_eq!(h.next_undo(), Some(&deleted), "the deleted one, at the path the bin knows");
+            // Ctrl+Z of the delete, then Ctrl+Y of it and of the rename.
+            let s = h.take_undo().unwrap();
+            assert_eq!(s, deleted);
+            h.undone(s);
+            let s = h.take_redo().unwrap();
+            assert_eq!(s, deleted);
+            h.redone(s);
+            let s = h.take_redo().unwrap();
+            h.folder_moved("C:\\x\\report (2).docx", "C:\\x\\report.docx");
+            h.redone(s);
+            assert_eq!(h.undo, vec![deleted.clone(), rename.clone()]);
+        }
+        // Brought back from the bin, it's there: a rename of it then does follow (Ctrl+Y finds it).
+        let s = h.take_undo().unwrap();
+        h.folder_moved("C:\\x\\report.docx", "C:\\x\\report (2).docx");
+        h.undone(s);
+        let s = h.take_undo().unwrap();
+        h.undone(s);
+        h.folder_moved("C:\\X\\Report.docx", "C:\\x\\kept.docx");
+        assert_eq!(h.take_redo(), Some(Step::Recycled { paths: vec!["C:\\x\\kept.docx".into(), "C:\\x\\kept.docx\\in.txt".into()] }));
+    }
+
+    /// Exactly the path an item was moved away from (or what a copy made and Ctrl+Z sent to the bin)
+    /// is something else now: it doesn't follow. A folder above it does.
+    #[test]
+    fn only_items_that_are_there_follow_by_their_own_path() {
+        let mut h = History::default();
+        h.done(Step::Moved { pairs: vec![("C:\\a\\x.txt".into(), "D:\\b\\x.txt".into())] });
+        h.done(Step::Made { paths: vec!["C:\\a\\copy.txt".into()], what: "copy" });
+        let s = h.take_undo().unwrap();
+        h.undone(s); // the copy is in the bin now
+        h.folder_moved("C:\\a\\x.txt", "C:\\a\\y.txt");
+        h.folder_moved("D:\\b\\x.txt", "D:\\b\\z.txt");
+        h.folder_moved("C:\\a\\copy.txt", "C:\\a\\other.txt");
+        assert_eq!(h.take_redo(), Some(Step::Made { paths: vec!["C:\\a\\copy.txt".into()], what: "copy" }));
+        assert_eq!(h.next_undo(), Some(&Step::Moved { pairs: vec![("C:\\a\\x.txt".into(), "D:\\b\\z.txt".into())] }));
+        h.folder_moved("C:\\a", "C:\\a2");
+        assert_eq!(h.next_undo(), Some(&Step::Moved { pairs: vec![("C:\\a2\\x.txt".into(), "D:\\b\\z.txt".into())] }), "the folder it came from was renamed");
+        // Undone: now it's back where it came from, and that end follows.
+        let s = h.take_undo().unwrap();
+        h.undone(s);
+        h.folder_moved("C:\\a2\\x.txt", "C:\\a2\\w.txt");
+        h.folder_moved("D:\\b\\z.txt", "D:\\b\\v.txt");
+        assert_eq!(h.take_redo(), Some(Step::Moved { pairs: vec![("C:\\a2\\w.txt".into(), "D:\\b\\z.txt".into())] }));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use crate::copyqueue;
 use crate::render::{Align, Renderer, TextStyle};
-use crate::theme::{Color, Theme};
+use crate::theme::Theme;
 use crate::ui::{Point, Rect};
 
 const WIDTH: f32 = 380.0;
@@ -50,10 +50,8 @@ impl QueueBox {
         let x = area.right() - w - MARGIN;
         let y = (area.bottom() - h - MARGIN).max(area.y);
         self.panel = Rect::new(x, y, w, h);
-        r.fill_round_rect(Rect::new(x - 1.0, y + 2.0, w + 2.0, h + 3.0), 6.0, Color::rgba(0, 0, 0, 0.25));
         r.fill_round_rect(self.panel, 5.0, theme.toolbar);
         r.stroke_round_rect(self.panel.inset(0.5, 0.5), 4.5, 1.0, theme.line);
-        r.fill_rect(Rect::new(x + 1.0, y, w - 2.0, 2.0), theme.accent);
 
         let label_style = TextStyle::new(theme.text_strong).semibold();
         let detail_style = TextStyle::new(theme.muted);

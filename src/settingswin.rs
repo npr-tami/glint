@@ -1,6 +1,6 @@
 //! The Settings window (Ctrl+, or the SETTINGS button): a window of its own, owned by the main
 //! window and drawn by Glint like everything else. The pages are listed on the left (General,
-//! Appearance, Files and folders, Mouse and keyboard, About), with cards of settings on the right:
+//! Appearance, Files, Mouse & keys, About), with cards of settings on the right:
 //! each row has a short title (a note under it only where needed) and its control. A change applies
 //! at once and is saved like any other choice. Settings that aren't in this version yet are shown
 //! greyed, with "Coming later", so the pages already look the way they will.
@@ -65,6 +65,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::app::AppState;
+use crate::registry;
 use crate::frame;
 use crate::winutil::{hi_word, lo_word, place_visible, visible_rect};
 use crate::kit::{self, size as ksize, Look, Scroller};
@@ -76,11 +77,11 @@ use crate::settings::{self, Settings, SettingsOpens, Terminal};
 use crate::shell;
 use crate::textbox::{self, TextBox, TextEvent, TextEventKind, WM_APP_TEXT};
 use crate::theme::{size, Color, Theme};
-use crate::ui::{Command, Menu, MenuItem, Point, Rect};
+use crate::ui::{Command, Menu, MenuItem, MenuPicture, Point, Rect};
 
 mod pages;
-pub use pages::ABOUT;
-use pages::{Act, Ctl, Facts, Item, Row, PAGES};
+pub use pages::{findable, ABOUT, PAGES};
+use pages::{Act, Ctl, Facts, Item, Row};
 
 /// The window's title (what Alt+Tab and the taskbar's thumbnails would call it).
 pub const TITLE: &str = "Glint settings";
@@ -197,6 +198,8 @@ pub enum Ask {
 #[derive(Debug)]
 enum Bg {
     Terminals([bool; 6]),
+    /// What the Zip icon row says (registry::zip_icon_said).
+    ZipSaid(String),
     CacheSize(u64),
     /// CLEAR is done: the bytes left (files in use).
     Cleared(u64),
@@ -325,6 +328,10 @@ pub struct SettingsWindow {
     /// The drop-down whose list is open: its setting and the values of its choices.
     menu_for: Option<(&'static str, Vec<pages::Val>)>,
     terminals: Option<[bool; 6]>,
+    /// What the Zip icon row says, once looked up.
+    zip_said: Option<String>,
+    /// The row to put the keyboard on once the page is laid out (found with the command box).
+    point_at: Option<String>,
     cache_size: Option<u64>,
     /// What clearing the cache said last; CLEAR was pressed once at this time and waits for a
     /// second press; the cache is being emptied.
@@ -532,6 +539,8 @@ pub fn create(owner: HWND, theme: &Theme, remembered: Option<[f32; 2]>, bounds: 
             box_text: String::new(),
             menu_for: None,
             terminals: None,
+            zip_said: None,
+            point_at: None,
             cache_size: None,
             cache_said: None,
             clear_asked_at: None,
@@ -973,6 +982,14 @@ impl SettingsWindow {
     }
 
     /// Opened again (Ctrl+, or SETTINGS while it's open), maybe for a particular page.
+    /// Puts the keyboard on the row titled `title` (on the page shown), in view - once the page is
+    /// laid out.
+    pub fn point_at(&mut self, title: &str) {
+        self.point_at = Some(title.to_string());
+        self.layout_dirty = true;
+        self.invalidate();
+    }
+
     pub fn reopen(&mut self, page: Option<usize>) -> Vec<Ask> {
         if let Some(p) = page {
             self.go_to_page(p, false);
@@ -991,7 +1008,17 @@ impl SettingsWindow {
             }
             post(to, Bg::Terminals(found));
         });
+        self.look_up_zip();
         self.measure_cache();
+    }
+
+    /// Whether zip and 7z files open in Glint (the Zip icon row says so).
+    fn look_up_zip(&self) {
+        let to = self.poster();
+        shell::background("settings: zip files", move || {
+            let said = registry::this_exe().map(|exe| registry::zip_icon_said(&registry::Places::current(), &exe)).unwrap_or_default();
+            post(to, Bg::ZipSaid(said));
+        });
     }
 
     fn measure_cache(&self) {
@@ -1053,6 +1080,7 @@ impl SettingsWindow {
         let facts = Facts {
             values: &self.values,
             terminals: self.terminals,
+            zip_said: self.zip_said.as_deref(),
             config: settings::config_now().display().to_string(),
             logs: settings::folders().logs.display().to_string(),
             cache: settings::folders().cache.display().to_string(),
@@ -1107,6 +1135,20 @@ impl SettingsWindow {
         if let Spot::Ctl(i, part) = self.focus {
             if !self.rows.get(i).is_some_and(|p| p.enabled && p.rect_of(part).is_some()) {
                 self.focus = Spot::Nav;
+            }
+        }
+        // A setting found with the command box: the keyboard goes to it, and it scrolls into view.
+        if content.h > 0.0 {
+            if let Some(title) = self.point_at.take() {
+                if let Some(i) = self.rows.iter().position(|p| p.row.title.trim() == title) {
+                    let p = &self.rows[i];
+                    let part = if p.row.ctl == Ctl::Folder || p.rect_of(Part::Main).is_none() { Part::Second } else { Part::Main };
+                    if p.enabled && p.rect_of(part).is_some() {
+                        self.set_focus(Spot::Ctl(i, part));
+                    } else {
+                        self.scroller.reveal(p.rect.y, p.rect.bottom(), 16.0, self.now());
+                    }
+                }
             }
         }
     }
@@ -1704,7 +1746,19 @@ impl SettingsWindow {
             (Ctl::Choice(k, choices), _) => {
                 let Some(at) = anchor else { return Vec::new() };
                 let current = self.values.get(k).cloned();
-                let items = choices.iter().enumerate().map(|(n, (v, label))| MenuItem::new(n as u32 + 1, label).checked(Some(v.json()) == current)).collect();
+                let mut items: Vec<MenuItem> = choices.iter().enumerate().map(|(n, (v, label))| MenuItem::new(n as u32 + 1, label).checked(Some(v.json()) == current)).collect();
+                for (item, (v, _)) in items.iter_mut().zip(&choices) {
+                    if let Some(picture) = choice_picture(k, *v, &app.theme) {
+                        *item = std::mem::take(item).picture(picture);
+                    }
+                }
+                if k == "Skin" {
+                    // The skin in use stands out: ticked and in bold.
+                    for item in &mut items {
+                        item.bold = item.checked;
+                    }
+                    items = skin_groups(&choices, items);
+                }
                 self.menu_for = Some((k, choices.iter().map(|(v, _)| *v).collect()));
                 let b = self.border();
                 vec![Ask::Job(Job::Menu(Menu { tag: 1, at: Point::new(at.x + b, at.bottom() + 2.0 + b), items, right_aligned: false }))]
@@ -1812,6 +1866,7 @@ impl SettingsWindow {
         for bg in results {
             match bg {
                 Bg::Terminals(found) => self.terminals = Some(found),
+                Bg::ZipSaid(said) => self.zip_said = Some(said),
                 // (A size measured before CLEAR was pressed is out of date while clearing.)
                 Bg::CacheSize(bytes) => {
                     if !self.clearing {
@@ -1884,7 +1939,19 @@ impl SettingsWindow {
             JobDone::Picked(id) => {
                 let Some((key, values)) = self.menu_for.take() else { return Vec::new() };
                 let Some(v) = id.checked_sub(1).and_then(|n| values.get(n as usize)) else { return Vec::new() };
-                let asks = self.set_value(app, key, v.json());
+                let mut asks = self.set_value(app, key, v.json());
+                // Skin: the list opens again, so skin after skin can be tried (Esc or a click
+                // elsewhere closes it).
+                if key == "Skin" {
+                    // In the new skin's sizes already, or the list opens where the old skin's
+                    // rows were and jumps the next time (the window gets the skin a moment later).
+                    self.apply_theme(&app.theme);
+                    self.layout();
+                    if let Some(i) = self.rows.iter().position(|p| matches!(p.row.ctl, Ctl::Choice("Skin", _))) {
+                        asks.extend(self.activate(i, Part::Main, app));
+                    }
+                    return asks;
+                }
                 // "A specific folder" with no folder yet: the keyboard goes to the folder box.
                 if key == "Startup" && *v == pages::Val::S("folder") && app.settings.startup_folder.is_none() {
                     self.layout();
@@ -2012,6 +2079,10 @@ impl SettingsWindow {
             WM_ACTIVATE => {
                 self.active = lo_word(wparam.0) != WA_INACTIVE;
                 self.invalidate();
+                // Back from Windows' "Open with": the Zip icon row says what's true now.
+                if self.active {
+                    self.look_up_zip();
+                }
                 if !self.active {
                     self.box_had_focus = self.folder_box.has_focus();
                     None
@@ -2144,6 +2215,41 @@ fn place_row(r: &mut Renderer, row: Row, x0: f32, y: f32, card_w: f32, enabled: 
     placed
 }
 
+/// The little picture beside a choice in a drop-down: the Logo list shows each logo, the Zip icon
+/// list each icon (glint.exe's own, by their numbers in res/glint.rc).
+fn choice_picture(key: &str, value: pages::Val, theme: &crate::theme::Theme) -> Option<MenuPicture> {
+    let pages::Val::S(v) = value else { return None };
+    match (key, v) {
+        ("Logo", "box") => Some(MenuPicture::Box(theme.logo_paint.base())),
+        ("Logo", "chrome") => Some(MenuPicture::Wordmark { caps: false, dark: theme.dark }),
+        ("Logo", "caps") => Some(MenuPicture::Wordmark { caps: true, dark: theme.dark }),
+        ("ZipIcon", "label") => Some(MenuPicture::Icon(2)),
+        ("ZipIcon", "folder") => Some(MenuPicture::Icon(4)),
+        ("ZipIcon", "page") => Some(MenuPicture::Icon(5)),
+        ("ZipIcon", "glint") => Some(MenuPicture::Icon(1)),
+        _ => None,
+    }
+}
+
+/// The skin list in two groups under greyed headings: Glint's own skins under "Default", the
+/// person's skin files under "Your skins" (a heading only shows when its group has skins).
+fn skin_groups(choices: &[(pages::Val, String)], items: Vec<MenuItem>) -> Vec<MenuItem> {
+    let theirs = |v: &pages::Val| matches!(v, pages::Val::S(id) if id.starts_with(crate::skin::FILE_PREFIX));
+    let (mine, yours): (Vec<_>, Vec<_>) = choices.iter().zip(items).partition(|((v, _), _)| !theirs(v));
+    let mut out = Vec::new();
+    for (title, group) in [("Default", mine), ("Your skins", yours)] {
+        if group.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(MenuItem::separator());
+        }
+        out.push(MenuItem::new(0, title).disabled(true));
+        out.extend(group.into_iter().map(|(_, item)| item));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2176,11 +2282,44 @@ mod tests {
     }
 
     #[test]
+    fn logo_and_zip_icon_choices_have_their_pictures() {
+        use pages::Val::{B, S};
+        let theme = crate::theme::Theme::dark();
+        for v in ["box", "chrome", "caps"] {
+            assert!(choice_picture("Logo", S(v), &theme).is_some(), "{v}");
+        }
+        assert_eq!(choice_picture("Logo", S("none"), &theme), None);
+        assert_eq!(choice_picture("ZipIcon", S("label"), &theme), Some(MenuPicture::Icon(2)));
+        assert_eq!(choice_picture("ZipIcon", S("glint"), &theme), Some(MenuPicture::Icon(1)));
+        assert_eq!(choice_picture("Skin", S("nvidia"), &theme), None);
+        assert_eq!(choice_picture("ZipIcon", B(true), &theme), None);
+    }
+
+    #[test]
+    fn skins_are_grouped_under_default_and_your_skins() {
+        use pages::Val::S;
+        let choices = vec![(S("nvidia"), "NVIDIA".to_string()), (S("file:Pink"), "Pink".to_string()), (S("amd"), "AMD Radeon".to_string()), (S("file:Blue"), "Blue".to_string())];
+        let items: Vec<MenuItem> = choices.iter().enumerate().map(|(n, (_, l))| MenuItem::new(n as u32 + 1, l).checked(n == 1)).collect();
+        let out = skin_groups(&choices, items);
+        let labels: Vec<&str> = out.iter().map(|m| m.label.as_str()).collect();
+        assert_eq!(labels, ["Default", "NVIDIA", "AMD Radeon", "", "Your skins", "Pink", "Blue"]);
+        // Headings can't be picked; each skin keeps its own number (the pick finds its choice).
+        assert!(out[0].disabled && out[4].disabled);
+        assert_eq!(out.iter().filter(|m| !m.label.is_empty() && !m.disabled).map(|m| m.id).collect::<Vec<_>>(), [1, 3, 2, 4]);
+        assert!(out[5].checked);
+        // Only Glint's own skins: no "Your skins" heading, no line.
+        let only = vec![(S("nvidia"), "NVIDIA".to_string())];
+        let out = skin_groups(&only, vec![MenuItem::new(1, "NVIDIA")]);
+        assert_eq!(out.iter().map(|m| m.label.as_str()).collect::<Vec<_>>(), ["Default", "NVIDIA"]);
+    }
+
+    #[test]
     fn rows_need_their_switch() {
         let mut values = values_of(&Settings::default());
         let facts = Facts {
             values: &values,
             terminals: None,
+            zip_said: None,
             config: String::new(),
             logs: String::new(),
             cache: String::new(),

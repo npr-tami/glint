@@ -35,18 +35,18 @@ use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT,
+    GetFocus, GetKeyState, GetKeyboardLayout, VkKeyScanExW, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT,
     VK_BACK, VK_OEM_5, VK_CONTROL, VK_F3, VK_F4, VK_F5, VK_F6, VK_LEFT, VK_MENU, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, GetClientRect, GetCursorPos,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos,
     GetWindowLongPtrW, IsChild, IsWindow, IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, LoadIconW, PostQuitMessage,
     RegisterClassExW, SetCursor, SetWindowLongPtrW, SC_KEYMENU, WM_SYSCHAR, WM_SYSCOMMAND,
-    SetTimer, SetWindowPos, ShowWindow, SystemParametersInfoW, TrackPopupMenu, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+    SetTimer, SetWindowPos, ShowWindow, SystemParametersInfoW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
     GWLP_USERDATA, HTCAPTION, HTCLIENT, HTCLOSE, HTMAXBUTTON, HTMINBUTTON, IDC_ARROW, IDC_HAND, IDC_IBEAM, IDC_SIZEWE,
-    MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MINMAXINFO, SHOW_WINDOW_CMD, SIZE_MINIMIZED, SPI_GETWORKAREA, SWP_FRAMECHANGED,
+    MINMAXINFO, SHOW_WINDOW_CMD, SIZE_MINIMIZED, SPI_GETWORKAREA, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WA_INACTIVE,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WA_INACTIVE,
     WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY,
     WM_DEVICECHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
@@ -55,7 +55,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_XBUTTONUP, WNDCLASSEXW, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW,
 };
 // Remembering the window (settings.rs) and submenus.
-use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic, HMENU, MF_POPUP, SIZE_MAXIMIZED, WM_ENDSESSION, WM_MOVE, WM_SETTINGCHANGE};
+use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic, SIZE_MAXIMIZED, WM_ENDSESSION, WM_MOVE, WM_SETTINGCHANGE};
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowPlacement, DBT_DEVICEQUERYREMOVE, WINDOWPLACEMENT};
 
 use windows::Win32::System::DataExchange::{AddClipboardFormatListener, RemoveClipboardFormatListener};
@@ -85,7 +85,7 @@ use windows::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, SC_CLOSE, SW_
 use crate::theme::size;
 use crate::titlebar::TitleBar;
 use crate::toolbar::Toolbar;
-use crate::ui::{Command, Component, Ctx, CursorKind, Effect, Hit, Menu, MenuItem, Mods, MouseButton, MouseEvent, Point, Rect};
+use crate::ui::{Command, Component, Ctx, CursorKind, Effect, Hit, Menu, Mods, MouseButton, MouseEvent, Point, Rect};
 // Drag and drop (dragdrop.rs, and the window's side in window/drag.rs).
 use crate::dragdrop::{self, WM_APP_DRAG, WM_APP_DROP_DONE};
 use crate::ui::DragOut;
@@ -198,6 +198,8 @@ enum Deferred {
     Front,
     /// Make the Settings window (or bring it to the front), at this page.
     OpenSettings(Option<usize>),
+    /// Settings at this page, with the keyboard on the row with this title.
+    OpenSetting(usize, String),
     /// Something the Settings window asked for that runs its own message loop or moves it
     /// (settingswin::run_job).
     Settings(settingswin::Job),
@@ -571,6 +573,30 @@ fn mods() -> Mods {
     }
 }
 
+/// Whether `vk` (with `shift`, Ctrl held and Alt not) is Ctrl+\: the \ key of US and UK keyboards
+/// (VK_OEM_5), or the key that types "\" on the keyboard layout in use.
+fn is_ctrl_backslash(vk: u16, shift: bool) -> bool {
+    // SAFETY: plain keyboard-layout queries.
+    let typed_by = unsafe { VkKeyScanExW('\\' as u16, GetKeyboardLayout(0)) };
+    (vk == VK_OEM_5.0 && !shift) || backslash_key(typed_by) == Some((vk, shift))
+}
+
+/// The key (and Shift or not) for Ctrl+\ from what VkKeyScanExW says types "\": that key, also when
+/// it takes AltGr ("\" is AltGr+\u{df} on German keyboards, so Ctrl+\u{df} there), since Ctrl+AltGr
+/// would come as Ctrl+Alt. None when no key types it, or it's a letter or a digit (AltGr+8 on French
+/// ones): Ctrl and those are other shortcuts already.
+fn backslash_key(typed_by: i16) -> Option<(u16, bool)> {
+    if typed_by == -1 {
+        return None;
+    }
+    let (vk, shifts) = ((typed_by as u16) & 0xFF, (typed_by as u16) >> 8);
+    // The shift state's bits: 1 Shift, 2 Ctrl, 4 Alt (AltGr is Ctrl and Alt); others are the layout's own.
+    if shifts & !7 != 0 || (b'0' as u16..=b'9' as u16).contains(&vk) || (b'A' as u16..=b'Z' as u16).contains(&vk) {
+        return None;
+    }
+    Some((vk, shifts & 1 != 0))
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // While a menu with Windows' items is open, the messages those items need go to their maker
     // (popup.rs). They come from inside the menu's own loop, so no state is touched here.
@@ -724,6 +750,19 @@ fn run_deferred(hwnd: HWND, ptr: *mut Window) {
                 },
                 Deferred::Front => bring_to_front(hwnd, ptr),
                 Deferred::OpenSettings(page) => open_settings(hwnd, ptr, page),
+                Deferred::OpenSetting(page, title) => {
+                    open_settings(hwnd, ptr, Some(page));
+                    if still_alive(hwnd, ptr) {
+                        BUSY.with(|b| b.set(true));
+                        // SAFETY: BUSY guards the only live reference.
+                        unsafe {
+                            if let Some(s) = (*ptr).settings_win.as_mut() {
+                                s.point_at(&title);
+                            }
+                        }
+                        BUSY.with(|b| b.set(false));
+                    }
+                }
                 Deferred::Settings(job) => {
                     // SAFETY: as above, a short borrow to read where the Settings window is.
                     let Some((swin, scale)) = (unsafe { (*ptr).settings_win.as_ref().map(|s| (s.hwnd(), s.scale())) }) else { continue };
@@ -974,53 +1013,19 @@ pub fn settings_message(owner: HWND, hwnd: HWND, msg: u32, wparam: WPARAM, lpara
     handled
 }
 
-/// Builds a native popup menu (and its submenus) from our items. None if Windows can't make one.
-fn build_menu(items: &[MenuItem]) -> Option<HMENU> {
-    // SAFETY: the menus are fresh; label buffers outlive AppendMenuW (which copies the text). A
-    // submenu appended with MF_POPUP belongs to its parent and is destroyed with it.
-    unsafe {
-        let h = CreatePopupMenu().ok()?;
-        for item in items {
-            if item.label.is_empty() {
-                let _ = AppendMenuW(h, MF_SEPARATOR, 0, PCWSTR::null());
-                continue;
-            }
-            let label: Vec<u16> = item.label.encode_utf16().chain(std::iter::once(0)).collect();
-            let mut flags = MF_STRING;
-            if item.checked {
-                flags |= MF_CHECKED;
-            }
-            if item.disabled {
-                flags |= MF_GRAYED;
-            }
-            let mut id = item.id as usize;
-            if !item.submenu.is_empty() {
-                match build_menu(&item.submenu) {
-                    Some(sub) => {
-                        flags |= MF_POPUP;
-                        id = sub.0 as usize;
-                    }
-                    None => continue,
-                }
-            }
-            let _ = AppendMenuW(h, flags, id, PCWSTR(label.as_ptr()));
-        }
-        Some(h)
-    }
-}
-
-/// Shows a native popup menu and returns the picked item's id (0 = none).
+/// Shows a native popup menu (popup.rs: with its items' dots and pictures, and its bold item) and
+/// returns the picked item's id (0 = none).
 fn show_menu(hwnd: HWND, menu: &Menu, scale: f32) -> u32 {
-    // SAFETY: the menu is created, shown (modal) and destroyed here.
+    let mut pt = POINT { x: (menu.at.x * scale).round() as i32, y: (menu.at.y * scale).round() as i32 };
+    // SAFETY: converts in place for our own window.
     unsafe {
-        let Some(h) = build_menu(&menu.items) else { return 0 };
-        crate::oldmenu::dress(h, &[]);
-        let mut pt = POINT { x: (menu.at.x * scale).round() as i32, y: (menu.at.y * scale).round() as i32 };
         let _ = ClientToScreen(hwnd, &mut pt);
-        let side = if menu.right_aligned { TPM_RIGHTALIGN } else { TPM_LEFTALIGN };
-        let picked = TrackPopupMenu(h, TPM_RETURNCMD | TPM_RIGHTBUTTON | side | TPM_TOPALIGN, pt.x, pt.y, None, hwnd, None);
-        let _ = DestroyMenu(h);
-        picked.0.max(0) as u32
+    }
+    let bold = menu.items.iter().find(|i| i.bold && i.submenu.is_empty() && !i.label.is_empty()).map_or(0, |i| i.id);
+    // (No Windows items here, so every id is one of the menu's own.)
+    match popup::show(hwnd, pt, menu, bold, None, false) {
+        Pick::Glint(id) | Pick::Windows(id) => id,
+        Pick::None => 0,
     }
 }
 
@@ -1288,6 +1293,8 @@ impl Window {
             frame::apply_theme(self.hwnd, theme);
             let _ = RedrawWindow(Some(self.hwnd), None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
         }
+        // Windows' suggestions under the path box, in the boxes' colours.
+        textbox::set_suggestion_colors(theme.dark, bg, fg);
         if let Some(s) = self.settings_win.as_mut() {
             s.apply_theme(&self.app.theme);
         }
@@ -1533,6 +1540,7 @@ impl Window {
                 self.apply(Part::List, e);
             }
             Command::OpenSettings(page) => self.deferred.push(Deferred::OpenSettings(page)),
+            Command::OpenSetting(page, title) => self.deferred.push(Deferred::OpenSetting(page, title)),
             Command::OpenSkinEditor => self.deferred.push(Deferred::OpenSkins),
             Command::CloseSettings => {
                 if self.settings_win.is_some() {
@@ -1958,11 +1966,14 @@ impl Window {
 
     fn paint(&mut self) {
         let frame_start = Instant::now();
+        // The first frame takes much longer than the others: where its time goes, for the timing log.
+        let mut marks = log::Marks::new(self.first_frame && log::timing_on());
         let ctx = self.ctx();
         // Take in finished folder reads first, so a frame never shows stale data needlessly.
         if self.app.receive() {
             self.drag_listing_changed(); // rows may have moved under something being dragged
         }
+        marks.mark("receive");
         self.sync_theme();
         self.app.settings_tab = self.settings_win.is_some() && self.app.settings.settings_opens == settings::SettingsOpens::Tab;
         self.app.icons.begin_frame();
@@ -1977,7 +1988,9 @@ impl Window {
         if self.palette.is_open() && (self.app.question.is_some() || self.app.form.is_some()) {
             self.palette.close(self.hwnd);
         }
+        marks.mark("theme and ticks");
         let shown = self.renderer.begin() && {
+            marks.mark("begin (render target)");
             let Window { renderer, app, titlebar, toolbar, sidebar, list, list2, split_strips, split_area, status, side, ask, form, queue, palette, hwnd, size: client, maximized, .. } = self;
             // (7's panes are parted by thin pale lines: all that shows of the window there.)
             let seven = app.theme.era == crate::theme::Era::Win7;
@@ -1986,13 +1999,18 @@ impl Window {
                 // A shaded background (in the gaps between the panels).
                 renderer.fill_paint(Rect::new(0.0, 0.0, client.0, client.1), 0.0, &app.theme.window_paint);
             }
+            marks.mark("clear");
             titlebar.paint(renderer, &app.theme, app, &ctx);
+            marks.mark("title bar");
             toolbar.paint(renderer, &app.theme, app, &ctx);
             titlebar.join_toolbar(renderer, &app.theme, app);
+            marks.mark("toolbar");
             if app.settings.show_sidebar {
                 sidebar.paint(renderer, &app.theme, app, &ctx);
             }
+            marks.mark("sidebar");
             list.paint(renderer, &app.theme, app, &ctx);
+            marks.mark("list");
             if let Some(other) = app.split_index() {
                 // Split view: the other half shows its own tab; a line in the skin's colour across
                 // the top of the half Glint works in.
@@ -2039,7 +2057,10 @@ impl Window {
             if b > 0.0 {
                 frame::paint_classic_border(renderer, &app.theme, Rect::new(0.0, 0.0, client.0, client.1));
             }
-            renderer.end() == FrameResult::Shown
+            marks.mark("the rest");
+            let shown = renderer.end() == FrameResult::Shown;
+            marks.mark("end (EndDraw, present)");
+            shown
         };
         if shown {
             self.failed_frames = 0;
@@ -2097,6 +2118,8 @@ impl Window {
                 if shown { "yes" } else { "not yet" },
                 crate::status::memory_report()
             ));
+            log::line(&format!("first frame, ms per step: {}; graphics warm-up: {}", marks.summary(), crate::render::warm_up_report()));
+            crate::render::warm_up_done();
             self.invalidate(); // once more, so the status bar shows the start-up time
         }
         if self.bench && self.app.tab().loading.is_none() && self.app.startup_ms.is_some() {
@@ -2449,7 +2472,7 @@ impl Window {
             Some(Command::SwitchTab((vk as u8 - b'1') as usize))
         } else if (ctrl && letter('L')) || (m.alt && !m.ctrl && letter('D')) || key(VK_F4) && !m.alt {
             Some(Command::EditPath)
-        } else if ctrl && !m.shift && key(VK_OEM_5) {
+        } else if ctrl && is_ctrl_backslash(vk, m.shift) {
             Some(Command::ToggleSplit)
         } else if key(VK_F6) && !m.ctrl && !m.alt && self.app.split.is_some() {
             Some(Command::OtherPane)
@@ -3123,6 +3146,26 @@ mod tests {
     use super::*;
 
     const WORK: RECT = RECT { left: 0, top: 0, right: 1920, bottom: 1040 };
+
+    #[test]
+    fn ctrl_backslash_on_any_keyboard() {
+        // US and UK: the \\ key itself.
+        assert_eq!(backslash_key(0x00DC), Some((0xDC, false)));
+        // German (AltGr+\u{df}): Ctrl+\u{df}, without the AltGr; Swiss (AltGr+<): Ctrl+<.
+        assert_eq!(backslash_key(0x06DB), Some((0xDB, false)));
+        assert_eq!(backslash_key(0x06E2), Some((0xE2, false)));
+        // Shifted: Ctrl+Shift and that key.
+        assert_eq!(backslash_key(0x01BF), Some((0xBF, true)));
+        // French (AltGr+8) and a layout's own shift states: Ctrl+8 stays the eighth tab.
+        assert_eq!(backslash_key(0x0638), None);
+        assert_eq!(backslash_key(0x0651), None);
+        assert_eq!(backslash_key(0x08DC), None);
+        assert_eq!(backslash_key(-1), None);
+        // The \\ key of US and UK keyboards always works, whatever the layout.
+        assert!(is_ctrl_backslash(VK_OEM_5.0, false));
+        assert!(!is_ctrl_backslash(b'S' as u16, true));
+        assert!(!is_ctrl_backslash(b'8' as u16, false));
+    }
 
     #[test]
     fn a_saved_place_that_fits_stays() {

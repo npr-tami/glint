@@ -48,7 +48,7 @@ use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_A, VK_BACK, VK_C, VK_CONTROL, VK_DELETE, VK_DIVIDE, VK_DOWN,
-    VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_MENU, VK_NEXT, VK_OEM_2, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP, VK_V, VK_X, VK_Y, VK_Z,
+    VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_MENU, VK_NEXT, VK_OEM_2, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VK_V, VK_X, VK_Y, VK_Z,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindow, GetWindowLongPtrW, GetWindowRect, IsIconic, KillTimer,
@@ -137,6 +137,7 @@ const EDIT_ALL: u32 = 106;
 const EDIT_NOTE: u32 = 107;
 const EDIT_UP: u32 = 108;
 const EDIT_DOWN: u32 = 109;
+const EDIT_SUGGEST: u32 = 110;
 /// Typing that goes on within this long (seconds) is taken back by one Ctrl+Z.
 const GROUP_SECS: f64 = 2.0;
 
@@ -308,6 +309,9 @@ pub struct SortWindow {
     pick: usize,
     /// Esc closed the list: it stays closed until the next change.
     list_closed: bool,
+    /// Ctrl+Space opened the list: it shows what fits even where nothing's typed, until the next
+    /// change (or the list closes).
+    asked: bool,
     places: Vec<Place>,
     lister: Lister,
     /// The text last used (in the tabs and settings.json).
@@ -327,6 +331,37 @@ pub struct SortWindow {
     suggestion_rects: Vec<Rect>,
     flips: kit::Flips,
 }
+
+/// The guide: an example first (lines starting with "|", shown as typed), then the words.
+const GUIDE: &[&str] = &[
+    "For example:",
+    "|in Downloads (",
+    "|newest_first      # newest at the top",
+    "|folder_last       # folders at the bottom",
+    "|)",
+    "|in Pictures (",
+    "|large_icons       # opens with large icons",
+    "|newest_first",
+    "|)",
+    "A folder's rules go between \"in <folder> (\" and \")\". Rules outside them are for every other folder.",
+    "Several folders, the same rules: write \"in = (\", then each folder's path on a line of its own, then the rules, then \")\".",
+    "Add and_subfolders to a folder's rules to give them to every folder inside it too.",
+    "Sort:  newest, oldest, biggest, smallest, a_to_z, by_type",
+    "Kinds:  folder, file, image, video, music, document, archive, program, code, font, shortcut, hidden, other (everything else)",
+    "When:  today, yesterday, updated_3_days, added_2_hours, older_than_1_year",
+    "Size:  bigger_than_100mb, smaller_than_1mb, empty (files with nothing in them)",
+    "Name:  name_has_invoice, name_starts_with_img, name_ends_with_final",
+    "One file type:  png, mp4, exe\u{2026} (any other type with a dot:  .blend)",
+    "A sort on its own line is for everything. After a kind, on the same line, it's just for that kind:  folder a_to_z",
+    "Add _first or _last to put a kind at the very top or bottom:  folder_first",
+    "View:  details, list, tree, medium_icons, large_icons, extra_large_icons",
+    "A folder with only a view, like large_icons, keeps the sort every other folder uses.",
+    "More:  updated_first, newest_by_day",
+    "The - in front is up to you:  -newest and newest are the same.",
+    "A line starting with # is a note.",
+    "Ctrl+Space shows the words that fit where the cursor is.",
+    "Ctrl+/ turns a line into a note and back. Alt+Up and Alt+Down move a line.",
+];
 
 /// The GUIDE button's words: it shows the guide, or hides it.
 fn guide_label(app: &AppState) -> &'static str {
@@ -500,6 +535,7 @@ pub fn create(owner: HWND, app: &mut AppState) -> Option<SortWindow> {
             completion: Completion::default(),
             pick: 0,
             list_closed: true,
+            asked: false,
             places: Vec::new(),
             lister: Lister::default(),
             apply_due: false,
@@ -780,6 +816,56 @@ fn missing_tip(text: &str, w: &Written, names: Option<&[String]>) -> Option<Mess
     }
     let span = (w.span.0 + leaf_at, w.span.0 + leaf_at + leaf.len());
     Some(Message { line: w.line, text: said, error: false, span: Some(span), fix: near.map(str::to_string), fix_label: None })
+}
+
+/// The lines with a problem (numbered from 0), each with whether it's a mistake, mistakes before
+/// tips: the gutter's mark for a line is its first one here, so a line with both gets the red dot.
+fn line_marks(messages: &[Message]) -> Vec<(usize, bool)> {
+    let mut marks: Vec<(usize, bool)> = messages.iter().filter(|m| m.line > 0).map(|m| (m.line - 1, m.error)).collect();
+    marks.sort_by_key(|&(line, error)| (line, !error));
+    marks
+}
+
+/// The faint words after the cursor's line (`line` from 1), and whether they're about a mistake:
+/// its first mistake when it has one, in the same words as in the problems under the box (which
+/// list it first too), else what the line does.
+fn cursor_hint(recipe: &Recipe, line: usize) -> Option<(String, bool)> {
+    if let Some(m) = recipe.messages.iter().find(|m| m.error && m.line == line) {
+        let text = problem_text(m);
+        let said = text.strip_prefix(&format!("Line {line}: ")).unwrap_or(&text).to_string();
+        return Some((said, true));
+    }
+    recipe.explained.iter().find(|(l, _)| *l == line).map(|(_, s)| (s.clone(), false))
+}
+
+/// The colour of the kinds of things (folder, image, .png, bigger_than_1mb…) in the rules box:
+/// the strong text colour, or, in a skin where that's the same as the plain one, the plain one a
+/// little toward the accent, so a word Glint knows never looks like one it doesn't.
+fn group_color(theme: &Theme) -> Color {
+    let (a, b) = (theme.text_strong, theme.text);
+    let apart = (a.r - b.r).abs() + (a.g - b.g).abs() + (a.b - b.b).abs();
+    if apart >= 0.12 {
+        a
+    } else {
+        b.mix(theme.accent.with_alpha(b.a), 0.45)
+    }
+}
+
+/// The colour of a word in the rules box: notes muted, "in … (" lines strong, order rules, views
+/// and and_subfolders in the accent, kinds of things in [`group_color`], and a word Glint doesn't
+/// know in the plain text colour (with a red line under it).
+fn word_color(theme: &Theme, word: &str, in_note: bool, in_line: bool) -> Color {
+    if in_note {
+        theme.muted
+    } else if in_line {
+        theme.text_strong
+    } else if sortrecipe::is_order_word(word) || sortrecipe::is_view_word(word) || sortrecipe::is_folder_word(word) {
+        theme.accent
+    } else if sortrecipe::is_group_word(word) {
+        group_color(theme)
+    } else {
+        theme.text
+    }
 }
 
 /// Enter at the end of a line opening a folder's rules ("in Downloads (") whose ")" never came:
@@ -1106,6 +1192,8 @@ impl SortWindow {
             MenuItem::new(EDIT_NOTE, note),
             MenuItem::new(EDIT_UP, "Move line up\tAlt+Up"),
             MenuItem::new(EDIT_DOWN, "Move line down\tAlt+Down"),
+            MenuItem::separator(),
+            MenuItem::new(EDIT_SUGGEST, "Suggest words\tCtrl+Space"),
         ];
         Menu { tag: MENU_EDIT, at: self.menu_at(at), items, right_aligned: false }
     }
@@ -1119,6 +1207,7 @@ impl SortWindow {
             EDIT_ALL => (self.anchor, self.caret) = (0, self.text.len()),
             EDIT_NOTE => self.toggle_note(app),
             EDIT_UP | EDIT_DOWN => self.move_line(id == EDIT_UP, app),
+            EDIT_SUGGEST => self.suggest_here(),
             _ => {}
         }
         self.invalidate();
@@ -1154,6 +1243,7 @@ impl SortWindow {
         self.check_places();
         self.here = here(app, &self.recipe);
         self.list_closed = false;
+        self.asked = false;
         self.want_col = None;
         self.suggest(app);
         self.apply_due = true;
@@ -1167,8 +1257,24 @@ impl SortWindow {
 
     /// Works out the suggestions for the cursor's place (asking for a folder's listing if needed).
     fn suggest(&mut self, _app: &AppState) {
+        self.asked &= !self.list_closed;
+        self.suggest_with(self.asked);
+    }
+
+    /// Ctrl+Space: the list at the cursor, even before anything's typed there.
+    fn suggest_here(&mut self) {
+        self.anchor = self.caret;
+        self.list_closed = false;
+        self.asked = true;
+        self.suggest_with(true);
+        self.reveal_caret();
+    }
+
+    /// The suggestions for the cursor's place; `asked`: with Ctrl+Space ([`complete::complete_asked`]).
+    fn suggest_with(&mut self, asked: bool) {
         let lister = &self.lister;
-        let c = complete::complete(&self.text, self.caret, &self.places, &|dir| lister.get(dir));
+        let listed = |dir: &str| lister.get(dir);
+        let c = if asked { complete::complete_asked(&self.text, self.caret, &self.places, &listed) } else { complete::complete(&self.text, self.caret, &self.places, &listed) };
         if let Some(dir) = &c.wants {
             self.lister.ask(dir, self.hwnd, WM_APP_LISTED);
         }
@@ -1461,30 +1567,6 @@ impl SortWindow {
 
     /// The guide, broken to fit: (line, whether it's an example line, in the rules box's font).
     fn guide_lines(&mut self, width: f32) -> Vec<(String, bool)> {
-        // An example first (lines starting with "|", shown as typed), then the words.
-        const GUIDE: &[&str] = &[
-            "For example:",
-            "|in Downloads (",
-            "|newest_first      # newest at the top",
-            "|folder_last       # folders at the bottom",
-            "|)",
-            "|in Pictures (",
-            "|large_icons       # opens with large icons",
-            "|newest_first",
-            "|)",
-            "A folder's rules go between \"in <folder> (\" and \")\". Rules outside them are for every other folder.",
-            "Several folders, the same rules: write \"in = (\", then each folder's path on a line of its own, then the rules, then \")\".",
-            "Add and_subfolders to a folder's rules to give them to every folder inside it too.",
-            "Sort:  newest, oldest, biggest, smallest, a_to_z, by_type",
-            "Kinds:  folder, image, video, music, document, program, other (everything else)",
-            "A sort on its own line is for everything. After a kind, on the same line, it's just for that kind:  folder a_to_z",
-            "Add _first or _last to put a kind at the very top or bottom:  folder_first",
-            "View:  details, list, tree, medium_icons, large_icons, extra_large_icons",
-            "A folder with only a view, like large_icons, keeps the sort every other folder uses.",
-            "More:  updated_first, bigger_than_100mb, name_has_invoice, newest_by_day",
-            "A line starting with # is a note.",
-            "Ctrl+/ turns a line into a note and back. Alt+Up and Alt+Down move a line.",
-        ];
         let style = TextStyle::new(Color::hex(0)).size(ksize::NOTE_FONT);
         let mut out = Vec::new();
         for g in GUIDE {
@@ -1647,18 +1729,13 @@ impl SortWindow {
         let caret_row_chars = self.text[caret_start..line_end(&self.text, self.caret)].chars().count();
         let (sel_a, sel_b) = self.selection();
         // The lines with a mistake, and with a tip (numbered from 0).
-        let mut marks: Vec<(usize, bool)> = self.recipe.messages.iter().filter(|m| m.line > 0).map(|m| (m.line - 1, m.error)).collect();
-        marks.sort_by_key(|&(line, error)| (line, !error));
+        let marks = line_marks(&self.recipe.messages);
         // The folder's rules the cursor is in (tinted), and their brackets when it's on either.
         let here_line = caret_line + 1;
         let block = self.recipe.blocks.iter().filter(|b| b.start <= here_line && here_line <= b.end).min_by_key(|b| b.end - b.start).cloned();
         let brackets = block.as_ref().filter(|b| b.closed && (b.start == here_line || b.end == here_line)).map(|b| (b.start, b.end));
-        // What the cursor's line does, in faint words after it.
-        let explained = if self.active && ghost.is_none() && sel_a == sel_b && !list_open {
-            self.recipe.explained.iter().find(|(l, _)| *l == here_line).map(|(_, s)| s.clone())
-        } else {
-            None
-        };
+        // What the cursor's line does (or its mistake), in faint words after it.
+        let explained = if self.active && ghost.is_none() && sel_a == sel_b && !list_open { cursor_hint(&self.recipe, here_line) } else { None };
         // The scrollbars: down the right side, along the bottom.
         self.bar = Bar::of(theme);
         let (view_h, view_w) = (e.h - 2.0 * BOX_PAD, e.w - 2.0 * BOX_PAD - gutter);
@@ -1723,31 +1800,35 @@ impl SortWindow {
                         r.stroke_rect(cell, 1.0, theme.accent.with_alpha(0.85));
                     }
                 }
-                // The words, coloured: notes muted, "in … (", ")" and "(" strong, order rules,
-                // views and and_subfolders in the accent.
+                // The words, coloured (word_color), split where the rules split them: at spaces,
+                // commas and semicolons. "in … (", ")" and "(" are strong.
                 let trimmed = row.trim_start();
                 let code = sortrecipe::strip_note(row);
                 let note = (code.len() < row.len()).then_some(code.len());
                 let is_in = trimmed.len() > 3 && trimmed.get(..3).is_some_and(|head| head.eq_ignore_ascii_case("in ")) || matches!(code.trim(), ")" | "(");
+                let sep = |c: char| c.is_whitespace() || c == ',' || c == ';';
                 let mut i = 0;
-                for piece in row.split_inclusive(char::is_whitespace) {
-                    let word = piece.trim_end();
+                for piece in row.split_inclusive(sep) {
                     let at = start + i;
                     i += piece.len();
-                    if word.is_empty() {
+                    let in_note = note.is_some_and(|n| at - start >= n);
+                    // A note, or a folder's path on an "in" line, is drawn as one (a comma in a
+                    // folder's name is part of it).
+                    let word = if in_note || is_in { piece.trim_end() } else { piece.trim_end_matches(sep) };
+                    if word.is_empty() && piece.trim().is_empty() {
                         continue;
                     }
-                    let color = if note.is_some_and(|n| at - start >= n) {
-                        theme.muted
-                    } else if is_in {
-                        theme.text_strong
-                    } else if sortrecipe::is_order_word(word) || sortrecipe::is_view_word(word) || sortrecipe::is_folder_word(word) {
-                        theme.accent
-                    } else {
-                        theme.text
-                    };
                     let x = x0 + col(at) * cw;
-                    r.mono_text(word, Rect::new(x, y, word.chars().count() as f32 * cw + cw, LINE_H), MONO, color);
+                    if !word.is_empty() {
+                        let color = word_color(theme, word, in_note, is_in);
+                        r.mono_text(word, Rect::new(x, y, word.chars().count() as f32 * cw + cw, LINE_H), MONO, color);
+                    }
+                    // The comma or semicolon after it.
+                    let mark = piece[word.len()..].trim_end();
+                    if !mark.is_empty() {
+                        let mx = x + word.chars().count() as f32 * cw;
+                        r.mono_text(mark, Rect::new(mx, y, mark.chars().count() as f32 * cw + cw, LINE_H), MONO, if in_note { theme.muted } else { theme.text });
+                    }
                 }
                 // A red line under words Glint doesn't know.
                 for &(a, b) in &errors {
@@ -1772,11 +1853,12 @@ impl SortWindow {
             if let Some(ghost) = ghost {
                 let ghost: String = ghost.chars().take(80).collect();
                 r.mono_text(&ghost, Rect::new(c.x, c.y, ghost.chars().count() as f32 * cw + cw, LINE_H), MONO, theme.muted.with_alpha(0.75));
-            } else if let Some(said) = explained {
+            } else if let Some((said, mistake)) = explained {
                 let x = text_area.x - self.scroll.0 + (caret_row_chars + 3) as f32 * cw;
                 let room = text_area.right() - x - if self.vtrack.is_some() { self.bar.w + 2.0 * self.bar.margin } else { 0.0 };
                 if room >= 90.0 {
-                    let style = TextStyle::new(theme.muted.with_alpha(0.7)).size(ksize::NOTE_FONT);
+                    let color = if mistake { PROBLEM_RED.with_alpha(0.85) } else { theme.muted.with_alpha(0.7) };
+                    let style = TextStyle::new(color).size(ksize::NOTE_FONT);
                     r.text(&said, Rect::new(x, c.y, room, LINE_H), &style);
                 }
             }
@@ -2302,6 +2384,8 @@ impl SortWindow {
             _ if ctrl && !alt && vk == VK_Z.0 => self.undo_redo(key_down(VK_SHIFT.0), app),
             _ if ctrl && !alt && vk == VK_Y.0 => self.undo_redo(true, app),
             _ if ctrl && !alt && (vk == VK_OEM_2.0 || vk == VK_DIVIDE.0) => self.toggle_note(app),
+            // Ctrl+Space: the words that fit where the cursor is.
+            _ if ctrl && !alt && vk == VK_SPACE.0 => self.suggest_here(),
             _ => return false,
         }
         self.invalidate();
@@ -2576,6 +2660,9 @@ mod tests {
         assert_eq!(closing(text, 14, &Recipe::parse(text).unclosed), None);
         let text = "in Downloads (";
         assert_eq!(closing(text, 5, &Recipe::parse(text).unclosed), None);
+        // "in = (", as the suggestions put it in.
+        let text = "-newest\nin = (";
+        assert_eq!(closing(text, text.len(), &Recipe::parse(text).unclosed), Some(("\n\n)".to_string(), 1)));
     }
 
     #[test]
@@ -2611,6 +2698,80 @@ mod tests {
         assert_eq!((h.text.as_str(), h.line, h.marked.as_slice()), ("On screen: sub, sorted by its own rules (line 2).", Some(2), &[(2, 4)][..]));
         let h = say(true, "in C:\\t (\n-and_subfolders\n-newest_first\n)", false);
         assert_eq!(h.text, "On screen: sub, sorted by the rules for C:\\t and the folders inside it (line 1).");
+    }
+
+    #[test]
+    fn words_glint_knows_are_coloured() {
+        let mut same = Theme::dark();
+        same.text_strong = same.text; // a skin whose bright text is its plain one
+        for theme in [Theme::dark(), Theme::light(), same] {
+            let ink = |w: &str| word_color(&theme, w, false, false);
+            let group = group_color(&theme);
+            assert_ne!(group, theme.text, "a kind of thing never looks like a word Glint doesn't know");
+            assert_ne!(group, theme.accent, "nor like an order rule");
+            for w in ["folder", "-file", "-image", "image_first", "-png", "-.blend", "-bigger_than_100mb", "updated_3_days", "-name_has_invoice", "-today", "-music", "-other"] {
+                assert_eq!(ink(w), group, "{w}");
+            }
+            for w in ["-newest", "a_to_z", "newest_by_day", "-large_icons", "-and_subfolders"] {
+                assert_eq!(ink(w), theme.accent, "{w}");
+            }
+            // Unknown, misspelt, or not finished: the plain colour (with the red line).
+            for w in ["-imgae", "-zzzz", "-name_has_", "-bigger_than_", "-.", "sort"] {
+                assert_eq!(ink(w), theme.text, "{w}");
+            }
+            assert_eq!(word_color(&theme, "image", true, false), theme.muted, "in a note");
+            assert_eq!(word_color(&theme, "image", false, true), theme.text_strong, "on an in line");
+        }
+    }
+
+    #[test]
+    fn the_hint_after_a_line_says_its_mistake() {
+        let text = "-newst_first\n-image\n-image -zz_zq\n-png -png";
+        let r = Recipe::parse(text);
+        // A mistake: in the same words as in the problems under the box.
+        let (said, mistake) = cursor_hint(&r, 1).expect("a hint");
+        assert!(mistake);
+        let m = r.messages.iter().find(|m| m.line == 1 && m.error).expect("the mistake");
+        assert_eq!(format!("Line 1: {said}"), problem_text(m));
+        assert!(said.contains("Did you mean -newest_first?"), "{said}");
+        // ...which the problems list first when the cursor is on its line.
+        let first = r.messages.iter().position(|m| m.line == 1 && m.error).unwrap();
+        let mut order: Vec<usize> = (0..r.messages.len()).collect();
+        order.sort_by_key(|&i| (r.messages[i].line != 1, !r.messages[i].error, r.messages[i].line));
+        assert_eq!(order[0], first);
+        // No mistake: what the line does.
+        assert_eq!(cursor_hint(&r, 2), Some(("Pictures first".to_string(), false)));
+        // A tip and a mistake on one line: the mistake, and the red dot in the gutter.
+        let (said, mistake) = cursor_hint(&r, 3).expect("a hint");
+        assert!(mistake && said.contains("zz_zq"), "{said}");
+        let marks = line_marks(&r.messages);
+        assert_eq!(marks.iter().find(|(l, _)| *l == 2), Some(&(2, true)));
+        assert_eq!(marks.iter().find(|(l, _)| *l == 0), Some(&(0, true)));
+        // Just a tip: a grey mark, and the hint says what the line does.
+        assert_eq!(marks.iter().find(|(l, _)| *l == 3), Some(&(3, false)));
+        assert!(cursor_hint(&r, 4).is_some_and(|(_, mistake)| !mistake));
+        assert_eq!(cursor_hint(&r, 9), None);
+    }
+
+    /// The guide's words and its example read without a mistake.
+    #[test]
+    fn the_guide_reads() {
+        let example: Vec<&str> = GUIDE.iter().filter_map(|g| g.strip_prefix('|')).collect();
+        let r = Recipe::parse(&example.join("\n"));
+        assert!(!r.has_errors(), "{:?}", r.messages);
+        let mut words = Vec::new();
+        for g in GUIDE {
+            let Some((head, list)) = g.split_once(":  ") else { continue };
+            if ["Sort", "Kinds", "When", "Size", "Name", "View", "More"].contains(&head) {
+                words.extend(list.split(", ").filter_map(|w| w.split_whitespace().next()));
+            }
+        }
+        words.extend(["png", ".png", "-newest", "newest", "folder_first", "and_subfolders"]);
+        assert!(words.len() > 35, "{words:?}");
+        for w in words {
+            let r = Recipe::parse(&format!("in C:\\x (\n{w}\n)"));
+            assert!(!r.has_errors(), "{w}: {:?}", r.messages);
+        }
     }
 
     #[test]

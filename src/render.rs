@@ -47,6 +47,8 @@ use std::sync::{Arc, Weak};
 use windows::Win32::Graphics::Direct2D::{
     ID2D1BitmapBrush, ID2D1DeviceContext, D2D1_BITMAP_BRUSH_PROPERTIES, D2D1_EXTEND_MODE_WRAP, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
 };
+// A wallpaper's fade at the list's edges (`wallpaper`).
+use windows::Win32::Graphics::Direct2D::{ID2D1Brush, D2D1_LAYER_OPTIONS_NONE, D2D1_LAYER_PARAMETERS};
 use windows_core::Interface;
 use crate::theme::{size, Color, Gradient, Paint, Stop, MAX_STOPS};
 use crate::ui::{Point, Rect};
@@ -932,6 +934,66 @@ impl Renderer {
 
 // ---------------------------------------------------------------- paints: gradients and glass
 
+/// How a skin's wallpaper is drawn (`Renderer::wallpaper`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WallDraw {
+    /// Once: the part `src` of the picture (in its pixels) into `dest`.
+    Once { dest: Rect, src: Rect },
+    /// Copies side by side all over `fill`, each `tile` DIPs, one with its top left at `origin`.
+    Tiled { fill: Rect, origin: Point, tile: (f32, f32) },
+}
+
+/// A wallpaper's fade at the edges as gradient stops (position, how much shows): see-through at
+/// both ends, whole from `fade` in (0 to 0.5).
+pub(crate) fn fade_stops(fade: f32) -> [(f32, f32); 4] {
+    let f = fade.clamp(0.0, 0.5);
+    [(0.0, 0.0), (f, 1.0), (1.0 - f, 1.0), (1.0, 0.0)]
+}
+
+/// The Direct2D copy of a picture, made the first time (and the picture's own pixels let go then).
+/// None when it couldn't be made: see `Renderer::picture`.
+fn picture_bitmap(t: &mut Target, pic: &Arc<Picture>) -> Option<ID2D1Bitmap> {
+    let id = pic.id();
+    // A video's next frame goes into the bitmap it has already (no new bitmap every frame).
+    if let Some((_, bmp)) = t.pictures.bitmaps.get(&id) {
+        if let Some(pixels) = pic.take_fresh() {
+            // SAFETY: `pixels` holds exactly height rows of width * 4 bytes (Picture checks), the
+            // bitmap's size, and lives across the call, which copies them. (If it fails, the
+            // last frame stays; the next one is tried as usual.)
+            let _ = unsafe { bmp.CopyFromMemory(None, pixels.as_ptr() as *const _, pic.width() * 4) };
+            pic.keep_spare(pixels);
+        }
+    }
+    if !t.pictures.bitmaps.contains_key(&id) {
+        let Some(pixels) = pic.take_pixels() else {
+            pic.mark_lost();
+            return None;
+        };
+        let size = D2D_SIZE_U { width: pic.width(), height: pic.height() };
+        let mut props = picture_props();
+        if pic.is_frame() {
+            // Video has no see-through parts (its fourth byte isn't looked at).
+            props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_IGNORE;
+        }
+        // SAFETY: `pixels` holds exactly height rows of width * 4 bytes (Picture::new checks) and
+        // lives across the call, which copies them.
+        match unsafe { t.rt.CreateBitmap(size, Some(pixels.as_ptr() as *const _), pic.width() * 4, &props) } {
+            Ok(bmp) => {
+                t.pictures.bitmaps.insert(id, (Arc::downgrade(pic), bmp));
+                pic.keep_spare(pixels);
+            }
+            // Too big for this graphics card (pictures are made under `max_bitmap_size`), or no
+            // memory there right now: the picture keeps its pixels for the next try, rather
+            // than looking lost and being made again on every frame.
+            Err(_) => {
+                pic.give_back(pixels);
+                return None;
+            }
+        }
+    }
+    t.pictures.bitmaps.get(&id).map(|(_, bmp)| bmp.clone())
+}
+
 /// The soft shadow under a marble: dark in the middle, fading out at its edge.
 const MARBLE_SHADOW: [Stop; 3] = [
     Stop { at: 0.0, color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.32 } },
@@ -1331,29 +1393,8 @@ impl Renderer {
         }
         let rect = self.snapped(dest);
         let Some(t) = self.target.as_mut() else { return false };
-        let id = pic.id();
-        if !t.pictures.bitmaps.contains_key(&id) {
-            let Some(pixels) = pic.take_pixels() else {
-                pic.mark_lost();
-                return false;
-            };
-            let size = D2D_SIZE_U { width: pic.width(), height: pic.height() };
-            // SAFETY: `pixels` holds exactly height rows of width * 4 bytes (Picture::new checks) and
-            // lives across the call, which copies them.
-            match unsafe { t.rt.CreateBitmap(size, Some(pixels.as_ptr() as *const _), pic.width() * 4, &picture_props()) } {
-                Ok(bmp) => {
-                    t.pictures.bitmaps.insert(id, (Arc::downgrade(pic), bmp));
-                }
-                // Too big for this graphics card (pictures are made under `max_bitmap_size`), or no
-                // memory there right now: the picture keeps its pixels for the next try, rather
-                // than looking lost and being made again on every frame.
-                Err(_) => {
-                    pic.give_back(pixels);
-                    return false;
-                }
-            }
-        }
-        let Some((_, bmp)) = t.pictures.bitmaps.get(&id) else { return false };
+        let Some(bmp) = picture_bitmap(t, pic) else { return false };
+        let bmp = &bmp;
         let src = src.map(|s| D2D_RECT_F { left: s.x, top: s.y, right: s.right(), bottom: s.bottom() });
         let src_ptr = src.as_ref().map(|s| s as *const D2D_RECT_F);
         // SAFETY: the bitmap belongs to this target; the rectangles live across the calls.
@@ -1365,6 +1406,87 @@ impl Renderer {
                     t.rt.DrawBitmap(bmp, Some(&rect), opacity, mode, src_ptr)
                 }
             }
+        }
+        true
+    }
+
+    /// Draws a skin's wallpaper (list.rs): once, or tiled (see [`WallDraw`]), `opacity` strong,
+    /// fading out over `fade` (0 to 0.5) of `area`'s width and height at `area`'s edges - the
+    /// list's, or in split view both halves', so the fade lies across them as one. Returns false
+    /// when it couldn't be drawn (as `picture`).
+    pub fn wallpaper(&mut self, pic: &Arc<Picture>, how: WallDraw, area: Rect, opacity: f32, fade: f32) -> bool {
+        if !self.in_frame || area.is_empty() || opacity <= 0.0 {
+            return false;
+        }
+        let fade = fade.clamp(0.0, 0.5);
+        let mut layers = Vec::new();
+        if fade > 0.0 {
+            let Some(t) = self.target.as_ref() else { return false };
+            let bounds = D2D_RECT_F { left: area.x, top: area.y, right: area.right(), bottom: area.bottom() };
+            // Across, then down: one layer inside the other, so their see-through parts multiply
+            // (the corners fade both ways).
+            for (a, b) in [(Vector2 { X: area.x, Y: area.y }, Vector2 { X: area.right(), Y: area.y }), (Vector2 { X: area.x, Y: area.y }, Vector2 { X: area.x, Y: area.bottom() })] {
+                let stops: Vec<D2D1_GRADIENT_STOP> = fade_stops(fade).iter().map(|&(at, alpha)| D2D1_GRADIENT_STOP { position: at, color: D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: alpha } }).collect();
+                let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: a, endPoint: b };
+                // SAFETY: plain creation calls on our own target; the stops and properties live
+                // across them. Each layer is popped below, before this returns.
+                let made = unsafe {
+                    t.rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
+                        .and_then(|c| t.rt.CreateLinearGradientBrush(&props, None, &c))
+                        .and_then(|brush| t.rt.CreateLayer(None).map(|layer| (brush, layer)))
+                };
+                let Ok((brush, layer)) = made else { break };
+                let Ok(brush) = brush.cast::<ID2D1Brush>() else { break };
+                let params = D2D1_LAYER_PARAMETERS {
+                    contentBounds: bounds,
+                    geometricMask: std::mem::ManuallyDrop::new(None),
+                    maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                    maskTransform: windows_numerics::Matrix3x2::identity(),
+                    opacity: 1.0,
+                    opacityBrush: std::mem::ManuallyDrop::new(Some(brush)),
+                    layerOptions: D2D1_LAYER_OPTIONS_NONE,
+                };
+                // SAFETY: the layer and brush belong to this target; popped below.
+                unsafe { t.rt.PushLayer(&params, &layer) };
+                layers.push((layer, params));
+            }
+        }
+        let drawn = match how {
+            WallDraw::Once { dest, src } => self.picture(pic, dest, Some(src), opacity, true),
+            WallDraw::Tiled { fill, origin, tile } => self.picture_tiled(pic, fill, origin, tile, opacity),
+        };
+        if let Some(t) = self.target.as_ref() {
+            for (_layer, mut params) in layers.into_iter().rev() {
+                // SAFETY: pops the layers pushed above, newest first; then lets go of the brush
+                // the layer's parameters held.
+                unsafe {
+                    t.rt.PopLayer();
+                    std::mem::ManuallyDrop::drop(&mut params.opacityBrush);
+                }
+            }
+        }
+        drawn
+    }
+
+    /// Fills `fill` with copies of a picture side by side, each `tile` DIPs, one with its top left
+    /// corner at `origin`.
+    fn picture_tiled(&mut self, pic: &Arc<Picture>, fill: Rect, origin: Point, tile: (f32, f32), opacity: f32) -> bool {
+        if fill.is_empty() || !(tile.0 > 0.0 && tile.1 > 0.0) {
+            return false;
+        }
+        let rect = self.snapped(fill);
+        let Some(t) = self.target.as_mut() else { return false };
+        let Some(bmp) = picture_bitmap(t, pic) else { return false };
+        let props = D2D1_BITMAP_BRUSH_PROPERTIES { extendModeX: D2D1_EXTEND_MODE_WRAP, extendModeY: D2D1_EXTEND_MODE_WRAP, interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_LINEAR };
+        // SAFETY: a brush of a bitmap of this target; the properties live across the call.
+        let Ok(brush) = (unsafe { t.rt.CreateBitmapBrush(&bmp, Some(&props), None) }) else { return false };
+        // Each of the picture's pixels becomes (tile / its size) DIPs, from `origin`.
+        let m = windows_numerics::Matrix3x2 { M11: tile.0 / pic.width() as f32, M12: 0.0, M21: 0.0, M22: tile.1 / pic.height() as f32, M31: origin.x, M32: origin.y };
+        // SAFETY: the brush belongs to this target; `m` and `rect` live across the calls.
+        unsafe {
+            brush.SetTransform(&m);
+            brush.SetOpacity(opacity.clamp(0.0, 1.0));
+            t.rt.FillRectangle(&rect, &brush);
         }
         true
     }
@@ -1527,6 +1649,147 @@ fn pick_family(dwrite: &IDWriteFactory, names: &[&'static str]) -> &'static str 
     names.iter().find(|name| family_in(&collection, name)).copied().unwrap_or(fallback)
 }
 
+// ---------------------------------------------------------------- warming up for the first frame
+
+/// What the warm-up found, for the timing log (`warm_up_report`).
+static WARM_UP: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// Dropped when the first frame is on screen: the warm-up lets go of its graphics device then.
+static WARM_DEVICE_HELD: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> = std::sync::Mutex::new(None);
+/// How long the warm-up keeps its graphics device at most (a window that never paints).
+const WARM_DEVICE_KEEP: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Most of the first frame's time goes to things done once per process: Windows loads the graphics
+/// card's driver and sets it up (the render target, `create_target`), DirectWrite reads the font
+/// files and shapes text for the first time, and the shell builds its icon cache (the sidebar's
+/// and the list's icons). Started at the very beginning, while settings load and the window is
+/// made, this does all that on two threads of its own - what they load stays loaded for the
+/// window - so the first frame only draws. Nothing it makes is used, so what the frame shows is
+/// the same; it is only quicker. If the window gets there first, it just does the work itself.
+/// GLINT_WARM_UP=off leaves it out (to compare start-up times with and without it).
+pub fn warm_up() {
+    if std::env::var("GLINT_WARM_UP").is_ok_and(|v| v.eq_ignore_ascii_case("off")) {
+        note_warm_up("off".to_string());
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    *WARM_DEVICE_HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+    let software = std::env::var("GLINT_RENDER").is_ok_and(|v| v.eq_ignore_ascii_case("software"));
+    // (Not under Wine: its Direct3D, made on another thread while the window is being made, stops
+    // the window from being made at all.)
+    if !software && !crate::frame::is_wine() {
+        crate::shell::background("warm up: graphics", move || {
+            let t = std::time::Instant::now();
+            let device = create_d3d_device();
+            note_warm_up(format!("graphics device {:.1} ms{}", ms(t), if device.is_some() { "" } else { " (none)" }));
+            // Kept until the window's own device is up (the driver stays loaded meanwhile).
+            if device.is_some() {
+                let _ = rx.recv_timeout(WARM_DEVICE_KEEP);
+            }
+            drop(device);
+        });
+    }
+    crate::shell::background("warm up: fonts and icons", || {
+        let t = std::time::Instant::now();
+        warm_up_text();
+        note_warm_up(format!("fonts {:.1} ms", ms(t)));
+        let t = std::time::Instant::now();
+        warm_up_shell();
+        note_warm_up(format!("shell icons {:.1} ms", ms(t)));
+    });
+}
+
+/// The first frame is on screen: the warm-up's graphics device can go.
+pub fn warm_up_done() {
+    WARM_DEVICE_HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+}
+
+/// What the warm-up did and how long each part took ("graphics device 41.0 ms, fonts 9.2 ms, ...").
+pub fn warm_up_report() -> String {
+    let done = WARM_UP.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if done.is_empty() {
+        "not done yet".to_string()
+    } else {
+        done.join(", ")
+    }
+}
+
+fn note_warm_up(what: String) {
+    WARM_UP.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(what);
+}
+
+fn ms(t: std::time::Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1000.0
+}
+
+/// A Direct3D 11 device on the graphics card (what Direct2D's render target makes for itself):
+/// loads and sets up the driver. None if there's no such thing (old Windows, a remote session).
+fn create_d3d_device() -> Option<windows_core::IUnknown> {
+    windows_core::link!("d3d11.dll" "system" fn D3D11CreateDevice(adapter: *mut core::ffi::c_void, driver_type: i32, software: *mut core::ffi::c_void, flags: u32, levels: *const i32, level_count: u32, sdk_version: u32, device: *mut *mut core::ffi::c_void, level: *mut i32, context: *mut *mut core::ffi::c_void) -> windows_core::HRESULT);
+    const D3D_DRIVER_TYPE_HARDWARE: i32 = 1;
+    const D3D11_CREATE_DEVICE_BGRA_SUPPORT: u32 = 0x20;
+    const D3D11_SDK_VERSION: u32 = 7;
+    let mut device = std::ptr::null_mut();
+    // SAFETY: all optional arguments are null, the out-pointer is valid; a device we get is owned
+    // by the IUnknown made from it (released when dropped). No context is asked for.
+    unsafe {
+        let hr = D3D11CreateDevice(
+            std::ptr::null_mut(),
+            D3D_DRIVER_TYPE_HARDWARE,
+            std::ptr::null_mut(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            std::ptr::null(),
+            0,
+            D3D11_SDK_VERSION,
+            &mut device,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        (hr.is_ok() && !device.is_null()).then(|| windows_core::IUnknown::from_raw(device))
+    }
+}
+
+/// Lays out a line of text in the font Glint will use, plain and bold: DirectWrite (its shared
+/// factory, the one the window uses too) reads the font files and their tables now.
+fn warm_up_text() {
+    // SAFETY: plain DirectWrite calls; every string lives across the calls that use it.
+    unsafe {
+        let Ok(dwrite) = DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED) else { return };
+        let family = HSTRING::from(pick_font_family(&dwrite));
+        let text: Vec<u16> = "Home Desktop Documents Downloads 0123456789 KB MB \u{2026}".encode_utf16().collect();
+        for weight in [400, 600, 700] {
+            let Ok(format) = dwrite.CreateTextFormat(&family, None::<&IDWriteFontCollection>, DWRITE_FONT_WEIGHT(weight), DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 12.0, &HSTRING::from("en-us")) else { continue };
+            if let Ok(layout) = dwrite.CreateTextLayout(&text, &format, 10_000.0, 100.0) {
+                let mut m = DWRITE_TEXT_METRICS::default();
+                let _ = layout.GetMetrics(&mut m);
+            }
+        }
+    }
+}
+
+/// Asks the shell for a folder's and a file's small icon (made-up names: no disk is touched), and
+/// makes a WIC factory: the shell's icon cache and the imaging DLL are loaded for the window.
+fn warm_up_shell() {
+    use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
+    use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES};
+    let _com = crate::shell::ComGuard::init();
+    for (name, attrs) in [("folder", FILE_ATTRIBUTE_DIRECTORY), ("file.txt", FILE_ATTRIBUTE_NORMAL)] {
+        let w: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let mut info = SHFILEINFOW::default();
+        // SAFETY: `w` is NUL-terminated; `info` is a valid SHFILEINFOW of the size passed; the icon
+        // we get is ours, and destroyed at once.
+        unsafe {
+            let ok = SHGetFileInfoW(PCWSTR(w.as_ptr()), attrs, Some(&mut info), std::mem::size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES);
+            if ok != 0 && !info.hIcon.is_invalid() {
+                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyIcon(info.hIcon);
+            }
+        }
+    }
+    // SAFETY: a plain COM object creation on this thread (COM is set up above).
+    let _wic: Option<windows::Win32::Graphics::Imaging::IWICImagingFactory> = unsafe {
+        windows::Win32::System::Com::CoCreateInstance(&windows::Win32::Graphics::Imaging::CLSID_WICImagingFactory, None, windows::Win32::System::Com::CLSCTX_INPROC_SERVER).ok()
+    };
+}
+
 fn color_f(c: Color) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r: c.r, g: c.g, b: c.b, a: c.a }
 }
@@ -1562,4 +1825,23 @@ fn family_in(collection: &IDWriteFontCollection, name: &str) -> bool {
     // SAFETY: `wide` lives across the call; index/exists are valid out-pointers.
     let ok = unsafe { collection.FindFamilyName(PCWSTR(wide.as_ptr()), &mut index, &mut exists) };
     ok.is_ok() && exists.as_bool()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+
+    #[test]
+    fn the_warm_up_runs_and_lets_go() {
+        warm_up();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !warm_up_report().contains("shell icons") && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let report = warm_up_report();
+        assert!(report.contains("fonts") && report.contains("shell icons"), "{report}");
+        warm_up_done();
+        warm_up_done(); // twice is fine
+    }
 }

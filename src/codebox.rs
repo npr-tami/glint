@@ -2,14 +2,16 @@
 //! (sortwin.rs): line numbers down its left side (a red dot by a line with a problem), words
 //! coloured by what they are, a red line under what Glint couldn't understand, and suggestions like
 //! a code editor's - the first one as grey text after the cursor, up to eight in a list under the
-//! line (Tab, or Enter while the list is open, takes one; Up / Down pick; Esc closes it). Faint
+//! line (Tab, or Enter while the list is open, takes one; Up / Down pick; Esc closes it; Ctrl+Space
+//! opens it where the cursor is, even before anything is typed). Faint
 //! words after the cursor's line say what it does (or what's wrong with it).
 //!
 //! It isn't a window: the window it's in (the skin customiser) gives it its place, paints it, and
 //! passes it the mouse and the keys while it has the keyboard. What it suggests and how it colours
 //! the words come from a [`Lang`]. Keys: the usual (arrows, Home / End, Ctrl for whole words, Shift
 //! to select, Page Up / Down), Ctrl+A / C / X / V, Ctrl+Z / Y (typing is taken back a word at a
-//! time), Ctrl+/ makes lines notes and back, Alt+Up / Alt+Down move them.
+//! time), Ctrl+/ makes lines notes and back, Alt+Up / Alt+Down move them, Ctrl+Space shows the
+//! suggestions.
 
 use std::time::Instant;
 
@@ -19,7 +21,7 @@ use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_A, VK_BACK, VK_C, VK_CONTROL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_MENU, VK_NEXT, VK_OEM_2,
-    VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP, VK_V, VK_X, VK_Y, VK_Z,
+    VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VK_V, VK_X, VK_Y, VK_Z,
 };
 
 use crate::complete::Completion;
@@ -48,6 +50,10 @@ pub const PROBLEM_RED: Color = Color::hex(0xe5484d);
 pub trait Lang {
     /// Suggestions for the cursor's place.
     fn complete(&self, text: &str, caret: usize) -> Completion;
+    /// Suggestions asked for with Ctrl+Space: also where typing alone shows none (a blank line).
+    fn complete_asked(&self, text: &str, caret: usize) -> Completion {
+        self.complete(text, caret)
+    }
     /// What line `row` does, in a few words (None: nothing to say).
     fn explain(&self, row: &str) -> Option<String>;
     /// The line's pieces and their colours: (from, to) in bytes of `row`. What's left out is in
@@ -275,6 +281,28 @@ impl CodeBox {
         self.completion = c;
     }
 
+    /// Ctrl+Space: the list for the cursor's place, even where typing alone shows none (on a
+    /// blank line, every setting). A selection becomes the cursor.
+    pub fn ask_for_suggestions(&mut self, lang: &dyn Lang) -> Done {
+        if self.read_only {
+            return Done::Moved;
+        }
+        self.caret = self.caret.min(self.text.len());
+        self.anchor = self.caret;
+        self.last_edit = None;
+        self.completion = lang.complete_asked(&self.text, self.caret);
+        self.pick = 0;
+        self.list_closed = false;
+        Done::Moved
+    }
+
+    /// Ctrl+A: all the text. A list open for the cursor's old place is shut.
+    fn select_all(&mut self) {
+        (self.anchor, self.caret) = (0, self.text.len());
+        self.list_closed = true;
+        self.last_edit = None;
+    }
+
     fn list_open(&self) -> bool {
         self.focused && !self.read_only && !self.list_closed && !self.completion.items.is_empty() && self.caret == self.anchor
     }
@@ -357,6 +385,11 @@ impl CodeBox {
         } else if x + 2.0 > self.scroll.0 + vw {
             self.scroll.0 = x + 40.0 - vw;
         }
+        // Never scrolled past the text's end: after lines are taken away, the lines left come back
+        // into view (with no scrollbar to bring them back when they all fit).
+        let lines = self.text.matches('\n').count() as f32 + 1.0;
+        self.scroll.1 = self.scroll.1.min((lines * LINE_H - vh).max(0.0)).max(0.0);
+        self.scroll.0 = self.scroll.0.min((self.widest() - vw).max(0.0)).max(0.0);
     }
 
     fn pos_at(&self, p: Point) -> usize {
@@ -400,7 +433,9 @@ impl CodeBox {
         let e = rect;
         let cw = self.char_w;
         let list_open = self.list_open();
-        let ghost = if list_open { self.completion.ghost(&self.text) } else { None };
+        // (Not when the suggestion takes in text after the cursor too: the grey text would sit in
+        // the middle of the line.)
+        let ghost = if list_open && self.completion.end == self.caret { self.completion.ghost(&self.text) } else { None };
         let gutter = self.gutter_w();
         let (caret_start, caret_line) = line_of(&self.text, self.caret);
         let caret_row = &self.text[caret_start..line_end(&self.text, self.caret)];
@@ -725,7 +760,9 @@ impl CodeBox {
                 if open {
                     self.list_closed = true;
                 } else if self.caret != self.anchor {
+                    // (An old list stays shut: it was for where the cursor was before.)
                     self.anchor = self.caret;
+                    self.list_closed = true;
                 } else {
                     return Done::NotMine;
                 }
@@ -811,7 +848,7 @@ impl CodeBox {
                 }
             }
             // (Not with Alt too: Ctrl+Alt is AltGr, which types letters like ą or @.)
-            _ if ctrl && !alt && vk == VK_A.0 => (self.anchor, self.caret) = (0, text_len),
+            _ if ctrl && !alt && vk == VK_A.0 => self.select_all(),
             _ if ctrl && !alt && (vk == VK_C.0 || vk == VK_X.0) => {
                 let (a, b) = self.selection();
                 // Cut takes the text away only once it's on the clipboard (another program may
@@ -830,6 +867,7 @@ impl CodeBox {
             _ if ctrl && !alt && vk == VK_Z.0 => done = self.undo_redo(key_down(VK_SHIFT.0), lang),
             _ if ctrl && !alt && vk == VK_Y.0 => done = self.undo_redo(true, lang),
             _ if ctrl && !alt && (vk == VK_OEM_2.0 || vk == VK_DIVIDE.0) => done = self.toggle_note(lang),
+            _ if ctrl && !alt && vk == VK_SPACE.0 => done = self.ask_for_suggestions(lang),
             _ => return Done::NotMine,
         }
         done
@@ -882,9 +920,17 @@ impl CodeBox {
     }
 }
 
+#[cfg(not(test))]
 pub(crate) fn key_down(vk: u16) -> bool {
     // SAFETY: a plain key-state query.
     unsafe { GetKeyState(vk as i32) < 0 }
+}
+
+/// In tests no key is held: the real keyboard (someone's Ctrl, a tester's automation) mustn't
+/// change what typing does.
+#[cfg(test)]
+pub(crate) fn key_down(_vk: u16) -> bool {
+    false
 }
 
 /// The text on the clipboard, if any.
@@ -1069,5 +1115,166 @@ mod tests {
         (b.anchor, b.caret) = (0, 4);
         b.move_line(false, &Plain);
         assert_eq!((b.text.as_str(), b.anchor, b.caret), ("\na\nb", 1, 4));
+    }
+
+    /// Ctrl+Space opens the list at the cursor: at a line's start and end, on an empty text, past
+    /// a selection, and not in a skin that can't be changed. Taking a suggestion then works.
+    #[test]
+    fn ctrl_space_opens_the_list_where_the_cursor_is() {
+        let skin = crate::skincode::SkinLang;
+        let new_box = |text: &str| {
+            let mut b = CodeBox { rect: Rect::new(0.0, 0.0, 300.0, 200.0), char_w: 7.0, focused: true, ..Default::default() };
+            b.set_text(text);
+            b
+        };
+        // An empty text: every setting, and taking one writes it.
+        let mut b = new_box("");
+        assert_eq!(b.ask_for_suggestions(&skin), Done::Moved);
+        assert!(b.list_open() && !b.completion.items.is_empty());
+        b.accept(b.pick, &skin);
+        assert!(b.text.ends_with(": ") && b.caret == b.text.len(), "{:?}", b.text);
+        // The start of a line: its name is replaced, not doubled.
+        let mut b = new_box("accent: #fff\ntext: #000");
+        b.ask_for_suggestions(&skin);
+        assert!(b.list_open());
+        let k = b.completion.items.iter().position(|s| s.label == "panel").unwrap();
+        b.accept(k, &skin);
+        assert_eq!(b.text, "panel: #fff\ntext: #000");
+        // The end of a line (and of the text): its value's words.
+        let mut b = new_box("x: 1\nshape: ");
+        (b.caret, b.anchor) = (b.text.len(), b.text.len());
+        b.ask_for_suggestions(&skin);
+        assert!(b.list_open() && b.completion.items.iter().any(|s| s.label == "rounded"));
+        // The end of the first line, where nothing fits: no list, no panic.
+        let mut b = new_box("accent: #fff\n");
+        (b.caret, b.anchor) = (12, 12);
+        b.ask_for_suggestions(&skin);
+        assert!(!b.list_open());
+        // A selection becomes the cursor; a cursor past the text (it was shortened) stays in it.
+        let mut b = new_box("\nshape: ");
+        (b.anchor, b.caret) = (0, 99);
+        b.ask_for_suggestions(&skin);
+        assert_eq!((b.anchor, b.caret), (b.text.len(), b.text.len()));
+        assert!(b.list_open());
+        // A built-in skin's text isn't changed: no list.
+        let mut b = new_box("");
+        b.read_only = true;
+        b.ask_for_suggestions(&skin);
+        assert!(!b.list_open());
+        // A language that has nothing to say: nothing, and no panic.
+        let mut b = new_box("");
+        b.ask_for_suggestions(&Plain);
+        assert!(!b.list_open());
+    }
+
+    /// Ctrl+A then Esc: the list typed open before stays shut, and Enter makes a new line at the
+    /// cursor (the text's end), not the old suggestion on an earlier line. Esc after any selection
+    /// does the same.
+    #[test]
+    fn a_selection_dropped_with_esc_never_brings_back_an_old_list() {
+        let skin = crate::skincode::SkinLang;
+        let mut b = CodeBox { rect: Rect::new(0.0, 0.0, 300.0, 400.0), char_w: 7.0, focused: true, ..Default::default() };
+        b.set_text("name: Mine\naccent: #fff\n\ntext: #000");
+        let start = "name: Mine\naccent: #fff\n".len();
+        (b.anchor, b.caret) = (start, start);
+        for c in "acc".chars() {
+            b.char(c, &skin);
+        }
+        // ("accent" is set already, but accent-text, accent-tint and on-accent aren't.)
+        let shown: Vec<&str> = b.completion.items.iter().map(|s| s.label.as_str()).collect();
+        assert!(shown.contains(&"accent-text") && !shown.contains(&"accent"), "suggested: {shown:?}");
+        assert!(b.list_open(), "typing opens the list (focused {}, closed {}, caret {} anchor {})", b.focused, b.list_closed, b.caret, b.anchor);
+        let before = b.text.clone();
+        b.select_all();
+        assert!(!b.list_open());
+        assert_eq!(b.key(VK_ESCAPE.0, HWND::default(), &skin), Done::Moved);
+        assert_eq!((b.anchor, b.caret), (b.text.len(), b.text.len()));
+        assert!(!b.list_open(), "no old list after Esc");
+        b.key(VK_RETURN.0, HWND::default(), &skin);
+        assert_eq!(b.text, format!("{before}\n"), "Enter starts a new line at the end");
+        assert_eq!(b.caret, b.text.len());
+        // Tab with no list isn't the box's.
+        assert_eq!(b.key(VK_TAB.0, HWND::default(), &skin), Done::NotMine);
+        // A selection made some other way, then Esc, then Esc again: shut, then not the box's.
+        for c in "sh".chars() {
+            b.char(c, &skin);
+        }
+        assert!(b.list_open());
+        b.anchor = 0;
+        b.key(VK_ESCAPE.0, HWND::default(), &skin);
+        assert!(!b.list_open());
+        assert_eq!(b.key(VK_ESCAPE.0, HWND::default(), &skin), Done::NotMine);
+        // Ctrl+A on an empty text, then Esc: nothing breaks.
+        let mut e = CodeBox { rect: Rect::new(0.0, 0.0, 300.0, 400.0), char_w: 7.0, focused: true, ..Default::default() };
+        e.select_all();
+        assert_eq!((e.anchor, e.caret), (0, 0));
+        assert!(!e.list_open());
+    }
+
+    /// Lines taken away (Delete, Backspace, undo, cut) never leave the box scrolled past the
+    /// text: the lines left are in view, also sideways.
+    #[test]
+    fn taking_lines_away_brings_the_rest_back_into_view() {
+        let new_box = || {
+            let mut b = CodeBox { rect: Rect::new(0.0, 0.0, 300.0, 400.0), char_w: 7.0, focused: true, ..Default::default() };
+            let text: Vec<String> = (1..=60).map(|i| format!("line-{i}: \u{1f338} {i}")).collect();
+            b.set_text(&text.join("\n"));
+            b
+        };
+        let mut b = new_box();
+        b.wheel(-1000.0, false);
+        let view = 400.0 - 2.0 * BOX_PAD;
+        assert!((b.scroll.1 - (60.0 * LINE_H - view)).abs() < 0.5, "at the bottom: {}", b.scroll.1);
+        // From the start of line 11 to the end, deleted: 11 lines left, all fit.
+        let line11 = b.text.match_indices('\n').nth(9).unwrap().0 + 1;
+        (b.anchor, b.caret) = (line11, b.text.len());
+        b.key(VK_DELETE.0, HWND::default(), &Plain);
+        assert_eq!(b.text.matches('\n').count() + 1, 11);
+        assert_eq!(b.scroll.1, 0.0, "every line left is in view");
+        // Undo brings them back (the cursor's line in view); redo takes them away again.
+        b.undo_redo(false, &Plain);
+        assert_eq!(b.text.matches('\n').count() + 1, 60);
+        b.undo_redo(true, &Plain);
+        assert_eq!(b.scroll.1, 0.0);
+        // Not all fit: scrolled no further than the last line at the bottom.
+        let mut b = new_box();
+        b.wheel(-1000.0, false);
+        let line40 = b.text.match_indices('\n').nth(38).unwrap().0 + 1;
+        (b.anchor, b.caret) = (line40, b.text.len());
+        b.key(VK_BACK.0, HWND::default(), &Plain);
+        let lines = (b.text.matches('\n').count() + 1) as f32;
+        assert!(b.scroll.1 <= lines * LINE_H - view + 0.01 && b.scroll.1 >= 0.0, "{}", b.scroll.1);
+        // Everything deleted: at the top.
+        (b.anchor, b.caret) = (0, b.text.len());
+        b.key(VK_DELETE.0, HWND::default(), &Plain);
+        assert_eq!(b.scroll, (0.0, 0.0));
+        // A long line scrolled sideways, then cut short: back to its start.
+        let mut b = CodeBox { rect: Rect::new(0.0, 0.0, 300.0, 400.0), char_w: 7.0, focused: true, ..Default::default() };
+        b.set_text(&"x".repeat(400));
+        (b.anchor, b.caret) = (400, 400);
+        b.reveal_caret();
+        assert!(b.scroll.0 > 0.0);
+        (b.anchor, b.caret) = (3, 400);
+        b.key(VK_DELETE.0, HWND::default(), &Plain);
+        assert_eq!(b.scroll.0, 0.0);
+    }
+
+    /// A double-click picks the word under it (the customiser's text: `accent`, `#ff8ad8`); a
+    /// single click just puts the cursor there.
+    #[test]
+    fn a_double_click_picks_a_word() {
+        let mut b = CodeBox { rect: Rect::new(0.0, 0.0, 300.0, 400.0), char_w: 7.0, focused: true, ..Default::default() };
+        b.set_text("accent: #ff8ad8\ntext: #000");
+        let x0 = BOX_PAD + b.gutter_w();
+        let at = |col: f32, line: f32| Point { x: x0 + col * 7.0 + 1.0, y: BOX_PAD + line * LINE_H + 2.0 };
+        b.mouse_down(at(2.0, 0.0), true, &Plain);
+        b.mouse_up();
+        assert_eq!(&b.text[b.anchor.min(b.caret)..b.anchor.max(b.caret)], "accent");
+        b.mouse_down(at(11.0, 0.0), true, &Plain);
+        b.mouse_up();
+        assert_eq!(&b.text[b.anchor.min(b.caret)..b.anchor.max(b.caret)], "#ff8ad8");
+        b.mouse_down(at(1.0, 1.0), false, &Plain);
+        b.mouse_up();
+        assert_eq!(b.anchor, b.caret);
     }
 }

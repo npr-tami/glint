@@ -25,6 +25,7 @@
 //! fix ("Did you mean -newest?").
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::folder::{self, Entry};
@@ -185,17 +186,58 @@ pub struct Written {
     pub named: bool,
 }
 
-/// The time now, and how far local time is from UTC, to tell which day something was changed.
+/// The time now, and how to tell which local day something was changed.
 #[derive(Clone, Copy, Debug)]
 pub struct Clock {
     /// FILETIME (100 ns steps since 1601, UTC).
     pub now: u64,
-    /// Local time minus UTC, in 100 ns steps.
+    /// Local time minus UTC, in 100 ns steps: used for every time when `zone` is Fixed, and when
+    /// Windows can't convert one.
     pub offset: i64,
+    /// Where each time's own offset from UTC comes from.
+    pub zone: Zone,
+}
+
+/// The rules local time follows.
+#[derive(Clone, Copy, Debug)]
+pub enum Zone {
+    /// Always `Clock::offset`.
+    Fixed,
+    /// This computer's time zone, with the daylight saving rule for each time's own date (as the
+    /// Date column shows it, folder.rs `local_time`).
+    System,
+    /// A given time zone (tests).
+    #[cfg(test)]
+    Given(windows::Win32::System::Time::TIME_ZONE_INFORMATION),
 }
 
 const HOUR: f64 = 36_000_000_000.0;
 const DAY: i64 = 864_000_000_000;
+/// Every time zone changes its offset (daylight saving) on a quarter hour of UTC, so one offset
+/// holds for each quarter hour.
+const QUARTER_HOUR: u64 = 9_000_000_000;
+
+thread_local! {
+    /// This computer's offset from UTC per quarter hour (`QUARTER_HOUR`), and the offset in force
+    /// when they were worked out: when that changes (another time zone picked) they're asked again.
+    static OFFSETS: std::cell::RefCell<(i64, HashMap<u64, i64>)> = std::cell::RefCell::new((0, HashMap::new()));
+}
+
+/// Local time minus UTC at the FILETIME `t`, by the daylight saving rule for its own date. None if
+/// Windows can't convert it.
+fn offset_at(t: u64, zone: Option<&windows::Win32::System::Time::TIME_ZONE_INFORMATION>) -> Option<i64> {
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToFileTime, SystemTimeToTzSpecificLocalTime};
+    // (SYSTEMTIME holds whole milliseconds.)
+    let t = t - t % 10_000;
+    let ft = FILETIME { dwLowDateTime: t as u32, dwHighDateTime: (t >> 32) as u32 };
+    let (mut utc, mut local, mut back) = (SYSTEMTIME::default(), SYSTEMTIME::default(), FILETIME::default());
+    // SAFETY: valid in/out pointers to plain structs.
+    let ok = unsafe {
+        FileTimeToSystemTime(&ft, &mut utc).is_ok() && SystemTimeToTzSpecificLocalTime(zone.map(|z| z as *const _), &utc, &mut local).is_ok() && SystemTimeToFileTime(&local, &mut back).is_ok()
+    };
+    ok.then(|| ((((back.dwHighDateTime as u64) << 32) | back.dwLowDateTime as u64) as i64).wrapping_sub(t as i64))
+}
 
 impl Clock {
     /// The time now on this computer.
@@ -204,7 +246,7 @@ impl Clock {
         use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
         use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
         // SAFETY: no arguments / valid in and out pointers to plain structs.
-        unsafe {
+        let clock = unsafe {
             let utc = GetSystemTimeAsFileTime();
             let mut local = FILETIME::default();
             let now = ((utc.dwHighDateTime as u64) << 32) | utc.dwLowDateTime as u64;
@@ -213,13 +255,44 @@ impl Clock {
             } else {
                 0
             };
-            Clock { now, offset }
+            Clock { now, offset, zone: Zone::System }
+        };
+        // Another time zone since the offsets were kept (or its rules changed): ask again.
+        let here = offset_at(clock.now, None).unwrap_or(clock.offset);
+        OFFSETS.with(|o| {
+            let mut o = o.borrow_mut();
+            if o.0 != here {
+                *o = (here, HashMap::new());
+            }
+        });
+        clock
+    }
+
+    /// Local time minus UTC at `t`.
+    fn offset_at(&self, t: u64) -> i64 {
+        match &self.zone {
+            Zone::Fixed => self.offset,
+            #[cfg(test)]
+            Zone::Given(z) => offset_at(t, Some(z)).unwrap_or(self.offset),
+            Zone::System => OFFSETS.with(|o| {
+                let mut o = o.borrow_mut();
+                let quarter = t / QUARTER_HOUR;
+                if let Some(&v) = o.1.get(&quarter) {
+                    return v;
+                }
+                if o.1.len() > 100_000 {
+                    o.1.clear();
+                }
+                let v = offset_at(quarter * QUARTER_HOUR, None).unwrap_or(self.offset);
+                o.1.insert(quarter, v);
+                v
+            }),
         }
     }
 
     /// The local day (days since 1 January 1601, a Monday).
     fn day(&self, t: u64) -> i64 {
-        (t as i64 + self.offset).div_euclid(DAY)
+        (t as i64 + self.offset_at(t)).div_euclid(DAY)
     }
 
     /// A time rounded down to its day, week (from Monday), month or year, as a number to compare.
@@ -313,6 +386,30 @@ pub const VIEW_RULES: &[(&str, &str)] = &[
     ("-extra_large_icons", "view: extra large icons"),
 ];
 
+/// More words the rules take, which the suggestions offer after the main ones: other ways to write
+/// a rule, and rules that need something after them (those end in "_", so the list stays open for
+/// it). "Did you mean" names a rule as they do (see `as_offered`).
+pub const MORE_RULES: &[(&str, &str)] = &[
+    ("-added_3_days", "added in 3 days"),
+    ("-larger_than_", "files over a size"),
+    ("-name_contains_", "names with a word"),
+    ("-music", "same as -audio"),
+    ("-photos", "same as -image"),
+    ("-pictures", "same as -image"),
+    ("-movies", "same as -video"),
+    ("-songs", "same as -audio"),
+    ("-docs", "same as -document"),
+    ("-apps", "same as -program"),
+    ("-installers", "same as -program"),
+    ("-links", "same as -shortcut"),
+    ("-this_week", "changed in the last 7 days"),
+    ("-this_month", "changed in the last 30 days"),
+    ("-largest", "same as -biggest"),
+    ("-alphabetical", "same as -a_to_z"),
+    ("-by_name", "same as -a_to_z"),
+    ("-by_date", "same as -newest"),
+    ("-by_size", "same as -biggest"),
+];
 /// The words for the views (without "view_" before or "_view" after), and the view.
 const VIEW_WORDS: &[(&str, ViewMode)] = &[
     ("details", ViewMode::Details),
@@ -507,6 +604,21 @@ pub fn known_type(word: &str) -> bool {
     OTHER_TYPES.contains(&word) || KINDS.iter().any(|(_, list)| list.contains(&word))
 }
 
+/// Every file type Glint knows, for the suggestions: the kinds' types in their order (pictures,
+/// videos, music…), then the others. Each one once.
+pub fn file_types() -> Vec<&'static str> {
+    let mut seen = std::collections::HashSet::new();
+    KINDS.iter().flat_map(|(_, list)| list.iter().copied()).chain(OTHER_TYPES.iter().copied()).filter(|t| seen.insert(*t)).collect()
+}
+
+/// Whether a rule as written is a kind of thing (-folder, -image, -png, -.blend, -updated_3_days,
+/// -name_has_invoice…): the editor colours those, so a word Glint knows looks different from one
+/// it doesn't.
+pub fn is_group_word(raw: &str) -> bool {
+    let word = normalize(raw);
+    !word.is_empty() && matches!(meaning(&word, raw), Meaning::Group(_))
+}
+
 /// Every rule word (without _first, _last or _by_…), for "Did you mean…": the ones the guide
 /// teaches first, then the other ways to write them.
 fn rule_words() -> Vec<&'static str> {
@@ -522,10 +634,100 @@ fn rule_words() -> Vec<&'static str> {
     v
 }
 
+/// The rule words the suggestions offer (without the dash), in their order: the guide's rules, then
+/// the other ways to write them in MORE_RULES.
+fn offered_words() -> impl Iterator<Item = &'static str> {
+    let main = GROUP_RULES.iter().chain(ORDER_RULES).chain(EXACT_RULES).chain(VIEW_RULES).chain(FOLDER_RULES).chain(MORE_RULES);
+    main.map(|(r, _)| &r[1..]).chain(["file"])
+}
+
+/// How "Did you mean" names the rule word `w` it found for what was typed: as the suggestions
+/// offer it, so the two never disagree. A way of writing it that they don't list (-pics) becomes
+/// one they do that goes on from what's typed (-pictures, for "pic"), or else the rule it means
+/// (-image).
+fn as_offered(w: &str, typed: &str) -> String {
+    if offered_words().any(|o| o == w) {
+        return w.to_string();
+    }
+    let means = alias(w);
+    offered_words().filter(|o| alias(o) == means).find(|o| o.starts_with(typed)).unwrap_or(means).to_string()
+}
+
+/// Why the group a rule word (normalised) names would do nothing after the groups `above` (the
+/// ones before it in its rules), if it would: they have it already, so it would be left out as a
+/// repeat (-pictures and -image are the same one), or one of them takes all of it, so it would never
+/// get anything (-png under -image, a name rule under -folder and -file). None for a word that
+/// names no group.
+fn unfit_reason(above: &[Group], word: &str) -> Option<String> {
+    let Meaning::Group(g) = meaning(word, word) else { return None };
+    if let Some(x) = above.iter().find(|x| x.name == g.name) {
+        return Some(format!("{} already have a line above", x.label));
+    }
+    if let Some(x) = above.iter().find(|x| covers(&x.takes, &g.takes)) {
+        return Some(format!("{} above already takes {}", x.written, what_it_takes(&g)));
+    }
+    let has = |t: fn(&Takes) -> bool| above.iter().find(|x| t(&x.takes));
+    match (has(|t| matches!(t, Takes::Folders)), has(|t| matches!(t, Takes::Files))) {
+        (Some(a), Some(b)) if matches!(g.takes, Takes::Hidden | Takes::NameStarts(_) | Takes::NameEnds(_) | Takes::NameHas(_)) => {
+            Some(format!("{} and {} above already take everything", a.written, b.written))
+        }
+        _ => None,
+    }
+}
+
+/// Whether the group a rule word (normalised) names would do something in rules with the groups
+/// `above` before it and `after` after it (see `unfit_reason`; one of `after` with the same group
+/// would be the line left out). A word that names no group fits.
+fn fits_beside(above: &[Group], after: &[Group], word: &str) -> bool {
+    if above.is_empty() && after.is_empty() {
+        return true;
+    }
+    unfit_reason(above, word).is_none() && group_named(word).is_none_or(|n| !after.iter().any(|x| x.name == n))
+}
+
+/// The group a rule word (normalised) names, by name.
+fn group_named(word: &str) -> Option<String> {
+    match meaning(word, word) {
+        Meaning::Group(g) => Some(g.name),
+        _ => None,
+    }
+}
+
+/// The groups of the rules a word written in the editor goes into (see [`beside`]).
+pub struct Beside {
+    groups: Vec<Group>,
+    /// How many of them come before the word.
+    above: usize,
+}
+
+impl Beside {
+    /// Whether a rule written there (as written: "-pictures") would do something (see `fits_beside`).
+    pub fn fits(&self, raw: &str) -> bool {
+        let word = normalize(raw);
+        word.is_empty() || fits_beside(&self.groups[..self.above], &self.groups[self.above..], &word)
+    }
+}
+
+/// The groups of the rules a word written at `start..end` of `text` goes into - its folder's, or
+/// the ones for every folder - from its other words and lines, for the suggestions to offer only
+/// rules that fit there. None when the word goes nowhere Glint can tell.
+pub fn beside(text: &str, start: usize, end: usize) -> Option<Beside> {
+    // The word is replaced by a file type no one writes: the rules that get it are the ones.
+    const PROBE: &str = "-.glint_suggestion_probe";
+    let r = Recipe::parse(&format!("{}{PROBE}{}", text.get(..start)?, text.get(end..)?));
+    let probe = &PROBE[1..];
+    // (In "in = (", every folder of it gets the same rules: the first will do.)
+    let rules = std::iter::once(&r.everywhere).chain(r.folders.iter().map(|(_, _, f)| f)).find(|f| f.groups.iter().any(|g| g.name == probe))?;
+    let above = rules.groups.iter().position(|g| g.name == probe)?;
+    let groups = rules.groups.iter().filter(|g| g.name != probe).cloned().collect();
+    Some(Beside { groups, above })
+}
+
 /// The rule a misspelt word (normalised) most likely means, with its ending: "new" -> "newest",
 /// "vid_first" -> "video_first", "folder_fist" -> "folder_first". Rules first: a file type only
-/// when it's one letter off one (so "new" never becomes -nef).
-fn suggestion(word: &str) -> Option<String> {
+/// when it's one letter off one (so "new" never becomes -nef). Only one that `fits` (see
+/// `fits_beside`): a fix that would be left out as a repeat is no fix.
+fn suggestion(word: &str, fits: &dyn Fn(&str) -> bool) -> Option<String> {
     // (Not for something long pasted in by mistake: comparing it with every rule would take long.)
     if word.len() > 100 {
         return None;
@@ -537,7 +739,8 @@ fn suggestion(word: &str) -> Option<String> {
             let (base, end) = (&rule[..cut], &rule[cut + 1..]);
             if end.len() >= 2 {
                 if let Some(e) = closest_within(end, ["first", "last"], 2).filter(|e| *e != end) {
-                    let base = if is_rule(base) { Some(base.to_string()) } else { suggest_base(base) };
+                    let base = if is_rule(base) { Some(base.to_string()) } else { suggest_base(base, fits) };
+                    let base = base.filter(|b| fits(b));
                     if let Some(base) = base {
                         return Some(format!("{base}_{e}"));
                     }
@@ -545,30 +748,32 @@ fn suggestion(word: &str) -> Option<String> {
             }
         }
     }
-    suggest_base(&rule).map(|base| format!("{base}{}", ending(place, grain)))
+    suggest_base(&rule, fits).map(|base| format!("{base}{}", ending(place, grain)))
 }
 
-/// The rule word (without an ending) a misspelt one most likely means.
-fn suggest_base(rule: &str) -> Option<String> {
+/// The rule word (without an ending) a misspelt one most likely means, as the suggestions offer it;
+/// only one that `fits`.
+fn suggest_base(rule: &str, fits: &dyn Fn(&str) -> bool) -> Option<String> {
     if !rule.chars().any(char::is_alphanumeric) {
         return None;
     }
     let n = rule.chars().count();
-    let words = rule_words();
+    let free = |w: &&str| fits(w);
+    let words: Vec<&str> = rule_words().into_iter().filter(free).collect();
     // Close in spelling: one letter off a short word, two in a longer one.
     let most = if n <= 4 { 1 } else if n <= 8 { 2 } else { n / 3 };
     if let Some(w) = closest_within(rule, words.iter().copied(), most) {
-        return Some(w.to_string());
+        return Some(as_offered(w, rule));
     }
     // Its start: "new" -> newest, "vid" -> video (the shortest; another way of writing one gives the
     // rule it means).
     if n >= 3 {
         if let Some(w) = words.iter().filter(|w| w.starts_with(rule)).min_by_key(|w| (ALIASES.iter().any(|(a, _)| a == *w), w.len())) {
-            return Some(alias(w).to_string());
+            return Some(as_offered(w, rule));
         }
     }
     // A file type, one letter off.
-    let types = KINDS.iter().flat_map(|(_, list)| list.iter().copied()).chain(OTHER_TYPES.iter().copied());
+    let types = KINDS.iter().flat_map(|(_, list)| list.iter().copied()).chain(OTHER_TYPES.iter().copied()).filter(free);
     (n >= 4).then(|| closest_within(rule, types, 1)).flatten().map(str::to_string)
 }
 
@@ -1724,18 +1929,31 @@ impl Recipe {
                 (pos, g, i)
             })
             .collect();
-        keyed.sort_by(|&(pa, ga, a), &(pb, _, b)| {
-            let (a, b) = (&entries[a as usize], &entries[b as usize]);
-            pa.cmp(&pb)
-                .then_with(|| {
-                    // The same place, so the same group: its own order rules first, then the ones
-                    // for every group.
-                    let own = ga.map_or(&[][..], |g| &rules.groups[g].orders[..]);
-                    own.iter().chain(&rules.orders).map(|o| compare(o, a, b, clock)).find(|c| c.is_ne()).unwrap_or(Ordering::Equal)
-                })
-                .then_with(|| folder::natural_cmp(&a.lower, &b.lower))
-                .then_with(|| a.name.cmp(&b.name))
-                .then_with(|| folder::result_folder(a).to_lowercase().cmp(&folder::result_folder(b).to_lowercase()))
+        // Type names in lower case, once per type (entries of one type share one Arc), when an
+        // order rule compares them.
+        let by_type = rules.orders.iter().chain(rules.groups.iter().flat_map(|g| &g.orders)).any(|o| o.key == Key::Type);
+        let mut types = TypeKeys::new();
+        if by_type {
+            for &i in view.iter() {
+                let t = &entries[i as usize].type_name;
+                types.entry(Arc::as_ptr(t) as *const u8).or_insert_with(|| t.to_lowercase());
+            }
+        }
+        // (Names' sort keys looked up once each, not on every compare.)
+        folder::with_name_keys(entries, view, |names| {
+            keyed.sort_by(|&(pa, ga, x), &(pb, _, y)| {
+                let (a, b) = (&entries[x as usize], &entries[y as usize]);
+                pa.cmp(&pb)
+                    .then_with(|| {
+                        // The same place, so the same group: its own order rules first, then the
+                        // ones for every group.
+                        let own = ga.map_or(&[][..], |g| &rules.groups[g].orders[..]);
+                        own.iter().chain(&rules.orders).map(|o| compare(o, (x, a), (y, b), clock, &types, names)).find(|c| c.is_ne()).unwrap_or(Ordering::Equal)
+                    })
+                    .then_with(|| names.cmp(x, y))
+                    .then_with(|| a.name.cmp(&b.name))
+                    .then_with(|| folder::result_folder(a).to_lowercase().cmp(&folder::result_folder(b).to_lowercase()))
+            })
         });
         for (slot, (_, _, i)) in view.iter_mut().zip(keyed) {
             *slot = i;
@@ -2185,7 +2403,9 @@ fn read_line(tokens: &[Token], line: usize, into: &mut Rules, messages: &mut Vec
                     say(messages, text, true, None);
                     continue;
                 }
-                let close = suggestion(&word);
+                let close = suggestion(&word, &|w| fits_beside(&into.groups, &[], w));
+                // What it looks like, even if that would do nothing here (then it says why).
+                let looks_like = close.clone().or_else(|| suggestion(&word, &|_| true));
                 // In "in = (", words on their own (no dash, nothing like a rule) are most likely a
                 // folder's name: folders go there as paths.
                 if ctx.multi && first && close.is_none() && !tokens.iter().any(|t| has_dash(t.text)) {
@@ -2196,7 +2416,7 @@ fn read_line(tokens: &[Token], line: usize, into: &mut Rules, messages: &mut Vec
                     break;
                 }
                 let plain = !rule.is_empty() && rule.len() <= 8 && rule.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
-                if close.is_none() && plain && n == 1 {
+                if looks_like.is_none() && plain && n == 1 {
                     // Not a rule: a file type (-blend).
                     say(messages, format!("{written} means files ending in .{rule}."), false, None);
                     let mut g = type_group(&rule);
@@ -2213,12 +2433,18 @@ fn read_line(tokens: &[Token], line: usize, into: &mut Rules, messages: &mut Vec
                     last_was_order = false;
                     continue;
                 }
-                match close {
-                    Some(fixed) => {
-                        say(messages, format!("\"{}\" isn't a rule. Did you mean -{fixed}?", raw.trim_start_matches(['-', '\u{2013}', '\u{2014}'])), true, Some(if dash { format!("-{fixed}") } else { fixed }));
+                let typed = raw.trim_start_matches(['-', '\u{2013}', '\u{2014}']);
+                match (close, looks_like) {
+                    (Some(fixed), _) => {
+                        say(messages, format!("\"{typed}\" isn't a rule. Did you mean -{fixed}?"), true, Some(if dash { format!("-{fixed}") } else { fixed }));
                     }
-                    None if !rule.chars().any(char::is_alphanumeric) => say(messages, format!("\"{raw}\" isn't a rule."), true, None),
-                    None => say(messages, format!("\"{written}\" isn't a rule. The guide lists them (for files ending in .{rule}, write -.{rule})."), true, None),
+                    // (No fix: the line would be left out, or get nothing.)
+                    (None, Some(meant)) => {
+                        let why = unfit_reason(&into.groups, &split(&meant).0).unwrap_or_else(|| "it wouldn't do anything here".into());
+                        say(messages, format!("\"{typed}\" isn't a rule. If you meant -{meant}: {why}."), true, None);
+                    }
+                    (None, None) if !rule.chars().any(char::is_alphanumeric) => say(messages, format!("\"{raw}\" isn't a rule."), true, None),
+                    (None, None) => say(messages, format!("\"{written}\" isn't a rule. The guide lists them (for files ending in .{rule}, write -.{rule})."), true, None),
                 }
             }
         }
@@ -2457,14 +2683,23 @@ fn group_of<'a>(rules: &'a Rules, e: &Entry, clock: &Clock) -> (i64, Option<&'a 
     (pos, g.map(|g| &rules.groups[g]))
 }
 
-fn compare(o: &Order, a: &Entry, b: &Entry, clock: &Clock) -> Ordering {
+/// Type names in lower case, by their Arc's address (see `Recipe::sort`).
+type TypeKeys = HashMap<*const u8, String>;
+
+/// One order rule on two items (each: its index into the entries, and the entry).
+fn compare(o: &Order, (x, a): (u32, &Entry), (y, b): (u32, &Entry), clock: &Clock, types: &TypeKeys, names: &folder::NameKeys) -> Ordering {
     let c = match o.key {
         Key::Modified => clock.round(a.modified, o.grain).cmp(&clock.round(b.modified, o.grain)),
         Key::Created => clock.round(a.created, o.grain).cmp(&clock.round(b.created, o.grain)),
         Key::Size => a.size.cmp(&b.size),
-        Key::Type => a.type_name.to_lowercase().cmp(&b.type_name.to_lowercase()),
+        // (One Arc: the same text.)
+        Key::Type if Arc::ptr_eq(&a.type_name, &b.type_name) => Ordering::Equal,
+        Key::Type => {
+            let lower = |e: &Entry| types.get(&(Arc::as_ptr(&e.type_name) as *const u8)).map_or_else(|| std::borrow::Cow::Owned(e.type_name.to_lowercase()), |s| std::borrow::Cow::Borrowed(s.as_str()));
+            lower(a).cmp(&lower(b))
+        }
         Key::Extension => a.ext.cmp(&b.ext),
-        Key::Name => folder::natural_cmp(&a.lower, &b.lower),
+        Key::Name => names.cmp(x, y),
     };
     if o.descending {
         c.reverse()
@@ -2553,7 +2788,7 @@ mod tests {
     const D: u64 = 24 * H;
 
     fn clock() -> Clock {
-        Clock { now: NOW, offset: 0 }
+        Clock { now: NOW, offset: 0, zone: Zone::Fixed }
     }
 
     fn entry(name: &str, dir: bool, modified: u64, size: u64) -> Entry {
@@ -2593,6 +2828,132 @@ mod tests {
             f("q.jpg", NOW - 6 * D, 900),
             f("s.png", NOW - 5 * H, 50),
         ]
+    }
+
+    /// A UTC date and time as a FILETIME.
+    fn utc(y: u16, m: u16, d: u16, h: u16, min: u16) -> u64 {
+        use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+        let st = SYSTEMTIME { wYear: y, wMonth: m, wDay: d, wHour: h, wMinute: min, ..Default::default() };
+        let mut ft = FILETIME::default();
+        // SAFETY: valid in/out pointers to plain structs.
+        unsafe { windows::Win32::System::Time::SystemTimeToFileTime(&st, &mut ft) }.unwrap();
+        ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64
+    }
+
+    /// The UK's time zone: GMT, and BST (an hour on) from the last Sunday of March to the last
+    /// Sunday of October.
+    fn uk() -> windows::Win32::System::Time::TIME_ZONE_INFORMATION {
+        use windows::Win32::Foundation::SYSTEMTIME;
+        windows::Win32::System::Time::TIME_ZONE_INFORMATION {
+            Bias: 0,
+            StandardBias: 0,
+            DaylightBias: -60,
+            StandardDate: SYSTEMTIME { wMonth: 10, wDayOfWeek: 0, wDay: 5, wHour: 2, ..Default::default() },
+            DaylightDate: SYSTEMTIME { wMonth: 3, wDayOfWeek: 0, wDay: 5, wHour: 1, ..Default::default() },
+            ..Default::default()
+        }
+    }
+
+    /// Each file's day, month and year come from the daylight saving rule for its own date (as the
+    /// Date column shows it), not the one in force today.
+    #[test]
+    fn dates_from_the_other_daylight_saving_season_keep_their_own_day() {
+        let summer = utc(2026, 7, 15, 12, 0);
+        let uk_at = |now: u64| Clock { now, offset: offset_at(now, Some(&uk())).unwrap(), zone: Zone::Given(uk()) };
+        let july = uk_at(summer);
+        assert_eq!(july.offset, 36_000_000_000, "BST: an hour on");
+        let late = utc(2026, 1, 15, 23, 30); // 23:30 on 15 January, GMT
+        assert_ne!(july.day(late), july.day(utc(2026, 1, 16, 10, 0)), "15 January, not the 16th");
+        assert_eq!(july.day(late), july.day(utc(2026, 1, 15, 0, 0)));
+        // (What the fixed offset got wrong.)
+        let fixed = Clock { zone: Zone::Fixed, ..july };
+        assert_eq!(fixed.day(late), fixed.day(utc(2026, 1, 16, 10, 0)));
+        // Months and years too.
+        assert_eq!(july.round(utc(2026, 1, 31, 23, 30), Some(Grain::Month)), july.round(utc(2026, 1, 1, 0, 0), Some(Grain::Month)));
+        assert_eq!(july.round(utc(2025, 12, 31, 23, 30), Some(Grain::Year)), july.round(utc(2025, 6, 1, 0, 0), Some(Grain::Year)));
+        // Seen in winter: a summer file changed at 00:30 BST is on the 16th.
+        let january = uk_at(utc(2026, 1, 20, 12, 0));
+        assert_eq!(january.offset, 0);
+        assert_eq!(january.day(utc(2026, 7, 15, 23, 30)), january.day(utc(2026, 7, 16, 12, 0)));
+        // Just after the spring switch (29 March 2026): Saturday 23:30 GMT is still Saturday.
+        let monday = uk_at(utc(2026, 3, 30, 12, 0));
+        assert_eq!(monday.day(utc(2026, 3, 28, 23, 30)), monday.day(monday.now) - 2);
+        // Around the switches themselves (01:00 UTC both times).
+        assert_eq!(july.offset_at(utc(2026, 3, 29, 0, 59)), 0);
+        assert_eq!(july.offset_at(utc(2026, 3, 29, 1, 0)), 36_000_000_000);
+        assert_eq!(july.offset_at(utc(2026, 10, 25, 0, 59)), 36_000_000_000);
+        assert_eq!(july.offset_at(utc(2026, 10, 25, 1, 0)), 0);
+
+        // The sort: by day, then A to Z within each day.
+        let entries = vec![f("m15.txt", utc(2026, 1, 15, 12, 0), 1), f("a late.txt", late, 1), f("z16.txt", utc(2026, 1, 16, 10, 0), 1)];
+        let mut view: Vec<u32> = vec![0, 1, 2];
+        Recipe::parse("-newest_by_day\n-a_to_z").sort(&entries, &mut view, "C:\\t", &july);
+        let names: Vec<&str> = view.iter().map(|&i| entries[i as usize].name.as_str()).collect();
+        assert_eq!(names, ["z16.txt", "a late.txt", "m15.txt"]);
+        // -today / -yesterday the same way.
+        let rules = Recipe::parse("-yesterday\n-today\n-a_to_z");
+        let saturday_late = f("sat.txt", utc(2026, 3, 28, 23, 30), 1);
+        let sunday = uk_at(utc(2026, 3, 29, 12, 0));
+        assert_eq!(rules.group_name(&saturday_late, "C:\\t", &sunday), "changed yesterday");
+    }
+
+    /// By type: one Arc per type, or several with the same text, or text that differs only in
+    /// capitals (Σ's final form too) - always the order lower-casing each one gives.
+    #[test]
+    fn by_type_orders_as_lower_case_text_does() {
+        let shared: Arc<str> = Arc::from("Text Document");
+        let mut entries = Vec::new();
+        let types = ["Text Document", "text document", "PNG File", "ΣΟΦΟΣ File", "σοφος file", "Ünïcode 😀", "a", "", "Text Document "];
+        for i in 0..60 {
+            let mut e = f(&format!("f{} {}.x", i % 7, i), NOW - (i as u64 % 5) * D, i as u64 % 3);
+            e.type_name = if i % 4 == 0 { shared.clone() } else { Arc::from(types[i % types.len()]) };
+            entries.push(e);
+        }
+        entries.push(d("Folder", NOW));
+        for recipe in ["-by_type\n-a_to_z", "-by_type_last\n-newest_first", "-folder_first\n-image -by_type\n-by_type", "-a_to_z"] {
+            let r = Recipe::parse(recipe);
+            let mut view: Vec<u32> = (0..entries.len() as u32).rev().collect();
+            r.sort(&entries, &mut view, "C:\\t", &clock());
+            // The same, by lower-casing on every compare (as before).
+            let rules = r.rules_for("C:\\t");
+            let mut want: Vec<u32> = (0..entries.len() as u32).rev().collect();
+            let key = |i: u32| group_index(rules, &entries[i as usize], &clock());
+            want.sort_by(|&x, &y| {
+                let (a, b) = (&entries[x as usize], &entries[y as usize]);
+                let ((pa, ga), (pb, _)) = (key(x), key(y));
+                let old = |o: &Order| {
+                    let c = match o.key {
+                        Key::Type => a.type_name.to_lowercase().cmp(&b.type_name.to_lowercase()),
+                        Key::Name => folder::natural_cmp(&a.lower, &b.lower),
+                        _ => folder::with_name_keys(&entries, &[], |names| compare(o, (x, a), (y, b), &clock(), &TypeKeys::new(), names)),
+                    };
+                    if o.descending && o.key == Key::Type { c.reverse() } else { c }
+                };
+                let own = ga.map_or(&[][..], |g| &rules.groups[g].orders[..]);
+                pa.cmp(&pb)
+                    .then_with(|| own.iter().chain(&rules.orders).map(old).find(|c| c.is_ne()).unwrap_or(Ordering::Equal))
+                    .then_with(|| folder::natural_cmp(&a.lower, &b.lower))
+                    .then_with(|| a.name.cmp(&b.name))
+            });
+            assert_eq!(view, want, "{recipe}");
+        }
+    }
+
+    /// This computer's zone: the kept quarter-hour offsets are what Windows says for each time.
+    #[test]
+    fn the_computers_offsets_are_kept_right() {
+        let clock = Clock::now();
+        let start = utc(2025, 1, 1, 0, 0);
+        for i in 0..2000u64 {
+            let t = start + i * 157_000_000_000 + 7; // about every 4.4 hours, at odd minutes
+            let want = offset_at(t, None).unwrap();
+            assert_eq!(clock.offset_at(t), want, "at {t}");
+            assert_eq!(clock.offset_at(t), want, "asked again");
+            assert_eq!(clock.day(t), (t as i64 + want).div_euclid(DAY));
+        }
+        assert_eq!(clock.offset_at(clock.now), clock.offset, "now");
+        // A time Windows can't convert (past year 30827) falls back to the offset now.
+        assert_eq!(clock.offset_at(u64::MAX - 5), clock.offset);
     }
 
     fn sorted_in(recipe: &str, folder: &str) -> Vec<String> {
@@ -2942,6 +3303,63 @@ mod tests {
         assert_eq!(r.group_heading(&f("Screenshot 1.png", NOW, 1), "C:\\t", &clock()), "names with \"screenshot\"  \u{00b7}  newest first");
     }
 
+    /// "Did you mean" names a rule as the suggestions offer it (-pictures for "pic", not -pics,
+    /// which they don't list), and never one that would be left out as a repeat or get nothing.
+    #[test]
+    fn did_you_mean_agrees_with_the_suggestions() {
+        let fix = |text: &str| errors(text).into_iter().next().map(|m| (m.text, m.fix));
+        let (said, fixed) = fix("-pic").unwrap();
+        assert_eq!((said.as_str(), fixed.as_deref()), ("\"pic\" isn't a rule. Did you mean -pictures?", Some("-pictures")));
+        assert_eq!(fix("-pictres").unwrap().1.as_deref(), Some("-pictures"), "one they list stays as it is");
+        assert_eq!(fix("pho").unwrap().1.as_deref(), Some("photos"), "without the dash, as written");
+        // A way of writing it that nothing starts with what's typed: the rule it means.
+        assert_eq!(fix("-pis").unwrap().1.as_deref(), Some("-image"));
+        assert_eq!(fix("-pic_first").unwrap().1.as_deref(), Some("-pictures_first"));
+        // Pictures have a line above: no fix that would be left out, and the typo isn't taken for
+        // a file type either.
+        for text in ["-image\n-pic", "-photos -newest\n\n-pic_last", "in C:\\t (\n-image\n-pic\n)"] {
+            let (said, fixed) = fix(text).unwrap_or_else(|| panic!("{text:?}"));
+            assert_eq!(fixed, None, "{text:?}");
+            assert!(said.starts_with("\"pic") && said.contains("If you meant -pictures") && said.ends_with("pictures already have a line above."), "{said}");
+        }
+        // In another folder's rules, or with only another kind above, the fix is offered.
+        assert_eq!(fix("in C:\\a (\n-image\n)\nin C:\\b (\n-pic\n)").unwrap().1.as_deref(), Some("-pictures"));
+        assert_eq!(fix("-video\n-pic").unwrap().1.as_deref(), Some("-pictures"));
+        // A type a group above takes all of: never offered (-png gets nothing under -image).
+        let (said, fixed) = fix("-image\n-pnng").unwrap();
+        assert_eq!((said.as_str(), fixed), ("\"pnng\" isn't a rule. If you meant -png: -image above already takes all .png files.", None));
+        assert_eq!(fix("-video\n-pnng").unwrap().1.as_deref(), Some("-png"));
+    }
+
+    #[test]
+    fn rules_that_fit_where_a_word_is() {
+        let fits = |text: &str, word: &str| {
+            let at = text.find('@').unwrap();
+            let text = text.replacen('@', "", 1);
+            super::beside(&text, at, at).map(|b| b.fits(word))
+        };
+        // A repeat, above or below, or on the same line; the same group however it's written.
+        for text in ["-image\n@", "@\n-photos", "-image_last @", "-folder\n\n-image -newest\n-hidden\n@"] {
+            assert_eq!(fits(text, "-pictures"), Some(false), "{text:?}");
+            assert_eq!(fits(text, "-image_first"), Some(false), "{text:?}");
+            assert_eq!(fits(text, "-video"), Some(true), "{text:?}");
+            assert_eq!(fits(text, "-newest"), Some(true), "an order rule isn't a group");
+        }
+        // Taken all of by a group above (not below: there it gets its own place first).
+        assert_eq!(fits("-image\n@", "-png"), Some(false));
+        assert_eq!(fits("@\n-image", "-png"), Some(true));
+        assert_eq!(fits("-folder\n-file\n@", "-name_has_x"), Some(false));
+        // Only the rules the word goes into count.
+        assert_eq!(fits("in C:\\a (\n-image\n)\n@", "-pictures"), Some(true));
+        assert_eq!(fits("-image\nin C:\\a (\n@\n)", "-pictures"), Some(true));
+        assert_eq!(fits("in C:\\a (\n-image\n@\n)", "-pictures"), Some(false));
+        assert_eq!(fits("in = (\nC:\\a\nC:\\b\n-image\n@\n)", "-pictures"), Some(false));
+        assert_eq!(fits("in C:\\a (\n-image\n@", "-pictures"), Some(false), "a block not closed yet");
+        // Places that aren't words, and an empty text.
+        assert_eq!(fits("@", "-pictures"), Some(true));
+        assert_eq!(super::beside("-image", 99, 99).map(|b| b.fits("-image")), None);
+    }
+
     #[test]
     fn typos_say_where_and_how_to_fix() {
         let text = "-folder\nnewst";
@@ -3221,8 +3639,9 @@ mod tests {
 
     #[test]
     fn did_you_mean_offers_rules() {
+        // (After a line of another group: one of the same would be left out, so it's no fix.)
         let fix = |word: &str| {
-            let m = errors(&format!("-folder\n{word}"));
+            let m = errors(&format!("-hidden\n{word}"));
             assert_eq!(m.len(), 1, "{word}: {m:?}");
             m[0].fix.clone()
         };

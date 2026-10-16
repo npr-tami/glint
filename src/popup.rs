@@ -15,9 +15,11 @@ use std::cell::Cell;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HGDIOBJ};
+use windows::Win32::Graphics::Imaging::{GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, WICBitmapInterpolationModeHighQualityCubic, WICBitmapPaletteTypeCustom};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetMenuItemCount, GetMenuItemInfoW, InsertMenuItemW, RemoveMenu, SetMenuDefaultItem,
+    AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, LoadImageW, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, GetMenuItemCount, GetMenuItemInfoW, InsertMenuItemW, RemoveMenu, SetMenuDefaultItem,
     SetMenuItemInfoW, TrackPopupMenuEx, HMENU, MENUITEMINFOW, MENU_ITEM_STATE, MENU_ITEM_TYPE, MFS_DEFAULT, MFT_OWNERDRAW, MF_BYPOSITION,
     MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_BITMAP, MIIM_CHECKMARKS, MIIM_DATA, MIIM_FTYPE, MIIM_ID, MIIM_STATE,
     MIIM_STRING, MIIM_SUBMENU, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WM_INITMENUPOPUP,
@@ -28,7 +30,7 @@ use crate::menu;
 use crate::log;
 use crate::shellmenu::{self, Built, Forwarded, ShellItem, SHELL_FIRST, SHELL_LAST};
 use crate::theme::Color;
-use crate::ui::{Menu, MenuItem, SHELL_SLOT};
+use crate::ui::{Menu, MenuItem, MenuPicture, SHELL_SLOT};
 
 /// MFT_BITMAP: an old-style item whose "text" is a bitmap handle (not copied).
 const MFT_BITMAP: u32 = 0x4;
@@ -102,17 +104,29 @@ pub fn show(owner: HWND, at: POINT, menu: &Menu, default_item: u32, built: Optio
     }
 }
 
-/// Puts each item's dot (`MenuItem::dot`: Tag ›'s colours) beside its words, as a little picture -
-/// on the items Windows draws: a skin's own menus (oldmenu.rs) draw their items themselves, words
-/// only. The pictures go in `made`, to be deleted once the menu is gone.
+/// Puts each item's dot (`MenuItem::dot`: Tag ›'s colours) or picture (`MenuItem::picture`) beside
+/// its words - on the items Windows draws: a skin's own menus (oldmenu.rs) draw their items
+/// themselves, words only. The pictures go in `made`, to be deleted once the menu is gone.
 ///
 /// # Safety
 /// `h` must be a live menu.
 unsafe fn add_dots(h: HMENU, items: &[MenuItem], dpi: u32, made: &mut Vec<HBITMAP>) {
+    let scale = dpi.max(96) as f32 / 96.0;
     for item in items {
         // SAFETY: as for this function.
         unsafe { add_dots(h, &item.submenu, dpi, made) };
-        let Some(color) = item.dot.filter(|_| item.submenu.is_empty() && item.id != 0) else { continue };
+        if !item.submenu.is_empty() || item.id == 0 {
+            continue;
+        }
+        let art = match (item.dot, item.picture) {
+            (Some(color), _) => {
+                let side = (16.0 * scale).round() as usize;
+                Some(Art { width: side, height: side, pixels: dot_pixels(color, side, scale) })
+            }
+            (None, Some(picture)) => picture_art(picture, scale),
+            (None, None) => None,
+        };
+        let Some(art) = art else { continue };
         let size = std::mem::size_of::<MENUITEMINFOW>() as u32;
         let mut now = MENUITEMINFOW { cbSize: size, fMask: MIIM_FTYPE, ..Default::default() };
         // (By its id: Windows finds it in the submenus too.)
@@ -120,7 +134,7 @@ unsafe fn add_dots(h: HMENU, items: &[MenuItem], dpi: u32, made: &mut Vec<HBITMA
         if unsafe { GetMenuItemInfoW(h, item.id, false, &mut now) }.is_err() || now.fType.0 & MFT_OWNERDRAW.0 != 0 {
             continue;
         }
-        let Some(picture) = dot_bitmap(color, dpi) else { continue };
+        let Some(picture) = bitmap(&art) else { continue };
         let set = MENUITEMINFOW { cbSize: size, fMask: MIIM_BITMAP, hbmpItem: picture, ..Default::default() };
         // SAFETY: as above. The picture lives until the caller deletes it, after the menu.
         if unsafe { SetMenuItemInfoW(h, item.id, false, &set) }.is_ok() {
@@ -132,16 +146,112 @@ unsafe fn add_dots(h: HMENU, items: &[MenuItem], dpi: u32, made: &mut Vec<HBITMA
     }
 }
 
-/// A dot of `color` as a menu item's picture at `dpi` (16 pixels square at 96 DPI): 32-bit, with
-/// see-through corners, as Windows' menus take them. None if Windows can't make it.
-fn dot_bitmap(color: Color, dpi: u32) -> Option<HBITMAP> {
-    let scale = dpi.max(96) as f32 / 96.0;
-    let side = (16.0 * scale).round() as usize;
-    let pixels = dot_pixels(color, side, scale);
+/// A menu item's picture: its size in pixels and its pixels, top row first, each see-through, red,
+/// green and blue from the top byte down, the colours already times the see-through.
+struct Art {
+    width: usize,
+    height: usize,
+    pixels: Vec<u32>,
+}
+
+/// The pixels of `picture` at `scale`: an icon 16 DIPs square, the logos 16 DIPs high.
+fn picture_art(picture: MenuPicture, scale: f32) -> Option<Art> {
+    let high = (16.0 * scale).round().max(1.0) as usize;
+    match picture {
+        MenuPicture::Icon(number) => icon_art(number, high),
+        MenuPicture::Wordmark { caps, dark } => {
+            let source = crate::logo::pixels(dark, caps, crate::logo::pick(scale))?;
+            // The wordmark fills a 40-DIP title bar; here it is as high as the icon beside its words.
+            let height = (high as f32 * 1.6).round() as u32;
+            let width = (source.width as f32 * height as f32 / source.height as f32).round().max(1.0) as u32;
+            shrink(source, width, height)
+        }
+        MenuPicture::Box(color) => Some(box_art(color, high, scale)),
+    }
+}
+
+/// glint.exe's icon `number` (res/glint.rc), `side` pixels square.
+fn icon_art(number: u16, side: usize) -> Option<Art> {
+    let wic = crate::thumbs::wic_factory()?;
+    // SAFETY: the icon is loaded from this exe and destroyed here; WIC's objects are owned
+    // wrappers; the buffer holds exactly `side` rows of `side * 4` bytes.
+    unsafe {
+        let module = GetModuleHandleW(None).ok()?;
+        let handle = LoadImageW(Some(module.into()), PCWSTR(number as usize as *const u16), IMAGE_ICON, side as i32, side as i32, LR_DEFAULTCOLOR).ok()?;
+        let icon = HICON(handle.0);
+        let pixels = (|| {
+            let from = wic.CreateBitmapFromHICON(icon).ok()?;
+            let (mut w, mut h) = (0u32, 0u32);
+            from.GetSize(&mut w, &mut h).ok()?;
+            let conv = wic.CreateFormatConverter().ok()?;
+            conv.Initialize(&from, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom).ok()?;
+            let mut buf = vec![0u8; w as usize * h as usize * 4];
+            conv.CopyPixels(std::ptr::null(), w * 4, &mut buf).ok()?;
+            Some(Art { width: w as usize, height: h as usize, pixels: words(&buf) })
+        })();
+        let _ = DestroyIcon(icon);
+        pixels.filter(|a| a.width > 0 && a.height > 0)
+    }
+}
+
+/// `source` shrunk smoothly to `width` x `height`.
+fn shrink(source: &crate::thumbs::Pixels, width: u32, height: u32) -> Option<Art> {
+    let wic = crate::thumbs::wic_factory()?;
+    // SAFETY: WIC copies `source`'s pixels when it makes the bitmap; the buffer holds exactly
+    // `height` rows of `width * 4` bytes.
+    unsafe {
+        let from = wic.CreateBitmapFromMemory(source.width, source.height, &GUID_WICPixelFormat32bppPBGRA, source.width * 4, &source.pixels).ok()?;
+        let scaler = wic.CreateBitmapScaler().ok()?;
+        scaler.Initialize(&from, width, height, WICBitmapInterpolationModeHighQualityCubic).ok()?;
+        let mut buf = vec![0u8; width as usize * height as usize * 4];
+        scaler.CopyPixels(std::ptr::null(), width * 4, &mut buf).ok()?;
+        Some(Art { width: width as usize, height: height as usize, pixels: words(&buf) })
+    }
+}
+
+/// Blue, green, red, see-through bytes as one number a pixel.
+fn words(bytes: &[u8]) -> Vec<u32> {
+    bytes.chunks_exact(4).map(|p| u32::from_le_bytes([p[0], p[1], p[2], p[3]])).collect()
+}
+
+/// The slanted box logo in `color`: `high` pixels high, its right edge leaning in at the bottom
+/// (edges smoothed).
+fn box_art(color: Color, high: usize, scale: f32) -> Art {
+    const SAMPLES: usize = 4;
+    let width = (26.0 * scale).round() as usize;
+    let (top, bottom) = (2.0 * scale, high as f32 - 2.0 * scale);
+    let lean = 5.0 * scale;
+    let n = (SAMPLES * SAMPLES) as f32;
+    let byte = |v: f32| ((v / n).clamp(0.0, 1.0) * 255.0).round() as u32;
+    let mut pixels = vec![0u32; width * high];
+    for y in 0..high {
+        for x in 0..width {
+            let mut a = 0.0;
+            for sy in 0..SAMPLES {
+                for sx in 0..SAMPLES {
+                    let px = x as f32 + (sx as f32 + 0.5) / SAMPLES as f32;
+                    let py = y as f32 + (sy as f32 + 0.5) / SAMPLES as f32;
+                    let right = width as f32 - lean * (py - top) / (bottom - top).max(1.0);
+                    if py >= top && py <= bottom && px <= right {
+                        a += 1.0;
+                    }
+                }
+            }
+            pixels[y * width + x] = (byte(a) << 24) | (byte(a * color.r) << 16) | (byte(a * color.g) << 8) | byte(a * color.b);
+        }
+    }
+    Art { width, height: high, pixels }
+}
+
+/// `art` as a 32-bit picture for a menu item.
+fn bitmap(art: &Art) -> Option<HBITMAP> {
+    if art.width == 0 || art.height == 0 || art.pixels.len() != art.width * art.height {
+        return None;
+    }
     let header = BITMAPINFOHEADER {
         biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-        biWidth: side as i32,
-        biHeight: -(side as i32), // the top row first
+        biWidth: art.width as i32,
+        biHeight: -(art.height as i32), // the top row first
         biPlanes: 1,
         biBitCount: 32,
         biCompression: BI_RGB.0,
@@ -149,15 +259,15 @@ fn dot_bitmap(color: Color, dpi: u32) -> Option<HBITMAP> {
     };
     let info = BITMAPINFO { bmiHeader: header, ..Default::default() };
     let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-    // SAFETY: a new side x side 32-bit picture; `bits` points to its side * side pixels, filled here
-    // before anything else sees it.
+    // SAFETY: a new 32-bit picture; `bits` points to its width * height pixels, filled here before
+    // anything else sees it.
     unsafe {
         let picture = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
         if bits.is_null() {
             let _ = DeleteObject(HGDIOBJ(picture.0));
             return None;
         }
-        std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u32, pixels.len());
+        std::ptr::copy_nonoverlapping(art.pixels.as_ptr(), bits as *mut u32, art.pixels.len());
         Some(picture)
     }
 }
@@ -382,6 +492,25 @@ mod tests {
         assert_eq!(to_pick(SHELL_SLOT as i32, &ours), Pick::None, "the slot itself is never an item");
         assert_eq!(to_pick(0, &ours), Pick::None);
         assert_eq!(to_pick(1, &[]), Pick::None, "Windows' whole menu has none of Glint's items");
+    }
+
+    #[test]
+    fn menu_pictures_are_whole_and_never_panic() {
+        for scale in [1.0, 1.25, 1.5, 2.0, 3.0] {
+            let b = box_art(Color::rgba(200, 30, 40, 1.0), (16.0 * scale) as usize, scale);
+            assert_eq!(b.pixels.len(), b.width * b.height);
+            // Solid in the middle, see-through above and below the box and at the leaning corner.
+            assert_eq!(b.pixels[(b.height / 2) * b.width + 2] >> 24, 255);
+            assert_eq!(b.pixels[0] >> 24, 0);
+            assert_eq!(b.pixels[(b.height - 1) * b.width + b.width - 1] >> 24, 0);
+            for p in [MenuPicture::Icon(1), MenuPicture::Icon(2), MenuPicture::Icon(9999), MenuPicture::Wordmark { caps: true, dark: false }] {
+                if let Some(a) = picture_art(p, scale) {
+                    assert_eq!(a.pixels.len(), a.width * a.height);
+                }
+            }
+        }
+        assert!(bitmap(&Art { width: 0, height: 0, pixels: Vec::new() }).is_none());
+        assert!(bitmap(&Art { width: 4, height: 4, pixels: vec![0; 3] }).is_none(), "wrong size");
     }
 
     #[test]

@@ -6,7 +6,9 @@
 //! whole archive (Extract here), and [`pack`] makes a new one (Compress to zip / 7z) from what
 //! [`plan_pack`] found. Nothing is kept between calls: each one opens the archive again. That's cheap, because the list of what's inside sits in
 //! one place (a zip's central directory at the end, a 7z's header), so listing never unpacks any
-//! file data.
+//! file data. The one exception is an archive inside the archive (`a.zip\sub\b.zip\docs`): it's
+//! taken out to Glint's temporary folder the first time it's looked into, and read from there
+//! ([`resolve`]), while its path stays the one through the outer archive.
 //!
 //! Names inside an archive are written by whoever made it, so they're cleaned before use: `/` and
 //! `\` both separate folders, and a name that climbs out (`..`) or names a drive (`C:`) is left
@@ -19,7 +21,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -95,6 +97,8 @@ struct Item {
     locked: bool,
     /// Where it is in the archive's own list (the zip index, the 7z file index).
     index: usize,
+    /// A zip entry the zip library has no index for (its name comes twice): where it is instead.
+    hidden: Option<Hidden>,
 }
 
 impl Item {
@@ -159,7 +163,12 @@ fn same_name(a: &str, b: &str) -> bool {
 /// These parts as one path in lower case, the way `same_name` compares them: so many items can be
 /// looked up by it at once.
 fn folded(parts: &[&str]) -> String {
-    parts.join("\\").chars().flat_map(char::to_lowercase).collect()
+    fold(&parts.join("\\"))
+}
+
+/// A path in lower case, as `same_name` compares names.
+fn fold(path: &str) -> String {
+    path.chars().flat_map(char::to_lowercase).collect()
 }
 
 /// Whether `item` is `want` itself or something under it (names compared ignoring case, as
@@ -174,10 +183,20 @@ fn under<'a>(item: &'a Item, want: &[&str]) -> Option<Vec<&'a str>> {
 
 // ---------------------------------------------------------------- listing
 
-fn list(archive: &str) -> Result<(Kind, Vec<Item>), String> {
+/// An archive file opened and read once: what [`list`] made of it, kept so that unpacking from it
+/// doesn't read its central directory or header again.
+enum Opened {
+    Zip(zip::ZipArchive<BufReader<File>>),
+    SevenZ(sevenz_rust2::Archive, BufReader<File>),
+}
+
+fn list(archive: &str) -> Result<(Opened, Vec<Item>), String> {
     match kind_of(archive) {
-        Some(Kind::Zip) => list_zip(archive).map(|items| (Kind::Zip, items)),
-        Some(Kind::SevenZ) => open_7z(archive).map(|(a, _)| (Kind::SevenZ, list_7z(&a))),
+        Some(Kind::Zip) => list_zip(archive).map(|(zip, items)| (Opened::Zip(zip), items)),
+        Some(Kind::SevenZ) => open_7z(archive).map(|(a, source)| {
+            let items = list_7z(&a);
+            (Opened::SevenZ(a, source), items)
+        }),
         None => Err("This isn't a zip or 7z file.".to_string()),
     }
 }
@@ -191,24 +210,129 @@ fn open_zip(archive: &str) -> Result<zip::ZipArchive<BufReader<File>>, String> {
     })
 }
 
-fn list_zip(archive: &str) -> Result<Vec<Item>, String> {
+fn list_zip(archive: &str) -> Result<(zip::ZipArchive<BufReader<File>>, Vec<Item>), String> {
     let zip = open_zip(archive)?;
     let mut items = Vec::with_capacity(zip.len());
+    // Where each entry the zip library knows starts, and the item for it.
+    let mut known: HashMap<u64, Item> = HashMap::new();
     for index in 0..zip.len() {
         // The central directory's copy of the entry: no seeking to the data.
         let Ok(e) = zip.by_index_data(index) else { continue };
         let Some(path) = clean_name(&zip_name(e.name_raw())) else { continue };
         let is_dir = e.is_dir();
-        items.push(Item {
+        let item = Item {
             path,
             is_dir,
             size: if is_dir { 0 } else { e.size() },
             modified: e.last_modified().map_or(0, |t| local_to_filetime(t.year(), t.month(), t.day(), t.hour(), t.minute(), t.second())),
             locked: e.encrypted(),
             index,
-        });
+            hidden: None,
+        };
+        known.insert(e.header_start(), item.clone());
+        items.push(item);
     }
-    Ok(items)
+    // The zip library keeps one entry of each name (the last), so an entry whose name comes again
+    // isn't among its entries at all: the central directory is gone through again for those, in
+    // its own order (so the first of a name stays first).
+    if let Some(records) = central_records(archive, &zip, &known) {
+        items = records
+            .into_iter()
+            .filter_map(|r| match r {
+                Record::Known(at) => known.remove(&at),
+                Record::Hidden(item) => Some(item),
+            })
+            .collect();
+    }
+    number_alike(&mut items);
+    Ok((zip, items))
+}
+
+/// An entry of a zip's central directory: one the zip library has (where it starts), or one it
+/// doesn't, with what's needed to list and unpack it.
+enum Record {
+    Known(u64),
+    Hidden(Item),
+}
+
+/// Where an entry the zip library can't reach by its index is, read from the central directory
+/// (which holds the right sizes and checksum even when the entry's own header leaves them out).
+#[derive(Clone, Copy, Debug)]
+struct Hidden {
+    /// Where its local header starts in the file.
+    header: u64,
+    compressed: u64,
+    size: u64,
+    crc: u32,
+}
+
+/// Every entry of the zip's central directory in order, when some aren't among the zip library's
+/// (`known`, by where they start). None when there are none such, or the directory doesn't read
+/// as expected (then the library's list is used as it is).
+fn central_records(archive: &str, zip: &zip::ZipArchive<BufReader<File>>, known: &HashMap<u64, Item>) -> Option<Vec<Record>> {
+    let mut file = BufReader::new(File::open(archive).ok()?);
+    let offset = zip.offset();
+    // The directory starts here (counted from the file's start, or from where the zip starts in it).
+    let start = [zip.central_directory_start(), zip.central_directory_start() + offset].into_iter().find(|&at| {
+        let mut sig = [0u8; 4];
+        file.seek(io::SeekFrom::Start(at)).is_ok() && file.read_exact(&mut sig).is_ok() && sig == *b"PK\x01\x02"
+    })?;
+    file.seek(io::SeekFrom::Start(start)).ok()?;
+    let mut records = Vec::new();
+    let mut found = 0;
+    let mut hidden = false;
+    loop {
+        let mut fixed = [0u8; 46];
+        if file.read_exact(&mut fixed).is_err() || fixed[..4] != *b"PK\x01\x02" {
+            break;
+        }
+        let u16_at = |i: usize| u16::from_le_bytes([fixed[i], fixed[i + 1]]);
+        let u32_at = |i: usize| u32::from_le_bytes([fixed[i], fixed[i + 1], fixed[i + 2], fixed[i + 3]]);
+        let (flags, time, date, crc) = (u16_at(8), u16_at(12), u16_at(14), u32_at(16));
+        let (mut compressed, mut size, mut header) = (u64::from(u32_at(20)), u64::from(u32_at(24)), u64::from(u32_at(42)));
+        let mut name = vec![0u8; usize::from(u16_at(28))];
+        let mut extra = vec![0u8; usize::from(u16_at(30))];
+        let mut comment = vec![0u8; usize::from(u16_at(32))];
+        file.read_exact(&mut name).ok()?;
+        file.read_exact(&mut extra).ok()?;
+        file.read_exact(&mut comment).ok()?;
+        let mut unicode: Option<Vec<u8>> = None;
+        let mut rest = extra.as_slice();
+        while rest.len() >= 4 {
+            let (id, len) = (u16::from_le_bytes([rest[0], rest[1]]), usize::from(u16::from_le_bytes([rest[2], rest[3]])));
+            let Some(data) = rest.get(4..4 + len) else { break };
+            match id {
+                // Zip64: the 8-byte sizes and start of the fields that didn't fit, in this order.
+                0x0001 => {
+                    let mut wide = data.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0; 8])));
+                    for field in [&mut size, &mut compressed, &mut header] {
+                        if *field == 0xFFFF_FFFF {
+                            *field = wide.next()?;
+                        }
+                    }
+                }
+                // The name in UTF-8, added by an older tool beside its own code page's.
+                0x7075 if data.len() > 5 => unicode = Some(data[5..].to_vec()),
+                _ => {}
+            }
+            rest = &rest[4 + len..];
+        }
+        let header = header.checked_add(offset)?;
+        if known.contains_key(&header) {
+            found += 1;
+            records.push(Record::Known(header));
+            continue;
+        }
+        hidden = true;
+        let name = unicode.unwrap_or(name);
+        let is_dir = name.ends_with(b"/") || name.ends_with(b"\\");
+        let Some(path) = clean_name(&zip_name(&name)) else { continue };
+        let modified = local_to_filetime((date >> 9) + 1980, ((date >> 5) & 15) as u8, (date & 31) as u8, (time >> 11) as u8, ((time >> 5) & 63) as u8, ((time & 31) * 2) as u8);
+        let at = Hidden { header, compressed, size, crc };
+        records.push(Record::Hidden(Item { path, is_dir, size: if is_dir { 0 } else { size }, modified, locked: flags & 1 != 0, index: usize::MAX, hidden: Some(at) }));
+    }
+    // Every entry the library has must be there (once), or this isn't the directory it read.
+    (hidden && found == known.len()).then_some(records)
 }
 
 /// A zip entry's name: UTF-8 when it is (newer zips, and older ones with a Unicode name added),
@@ -249,18 +373,61 @@ fn list_7z(a: &sevenz_rust2::Archive) -> Vec<Item> {
             modified: if f.has_last_modified_date { u64::from(f.last_modified_date) } else { 0 },
             locked: block.is_some_and(|b| b.coders.iter().any(|c| c.encoder_method_id() == SEVENZ_AES)),
             index,
+            hidden: None,
         });
     }
+    number_alike(&mut items);
     items
+}
+
+/// Gives every file a path of its own. An archive can hold the same name twice in one folder (a
+/// file added again, or names that differ only in capitals, from a Linux zip), and a file can
+/// have the name of a folder there. Windows keeps only one of each, so the first keeps its name
+/// and the later ones are numbered as Windows numbers copies ("notes (2).txt", "notes (3).txt"),
+/// never taking a name another item already has. The list then shows each of them, and opening,
+/// copying or extracting one takes out its own data. Folders listed twice stay one folder.
+fn number_alike(items: &mut [Item]) {
+    // Every folder, named or only implied by the paths under it.
+    let mut dirs: HashSet<String> = HashSet::new();
+    for item in items.iter() {
+        let parts: Vec<&str> = item.parts().collect();
+        let implied = if item.is_dir { parts.len() } else { parts.len() - 1 };
+        for n in 1..=implied {
+            dirs.insert(folded(&parts[..n]));
+        }
+    }
+    // Every file's own name, so a number given to one never takes a name that comes later.
+    let mut taken: HashSet<String> = items.iter().filter(|i| !i.is_dir).map(|i| fold(&i.path)).collect();
+    let mut kept: HashSet<String> = HashSet::new();
+    for item in items.iter_mut().filter(|i| !i.is_dir) {
+        let key = fold(&item.path);
+        if !dirs.contains(&key) && kept.insert(key) {
+            continue;
+        }
+        let (parent, name) = match item.path.rfind('\\') {
+            Some(i) => (&item.path[..=i], &item.path[i + 1..]),
+            None => ("", item.path.as_str()),
+        };
+        let name = free_name(name, false, |n| {
+            let k = fold(&format!("{parent}{n}"));
+            taken.contains(&k) || dirs.contains(&k)
+        });
+        item.path = format!("{parent}{name}");
+        taken.insert(fold(&item.path));
+        kept.insert(fold(&item.path));
+    }
 }
 
 /// Reads the folder `inner` of the archive (`\` separators, "" for its root) as a [`Folder`] whose
 /// path is `full_path`. Folders that only show up in the names of the files in them are listed too
 /// (many zips have no entries for folders). Never panics; problems end up in `Folder::error`.
+/// An archive inside the archive (`outer.zip\sub\inner.zip\docs`) is read like any other folder of
+/// it: see [`resolve`].
 pub fn read(archive: &str, inner: &str, full_path: &str) -> Folder {
     let start = Instant::now();
     let mut f = Folder { path: full_path.to_string(), ..Default::default() };
-    match list(archive).and_then(|(_, items)| children(&items, inner)) {
+    let listed = resolve(archive, inner).and_then(|(archive, inner)| list(&archive).and_then(|(_, items)| children(&items, &inner)));
+    match listed {
         Ok(entries) => f.entries = entries,
         Err(msg) => f.error = Some(msg),
     }
@@ -334,14 +501,120 @@ fn entry(name: &str, is_dir: bool, size: u64, modified: u64, types: &mut HashMap
     }
 }
 
+// ---------------------------------------------------------------- archives inside archives
+
+/// Where a path inside an archive really is when it goes through another archive kept in it
+/// (`sub\inner.zip\docs` in outer.zip): the archive file to open and the path inside that one.
+/// Each archive on the way is taken out to Glint's temporary folder ([`nested_copy`]), as deep as
+/// the path goes; Up, Back and the path bar keep the whole path, so going up from inner.zip lands
+/// back in outer.zip's `sub`. A path that ends at an archive means the inside of it (to list it;
+/// [`by_archive`] looks up an item's folder, so copying one takes the file itself). A plain path
+/// comes back as it is.
+fn resolve(archive: &str, inner: &str) -> Result<(String, String), String> {
+    let mut archive = archive.to_string();
+    let mut parts: Vec<String> = inner_parts(inner).into_iter().map(str::to_string).collect();
+    'deeper: loop {
+        // Only parts named like an archive can be one: a plain path costs no listing.
+        let named: Vec<usize> = (1..=parts.len()).filter(|&n| is_archive_name(&parts[n - 1])).collect();
+        if named.is_empty() {
+            break;
+        }
+        let (mut opened, items) = list(&archive)?;
+        for n in named {
+            let key = fold(&parts[..n].join("\\"));
+            // (A folder named "x.zip" is just a folder.)
+            if let Some(at) = items.iter().position(|i| !i.is_dir && fold(&i.path) == key) {
+                archive = nested_copy(&archive, &mut opened, &items, at)?;
+                parts.drain(..n);
+                continue 'deeper;
+            }
+        }
+        break;
+    }
+    Ok((archive, parts.join("\\")))
+}
+
+/// The archive `items[at]` of `archive`, taken out to Glint's temporary folder to be looked into:
+/// once, as later visits find it there (it's kept with the archive's other take-outs, under a name
+/// made from its path inside, so a changed outer archive gets a new copy). It's unpacked to a
+/// folder of its own first and then moved into place, so a copy that's there is always whole.
+fn nested_copy(archive: &str, opened: &mut Opened, items: &[Item], at: usize) -> Result<String, String> {
+    let item = &items[at];
+    let name = folder::file_name(&item.path);
+    let home = temp_home(archive)?.join("inside").join(format!("{:012x}", fnv(fold(&item.path).bytes()) >> 16));
+    let copy = home.join(name);
+    let whole = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() == item.size);
+    if whole(&copy) {
+        return Ok(copy.to_string_lossy().into_owned());
+    }
+    let fresh = temp_dir_for(archive)?;
+    let out = Path::new(&fresh).join(name);
+    let made = unpack(archive, opened, items, &[(at, out.clone())], &Meter::new(0));
+    let moved = made.and_then(|()| {
+        std::fs::create_dir_all(&home).map_err(|e| write_error(&home, &e))?;
+        // (Another window may have put it there meanwhile: then that one is used.)
+        match std::fs::rename(&out, &copy) {
+            Ok(()) => Ok(()),
+            Err(_) if whole(&copy) => Ok(()),
+            Err(e) => Err(write_error(&copy, &e)),
+        }
+    });
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_dir(&fresh);
+    moved.map(|()| copy.to_string_lossy().into_owned())
+}
+
 // ---------------------------------------------------------------- extracting
 
 /// Extracts these items of the archive (paths inside it; a folder brings everything under it)
 /// into the real folder `dest_dir`, laid out as they are under their parent inside the archive.
-/// Files already there are replaced. Returns the full paths of the top-level items written.
-/// (Used for Glint's temporary folder: to open, copy or drag items out of an archive.)
+/// Nothing already there is replaced (that's an error instead). Returns the full paths of the
+/// top-level items written. Items inside an archive in the archive are taken from that one
+/// ([`resolve`]). (Used for Glint's temporary folder: to open, copy or drag items out of an
+/// archive.)
 pub fn extract(archive: &str, inner_items: &[String], dest_dir: &str) -> Result<Vec<String>, String> {
-    let (kind, items) = list(archive)?;
+    let mut tops = Vec::new();
+    for (real, those) in by_archive(archive, inner_items)? {
+        tops.extend(extract_from(&real, &those, dest_dir)?);
+    }
+    Ok(tops)
+}
+
+/// Paths inside `archive`, by the archive file each is really in ([`resolve`]) - the same one
+/// for all, as a rule (they're from one folder) - in the order asked for.
+fn by_archive(archive: &str, inner_items: &[String]) -> Result<Vec<(String, Vec<String>)>, String> {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    // Each folder is looked up once, not once for each of thousands of items in it.
+    let mut folders: HashMap<String, (String, String)> = HashMap::new();
+    for item in inner_items {
+        let mut parts = inner_parts(item);
+        let name = parts.pop().unwrap_or("");
+        let parent = parts.join("\\");
+        let (real, at) = match folders.get(&fold(&parent)) {
+            Some(known) => known.clone(),
+            None => {
+                let found = resolve(archive, &parent)?;
+                folders.insert(fold(&parent), found.clone());
+                found
+            }
+        };
+        let inner = if at.is_empty() { name.to_string() } else { format!("{at}\\{name}") };
+        match groups.iter_mut().find(|(a, _)| *a == real) {
+            Some((_, those)) => those.push(inner),
+            None => groups.push((real, vec![inner])),
+        }
+    }
+    Ok(groups)
+}
+
+/// [`extract`] from one archive file.
+fn extract_from(archive: &str, inner_items: &[String], dest_dir: &str) -> Result<Vec<String>, String> {
+    let (mut opened, items) = list(archive)?;
+    extract_listed(archive, &mut opened, &items, inner_items, dest_dir)
+}
+
+/// [`extract_from`] an archive already listed.
+fn extract_listed(archive: &str, opened: &mut Opened, items: &[Item], inner_items: &[String], dest_dir: &str) -> Result<Vec<String>, String> {
     let wants: Vec<Vec<&str>> = inner_items.iter().map(|w| inner_parts(w)).collect();
     // The items each wanted path has (it and what's under it), found in one go through the archive:
     // a go for each one asked for took minutes for thousands of them.
@@ -378,15 +651,48 @@ pub fn extract(archive: &str, inner_items: &[String], dest_dir: &str) -> Result<
             }
         }
     }
-    unpack(archive, kind, &items, &plan, true, &Meter::new(0))?;
+    unpack(archive, opened, items, &plan, &Meter::new(0))?;
     Ok(tops)
 }
 
 /// How many bytes taking these items out with [`extract`] unpacks: every file under a wanted
 /// folder (the list shows folders as 0 bytes), and in a 7z also what's packed before them in their
 /// block, which is unpacked (and thrown away) to get to them. So a big take-out can be told apart
-/// before it starts.
-pub fn unpack_size(archive: &str, inner_items: &[String]) -> Result<u64, String> {
+/// before it starts. (Glint itself asks [`extract_at_most`], which reads each archive once.)
+#[cfg(test)]
+fn unpack_size(archive: &str, inner_items: &[String]) -> Result<u64, String> {
+    let mut size = 0;
+    for (real, those) in by_archive(archive, inner_items)? {
+        let (opened, items) = list(&real)?;
+        size += unpack_size_in(&opened, &items, &those);
+    }
+    Ok(size)
+}
+
+/// [`extract`] to a new folder of Glint's temporary folder ([`temp_dir_for`]), but only when that
+/// unpacks no more than `most` bytes (counted as `unpack_size` counts them): otherwise `too_much` is the error, and
+/// nothing is made. Each archive is read once for both. Returns the folder and the top items.
+pub fn extract_at_most(archive: &str, inner_items: &[String], most: u64, too_much: &str) -> Result<(String, Vec<String>), String> {
+    let mut listed = Vec::new();
+    let mut size = 0;
+    for (real, those) in by_archive(archive, inner_items)? {
+        let (opened, items) = list(&real)?;
+        size += unpack_size_in(&opened, &items, &those);
+        listed.push((real, opened, items, those));
+    }
+    if size > most {
+        return Err(too_much.to_string());
+    }
+    let dir = temp_dir_for(archive)?;
+    let mut tops = Vec::new();
+    for (real, mut opened, items, those) in listed {
+        tops.extend(extract_listed(&real, &mut opened, &items, &those, &dir)?);
+    }
+    Ok((dir, tops))
+}
+
+/// [`unpack_size`] in one archive file, already listed.
+fn unpack_size_in(opened: &Opened, items: &[Item], inner_items: &[String]) -> u64 {
     let wants: Vec<Vec<&str>> = inner_items.iter().map(|w| inner_parts(w)).collect();
     // Each item's path is looked up among the wanted ones (as in `extract`), not compared with each.
     let paths: HashSet<String> = wants.iter().map(|w| folded(w)).collect();
@@ -395,15 +701,13 @@ pub fn unpack_size(archive: &str, inner_items: &[String]) -> Result<u64, String>
         let parts: Vec<&str> = item.parts().collect();
         !item.is_dir && depths.iter().take_while(|&&n| n <= parts.len()).any(|&n| paths.contains(&folded(&parts[..n])))
     };
-    if kind_of(archive) != Some(Kind::SevenZ) {
-        let (_, items) = list(archive)?;
-        return Ok(items.iter().filter(|i| wanted(i)).map(|i| i.size).sum());
-    }
-    let (a, _) = open_7z(archive)?;
+    let Opened::SevenZ(a, _) = opened else {
+        return items.iter().filter(|i| wanted(i)).map(|i| i.size).sum();
+    };
     let block_of = |index: usize| a.stream_map.file_block_index.get(index).copied().flatten();
     // Each block that holds a wanted file, with the last wanted file in it (as in extract_7z).
     let mut blocks: HashMap<usize, usize> = HashMap::new();
-    for item in list_7z(&a).iter().filter(|i| wanted(i)) {
+    for item in items.iter().filter(|i| wanted(i)) {
         if let Some(b) = block_of(item.index) {
             let last = blocks.entry(b).or_insert(item.index);
             *last = (*last).max(item.index);
@@ -411,7 +715,7 @@ pub fn unpack_size(archive: &str, inner_items: &[String]) -> Result<u64, String>
     }
     // A block's files come one after another from its first: all of them up to that last one.
     let before_last = |index: usize| block_of(index).and_then(|b| blocks.get(&b)).is_some_and(|&last| index <= last);
-    Ok(a.files.iter().enumerate().filter(|&(i, _)| before_last(i)).map(|(_, f)| f.size).sum())
+    a.files.iter().enumerate().filter(|&(i, _)| before_last(i)).map(|(_, f)| f.size).sum()
 }
 
 /// Unpacks the whole archive into the folder `dest_dir` (Extract here), replacing nothing: a top
@@ -419,13 +723,13 @@ pub fn unpack_size(archive: &str, inner_items: &[String]) -> Result<u64, String>
 /// "docs (2)"). The full paths of the top items it makes go in `made` before they are made, so
 /// they can be cleaned up when it stops partway (a cancel). Reports to the copy queue.
 pub fn extract_all(archive: &str, dest_dir: &str, made: &mut Vec<String>) -> Result<(), String> {
-    let (kind, items) = list(archive)?;
+    let (mut opened, items) = list(archive)?;
     let meter = Meter::new(items.iter().filter(|i| !i.is_dir).map(|i| i.size).sum());
     // The archive's top names (lower case) and the names they get in `dest_dir`.
     let mut renamed: HashMap<String, String> = HashMap::new();
     let mut given: HashSet<String> = HashSet::new();
-    // Where each item goes (lower case) and its place in the plan, so an archive listing the same
-    // name twice writes it once: the last one, as its list shows it and a copy takes it out.
+    // Where each item goes (lower case) and its place in the plan, so a folder the archive lists
+    // twice is made once. (Files never meet here: each has a path of its own, `number_alike`.)
     let mut planned: HashMap<String, usize> = HashMap::new();
     let mut plan: Vec<(usize, PathBuf)> = Vec::new();
     for (i, item) in items.iter().enumerate() {
@@ -448,12 +752,12 @@ pub fn extract_all(archive: &str, dest_dir: &str, made: &mut Vec<String>) -> Res
             }
         }
     }
-    unpack(archive, kind, &items, &plan, false, &meter)
+    unpack(archive, &mut opened, &items, &plan, &meter)
 }
 
-/// Writes the planned items (index in `items`, where it goes): folders first, then the files.
-/// `replace`: a file already there is replaced (otherwise that's an error, never an overwrite).
-fn unpack(archive: &str, kind: Kind, items: &[Item], plan: &[(usize, PathBuf)], replace: bool, meter: &Meter) -> Result<(), String> {
+/// Writes the planned items (index in `items`, where it goes): folders first, then the files. A
+/// file already there is never replaced: that's an error instead.
+fn unpack(archive: &str, opened: &mut Opened, items: &[Item], plan: &[(usize, PathBuf)], meter: &Meter) -> Result<(), String> {
     if let Some(&(i, _)) = plan.iter().find(|(i, _)| items[*i].locked && !items[*i].is_dir) {
         return Err(format!("\u{201c}{}\u{201d} is locked with a password, and Glint can't open password-protected archives yet.", folder::file_name(&items[i].path)));
     }
@@ -465,10 +769,9 @@ fn unpack(archive: &str, kind: Kind, items: &[Item], plan: &[(usize, PathBuf)], 
         }
     }
     let files: Vec<(&Item, &Path)> = plan.iter().filter(|(i, _)| !items[*i].is_dir).map(|(i, out)| (&items[*i], out.as_path())).collect();
-    let to = Out { replace, meter };
-    match kind {
-        Kind::Zip => extract_zip(archive, &files, &to)?,
-        Kind::SevenZ => extract_7z(archive, &files, &to)?,
+    match opened {
+        Opened::Zip(zip) => extract_zip(archive, zip, &files, meter)?,
+        Opened::SevenZ(a, source) => extract_7z(a, source, &files, meter)?,
     }
     // Folders get the times they had in the archive, now that nothing more is written into them.
     for (i, out) in plan.iter().filter(|(i, _)| items[*i].is_dir) {
@@ -477,12 +780,6 @@ fn unpack(archive: &str, kind: Kind, items: &[Item], plan: &[(usize, PathBuf)], 
         }
     }
     Ok(())
-}
-
-/// How files are written out: replacing what's there or not, and where the progress goes.
-struct Out<'a> {
-    replace: bool,
-    meter: &'a Meter,
 }
 
 /// The name a new item called `name` gets where `taken` names are in use: "notes (2).txt",
@@ -520,24 +817,37 @@ fn inside(dest: &str, parts: &[&str]) -> Result<PathBuf, String> {
     Ok(out)
 }
 
-fn extract_zip(archive: &str, files: &[(&Item, &Path)], to: &Out) -> Result<(), String> {
-    let mut zip = open_zip(archive)?;
+fn extract_zip(archive: &str, zip: &mut zip::ZipArchive<BufReader<File>>, files: &[(&Item, &Path)], meter: &Meter) -> Result<(), String> {
+    // For entries the library has no index for: the file, read from each one's own header.
+    let mut direct: Option<BufReader<File>> = None;
     for (item, out) in files {
         let name = folder::file_name(&item.path);
-        let mut reader = zip.by_index(item.index).map_err(|e| match e {
+        let unreadable = |e: zip::result::ZipError| match e {
             zip::result::ZipError::CompressionMethodNotSupported(_) => format!("\u{201c}{name}\u{201d} is packed in a way Glint can't unpack yet."),
             zip::result::ZipError::UnsupportedArchive(m) if m == zip::result::ZipError::PASSWORD_REQUIRED => PASSWORD.to_string(),
             zip::result::ZipError::InvalidPassword => PASSWORD.to_string(),
             zip::result::ZipError::Io(e) => format!("\u{201c}{name}\u{201d} couldn't be read from the archive ({e})."),
             _ => format!("\u{201c}{name}\u{201d} is damaged in this zip file."),
-        })?;
-        copy_out(&mut reader, out, item.modified, name, to)?;
+        };
+        let Some(at) = item.hidden else {
+            let mut reader = zip.by_index(item.index).map_err(unreadable)?;
+            copy_out(&mut reader, out, item.modified, name, meter)?;
+            continue;
+        };
+        if direct.is_none() {
+            direct = Some(BufReader::new(File::open(archive).map_err(|e| open_error(&e))?));
+        }
+        let Some(source) = direct.as_mut() else { continue };
+        source.seek(io::SeekFrom::Start(at.header)).map_err(|e| unreadable(e.into()))?;
+        // (The central directory's sizes and checksum: right even when the header leaves them out.)
+        let options = zip::ZipReadOptions::new().override_compressed_size(at.compressed).override_uncompressed_size(at.size).override_crc(at.crc);
+        let mut reader = zip::read::read_zipfile_from_stream_with_options(source, options).map_err(unreadable)?.ok_or_else(|| format!("\u{201c}{name}\u{201d} is damaged in this zip file."))?;
+        copy_out(&mut reader, out, item.modified, name, meter)?;
     }
     Ok(())
 }
 
-fn extract_7z(archive: &str, files: &[(&Item, &Path)], to: &Out) -> Result<(), String> {
-    let (a, mut source) = open_7z(archive)?;
+fn extract_7z(a: &sevenz_rust2::Archive, source: &mut BufReader<File>, files: &[(&Item, &Path)], meter: &Meter) -> Result<(), String> {
     let mut wanted: HashMap<usize, (&Item, &Path)> = HashMap::new();
     // Each block that holds a wanted file, with the last wanted file in it.
     let mut blocks: BTreeMap<usize, usize> = BTreeMap::new();
@@ -549,7 +859,7 @@ fn extract_7z(archive: &str, files: &[(&Item, &Path)], to: &Out) -> Result<(), S
                 wanted.insert(item.index, (item, out));
             }
             // No data stored: an empty file.
-            _ => copy_out(&mut io::empty(), out, item.modified, folder::file_name(&item.path), to)?,
+            _ => copy_out(&mut io::empty(), out, item.modified, folder::file_name(&item.path), meter)?,
         }
     }
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(4)) as u32;
@@ -560,13 +870,13 @@ fn extract_7z(archive: &str, files: &[(&Item, &Path)], to: &Out) -> Result<(), S
         let first = a.stream_map.block_first_file_index.get(b).copied().unwrap_or(0);
         let mut index = first;
         let mut failed: Option<String> = None;
-        let decoder = sevenz_rust2::BlockDecoder::new(threads, b, &a, &password, &mut source);
+        let decoder = sevenz_rust2::BlockDecoder::new(threads, b, a, &password, source);
         let result = decoder.for_each_entries(&mut |_entry, reader: &mut dyn Read| {
             let this = index;
             index += 1;
             match wanted.get(&this) {
                 Some((item, out)) => {
-                    if let Err(e) = copy_out(reader, out, item.modified, folder::file_name(&item.path), to) {
+                    if let Err(e) = copy_out(reader, out, item.modified, folder::file_name(&item.path), meter) {
                         failed = Some(e);
                         return Ok(false);
                     }
@@ -594,8 +904,8 @@ fn extract_7z(archive: &str, files: &[(&Item, &Path)], to: &Out) -> Result<(), S
 
 /// Copies one file's data out of the archive to `out`, then gives it the time it had in the
 /// archive. A half-written file is removed again.
-fn copy_out(reader: &mut dyn Read, out: &Path, modified: u64, name: &str, to: &Out) -> Result<(), String> {
-    let made = if to.replace { File::create(out) } else { File::create_new(out) };
+fn copy_out(reader: &mut dyn Read, out: &Path, modified: u64, name: &str, meter: &Meter) -> Result<(), String> {
+    let made = File::create_new(out);
     let mut file = made.map_err(|e| write_error(out, &e))?;
     let mut buf = vec![0u8; 256 * 1024];
     let result = loop {
@@ -608,7 +918,7 @@ fn copy_out(reader: &mut dyn Read, out: &Path, modified: u64, name: &str, to: &O
         if let Err(e) = file.write_all(&buf[..n]) {
             break Err(write_error(out, &e));
         }
-        if !to.meter.add(n as u64) {
+        if !meter.add(n as u64) {
             break Err(CANCELLED.to_string());
         }
     };
@@ -659,6 +969,8 @@ struct Packed {
     is_dir: bool,
     size: u64,
     modified: Option<SystemTime>,
+    created: Option<SystemTime>,
+    accessed: Option<SystemTime>,
 }
 
 /// The name a new archive of `paths` gets, without .zip / .7z: one file's name without its
@@ -707,7 +1019,7 @@ impl Packing {
     fn add(&mut self, path: &Path, name: String, meta: &std::fs::Metadata) {
         let size = if meta.is_dir() { 0 } else { meta.len() };
         self.total += size;
-        self.items.push(Packed { path: path.to_path_buf(), name, is_dir: meta.is_dir(), size, modified: meta.modified().ok() });
+        self.items.push(Packed { path: path.to_path_buf(), name, is_dir: meta.is_dir(), size, modified: meta.modified().ok(), created: meta.created().ok(), accessed: meta.accessed().ok() });
     }
 }
 
@@ -732,6 +1044,9 @@ fn walk(dir: &Path, name: &str, plan: &mut Packing, stop: &AtomicBool) -> Result
             } else {
                 entry.metadata().map_err(|e| read_error(&path, &e))?
             };
+            // A folder's own times: in its parent's listing Windows can still show older ones
+            // after files were added inside it. (One more look per folder; folders are few.)
+            let meta = if meta.is_dir() { std::fs::metadata(&path).unwrap_or(meta) } else { meta };
             plan.add(&path, inner.clone(), &meta);
             if meta.is_dir() {
                 todo.push((path, inner));
@@ -754,6 +1069,15 @@ pub fn pack(plan: &Packing, out: &str, format: Format) -> Result<(), String> {
     };
     if result.is_err() {
         let _ = std::fs::remove_file(path);
+    }
+    // The packers' tables and buffers are all freed by now: the heap's free space goes back to
+    // Windows rather than staying with Glint after the job.
+    // SAFETY: plain call on our own process's default heap.
+    unsafe {
+        use windows::Win32::System::Memory::{GetProcessHeap, HeapCompact, HEAP_FLAGS};
+        if let Ok(heap) = GetProcessHeap() {
+            HeapCompact(heap, HEAP_FLAGS(0));
+        }
     }
     result
 }
@@ -791,42 +1115,181 @@ fn pack_zip(plan: &Packing, file: File, out: &Path, meter: &Meter) -> Result<(),
 }
 
 fn pack_7z(plan: &Packing, file: File, out: &Path, meter: &Meter) -> Result<(), String> {
-    use sevenz_rust2::encoder_options::Lzma2Options;
-    use sevenz_rust2::{ArchiveEntry, ArchiveWriter, EncoderConfiguration};
+    use sevenz_rust2::ArchiveWriter;
     let seven_error = |e: sevenz_rust2::Error| meter.problem.take().unwrap_or_else(|| format!("\u{201c}{}\u{201d} couldn't be written ({e}).", out.display()));
     let mut w = ArchiveWriter::new(BufWriter::new(file)).map_err(seven_error)?;
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(4)) as u32;
-    // (Chunk size 0: the smallest the level allows, so each thread holds little.)
-    w.set_content_methods(vec![EncoderConfiguration::from(Lzma2Options::from_level_mt(6, threads, 0))]);
-    // Files go in solid blocks of up to SOLID_BLOCK bytes, packed together.
-    let mut block: Vec<&Packed> = Vec::new();
-    let mut bytes = 0;
+    // Files go in solid blocks of up to SOLID_BLOCK bytes, packed together. Those already packed
+    // (photos, videos, archives...), which LZMA2 would only spend its time on, are stored as they
+    // are, in blocks of their own: (files, bytes) for each kind.
+    let mut packed: (Vec<&Packed>, u64) = (Vec::new(), 0);
+    let mut stored: (Vec<&Packed>, u64) = (Vec::new(), 0);
     for p in &plan.items {
         if p.is_dir || p.size == 0 {
-            w.push_archive_entry::<&[u8]>(ArchiveEntry::from_path(&p.path, p.name.clone()), None).map_err(seven_error)?;
+            w.push_archive_entry::<&[u8]>(sevenz_entry(p), None).map_err(seven_error)?;
             continue;
         }
-        block.push(p);
-        bytes += p.size;
-        if bytes >= SOLID_BLOCK {
-            push_block(&mut w, &mut block, meter).map_err(seven_error)?;
-            bytes = 0;
+        let store = already_packed(p);
+        let block = if store { &mut stored } else { &mut packed };
+        block.0.push(p);
+        block.1 += p.size;
+        if block.1 >= SOLID_BLOCK {
+            push_block(&mut w, block, store, meter).map_err(seven_error)?;
         }
     }
-    push_block(&mut w, &mut block, meter).map_err(seven_error)?;
+    push_block(&mut w, &mut packed, false, meter).map_err(seven_error)?;
+    push_block(&mut w, &mut stored, true, meter).map_err(seven_error)?;
     let mut f = w.finish().map_err(|e| meter.problem.take().unwrap_or_else(|| write_error(out, &e)))?;
     f.flush().map_err(|e| write_error(out, &e))
 }
 
-/// Packs these files together as one solid block of the 7z.
-fn push_block<W: Write + io::Seek>(w: &mut sevenz_rust2::ArchiveWriter<W>, block: &mut Vec<&Packed>, meter: &Meter) -> Result<(), sevenz_rust2::Error> {
-    if block.is_empty() {
+/// The 7z entry for `p`: what sevenz_rust2's `ArchiveEntry::from_path` makes, but from what the
+/// walk already found (from_path asks the disk again, which opens each file three more times).
+fn sevenz_entry(p: &Packed) -> sevenz_rust2::ArchiveEntry {
+    use sevenz_rust2::NtTime;
+    // (A time before 1601 isn't kept, as from_path keeps none.)
+    let time = |t: Option<SystemTime>| t.and_then(|t| NtTime::try_from(t).ok()).filter(|&t| u64::from(t) > 0);
+    let mut entry = sevenz_rust2::ArchiveEntry { name: p.name.clone(), has_stream: !p.is_dir, is_directory: p.is_dir, ..Default::default() };
+    if let Some(t) = time(p.modified) {
+        entry.last_modified_date = t;
+        entry.has_last_modified_date = true;
+    }
+    if let Some(t) = time(p.created) {
+        entry.creation_date = t;
+        entry.has_creation_date = true;
+    }
+    if let Some(t) = time(p.accessed) {
+        entry.access_date = t;
+        entry.has_access_date = true;
+    }
+    entry
+}
+
+/// Kinds of file that are packed already: LZMA2 makes them a percent or two smaller at most, at
+/// its full (slow) speed.
+const PACKED_KINDS: &[&str] = &[
+    "jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "avif", "jxl", "mp4", "m4v", "mkv", "webm", "mov", "avi", "wmv", "flv", "mp3", "m4a", "aac", "ogg", "opus", "flac", "wma", "zip", "7z", "rar", "gz", "tgz", "bz2", "xz", "zst", "lz4", "lzma", "cab", "jar", "apk", "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub",
+];
+/// From this size a file of another kind is tried first ([`barely_shrinks`]): smaller ones take
+/// little time anyway.
+const TRY_FROM: u64 = 1 << 20;
+
+/// Whether `p` goes into the 7z stored as it is: a kind that's packed already, or a big file
+/// whose data doesn't shrink (random-looking: packed or encrypted data with another name).
+fn already_packed(p: &Packed) -> bool {
+    let name = p.name.rsplit('/').next().unwrap_or("");
+    let kind = match name.rfind('.') {
+        Some(i) if i > 0 => name[i + 1..].to_ascii_lowercase(),
+        _ => String::new(),
+    };
+    PACKED_KINDS.contains(&kind.as_str()) || (p.size >= TRY_FROM && barely_shrinks(&p.path, p.size))
+}
+
+/// Whether three samples of this file (its start, middle and end) shrink by less than 2% with a
+/// quick Deflate. False when it can't be read: then packing it says why.
+fn barely_shrinks(path: &Path, size: u64) -> bool {
+    const SAMPLE: u64 = 64 * 1024;
+    /// Counts what's written to it.
+    struct Count(u64);
+    impl Write for Count {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0 += buf.len() as u64;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let Ok(mut file) = File::open(path) else { return false };
+    let mut deflate = flate2::write::DeflateEncoder::new(Count(0), flate2::Compression::fast());
+    let mut buf = vec![0u8; SAMPLE as usize];
+    let mut read = 0u64;
+    for at in [0, (size / 2).saturating_sub(SAMPLE / 2), size.saturating_sub(SAMPLE)] {
+        if file.seek(io::SeekFrom::Start(at)).is_err() {
+            return false;
+        }
+        let mut n = 0;
+        while n < buf.len() {
+            match file.read(&mut buf[n..]) {
+                Ok(0) => break,
+                Ok(m) => n += m,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return false,
+            }
+        }
+        // (Each sample apart: the next one's start shouldn't look like a repeat of this one.)
+        if deflate.write_all(&buf[..n]).and_then(|()| deflate.flush()).is_err() {
+            return false;
+        }
+        read += n as u64;
+    }
+    let Ok(Count(out)) = deflate.finish() else { return false };
+    // (A file that's shorter now than it was is packed as it is.)
+    read >= SAMPLE && out * 100 >= read * 98
+}
+
+/// Packs these files (`block.1` bytes in all) together as one solid block of the 7z: stored as
+/// they are, or with LZMA2 sized for them ([`lzma2_setup`]). Leaves `block` empty.
+fn push_block<W: Write + io::Seek>(w: &mut sevenz_rust2::ArchiveWriter<W>, block: &mut (Vec<&Packed>, u64), store: bool, meter: &Meter) -> Result<(), sevenz_rust2::Error> {
+    use sevenz_rust2::encoder_options::Lzma2Options;
+    use sevenz_rust2::{EncoderConfiguration, EncoderMethod};
+    let (files, bytes) = (std::mem::take(&mut block.0), std::mem::take(&mut block.1));
+    if files.is_empty() {
         return Ok(());
     }
-    let entries = block.iter().map(|p| sevenz_rust2::ArchiveEntry::from_path(&p.path, p.name.clone())).collect();
-    let feeds = block.iter().map(|p| sevenz_rust2::SourceReader::new(Feed::new(&p.path, meter))).collect();
-    block.clear();
+    if store {
+        w.set_content_methods(vec![EncoderConfiguration::new(EncoderMethod::COPY)]);
+    } else {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let (dict, threads) = lzma2_setup(bytes, cores.min(packers_with_room()));
+        let mut options = if threads > 1 {
+            // (Chunk size 0: one dictionary's worth for each thread, the smallest allowed.)
+            Lzma2Options::from_level_mt(PACK_LEVEL, threads, 0)
+        } else {
+            Lzma2Options::from_level(PACK_LEVEL)
+        };
+        options.set_dictionary_size(dict);
+        w.set_content_methods(vec![EncoderConfiguration::from(options)]);
+    }
+    let entries = files.iter().map(|p| sevenz_entry(p)).collect();
+    let feeds = files.iter().map(|p| sevenz_rust2::SourceReader::new(Feed::new(&p.path, meter))).collect();
     w.push_archive_entries(entries, feeds).map(|_| ())
+}
+
+/// The LZMA2 level Glint packs 7z files at (7-Zip's own "normal").
+const PACK_LEVEL: u32 = 6;
+/// The dictionary that level has: the most a block is given.
+const LEVEL_DICT: u32 = 8 << 20;
+/// The least a block is given.
+const MIN_DICT: u32 = 64 << 10;
+/// The most packers that run at once.
+const MOST_THREADS: usize = 8;
+
+/// How the 7z packer is set up for a solid block of `bytes`, on a PC with `cores`: (dictionary
+/// size, threads). The packer's memory goes with its dictionary - its match tables are about
+/// eleven times as big, whatever it's given to pack, so level 6's 8 MB took about 95 MB for each
+/// thread even for one small file - and a dictionary bigger than the data finds nothing more. So
+/// it's the next power of two up from the data (64 KB at least, 8 MB at most). Threads each pack a
+/// dictionary's worth of their own (and hold a packer each), so there's one for each such piece,
+/// up to 8 (a block is 8 pieces): a block smaller than one piece is packed by one packer, without
+/// a thread pool.
+fn lzma2_setup(bytes: u64, cores: usize) -> (u32, u32) {
+    let dict = bytes.clamp(1, u64::from(LEVEL_DICT)).next_power_of_two().max(u64::from(MIN_DICT)) as u32;
+    let pieces = bytes.div_ceil(u64::from(dict)).max(1);
+    let threads = (cores.clamp(1, MOST_THREADS) as u64).min(pieces) as u32;
+    (dict, threads)
+}
+
+/// How many full-size packers (about 100 MB each) fit in a quarter of the memory free now, one
+/// at least: on a PC short of memory a big 7z is packed by fewer threads rather than pushing
+/// everything else out to the page file.
+fn packers_with_room() -> usize {
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+    // SAFETY: a plain query filling our own struct, its size given.
+    if unsafe { GlobalMemoryStatusEx(&mut status) }.is_err() {
+        return MOST_THREADS;
+    }
+    ((status.ullAvailPhys / 4 / (12 * u64::from(LEVEL_DICT))) as usize).max(1)
 }
 
 /// How far unpacking or packing is, for the copy queue's list (copyqueue.rs) - and whether it was
@@ -909,15 +1372,7 @@ impl Read for Feed<'_> {
 /// folders of the same name from different places in the archive aren't mixed together, and a
 /// file still open from an earlier take-out isn't in the way.
 pub fn temp_dir_for(archive: &str) -> Result<String, String> {
-    let meta = std::fs::metadata(archive).map_err(|e| open_error(&e))?;
-    let changed = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as u64);
-    // FNV-1a: tiny, and the same on every run (unlike std's hasher).
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in archive.to_lowercase().bytes().chain(changed.to_le_bytes()) {
-        hash = (hash ^ byte as u64).wrapping_mul(0x0100_0000_01b3);
-    }
-    let dir = std::env::temp_dir().join("Glint").join("archives").join(format!("{:012x}", hash >> 16));
-    std::fs::create_dir_all(&dir).map_err(|e| write_error(&dir, &e))?;
+    let dir = temp_home(archive)?;
     // The earlier take-outs stay (Windows clears %TEMP% in time), so counting starts past them.
     let mut n = std::fs::read_dir(&dir).map_or(0, |d| d.count()) + 1;
     loop {
@@ -928,6 +1383,26 @@ pub fn temp_dir_for(archive: &str) -> Result<String, String> {
             Err(e) => return Err(write_error(&fresh, &e)),
         }
     }
+}
+
+/// The archive's own folder in %TEMP%\Glint\archives (made if need be), named after the archive's
+/// path and when it last changed.
+fn temp_home(archive: &str) -> Result<PathBuf, String> {
+    let meta = std::fs::metadata(archive).map_err(|e| open_error(&e))?;
+    let changed = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as u64);
+    let hash = fnv(archive.to_lowercase().bytes().chain(changed.to_le_bytes()));
+    let dir = std::env::temp_dir().join("Glint").join("archives").join(format!("{:012x}", hash >> 16));
+    std::fs::create_dir_all(&dir).map_err(|e| write_error(&dir, &e))?;
+    Ok(dir)
+}
+
+/// FNV-1a: tiny, and the same on every run (unlike std's hasher).
+fn fnv(bytes: impl Iterator<Item = u8>) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash = (hash ^ byte as u64).wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
 }
 
 // ---------------------------------------------------------------- times and errors
@@ -1637,30 +2112,254 @@ mod tests {
     }
 
     #[test]
-    fn the_same_name_twice_comes_out_as_the_list_shows_it() {
-        // Names that differ only in capitals (from a Linux zip), and one name twice: Windows can keep
-        // one of each, so it's the one the list shows (the last), whichever way it's taken out.
+    fn the_same_name_twice_shows_twice_and_each_comes_out_with_its_own_data() {
+        // One name three times (added again and again), and names that differ only in capitals
+        // (from a Linux zip): Windows keeps one of each name, so the later ones are numbered, in the
+        // list and wherever they're taken out to, each with its own data.
         let t = Scratch::new("twice");
-        let zip = t.join("case.zip");
-        zip_with(&zip, &[("Same.txt", b"first"), ("same.TXT", b"second!")]);
         let dup = t.join("dup.zip");
-        zip_with(&dup, &[("a.txt", b"one"), ("b.txt", b"two!")]);
+        zip_with(&dup, &[("a.txt", b"one"), ("b.txt", b"two!"), ("c.txt", b"three"), ("A.TXT", b"CAPS"), ("a (2).txt", b"really (2)"), ("docs/Same.txt", b"first"), ("docs/same.TXT", b"second!")]);
         patch(&dup, b"b.txt", b"a.txt");
+        patch(&dup, b"c.txt", b"a.txt");
         let seven = t.join("dup.7z");
-        seven_with(&seven, &[("a.txt", b"one"), ("a.txt", b"two!")]);
-        for (archive, name, last) in [(&zip, "Same.txt", &b"second!"[..]), (&dup, "a.txt", b"two!"), (&seven, "a.txt", b"two!")] {
+        seven_with(&seven, &[("a.txt", b"one"), ("a.txt", b"two!"), ("a.txt", b"three"), ("A.TXT", b"CAPS"), ("a (2).txt", b"really (2)"), ("docs/Same.txt", b"first"), ("docs/same.TXT", b"second!")]);
+        // The first keeps its name; the others take the next numbers free, never one the archive
+        // already uses ("a (2).txt" is a real one here).
+        let want: &[(&str, &[u8])] = &[
+            ("a.txt", b"one"),
+            ("a (3).txt", b"two!"),
+            ("a (4).txt", b"three"),
+            ("A (5).TXT", b"CAPS"),
+            ("a (2).txt", b"really (2)"),
+            ("docs\\Same.txt", b"first"),
+            ("docs\\same (2).TXT", b"second!"),
+        ];
+        for archive in [&dup, &seven] {
             let a = s(archive);
-            let listed = read(&a, "", "");
-            assert_eq!(listed.entries.len(), 1, "{a}");
-            assert_eq!(listed.entries[0].size, last.len() as u64, "{a}");
-            let taken = t.dir(&format!("taken-{}", folder::file_name(&a)));
-            extract(&a, &[name.to_string()], &s(&taken)).expect("take out");
-            assert_eq!(std::fs::read(taken.join(name)).expect("read"), last, "{a}");
+            let mut listed: Vec<(String, u64)> = read(&a, "", "").entries.iter().map(|e| (e.name.clone(), e.size)).collect();
+            listed.sort();
+            let mut top: Vec<(String, u64)> = want.iter().filter(|(p, _)| !p.contains('\\')).map(|(p, d)| (p.to_string(), d.len() as u64)).chain([("docs".to_string(), 0)]).collect();
+            top.sort();
+            assert_eq!(listed, top, "{a}");
+            assert_eq!(names(&read(&a, "docs", "")), ["Same.txt", "same (2).TXT"], "{a}");
+            // Each one taken out on its own (open, copy, drag) brings its own data.
+            for (i, (path, data)) in want.iter().enumerate() {
+                let taken = t.dir(&format!("one-{}-{i}", folder::file_name(&a)));
+                let tops = extract(&a, &[path.to_string()], &s(&taken)).expect("take out");
+                assert_eq!(tops, [s(&taken.join(folder::file_name(path)))], "{a} {path}");
+                assert_eq!(std::fs::read(&tops[0]).expect("read"), *data, "{a} {path}");
+            }
+            // All of them at once, to one folder: none is written over another.
+            let together = t.dir(&format!("together-{}", folder::file_name(&a)));
+            let all: Vec<String> = want.iter().map(|(p, _)| p.to_string()).collect();
+            extract(&a, &all, &s(&together)).expect("take out all");
+            assert_eq!(names_in(&together).len(), want.len(), "{a}");
+            assert_eq!(unpack_size(&a, &all), Ok(want.iter().map(|(_, d)| d.len() as u64).sum()), "{a}");
+            // Extract here: every one, as listed.
             let here = t.dir(&format!("here-{}", folder::file_name(&a)));
             extract_all(&a, &s(&here), &mut Vec::new()).expect("extract here");
-            assert_eq!(names_in(&here).len(), 1, "{a}");
-            assert_eq!(std::fs::read(here.join(name)).expect("read"), last, "{a}");
+            let mut expect: Vec<(String, Option<Vec<u8>>)> = want.iter().map(|(p, d)| (p.to_string(), Some(d.to_vec()))).chain([("docs".to_string(), None)]).collect();
+            expect.sort();
+            assert_eq!(tree(&here), expect, "{a}");
+            // Taking one out where its name is already used is refused: what's there stays.
+            let busy = t.dir(&format!("busy-{}", folder::file_name(&a)));
+            std::fs::write(busy.join("a (3).txt"), b"mine").expect("write");
+            assert!(extract(&a, &["a (3).txt".to_string()], &s(&busy)).is_err(), "{a}");
+            assert_eq!(std::fs::read(busy.join("a (3).txt")).expect("read"), b"mine", "{a}");
         }
+    }
+
+    #[test]
+    fn the_same_name_twice_in_a_streamed_or_stored_zip_comes_out_too() {
+        // A zip written as a stream keeps its sizes after the data, not in the entry's header; and
+        // one stored without packing. The second of a name is read from where its header is.
+        let t = Scratch::new("twicestream");
+        for (name, method) in [("stream.zip", zip::CompressionMethod::Deflated), ("stored.zip", zip::CompressionMethod::Stored)] {
+            let mut w = zip::ZipWriter::new_stream(Vec::new());
+            let opts = zip::write::SimpleFileOptions::default().compression_method(method);
+            for (n, data) in [("x.txt", &b"first one"[..]), ("y.txt", &b"second, longer one"[..])] {
+                w.start_file(n, opts).expect("start");
+                w.write_all(data).expect("write");
+            }
+            let path = t.join(name);
+            std::fs::write(&path, w.finish().expect("finish").into_inner()).expect("write");
+            patch(&path, b"y.txt", b"x.txt");
+            let a = s(&path);
+            assert_eq!(names(&read(&a, "", "")), ["x (2).txt", "x.txt"], "{name}");
+            let out = t.dir(&format!("out-{name}"));
+            extract(&a, &["x.txt".to_string(), "x (2).txt".to_string()], &s(&out)).expect("take out");
+            assert_eq!(tree(&out), expected(&[("x (2).txt", Some(b"second, longer one")), ("x.txt", Some(b"first one"))]), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_file_named_like_a_folder_beside_it_gets_its_own_name() {
+        // A zip can hold a file "docs" and a folder "docs": on disk they can't both be "docs".
+        let t = Scratch::new("filefolder");
+        let zip = t.join("both.zip");
+        zip_with(&zip, &[("docs", b"a file"), ("docs/in.txt", b"inside")]);
+        let z = s(&zip);
+        assert_eq!(names(&read(&z, "", "")), ["docs (2)", "docs\\"]);
+        let here = t.dir("here");
+        extract_all(&z, &s(&here), &mut Vec::new()).expect("extract");
+        assert_eq!(tree(&here), expected(&[("docs", None), ("docs (2)", Some(b"a file")), ("docs\\in.txt", Some(b"inside"))]));
+    }
+
+    /// A zip of these entries, as bytes (to go inside another one).
+    fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use zip::write::SimpleFileOptions;
+        let mut w = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, data) in entries {
+            w.start_file(*name, opts).expect("start");
+            w.write_all(data).expect("write");
+        }
+        w.finish().expect("finish").into_inner()
+    }
+
+    /// outer.zip > sub > mid.zip > level2 > deep.zip > deep.txt (names with # and, where the disk
+    /// takes them, emoji): (the outer zip, the mid and deep zips' names, the deep zip's bytes).
+    fn three_deep(t: &Scratch) -> (PathBuf, String, String, Vec<u8>) {
+        let fancy = crate::search::odd_names_work(&t.0);
+        let deep_name = if fancy { "deep \u{1f600} #3.zip" } else { "deep #3.zip" }.to_string();
+        let mid_name = "mid #2.zip".to_string();
+        let deep = zip_bytes(&[("deep.txt", b"at the bottom"), ("more/x.txt", b"x")]);
+        let mid = zip_bytes(&[(&format!("level2/{deep_name}"), &deep), ("two.txt", b"two")]);
+        let outer = t.join("outer #1.zip");
+        zip_with(&outer, &[(&format!("sub/{mid_name}"), &mid), ("one.txt", b"one")]);
+        (outer, mid_name, deep_name, deep)
+    }
+
+    #[test]
+    fn an_archive_inside_an_archive_is_read_at_its_path_there() {
+        let t = Scratch::new("nested");
+        let (outer, mid, deep, deep_bytes) = three_deep(&t);
+        let o = s(&outer);
+        let deepest = format!("{o}\\sub\\{mid}\\level2\\{deep}");
+        // Every level, by its whole path: the outer zip is the archive, the rest is inside it.
+        assert_eq!(split(&deepest), Some((o.clone(), format!("sub\\{mid}\\level2\\{deep}"))));
+        assert_eq!(names(&folder::read(&deepest)), ["deep.txt", "more\\"]);
+        assert_eq!(names(&folder::read(&format!("{deepest}\\MORE"))), ["x.txt"]);
+        assert_eq!(folder::read(&deepest).path, deepest);
+        // Up from each level, and what's there.
+        let mut at = format!("{deepest}\\more");
+        let mut seen = Vec::new();
+        while at != s(&t.0) {
+            let listed = folder::read(&at);
+            assert_eq!(listed.error, None, "{at}");
+            seen.push(names(&listed));
+            at = folder::parent(&at).expect("a parent");
+        }
+        let want: Vec<Vec<String>> = vec![
+            vec!["x.txt".into()],
+            vec!["deep.txt".into(), "more\\".into()],
+            vec![deep.clone()],
+            vec!["level2\\".into(), "two.txt".into()],
+            vec![mid.clone()],
+            vec!["one.txt".into(), "sub\\".into()],
+        ];
+        assert_eq!(seen, want);
+        // Up from the top of the outer zip is the folder the zip is in.
+        assert_eq!(folder::parent(&o), Some(s(&t.0)));
+        // A file in the deepest one is a file, not a folder.
+        assert_eq!(folder::read(&format!("{deepest}\\deep.txt")).error.as_deref(), Some(folder::NOT_A_FOLDER));
+        assert_eq!(folder::read(&format!("{o}\\sub\\{mid}\\two.txt")).error.as_deref(), Some(folder::NOT_A_FOLDER));
+        // Taking things out of the deepest one: a file, a folder, and the deep zip itself whole.
+        let out = t.dir("out");
+        let tops = extract(&o, &[format!("sub\\{mid}\\level2\\{deep}\\deep.txt"), format!("sub\\{mid}\\level2\\{deep}\\more")], &s(&out)).expect("take out");
+        assert_eq!(tops, [s(&out.join("deep.txt")), s(&out.join("more"))]);
+        assert_eq!(std::fs::read(out.join("deep.txt")).expect("read"), b"at the bottom");
+        assert_eq!(std::fs::read(out.join("more").join("x.txt")).expect("read"), b"x");
+        let whole = t.dir("whole");
+        extract(&o, &[format!("sub\\{mid}\\level2\\{deep}")], &s(&whole)).expect("take out the zip");
+        assert_eq!(std::fs::read(whole.join(&deep)).expect("read"), deep_bytes);
+        assert_eq!(unpack_size(&o, &[format!("sub\\{mid}\\level2\\{deep}\\deep.txt")]), Ok(13));
+        // Read again (as Back and Forward do): the copy taken out the first time is used.
+        assert_eq!(names(&folder::read(&deepest)), ["deep.txt", "more\\"]);
+        // A name that only looks like an archive, and one that isn't there.
+        assert!(folder::read(&format!("{o}\\sub\\nope.zip")).error.is_some());
+        assert!(folder::read(&format!("{o}\\sub\\{mid}\\nope.7z\\x")).error.is_some());
+    }
+
+    #[test]
+    fn a_changed_outer_archive_shows_its_new_inner_archive() {
+        let t = Scratch::new("nestedchange");
+        let outer = t.join("o.zip");
+        zip_with(&outer, &[("in.zip", &zip_bytes(&[("old.txt", b"old")]))]);
+        let o = s(&outer);
+        assert_eq!(names(&folder::read(&format!("{o}\\in.zip"))), ["old.txt"]);
+        std::fs::remove_file(&outer).expect("remove");
+        zip_with(&outer, &[("in.zip", &zip_bytes(&[("new.txt", b"newer")]))]);
+        File::options().write(true).open(&outer).expect("open").set_modified(UNIX_EPOCH + Duration::from_secs(1_600_000_000)).expect("time");
+        assert_eq!(names(&folder::read(&format!("{o}\\in.zip"))), ["new.txt"]);
+    }
+
+    #[test]
+    fn a_7z_inside_a_zip_inside_a_7z_opens_too() {
+        let t = Scratch::new("nestedmix");
+        let seven_inner = t.join("inner.7z");
+        seven_with(&seven_inner, &[("x/y.txt", b"why")]);
+        let zip = zip_bytes(&[("inner.7z", &std::fs::read(&seven_inner).expect("read"))]);
+        let outer = t.join("outer.7z");
+        seven_with(&outer, &[("dir/", b""), ("dir/mid.zip", &zip)]);
+        let o = s(&outer);
+        let at = format!("{o}\\dir\\mid.zip\\inner.7z\\x");
+        assert_eq!(names(&folder::read(&at)), ["y.txt"]);
+        let out = t.dir("out");
+        extract(&o, &["dir\\mid.zip\\inner.7z\\x\\y.txt".to_string()], &s(&out)).expect("take out");
+        assert_eq!(std::fs::read(out.join("y.txt")).expect("read"), b"why");
+    }
+
+    #[test]
+    fn the_7z_packer_is_sized_by_what_it_packs() {
+        const K: u64 = 1024;
+        const M: u64 = 1024 * K;
+        // Small: the next power of two up, 64 KB at least, one packer and no thread pool.
+        assert_eq!(lzma2_setup(0, 8), (64 * 1024, 1));
+        assert_eq!(lzma2_setup(1, 8), (64 * 1024, 1));
+        assert_eq!(lzma2_setup(64 * K, 8), (64 * 1024, 1));
+        assert_eq!(lzma2_setup(64 * K + 1, 8), (128 * 1024, 1));
+        assert_eq!(lzma2_setup(3 * M, 8), (4 << 20, 1));
+        assert_eq!(lzma2_setup(8 * M, 8), (8 << 20, 1));
+        // Big: level 6's own 8 MB at most, and a thread for each 8 MB piece, up to 8 (and the cores).
+        assert_eq!(lzma2_setup(8 * M + 1, 8), (8 << 20, 2));
+        assert_eq!(lzma2_setup(20 * M, 8), (8 << 20, 3));
+        assert_eq!(lzma2_setup(64 * M, 8), (8 << 20, 8));
+        assert_eq!(lzma2_setup(64 * M, 32), (8 << 20, 8));
+        assert_eq!(lzma2_setup(u64::MAX, 8), (8 << 20, 8));
+        assert_eq!(lzma2_setup(64 * M, 4), (8 << 20, 4));
+        assert_eq!(lzma2_setup(64 * M, 2), (8 << 20, 2));
+        assert_eq!(lzma2_setup(64 * M, 1), (8 << 20, 1));
+        assert_eq!(lzma2_setup(64 * M, 0), (8 << 20, 1));
+
+        // And it's what a packed 7z says it was packed with: one byte, an empty folder, a few KB.
+        let t = Scratch::new("dict");
+        std::fs::write(t.join("one.txt"), b"1").expect("write");
+        let empty = t.dir("Empty");
+        let small = t.dir("Small #1");
+        std::fs::write(small.join("a.txt"), "words ".repeat(20_000)).expect("write");
+        let never = AtomicBool::new(false);
+        for (name, what, dict) in [("one", s(&t.join("one.txt")), Some(64 * 1024)), ("empty", s(&empty), None), ("small", s(&small), Some(128 * 1024))] {
+            let plan = plan_pack(std::slice::from_ref(&what), &never).expect("plan").expect("not stopped");
+            let out = t.join(&format!("{name}.7z"));
+            pack(&plan, &s(&out), Format::SevenZ).expect("pack");
+            let (a, _) = open_7z(&s(&out)).expect("open");
+            let dicts: Vec<u32> = a.blocks.iter().flat_map(|b| &b.coders).map(|c| lzma2_dict(c.properties())).collect();
+            assert_eq!(dicts, dict.into_iter().collect::<Vec<u32>>(), "{name}");
+            let back = t.dir(&format!("back-{name}"));
+            extract_all(&s(&out), &s(&back), &mut Vec::new()).expect("extract");
+            if name == "one" {
+                assert_eq!(tree(&back), expected(&[("one.txt", Some(b"1"))]));
+            } else {
+                assert_eq!(tree(&back.join(folder::file_name(&what))), tree(Path::new(&what)), "{name}");
+            }
+        }
+    }
+
+    /// The dictionary size an LZMA2 coder's one property byte gives.
+    fn lzma2_dict(props: &[u8]) -> u32 {
+        let p = u32::from(props[0]);
+        (2 | (p & 1)) << (p / 2 + 11)
     }
 
     #[test]
@@ -2053,5 +2752,224 @@ mod tests {
         let here = t.dir("here");
         extract_all(&z, &s(&here), &mut Vec::new()).expect("extract");
         assert_eq!(tree(&here), vec![(name, Some(b"coffee".to_vec()))]);
+    }
+
+    /// `n` bytes that look random (and don't shrink), the same each time for one `seed`.
+    fn noise(n: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed | 1;
+        let mut out = Vec::with_capacity(n + 8);
+        while out.len() < n {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out.truncate(n);
+        out
+    }
+
+    /// The 7z coder each file of `a` is packed with: "copy", "lzma2", or "" for no data.
+    fn coders(a: &sevenz_rust2::Archive) -> Vec<(String, &'static str)> {
+        let mut out: Vec<(String, &'static str)> = a
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let block = a.stream_map.file_block_index.get(i).copied().flatten().map(|b| &a.blocks[b]);
+                let how = match block.map(|b| b.coders[0].encoder_method_id().to_vec()) {
+                    None => "",
+                    Some(id) if id == [0x00] => "copy",
+                    Some(id) if id == [0x21] => "lzma2",
+                    Some(_) => "other",
+                };
+                (f.name.clone(), how)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn photos_videos_and_data_that_doesnt_shrink_are_stored_in_a_7z_and_come_out_exactly() {
+        let t = Scratch::new("stored");
+        // (Emoji where the disk takes them: not under Wine without a UTF-8 locale.)
+        let fancy = crate::search::odd_names_work(&t.0);
+        let d = if fancy { "Mixed \u{1f4f7}" } else { "Mixed #1" };
+        let clip = if fancy { "\u{1f600} clip.mp4" } else { "a clip.mp4" };
+        let top = t.dir(d);
+        std::fs::write(top.join("PHOTO.JPG"), noise(300_000, 1)).expect("write");
+        std::fs::write(top.join(clip), noise(2_000_000, 2)).expect("write");
+        std::fs::write(top.join("inner.zip"), zip_bytes(&[("a.txt", b"inside")])).expect("write");
+        // Random data with a name that says nothing, big enough to be tried, and text named the same.
+        std::fs::write(top.join("noise.bin"), noise(3_000_000, 3)).expect("write");
+        std::fs::write(top.join("words.bin"), "plain words again and again ".repeat(100_000)).expect("write");
+        // Text first, random after: the samples see both, and it shrinks.
+        let mut half = "half text ".repeat(150_000).into_bytes();
+        half.extend(noise(1_500_000, 4));
+        std::fs::write(top.join("half.dat"), &half).expect("write");
+        // Small text, a file only named ".jpg", and nothing at all.
+        std::fs::write(top.join("notes.txt"), b"notes").expect("write");
+        std::fs::write(top.join(".jpg"), "not a photo ".repeat(100)).expect("write");
+        std::fs::write(top.join("empty.png"), b"").expect("write");
+        let never = AtomicBool::new(false);
+        let plan = plan_pack(&[s(&top)], &never).expect("plan").expect("not stopped");
+        let out = t.join("mixed.7z");
+        pack(&plan, &s(&out), Format::SevenZ).expect("pack");
+        let (a, _) = open_7z(&s(&out)).expect("open");
+        let want: Vec<(String, &str)> = vec![
+            (d.to_string(), ""),
+            (format!("{d}/.jpg"), "lzma2"),
+            (format!("{d}/PHOTO.JPG"), "copy"),
+            (format!("{d}/empty.png"), ""),
+            (format!("{d}/half.dat"), "lzma2"),
+            (format!("{d}/inner.zip"), "copy"),
+            (format!("{d}/noise.bin"), "copy"),
+            (format!("{d}/notes.txt"), "lzma2"),
+            (format!("{d}/words.bin"), "lzma2"),
+            (format!("{d}/{clip}"), "copy"),
+        ];
+        let mut want = want;
+        want.sort();
+        assert_eq!(coders(&a), want);
+        // Stored ones take no more room than they hold, and everything comes out as it went in.
+        assert!(std::fs::metadata(&out).expect("size").len() < 300_000 + 2_000_000 + 3_000_000 + 1_600_000 + 10_000);
+        let back = t.dir("back");
+        extract_all(&s(&out), &s(&back), &mut Vec::new()).expect("extract");
+        assert_eq!(tree(&back.join(d)), tree(&top));
+        // One out of the middle of a stored block, and the zip inside opened where it is.
+        let one = t.dir("one");
+        extract(&s(&out), &[format!("{d}\\noise.bin")], &s(&one)).expect("take out");
+        assert_eq!(std::fs::read(one.join("noise.bin")).expect("read"), noise(3_000_000, 3));
+        assert_eq!(names(&read(&s(&out), &format!("{d}\\inner.zip"), "")), ["a.txt"]);
+    }
+
+    #[test]
+    fn the_quick_try_tells_data_that_shrinks_from_data_that_doesnt() {
+        let t = Scratch::new("try");
+        let file = |name: &str, data: &[u8]| {
+            let p = t.join(name);
+            std::fs::write(&p, data).expect("write");
+            let size = data.len() as u64;
+            (p, size)
+        };
+        let (p, n) = file("noise", &noise(2 << 20, 9));
+        assert!(barely_shrinks(&p, n));
+        let (p, n) = file("zeros", &vec![0u8; 2 << 20]);
+        assert!(!barely_shrinks(&p, n));
+        // Random but for a repeated middle: one sample shrinks, so all of it is packed.
+        let mut mid = noise(2 << 20, 10);
+        mid[(1 << 20) - 40_000..(1 << 20) + 40_000].fill(b'x');
+        let (p, n) = file("middle", &mid);
+        assert!(!barely_shrinks(&p, n));
+        // Gone, or shorter than it was: never stored on a guess.
+        assert!(!barely_shrinks(&t.join("nothing here"), 2 << 20));
+        let (p, _) = file("short", b"tiny");
+        assert!(!barely_shrinks(&p, 2 << 20));
+        let (p, _) = file("empty", b"");
+        assert!(!barely_shrinks(&p, 2 << 20));
+    }
+
+    #[test]
+    fn a_7z_entry_has_the_times_the_disk_has_without_asking_it_again() {
+        let t = Scratch::new("times");
+        let top = make_tree(&t.0);
+        let never = AtomicBool::new(false);
+        let plan = plan_pack(&[s(&top)], &never).expect("plan").expect("not stopped");
+        assert!(plan.items.len() >= 6);
+        for p in &plan.items {
+            let mine = sevenz_entry(p);
+            let theirs = sevenz_rust2::ArchiveEntry::from_path(&p.path, p.name.clone());
+            let fields = |e: &sevenz_rust2::ArchiveEntry| {
+                (e.name.clone(), e.has_stream, e.is_directory, e.has_last_modified_date, u64::from(e.last_modified_date), e.has_creation_date, u64::from(e.creation_date), e.has_access_date)
+            };
+            assert_eq!(fields(&mine), fields(&theirs), "{}", p.name);
+            // (Reading the disk again may have moved the access time on.)
+            assert!(!mine.has_access_date || u64::from(mine.access_date) > 0, "{}", p.name);
+        }
+        // And the packed archive says so: a.txt's old time.
+        let out = t.join("times.7z");
+        pack(&plan, &s(&out), Format::SevenZ).expect("pack");
+        let (a, _) = open_7z(&s(&out)).expect("open");
+        let f = a.files.iter().find(|f| f.name == "Stuff/a.txt").expect("a.txt");
+        assert!(f.has_last_modified_date && f.has_creation_date);
+        assert_eq!(SystemTime::from(f.last_modified_date), UNIX_EPOCH + Duration::from_secs(1_500_000_000));
+        let d = a.files.iter().find(|f| f.name == "Stuff/empty").expect("empty");
+        assert!(d.is_directory && !d.has_stream && d.has_last_modified_date);
+    }
+
+    #[test]
+    fn dragging_out_checks_the_size_first_and_makes_nothing_when_it_is_too_much() {
+        let t = Scratch::new("atmost");
+        let smile = if crate::search::odd_names_work(&t.0) { "\u{1f600}.txt" } else { "smile.txt" };
+        for ext in ["zip", "7z"] {
+            let path = t.join(&format!("a.{ext}"));
+            archive_with(&path, &[("docs/a.txt", b"aaaa"), ("docs/b.txt", b"bb"), ("big.txt", &[b'x'; 5000]), (smile, b"smile")]);
+            let a = s(&path);
+            let home = temp_home(&a).expect("home");
+            let before = std::fs::read_dir(&home).map_or(0, |d| d.count());
+            let err = extract_at_most(&a, &["big.txt".to_string()], 4999, "Too much.").expect_err("too big");
+            assert_eq!(err, "Too much.");
+            assert_eq!(std::fs::read_dir(&home).map_or(0, |d| d.count()), before, "{ext}: no folder made");
+            let err = extract_at_most(&a, &["nope.txt".to_string()], u64::MAX, "Too much.").expect_err("missing");
+            assert!(err.contains("nope.txt"), "{err}");
+            let (dir, tops) = extract_at_most(&a, &["docs".to_string(), smile.to_string()], 4 + 2 + 5, "Too much.").expect("fits");
+            assert_eq!(tops, [folder::join(&dir, "docs"), folder::join(&dir, smile)]);
+            assert_eq!(std::fs::read(Path::new(&dir).join("docs").join("b.txt")).expect("read"), b"bb");
+            // Again: a new folder, nothing replaced.
+            let (again, _) = extract_at_most(&a, &["docs".to_string()], 6, "Too much.").expect("again");
+            assert_ne!(again, dir);
+        }
+        // From an archive inside one: counted and taken out of the inner one.
+        let (outer, mid, deep, _) = three_deep(&t);
+        let o = s(&outer);
+        let item = format!("sub\\{mid}\\level2\\{deep}\\deep.txt");
+        let (dir, tops) = extract_at_most(&o, std::slice::from_ref(&item), 13, "Too much.").expect("deep");
+        assert_eq!(std::fs::read(&tops[0]).expect("read"), b"at the bottom");
+        assert!(tops[0].starts_with(&dir));
+        assert_eq!(extract_at_most(&o, &[item], 12, "Too much."), Err("Too much.".to_string()));
+    }
+
+    /// How long packing and unpacking a fixed set takes (not run by default): 50 MB of text and
+    /// 100 MB of random bytes, made in the temporary folder. Run on a real PC with
+    /// `cargo test --release archive_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn archive_timing_of_a_fixed_set() {
+        let t = Scratch::new("timing");
+        let src = t.dir("set");
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let words = ["the", "file", "folder", "window", "glint", "archive", "packed", "small", "quick", "brown", "fox", "jumps", "over", "lazy", "dog", "explorer", "copy", "paste", "rename", "delete", "photo", "music", "report", "notes", "draft", "final", "version", "2026", "settings", "theme"];
+        for n in 0..10 {
+            let mut text = String::with_capacity(5 << 20);
+            while text.len() < 5 << 20 {
+                let r = next();
+                text.push_str(words[(r % words.len() as u64) as usize]);
+                text.push(if r >> 60 == 0 { '\n' } else { ' ' });
+            }
+            std::fs::write(src.join(format!("text{n}.txt")), text).expect("write");
+        }
+        for n in 0..4 {
+            let bytes: Vec<u8> = (0..(25 << 20) / 8).flat_map(|_| next().to_le_bytes()).collect();
+            std::fs::write(src.join(format!("random{n}.bin")), bytes).expect("write");
+        }
+        let never = AtomicBool::new(false);
+        let plan = plan_pack(&[s(&src)], &never).expect("plan").expect("not stopped");
+        for format in [Format::Zip, Format::SevenZ] {
+            let out = t.join(&format!("set{}", format.ext()));
+            let start = Instant::now();
+            pack(&plan, &s(&out), format).expect("pack");
+            let packed = start.elapsed();
+            let size = std::fs::metadata(&out).map_or(0, |m| m.len());
+            let back = t.dir(&format!("back{}", format.ext()));
+            let start = Instant::now();
+            extract_all(&s(&out), &s(&back), &mut Vec::new()).expect("extract");
+            eprintln!("{format:?}: {} MB packed in {packed:?} to {} MB, unpacked in {:?}", plan.total >> 20, size >> 20, start.elapsed());
+        }
     }
 }

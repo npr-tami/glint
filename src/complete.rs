@@ -4,9 +4,13 @@
 //! - after `in ` → folders: the user's places (Downloads, Documents…), pinned folders, the open
 //!   tabs' folders, the subfolders of the folder on screen and the drives; a path being typed
 //!   (`C:\Us`) → the real folders in it, listed off the UI thread ([`Lister`]);
-//! - after `-` or at the start of a word → the rule words, each with a few words about it;
+//! - after `-` or at the start of a word → the rule words, each with a few words about it, then
+//!   every file type Glint knows (after `-.`, written with the dot: `-.png`);
+//! - at the start of a line → `in` and `in = (` too, or `)` inside a folder's rules not closed yet;
 //! - after `-bigger_than_` / `-smaller_than_` → sizes; after `-updated_` / `-older_than_` → times;
 //! - after a rule and `_` → `_first`, `_last`, and `_by_day`… on date orders.
+//!
+//! Ctrl+Space ([`complete_asked`]) gives them before anything's typed too.
 //!
 //! Matching: the ones that start with what's typed first, then the ones that contain it.
 
@@ -17,7 +21,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::folder;
-use crate::sortrecipe::{self, EXACT_RULES, FOLDER_RULES, GROUP_RULES, ORDER_RULES, PLACE_NAMES, VIEW_RULES};
+use crate::sortrecipe::{self, EXACT_RULES, FOLDER_RULES, GROUP_RULES, MORE_RULES, ORDER_RULES, PLACE_NAMES, VIEW_RULES};
 
 /// One suggestion: what replaces the word being typed, what the list shows, and a few words about it.
 #[derive(Clone, Debug, PartialEq)]
@@ -56,8 +60,9 @@ pub struct Place {
     pub hint: String,
 }
 
-/// Common file types offered as rules.
+/// The file types people sort by most, offered first (then every other type Glint knows).
 const TYPES: &[&str] = &["png", "jpg", "pdf", "exe", "zip", "mp4", "mp3", "txt", "docx", "xlsx", "msi", "iso", "psd", "svg", "gif", "json"];
+
 const SIZES: &[&str] = &["1mb", "10mb", "100mb", "1gb", "500kb"];
 const TIMES: &[&str] = &["2_hours", "3_days", "7_days", "2_weeks", "1_month"];
 const AGES: &[&str] = &["1_month", "6_months", "1_year", "2_years"];
@@ -102,6 +107,36 @@ fn in_multi(text: &str, line_start: usize) -> bool {
     false
 }
 
+/// Whether the line starting at `line_start` is inside a folder's rules whose ")" never comes:
+/// the lines above it open them ("in Downloads (", "in = ("), and the lines below it don't close
+/// them before the next "in".
+fn in_open_block(text: &str, line_start: usize) -> bool {
+    let is_in = |code: &str| code.get(..3).is_some_and(|h| h.eq_ignore_ascii_case("in ") || h.eq_ignore_ascii_case("in\t"));
+    let mut open = false;
+    for line in text[..line_start].lines() {
+        let code = sortrecipe::strip_note(line).trim();
+        if code.starts_with([')', '}', ']']) {
+            open = false;
+        } else if code == "(" || is_in(code) {
+            open = code.ends_with(['(', '{', '[']);
+        }
+    }
+    if !open {
+        return false;
+    }
+    let below = text[line_start..].split_once('\n').map_or("", |(_, rest)| rest);
+    for line in below.lines() {
+        let code = sortrecipe::strip_note(line).trim();
+        if code.starts_with([')', '}', ']']) {
+            return false;
+        }
+        if is_in(code) {
+            break;
+        }
+    }
+    true
+}
+
 /// The places as folders of an "in = (": their full path goes in.
 fn place_paths(places: &[Place]) -> Vec<(String, Suggestion)> {
     places
@@ -128,10 +163,21 @@ fn looks_like_path(s: &str) -> bool {
     s.contains('\\') || s.starts_with(['%', '~']) || s.as_bytes().get(1) == Some(&b':')
 }
 
-/// The suggestions at `caret` in `text`. `places` are the folders for "in"; `listed` gives a
-/// folder's subfolders when they've been listed (None: not yet).
+/// The suggestions at `caret` in `text`, as it's typed. `places` are the folders for "in";
+/// `listed` gives a folder's subfolders when they've been listed (None: not yet).
 pub fn complete(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str) -> Option<Arc<Vec<String>>>) -> Completion {
-    let caret = caret.min(text.len());
+    suggestions(text, caret, places, listed, false)
+}
+
+/// Ctrl+Space: the suggestions at `caret`, even where nothing's typed yet (at the start of a line,
+/// after a space, in an empty box): everything that fits there.
+pub fn complete_asked(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str) -> Option<Arc<Vec<String>>>) -> Completion {
+    suggestions(text, caret, places, listed, true)
+}
+
+/// The suggestions at `caret`; `asked`: with Ctrl+Space, so before a word is started too.
+fn suggestions(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str) -> Option<Arc<Vec<String>>>, asked: bool) -> Completion {
+    let caret = (0..=caret.min(text.len())).rev().find(|&c| text.is_char_boundary(c)).unwrap_or(0);
     let line_start = text[..caret].rfind('\n').map_or(0, |i| i + 1);
     let before = &text[line_start..caret];
     let lead = before.len() - before.trim_start().len();
@@ -183,6 +229,8 @@ pub fn complete(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str
                 items.push((p.path.clone(), s));
             }
         }
+        // "in = (": several folders, the same rules (after the folders: they're what's wanted most).
+        items.push(("= (".into(), Suggestion { insert: "= (".into(), label: "= (".into(), hint: "the same rules for several folders".into() }));
         done.items = rank(items, typed);
         return done;
     }
@@ -204,7 +252,8 @@ pub fn complete(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str
 
     // A folder's name on a line of its own in "in = (": the folder, as its full path. (With a space,
     // the whole line is the name; without, rules are suggested too, below.)
-    let multi = in_multi(text, line_start) && !trimmed.is_empty() && !trimmed.starts_with(['-', '\u{2013}', '\u{2014}', '#']);
+    let in_folders = in_multi(text, line_start) && !trimmed.starts_with(['-', '\u{2013}', '\u{2014}', '#']);
+    let multi = in_folders && !trimmed.is_empty();
     if multi && trimmed.contains(' ') {
         let items = rank(place_paths(places), trimmed);
         if !items.is_empty() {
@@ -212,10 +261,16 @@ pub fn complete(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str
         }
     }
 
+    // Nothing in a note (after a #): it's plain words.
+    if sortrecipe::strip_note(before).len() < before.len() {
+        return none;
+    }
     // The word being typed (from the last space to the cursor).
     let word_start = before.rfind(is_sep).map_or(0, |i| i + before[i..].chars().next().map_or(1, char::len_utf8));
     let word = &before[word_start..];
     let start = line_start + word_start;
+    // (The word can go on after the cursor: the suggestion replaces what's before it.)
+    let word_end = caret + text[caret..].find(is_sep).unwrap_or(text.len() - caret);
     let prev: Vec<String> = before[..word_start].split(is_sep).filter(|t| !t.is_empty()).map(|t| t.trim_start_matches('-').to_lowercase()).collect();
     let dash = if word.starts_with('-') { "-" } else { "" };
     let norm = word.trim_start_matches('-').to_lowercase().replace('-', "_");
@@ -226,9 +281,9 @@ pub fn complete(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str
     if last2.len() == 2 && last2[0] == "than" && matches!(last2[1], "bigger" | "larger" | "smaller") && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
         let items = SIZES.iter().map(|s| (s.to_string(), Suggestion { insert: s.to_string(), label: s.to_string(), hint: "a size".into() })).collect();
         done.items = rank(items, &norm);
-        return done;
+        return without_repeats(done, text, word_end);
     }
-    if word.is_empty() {
+    if word.is_empty() && !asked {
         return none;
     }
     let mut items: Vec<(String, Suggestion)> = Vec::new();
@@ -238,11 +293,15 @@ pub fn complete(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str
             let items = list.iter().map(|s| (s.to_string(), Suggestion { insert: format!("{dash}{base}{s}"), label: format!("{base}{s}"), hint: hint.into() })).collect();
             done.items = rank(items, partial);
             if !done.items.is_empty() || base != "updated_" && base != "added_" {
-                return done;
+                return without_repeats(done, text, word_end);
             }
         }
     }
-    // A rule and "_" → _first, _last, _by_day…
+    // A rule and "_" → _first, _last, _by_day… (After the rule words that go on from what's
+    // typed when the rule is another way of writing one: "name_" is -name_has_… more likely than
+    // -a_to_z written as -name_first.)
+    let mut endings: Vec<(String, Suggestion)> = Vec::new();
+    let mut endings_last = false;
     if let Some(cut) = norm.rfind('_') {
         let (base, partial) = (&norm[..cut], &norm[cut..]);
         let order = sortrecipe::is_order_word(base);
@@ -254,26 +313,65 @@ pub fn complete(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str
                 ends.extend([("_by_day", "a day counts as one"), ("_by_week", "a week counts as one"), ("_by_month", "a month counts as one"), ("_by_year", "a year counts as one")]);
             }
             let suffixes = ends.into_iter().filter(|(e, _)| !base.ends_with(e)).map(|(e, h)| (e.to_string(), Suggestion { insert: format!("{dash}{base}{e}"), label: format!("{base}{e}"), hint: h.into() })).collect();
-            items.extend(rank(suffixes, partial).into_iter().map(|s| (s.label.clone(), s)));
+            endings.extend(rank(suffixes, partial).into_iter().map(|s| (s.label.clone(), s)));
+            let main = GROUP_RULES.iter().chain(ORDER_RULES).any(|(r, _)| r[1..] == *base) || sortrecipe::known_type(base);
+            endings_last = !main;
         }
     }
-    // Rule words.
-    for (rule, hint) in GROUP_RULES.iter().chain(ORDER_RULES).chain(EXACT_RULES).chain(VIEW_RULES).chain(FOLDER_RULES) {
+    if !endings_last {
+        items.append(&mut endings);
+    }
+    // In a folder's rules not closed yet, at the start of a line: the ")" that closes them, first.
+    let line_start_word = prev.is_empty() && dash.is_empty();
+    let open_block = line_start_word && in_open_block(text, line_start);
+    if open_block {
+        items.push((")".into(), Suggestion { insert: ")".into(), label: ")".into(), hint: "the end of this folder's rules".into() }));
+    }
+    // Rule words (-file, which the guide leaves out, right after -folder), then other ways to
+    // write them.
+    let rule = |rule: &str, hint: &str| {
         let w = &rule[1..];
-        items.push((w.to_string(), Suggestion { insert: format!("{dash}{w}"), label: rule.to_string(), hint: hint.to_string() }));
+        (w.to_string(), Suggestion { insert: format!("{dash}{w}"), label: rule.to_string(), hint: hint.to_string() })
+    };
+    for (r, hint) in GROUP_RULES.iter().chain(ORDER_RULES).chain(EXACT_RULES).chain(VIEW_RULES).chain(FOLDER_RULES) {
+        items.push(rule(r, hint));
+        if *r == "-folder" {
+            items.push(rule("-file", "files (not folders)"));
+        }
     }
-    for t in TYPES {
-        items.push((t.to_string(), Suggestion { insert: format!("{dash}{t}"), label: format!("-{t}"), hint: format!(".{t} files") }));
-    }
-    // "in" at the start of a line: rules for one folder.
-    if prev.is_empty() && dash.is_empty() {
+    items.extend(MORE_RULES.iter().map(|(r, hint)| rule(r, hint)));
+    items.append(&mut endings);
+    // "in" at the start of a line: rules for one folder, or "in = (" for several (not inside a
+    // folder's rules: those end with ")" first).
+    if line_start_word && !open_block {
         items.push(("in".into(), Suggestion { insert: "in ".into(), label: "in".into(), hint: "rules for one folder".into() }));
+        items.push(("in = (".into(), Suggestion { insert: "in = (".into(), label: "in = (".into(), hint: "the same rules for several folders".into() }));
     }
-    // In "in = (": the folders too, first (its lines name folders before their rules).
-    if multi && prev.is_empty() {
-        items.splice(0..0, place_paths(places));
+    // File types: the common ones, then every other one Glint knows. After "-." with the dot.
+    let dot = if norm.starts_with('.') { "." } else { "" };
+    for t in TYPES.iter().copied().chain(sortrecipe::file_types()) {
+        items.push((format!("{dot}{t}"), Suggestion { insert: format!("{dash}{dot}{t}"), label: format!("-{dot}{t}"), hint: format!(".{t} files") }));
+    }
+    // In "in = (": the folders too, first (its lines name folders before their rules), after the ")".
+    if in_folders && prev.is_empty() {
+        let at = items.iter().position(|(key, _)| key == ")").map_or(0, |i| i + 1);
+        items.splice(at..at, place_paths(places));
     }
     done.items = rank(items, &norm);
+    without_repeats(done, text, word_end)
+}
+
+/// The suggestions without the rules that wouldn't fit where the word is: a group the rules there
+/// have already (on another line of the folder's block, or of the rules for every folder, or on
+/// this line), which would be left out as a repeat, or one a group above takes all of.
+/// `word_end`: where the word being replaced ends.
+fn without_repeats(mut done: Completion, text: &str, word_end: usize) -> Completion {
+    if done.items.is_empty() {
+        return done;
+    }
+    if let Some(here) = sortrecipe::beside(text, done.start, word_end) {
+        done.items.retain(|s| here.fits(&s.insert));
+    }
     done
 }
 
@@ -487,6 +585,216 @@ mod tests {
         assert_eq!(c.items[0].insert, "-image_last");
         assert_eq!(c.items[0].hint, "at the very bottom");
         assert!(!labels(&at_end("-image_")).contains(&"image_by_day"), "_by_ only on date orders");
+    }
+
+    fn asked(text: &str, caret: usize) -> Completion {
+        complete_asked(text, caret, &places(), &|_: &str| None)
+    }
+
+    fn inserts(c: &Completion) -> Vec<&str> {
+        c.items.iter().map(|s| s.insert.as_str()).collect()
+    }
+
+    #[test]
+    fn other_ways_to_write_rules_are_suggested() {
+        // -file (which the guide leaves out), right after -folder.
+        let c = at_end("-f");
+        let at = |w: &str| inserts(&c).iter().position(|i| *i == w);
+        assert_eq!(at("-file"), at("-folder").map(|i| i + 1));
+        assert!(inserts(&at_end("fi")).contains(&"file"), "without the dash, as written");
+        // The name rules, in place of -name_first (which is -a_to_z written another way).
+        assert_eq!(at_end("-name_h").items[0].insert, "-name_has_");
+        assert_eq!(at_end("-name_s").items[0].insert, "-name_starts_with_");
+        assert_eq!(at_end("-name_e").items[0].insert, "-name_ends_with_");
+        assert_eq!(at_end("-name_c").items[0].insert, "-name_contains_");
+        let c = at_end("-name_");
+        assert!(c.items[0].insert.starts_with("-name_has_") && c.items[1].insert.starts_with("-name_starts_with_"), "{:?}", labels(&c));
+        assert!(labels(&c).contains(&"name_first"), "still there, after them");
+        // -larger_than_, and its sizes.
+        assert!(inserts(&at_end("-larg")).contains(&"-larger_than_"));
+        assert_eq!(at_end("-larger_than_1").items[0].insert, "-larger_than_1mb");
+        assert!(inserts(&at_end("-add")).contains(&"-added_3_days"));
+        // Other words for the kinds, which the rules take as they are.
+        assert_eq!(at_end("-mus").items[0].insert, "-music");
+        assert_eq!(at_end("-pho").items[0].insert, "-photos");
+        assert_eq!(at_end("-mov").items[0].insert, "-movies");
+        assert_eq!(at_end("alpha").items[0].insert, "alphabetical");
+        // The main words still come first.
+        assert_eq!(at_end("-a").items[0].insert, "-audio");
+        assert_eq!(at_end("-new").items[0].insert, "-newest");
+    }
+
+    /// Only rules that fit are offered: not one naming a group the rules there have already (it
+    /// would be left out as a repeat), nor one a group above takes all of.
+    #[test]
+    fn rules_already_there_are_not_offered() {
+        let c = at_end("-pic");
+        assert_eq!(c.items[0].insert, "-pictures", "{:?}", labels(&c));
+        for text in ["-image -newest\n-pic", "-photos\n\n-folder\n-pic", "-pictures_last -pic"] {
+            let c = at_end(text);
+            assert!(!inserts(&c).iter().any(|i| ["-pictures", "-photos", "-image", "-png"].contains(i)), "{text:?}: {:?}", inserts(&c));
+        }
+        // Below the word, too (that line would be the one left out), and Ctrl+Space before anything's typed.
+        let text = "-pi\n-image";
+        assert!(!inserts(&complete(text, 3, &places(), &|_: &str| None)).contains(&"-pictures"));
+        let text = "-video\n\n-image";
+        let c = asked(text, 7);
+        assert!(!labels(&c).contains(&"-image") && !labels(&c).contains(&"-video") && labels(&c).contains(&"-audio"), "{:?}", labels(&c));
+        // In a folder's own rules, only its own lines count.
+        assert_eq!(at_end("-image\nin C:\\x (\n-pic").items[0].insert, "-pictures");
+        assert!(!inserts(&at_end("in C:\\x (\n-image\n-pic")).contains(&"-pictures"));
+        // The word going on after the cursor is the one replaced: it isn't counted as a line.
+        let text = "-video\n-pictures";
+        assert_eq!(complete(text, 10, &places(), &|_: &str| None).items[0].insert, "-pictures");
+        // The endings of a group already there aren't offered either; an order rule's are.
+        assert!(at_end("-image\n-image_").items.is_empty());
+        assert!(!at_end("-newest\n-newest_").items.is_empty());
+        // What's offered and "Did you mean" agree.
+        let r = sortrecipe::Recipe::parse("-pic");
+        assert_eq!(r.messages[0].fix.as_deref(), Some(at_end("-pic").items[0].insert.as_str()));
+    }
+
+    #[test]
+    fn every_file_type_is_suggested() {
+        let all = at_end("-");
+        let offered: HashSet<&str> = inserts(&all).into_iter().collect();
+        for t in sortrecipe::file_types() {
+            assert!(offered.contains(format!("-{t}").as_str()), "-{t}");
+        }
+        assert!(sortrecipe::file_types().len() > 200);
+        // The common ones before the rest.
+        let c = at_end("-ps");
+        let at = |w: &str| inserts(&c).iter().position(|i| *i == w).unwrap_or_else(|| panic!("{w}"));
+        assert!(at("-psd") < at("-ps1"));
+        assert!(inserts(&at_end("-blen")).contains(&"-blend"));
+        assert!(inserts(&at_end("-torr")).contains(&"-torrent"));
+        // With the dot, written with the dot (and nothing else).
+        let c = at_end("-.pn");
+        assert_eq!(c.items[0].insert, "-.png");
+        assert!(c.items.iter().all(|s| s.insert.starts_with("-.")));
+        assert!(inserts(&at_end(".bl")).contains(&".blend"));
+        assert!(at_end("-.zzzz").items.is_empty());
+    }
+
+    #[test]
+    fn in_and_brackets_at_the_start_of_a_line() {
+        // "in = (" beside "in".
+        let c = at_end("i");
+        assert!(inserts(&c).contains(&"in ") && inserts(&c).contains(&"in = ("));
+        assert!(inserts(&at_end("in")).contains(&"in = ("), "\"in\" typed: \"in = (\" goes on from it");
+        assert!(inserts(&at_end("in ")).contains(&"= ("), "after \"in \" too, after the folders");
+        assert_eq!(at_end("in ").items.last().map(|s| s.insert.as_str()), Some("= ("));
+        assert_eq!(inserts(&at_end("in =")), ["= ("]);
+        assert!(at_end("in = (").items.is_empty());
+        // Not after another word, nor with a dash.
+        let has_in = |c: &Completion| inserts(c).iter().any(|i| matches!(*i, "in " | "in = (" | "-in " | "-in = ("));
+        assert!(!has_in(&at_end("-folder i")));
+        assert!(!has_in(&at_end("-i")));
+        // Not inside a folder's rules not closed yet: their ")" comes first.
+        assert!(!has_in(&at_end("in Downloads (\ni")));
+        assert!(inserts(&at_end("in Downloads (\n)\ni")).contains(&"in "), "after the )");
+        // The ")" (Ctrl+Space on an empty line in rules not closed yet).
+        assert_eq!(asked("in Downloads (\n-newest\n", 23).items[0].insert, ")");
+        assert_eq!(asked("in Downloads (\n  ", 17).items[0].insert, ")", "indented");
+        assert_eq!(asked("in Downloads\n(\n", 15).items[0].insert, ")", "the ( on a line of its own");
+        let none = |text: &str, caret: usize| !inserts(&asked(text, caret)).contains(&")");
+        assert!(none("", 0), "no rules to close");
+        assert!(none("in Downloads (\n\n)", 15), "closed below already");
+        assert!(none("in Downloads (\n-a_to_z\n)\n", 25), "closed above");
+        assert!(none("in Downloads (-a_to_z)\n", 23), "on one line");
+        assert!(none("in Downloads:\n", 14), "the older kind, without brackets");
+        assert!(none("in Downloads (\n-newest ", 23), "not after a word");
+        assert!(!inserts(&at_end("in Downloads (\n-")).contains(&")"), "not with a dash");
+        // In "in = (": the ")" first, then the folders.
+        let c = asked("in = (\n", 7);
+        assert_eq!(c.items[0].insert, ")");
+        assert_eq!(c.items[1].insert, "C:\\Users\\me");
+    }
+
+    #[test]
+    fn ctrl_space_lists_what_fits() {
+        // An empty box: the rules, "in" and "in = (" — and typed, nothing until a letter.
+        let c = asked("", 0);
+        assert_eq!((c.start, c.end), (0, 0));
+        assert_eq!(c.items[0].insert, "folder");
+        assert!(inserts(&c).contains(&"in ") && inserts(&c).contains(&"in = ("));
+        assert!(!inserts(&c).contains(&")"));
+        assert!(at_end("").items.is_empty());
+        // At the start of a line.
+        let text = "-newest\n";
+        let c = asked(text, text.len());
+        assert_eq!((c.start, c.end), (8, 8));
+        assert_eq!(c.items[0].insert, "folder");
+        assert!(inserts(&c).contains(&"in "));
+        assert!(at_end(text).items.is_empty());
+        // At the end of a line, after a space: rules, no "in".
+        let text = "-folder ";
+        let c = asked(text, text.len());
+        assert!(inserts(&c).contains(&"a_to_z"));
+        assert!(!inserts(&c).iter().any(|i| matches!(*i, "in " | "in = (")));
+        // At the end of a word: the same as typing it.
+        assert_eq!(asked("-new", 4), at_end("-new"));
+        // In the middle of a line, between words.
+        let c = asked("-folder  -newest", 8);
+        assert_eq!((c.start, c.end), (8, 8));
+        assert!(!c.items.is_empty());
+        // After "in ": the folders.
+        assert_eq!(asked("in ", 3).items[0].label, "Home");
+        // Nothing in a note, asked or typed.
+        assert!(asked("# my notes ", 11).items.is_empty());
+        assert!(at_end("-a_to_z # new").items.is_empty());
+        // A cursor past the end, or inside a letter, is taken back to one.
+        assert_eq!(asked("", 5), asked("", 0));
+        assert_eq!(asked("é", 1).start, 0);
+    }
+
+    /// Every word the list offers reads without a mistake (and so is coloured as a word Glint
+    /// knows): the rule words, the file types, the endings, the sizes and the times.
+    #[test]
+    fn every_word_offered_reads() {
+        let check = |word: &str| {
+            // Inside a folder's rules, where every rule (-and_subfolders too) goes.
+            let text = format!("in C:\\x (\n{word}\n)");
+            let r = sortrecipe::Recipe::parse(&text);
+            assert!(!r.has_errors(), "{word}: {:?}", r.messages);
+            assert!(
+                sortrecipe::is_order_word(word) || sortrecipe::is_view_word(word) || sortrecipe::is_folder_word(word) || sortrecipe::is_group_word(word),
+                "{word} isn't coloured as a rule"
+            );
+        };
+        // A word that needs something after it, with something after it.
+        let finished = |w: &str| -> String {
+            if !w.ends_with('_') {
+                w.to_string()
+            } else if w.contains("name_") {
+                format!("{w}invoice")
+            } else if w.contains("older_than_") {
+                format!("{w}1_year")
+            } else if w.contains("than_") {
+                format!("{w}100mb")
+            } else {
+                format!("{w}3_days")
+            }
+        };
+        let structure = ["in ", "in = (", ")"];
+        let mut n = 0;
+        for c in [asked("", 0), at_end("-"), at_end("-."), asked("-folder ", 8)] {
+            for s in &c.items {
+                if !structure.contains(&s.insert.as_str()) {
+                    check(&finished(&s.insert));
+                    n += 1;
+                }
+            }
+        }
+        assert!(n > 600, "{n}");
+        // The endings, sizes and times.
+        for stem in ["-bigger_than_", "-larger_than_", "-smaller_than_", "-older_than_", "-updated_", "-added_", "-newest_", "-oldest_added_", "-image_", "-png_", "-music_", "-name_"] {
+            let c = at_end(stem);
+            assert!(!c.items.is_empty(), "{stem}");
+            for s in &c.items {
+                check(&finished(&s.insert));
+            }
+        }
     }
 
     #[test]

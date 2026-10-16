@@ -20,7 +20,7 @@
 //! The clipboard: files go on it the way Explorer puts them there (CF_HDROP, plus "Preferred
 //! DropEffect" saying copy or cut), so Explorer pastes what Glint copied and the other way round.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,7 +29,7 @@ use windows::Win32::Foundation::{GlobalFree, E_ABORT, HANDLE, HGLOBAL, HWND};
 use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetFileAttributesW, MoveFileExW, INVALID_FILE_ATTRIBUTES, MOVE_FILE_FLAGS};
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, IPersistFile, CLSCTX_ALL, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
+    CloseClipboard, CountClipboardFormats, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
     RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT};
@@ -319,13 +319,8 @@ fn paste(dest: &str) -> Outcome {
 fn transfer(sources: &[String], dest: &str, moving: bool, same_folder: bool) -> Outcome {
     let mut changed = vec![dest.to_string()];
     if moving {
-        for s in sources {
-            if let Some(p) = parent(s) {
-                if !changed.iter().any(|c| same_path(c, &p)) {
-                    changed.push(p);
-                }
-            }
-        }
+        let dest_key = path_key(dest);
+        changed.extend(distinct_parents(sources).into_iter().filter(|p| path_key(p) != dest_key));
     }
     let verb = if moving { "move" } else { "copy" };
     // The folder may be gone since the tab showed it (the older engine would quietly make it again).
@@ -431,8 +426,13 @@ fn transfer(sources: &[String], dest: &str, moving: bool, same_folder: bool) -> 
     };
     // Where each moved item went: as the copy engine reported it ("a (2).txt" after "keep both"),
     // else its own name in `dest`. (true: reported.)
-    let went = |s: &String| match done.moved.iter().find(|(from, _)| same_path(from, s)) {
-        Some((_, to)) => (to.clone(), true),
+    // (By path key, the first report of each item: as a search from the start would find it.)
+    let mut reported: HashMap<String, &String> = HashMap::with_capacity(done.moved.len());
+    for (from, to) in &done.moved {
+        reported.entry(path_key(from)).or_insert(to);
+    }
+    let went = |s: &String| match reported.get(&path_key(s)) {
+        Some(to) => ((*to).clone(), true),
         None => (join(dest, file_name(s)), false),
     };
     // A folder that is gone from where it was and is in `dest` now has moved (some may have been
@@ -566,18 +566,10 @@ fn remove_made(paths: &[String]) {
 /// in a circle pass through a temporary name. Nothing is ever replaced: an item whose new name is
 /// taken by something else stays as it is.
 fn rename_many(pairs: &[(String, String)]) -> Outcome {
-    let mut changed: Vec<String> = Vec::new();
-    for (a, _) in pairs {
-        if let Some(d) = parent(a) {
-            if !changed.iter().any(|c| same_path(c, &d)) {
-                changed.push(d);
-            }
-        }
-    }
     // Each folder renamed, in the order it was done (through a temporary name too): followed one
     // after the other, tabs inside them land where they went.
     let mut moved_folders: Vec<(String, String)> = Vec::new();
-    let mut rename = |from: &str, to: &str| {
+    let mut out = rename_many_by(pairs, |from, to| {
         let (f, t) = (wide_path(from), wide_path(to));
         // SAFETY: both paths are NUL-terminated and outlive the call. No flags: never replace.
         let ok = unsafe { MoveFileExW(PCWSTR(f.as_ptr()), PCWSTR(t.as_ptr()), MOVE_FILE_FLAGS(0)) }.is_ok();
@@ -585,47 +577,98 @@ fn rename_many(pairs: &[(String, String)]) -> Outcome {
             moved_folders.push((from.to_string(), to.to_string()));
         }
         ok
-    };
-    // (where it was, where it is now, where it goes)
-    let mut todo: Vec<(String, String, String)> = pairs.iter().filter(|(a, _)| exists(a)).map(|(a, b)| (a.clone(), a.clone(), b.clone())).collect();
+    });
+    out.moved_folders = moved_folders;
+    out
+}
+
+/// [`rename_many`] with the one-item rename given (true: done; it never replaces anything).
+///
+/// A temporary name is only ever used for an item in a real circle of names (each one's new name is
+/// the next one's present name, round to the first), and the item never stays there: either the
+/// circle goes round, or what moved goes back and the item gets its own name again. Should that name
+/// be taken meanwhile, it gets the first free numbered one with its own extension ("a (2).txt"),
+/// and the note says so.
+fn rename_many_by(pairs: &[(String, String)], mut rename: impl FnMut(&str, &str) -> bool) -> Outcome {
+    let changed = distinct_parents(pairs.iter().map(|(a, _)| a));
+    // (where it is, where it goes, whether it turned out it can't be moved there for now)
+    let mut todo: Vec<(String, String, bool)> = pairs.iter().filter(|(a, _)| exists(a)).map(|(a, b)| (a.clone(), b.clone(), false)).collect();
     let mut done: Vec<(String, String)> = Vec::new();
-    let mut hops = 0;
+    // Items that couldn't have their own name back after stepping aside: (was, is called now).
+    let mut aside: Vec<(String, String)> = Vec::new();
     loop {
         let mut moved_any = false;
         let mut i = 0;
         while i < todo.len() {
-            let (_, now, to) = &todo[i];
+            let (now, to, _) = &todo[i];
             // (A change of capitals only is the same item: its "taken" name is itself.)
             if (!exists(to) || same_path(now, to)) && rename(now, to) {
-                let (was, _, to) = todo.remove(i);
+                let (was, to, _) = todo.remove(i);
                 done.push((was, to));
                 moved_any = true;
             } else {
                 i += 1;
             }
         }
-        if todo.is_empty() || moved_any {
-            if todo.is_empty() {
-                break;
-            }
-            continue;
-        }
-        // Stuck: a circle of names (or names taken by other items). One whose new name is another's
-        // present name steps aside to a temporary name, which frees that one.
-        let Some(i) = todo.iter().position(|(_, _, to)| todo.iter().any(|(_, now, _)| same_path(now, to))) else { break };
-        let dir = parent(&todo[i].1).unwrap_or_default();
-        let tmp = unique_name(&format!("glint-renaming-{}", std::process::id()), ".tmp", |n| exists(&join(&dir, n)));
-        let tmp = join(&dir, &tmp);
-        hops += 1;
-        if hops > pairs.len() + 1 || !rename(&todo[i].1, &tmp) {
+        if todo.is_empty() {
             break;
         }
-        todo[i].1 = tmp;
-    }
-    // Something left at a temporary name goes back to its old one.
-    for (was, now, _) in &todo {
-        if now != was {
-            rename(now, was);
+        if moved_any {
+            continue;
+        }
+        // Stuck: names go round in a circle, or are taken by other items (or something is in use).
+        // One of a circle steps aside to a temporary name, which frees the name the circle needs.
+        let Some(circle) = name_circle(&todo) else { break };
+        let i = circle[0];
+        let (was, to) = (todo[i].0.clone(), todo[i].1.clone());
+        let dir = parent(&was).unwrap_or_default();
+        let tmp = join(&dir, &unique_name(&format!("glint-renaming-{}", std::process::id()), ".tmp", |n| exists(&join(&dir, n))));
+        if exists(&tmp) || !rename(&was, &tmp) {
+            todo[i].2 = true; // in use: it can't step aside (or move at all)
+            continue;
+        }
+        // The rest of the circle, from the one whose new name is this one's old name, back round.
+        let mut moved: Vec<usize> = Vec::new();
+        let mut stuck = None;
+        for &j in circle[1..].iter().rev() {
+            if !exists(&todo[j].1) && rename(&todo[j].0, &todo[j].1) {
+                moved.push(j);
+            } else {
+                stuck = Some(j);
+                break;
+            }
+        }
+        let finished = stuck.is_none() && !exists(&to) && rename(&tmp, &to);
+        // The items of `todo` that are done now, in the order they were done.
+        let mut finished_now: Vec<usize> = Vec::new();
+        if finished {
+            finished_now.extend(moved.iter().copied());
+            finished_now.push(i);
+        } else {
+            // It can't go round: what moved goes back, last first, then this one gets its name back.
+            todo[stuck.unwrap_or(i)].2 = true;
+            for &j in moved.iter().rev() {
+                if !rename(&todo[j].1, &todo[j].0) {
+                    finished_now.push(j); // (it stays renamed: that's done, then)
+                }
+            }
+            let now = put_back(&tmp, &was, &mut rename);
+            if now != was {
+                aside.push((was.clone(), now.clone()));
+                done.push((was.clone(), now));
+                todo[i].2 = true;
+                todo[i].1 = String::new(); // (taken out below, not recorded again)
+                finished_now.push(i);
+            }
+        }
+        for &j in &finished_now {
+            if !todo[j].1.is_empty() {
+                done.push((todo[j].0.clone(), todo[j].1.clone()));
+            }
+        }
+        finished_now.sort_unstable();
+        for &j in finished_now.iter().rev() {
+            todo.remove(j);
         }
     }
     let created = match done.first().and_then(|(_, to)| parent(to)) {
@@ -635,30 +678,79 @@ fn rename_many(pairs: &[(String, String)]) -> Outcome {
         }
         _ => None,
     };
-    let note = if todo.is_empty() {
+    let note = if todo.is_empty() && aside.is_empty() {
         format!("Renamed {}", items_text(&done.iter().map(|(a, _)| a.clone()).collect::<Vec<_>>()))
     } else {
-        let left: Vec<String> = todo.iter().map(|(a, _, _)| a.clone()).collect();
-        format!("Couldn't rename {}: the name is taken, or it's in use", items_text(&left))
+        let left: Vec<String> = todo.iter().map(|(a, _, _)| a.clone()).chain(aside.iter().map(|(a, _)| a.clone())).collect();
+        let mut note = format!("Couldn't rename {}: the name is taken, or it's in use", items_text(&left));
+        for (was, now) in &aside {
+            note.push_str(&format!(". \u{201c}{}\u{201d} is called \u{201c}{}\u{201d} now: its own name was taken", file_name(was), file_name(now)));
+        }
+        note
     };
+    let ok = todo.is_empty() && aside.is_empty() && done.len() == pairs.len();
     let undo = (!done.is_empty()).then(|| crate::undo::Step::Moved { pairs: done.clone() });
-    Outcome { ok: todo.is_empty() && done.len() == pairs.len(), changed, created, moved_folders, note: Some(note), undo, ..Default::default() }
+    Outcome { ok, changed, created, note: Some(note), undo, ..Default::default() }
+}
+
+/// A circle of names among `todo` (see [`rename_many_by`]): its items in order, each one's new name
+/// the next one's present name, the last one's new name the first one's. Items marked as stuck are
+/// left out. None: there is no circle (each chain ends at a name taken by something else).
+fn name_circle(todo: &[(String, String, bool)]) -> Option<Vec<usize>> {
+    let at: HashMap<String, usize> = todo.iter().enumerate().map(|(i, (now, _, _))| (path_key(now), i)).collect();
+    let next = |i: usize| at.get(&path_key(&todo[i].1)).copied().filter(|&j| !todo[j].2);
+    // 0: not looked at, 1: on the chain being followed, 2: looked at (in no circle).
+    let mut state = vec![0u8; todo.len()];
+    for start in 0..todo.len() {
+        if todo[start].2 || state[start] != 0 {
+            continue;
+        }
+        let mut chain = Vec::new();
+        let mut k = start;
+        loop {
+            state[k] = 1;
+            chain.push(k);
+            match next(k) {
+                Some(j) if state[j] == 1 => {
+                    let from = chain.iter().position(|&c| c == j).unwrap_or(0);
+                    return Some(chain[from..].to_vec());
+                }
+                Some(j) if state[j] == 0 => k = j,
+                _ => break,
+            }
+        }
+        for c in chain {
+            state[c] = 2;
+        }
+    }
+    None
+}
+
+/// Moves an item that stepped aside to `tmp` back to its own name `was`; when that's taken
+/// meanwhile, to the first free numbered name with its own extension ("Report (2).xlsx"), never
+/// leaving it at the temporary name if there is any way not to. Where it is now.
+fn put_back(tmp: &str, was: &str, rename: &mut impl FnMut(&str, &str) -> bool) -> String {
+    if !exists(was) && rename(tmp, was) {
+        return was.to_string();
+    }
+    let dir = parent(was).unwrap_or_default();
+    let name = file_name(was);
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 && !is_folder(tmp) => name.split_at(i),
+        _ => (name, ""),
+    };
+    let free = join(&dir, &unique_name(stem, ext, |n| exists(&join(&dir, n))));
+    if !exists(&free) && rename(tmp, &free) {
+        return free;
+    }
+    tmp.to_string()
 }
 
 /// Moves each item to exactly the path given (Ctrl+Z after a move puts things back where they
 /// were, Ctrl+Y moves them again). An item whose place is taken meanwhile stays where it is: nothing
 /// is replaced.
 fn move_each(pairs: &[(String, String)]) -> Outcome {
-    let mut changed: Vec<String> = Vec::new();
-    for (a, b) in pairs {
-        for p in [a, b] {
-            if let Some(d) = parent(p) {
-                if !changed.iter().any(|c| same_path(c, &d)) {
-                    changed.push(d);
-                }
-            }
-        }
-    }
+    let changed = distinct_parents(pairs.iter().flat_map(|(a, b)| [a, b]));
     let (todo, taken): (Vec<&(String, String)>, Vec<&(String, String)>) = pairs.iter().filter(|(from, _)| exists(from)).partition(|(_, to)| !exists(to));
     if todo.is_empty() {
         let note = match taken.first() {
@@ -703,7 +795,8 @@ fn move_each(pairs: &[(String, String)]) -> Outcome {
         _ => None,
     };
     let ok = done.ok() && moved.len() == pairs.len();
-    let left: Vec<String> = pairs.iter().filter(|(a, _)| !moved.iter().any(|(m, _)| m == a)).map(|(a, _)| a.clone()).collect();
+    let moved_from: HashSet<&str> = moved.iter().map(|(m, _)| m.as_str()).collect();
+    let left: Vec<String> = pairs.iter().filter(|(a, _)| !moved_from.contains(a.as_str())).map(|(a, _)| a.clone()).collect();
     let note = done.problem("Couldn't move everything").or_else(|| {
         (!left.is_empty()).then(|| format!("{} stayed where it was: its place is taken, or it's gone", items_text(&left)))
     });
@@ -808,14 +901,7 @@ pub(crate) fn make_shortcut(target: &str, lnk: &str) -> Result<(), HRESULT> {
 }
 
 fn delete(paths: &[String], recycle: bool) -> Outcome {
-    let mut changed: Vec<String> = Vec::new();
-    for p in paths {
-        if let Some(dir) = parent(p) {
-            if !changed.iter().any(|c| same_path(c, &dir)) {
-                changed.push(dir);
-            }
-        }
-    }
+    let mut changed = distinct_parents(paths);
     if recycle {
         // Tabs showing the Recycle Bin read it again too.
         changed.push(crate::recycle::LOCATION.to_string());
@@ -847,7 +933,8 @@ fn delete(paths: &[String], recycle: bool) -> Outcome {
     }
     // Sent to the Recycle Bin: Ctrl+Z brings back what really went. (Deleted for good - Windows
     // asks first when something can't go there - there's no way back.)
-    let for_good = |p: &String| done.gone_for_good.iter().any(|g| same_path(g, p));
+    let gone_for_good: HashSet<String> = done.gone_for_good.iter().map(|g| path_key(g)).collect();
+    let for_good = |p: &String| gone_for_good.contains(&path_key(p));
     let gone: Vec<String> = paths.iter().filter(|p| !exists(p) && !for_good(p)).cloned().collect();
     let note = if !recycle || gone.is_empty() {
         format!("{} deleted", items_text(paths))
@@ -1122,7 +1209,7 @@ impl Engine {
         unsafe {
             let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL).ok()?;
             // Wine's stubs answer "not implemented" here, before anything happens.
-            op.SetOperationFlags(flags).ok()?;
+            op.SetOperationFlags(unseen_in_tests(flags)).ok()?;
             let done = Arc::new(Mutex::new(Done::default()));
             let sink: IFileOperationProgressSink = Sink(done.clone()).into();
             // Without the reports Glint only can't select what was made; the job itself still works.
@@ -1189,6 +1276,16 @@ fn names_in_folder(paths: &[String], dir: &str) -> Vec<String> {
     paths.iter().filter(|p| parent(p).is_some_and(|d| same_path(&d, dir))).map(|p| file_name(p).to_string()).collect()
 }
 
+/// The flags a job runs with. In the tests, never Windows' progress window or its error messages:
+/// with no owner window they'd pop up in front of whatever the person is doing while the tests run.
+fn unseen_in_tests(flags: FILEOPERATION_FLAGS) -> FILEOPERATION_FLAGS {
+    if cfg!(test) {
+        FILEOPERATION_FLAGS(flags.0 | FOF_SILENT.0 | FOF_NOERRORUI.0)
+    } else {
+        flags
+    }
+}
+
 /// The fallback for copy, move and delete: SHFileOperation, the engine before IFileOperation.
 /// `to`: nothing (delete), or one full target path per item (with FOF_MULTIDESTFILES).
 fn legacy(func: u32, from: &[String], to: &[String], flags: FILEOPERATION_FLAGS) -> Done {
@@ -1200,7 +1297,7 @@ fn legacy(func: u32, from: &[String], to: &[String], flags: FILEOPERATION_FLAGS)
         pFrom: PCWSTR(from_w.as_ptr()),
         pTo: to_w.as_ref().map_or(PCWSTR::null(), |t| PCWSTR(t.as_ptr())),
         // Only the old FOF_ flags fit (the FOFX_ ones are the copy engine's own).
-        fFlags: (flags.0 & 0xFFFF) as u16,
+        fFlags: (unseen_in_tests(flags).0 & 0xFFFF) as u16,
         ..Default::default()
     };
     // SAFETY: the struct and both lists live across the call; the lists are double-NUL-terminated.
@@ -1388,7 +1485,26 @@ pub fn is_full_item_path(path: &str) -> bool {
 
 /// Whether two paths name the same folder (Windows ignores capitals).
 pub fn same_path(a: &str, b: &str) -> bool {
-    a.trim_end_matches('\\').to_lowercase() == b.trim_end_matches('\\').to_lowercase()
+    path_key(a) == path_key(b)
+}
+
+/// What [`same_path`] compares: two paths are the same when their keys are equal (for hash lookups).
+pub fn path_key(p: &str) -> String {
+    p.trim_end_matches('\\').to_lowercase()
+}
+
+/// The folders `paths` are in, each once (the first spelling seen), in the order first seen.
+fn distinct_parents<'a>(paths: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for p in paths {
+        if let Some(d) = parent(p) {
+            if seen.insert(path_key(&d)) {
+                out.push(d);
+            }
+        }
+    }
+    out
 }
 
 /// Whether `dest` is `src` itself or somewhere inside it (a folder can't go into itself).
@@ -1521,15 +1637,25 @@ unsafe fn global_bytes(h: HANDLE) -> Option<Vec<u8>> {
     }
 }
 
-/// Empties the clipboard (Ctrl+C inside an archive, until its items are out).
-pub fn clear_clipboard(owner: HWND) {
+/// Empties the clipboard (Ctrl+C inside an archive, until its items are out). False: it couldn't
+/// (another program has it open).
+pub fn clear_clipboard(owner: HWND) -> bool {
     // SAFETY: the clipboard is opened here and closed again.
     unsafe {
         if OpenClipboard(Some(owner)).is_ok() {
-            let _ = EmptyClipboard();
+            let emptied = EmptyClipboard().is_ok();
             let _ = CloseClipboard();
+            return emptied;
         }
     }
+    false
+}
+
+/// Whether nothing at all is on the clipboard (as [`clear_clipboard`] leaves it): no other
+/// program has put anything there since.
+pub fn clipboard_is_empty() -> bool {
+    // SAFETY: a plain query; it doesn't open the clipboard.
+    unsafe { CountClipboardFormats() == 0 }
 }
 
 /// Empties the clipboard if nothing else was put on it since `seq` (after cut files were moved).
@@ -1601,6 +1727,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.to_string_lossy().into_owned()
+    }
+
+    /// The tests' moves and deletes go through Windows' copy engine: it must never show anything
+    /// while they run (its progress window would come to the front, taking the keyboard).
+    #[test]
+    fn test_jobs_show_no_windows() {
+        for flags in [FOF_ALLOWUNDO | FOFX_ADDUNDORECORD | FOF_NOCONFIRMMKDIR, FOF_NOCONFIRMATION, FOF_SILENT] {
+            let f = unseen_in_tests(flags).0;
+            assert!(f & FOF_SILENT.0 != 0 && f & FOF_NOERRORUI.0 != 0, "{f:#x}");
+            assert_eq!(f & flags.0, flags.0, "nothing else changes");
+        }
+        // (No confirmations are turned off: a test that would be asked something must fail, not
+        // quietly replace a file.)
+        assert_eq!(unseen_in_tests(FOF_ALLOWUNDO).0 & FOF_NOCONFIRMATION.0, 0);
     }
 
     #[test]
@@ -2031,6 +2171,126 @@ mod tests {
         assert!(!out.ok && out.undo.is_none());
         assert_eq!((read(&s.at("a.txt")), read(&s.at("b.txt"))), ("a".into(), "b".into()), "each back under its own name");
         assert_eq!(names_in(&s.0).unwrap().len(), 2, "no temporary name left");
+    }
+
+    /// No item may be left at a temporary name: there is none in the folder.
+    fn no_temporary_name(dir: &str) -> bool {
+        names_in(dir).unwrap().iter().all(|n| !n.to_lowercase().contains("glint-renaming"))
+    }
+
+    /// A chain that isn't a circle (Report 3 onto Report 1, which is in use) never steps aside: the
+    /// item keeps its own name and extension, and Budget doesn't take it.
+    #[test]
+    fn a_chain_onto_an_item_in_use_leaves_no_temporary_name() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let s = Scratch::new("many-chain-in-use");
+        for n in ["Report 3.xlsx", "Report 1.xlsx", "Budget.xlsx"] {
+            put(&s.0, n, n);
+        }
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(s.at("Report 1.xlsx")).unwrap();
+        let pairs = vec![(s.at("Report 3.xlsx"), s.at("Report 1.xlsx")), (s.at("Report 1.xlsx"), s.at("Report 2.xlsx")), (s.at("Budget.xlsx"), s.at("Report 3.xlsx"))];
+        let out = run(Job::RenameMany { pairs: pairs.clone() });
+        // Again while it's still in use: the same.
+        let again = run(Job::RenameMany { pairs });
+        drop(held);
+        assert!(!out.ok && !again.ok);
+        assert!(no_temporary_name(&s.0), "{:?}", names_in(&s.0));
+        for n in ["Report 3.xlsx", "Report 1.xlsx", "Budget.xlsx"] {
+            assert_eq!(read(&s.at(n)), n, "each under its own name");
+        }
+        assert_eq!(names_in(&s.0).unwrap().len(), 3);
+        assert!(out.undo.is_none());
+        assert_eq!(out.note.as_deref(), Some("Couldn't rename 3 items: the name is taken, or it's in use"));
+    }
+
+    /// 1 and 2 swap (2 is in use), a and b swap: a and b still do. Ctrl+Z and Ctrl+Y too.
+    #[test]
+    fn an_item_in_use_doesnt_stop_another_swap() {
+        use std::os::windows::fs::OpenOptionsExt;
+        for locked in ["2.jpg", "1.jpg"] {
+            let s = Scratch::new(&format!("many-other-swap-{}", &locked[..1]));
+            for n in ["1.jpg", "2.jpg", "a [1] & b's.jpg", "b #2 ~ (x).jpg"] {
+                put(&s.0, n, n);
+            }
+            let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(s.at(locked)).unwrap();
+            let pairs = vec![(s.at("1.jpg"), s.at("2.jpg")), (s.at("2.jpg"), s.at("1.jpg")), (s.at("a [1] & b's.jpg"), s.at("b #2 ~ (x).jpg")), (s.at("b #2 ~ (x).jpg"), s.at("a [1] & b's.jpg"))];
+            let out = run(Job::RenameMany { pairs });
+            drop(held); // (to read it below)
+            assert!(!out.ok);
+            assert_eq!((read(&s.at("a [1] & b's.jpg")), read(&s.at("b #2 ~ (x).jpg"))), ("b #2 ~ (x).jpg".into(), "a [1] & b's.jpg".into()), "{:?}", out.note);
+            assert_eq!((read(&s.at("1.jpg")), read(&s.at("2.jpg"))), ("1.jpg".into(), "2.jpg".into()), "each back under its own name");
+            assert!(no_temporary_name(&s.0), "{:?}", names_in(&s.0));
+            assert_eq!(out.note.as_deref(), Some("Couldn't rename 2 items: the name is taken, or it's in use"));
+            let step = out.undo.clone().unwrap();
+            assert!(matches!(&step, crate::undo::Step::Moved { pairs } if pairs.len() == 2), "{step:?}");
+            for (job, swapped) in [(step.undo_job(), false), (step.redo_job(), true), (step.undo_job(), false)] {
+                let out = run(job);
+                assert!(out.ok, "{:?}", out.note);
+                let a = if swapped { "b #2 ~ (x).jpg" } else { "a [1] & b's.jpg" };
+                assert_eq!(read(&s.at("a [1] & b's.jpg")), a);
+                assert!(no_temporary_name(&s.0));
+            }
+        }
+    }
+
+    /// A circle that can't go round, and what moved can't go back either (c took a's name): a gets a
+    /// free numbered name with its own extension, and the note says so - never the temporary one.
+    #[test]
+    fn an_item_whose_name_is_taken_meanwhile_gets_a_free_one() {
+        let s = Scratch::new("many-put-back");
+        for n in ["a.txt", "b.txt", "c.txt", "a (2).txt"] {
+            put(&s.0, n, n);
+        }
+        let pairs = vec![(s.at("a.txt"), s.at("b.txt")), (s.at("b.txt"), s.at("c.txt")), (s.at("c.txt"), s.at("a.txt"))];
+        let real = |from: &str, to: &str| {
+            let (f, t) = (wide_path(from), wide_path(to));
+            // SAFETY: both paths are NUL-terminated and outlive the call.
+            unsafe { MoveFileExW(PCWSTR(f.as_ptr()), PCWSTR(t.as_ptr()), MOVE_FILE_FLAGS(0)) }.is_ok()
+        };
+        // b is in use, and c can't be moved back once it has a's name.
+        let (b, a, c) = (s.at("b.txt"), s.at("a.txt"), s.at("c.txt"));
+        let out = rename_many_by(&pairs, |from, to| from != b && !(from == a && to == c) && real(from, to));
+        assert!(!out.ok);
+        assert!(no_temporary_name(&s.0), "{:?}", names_in(&s.0));
+        assert_eq!(read(&s.at("a (3).txt")), "a.txt", "its stem and extension, the first free number");
+        assert_eq!((read(&s.at("a.txt")), read(&s.at("b.txt")), read(&s.at("a (2).txt"))), ("c.txt".into(), "b.txt".into(), "a (2).txt".into()));
+        assert_eq!(names_in(&s.0).unwrap().len(), 4, "nothing lost");
+        let note = out.note.unwrap();
+        assert!(note.contains("\u{201c}a.txt\u{201d} is called \u{201c}a (3).txt\u{201d} now"), "{note}");
+        // Ctrl+Z knows where both are.
+        assert_eq!(out.undo, Some(crate::undo::Step::Moved { pairs: vec![(s.at("a.txt"), s.at("a (3).txt")), (s.at("c.txt"), s.at("a.txt"))] }));
+        // A folder keeps its whole name ("v1.2 (2)", not "v1 (2).2").
+        std::fs::create_dir(s.at("v1.2")).unwrap();
+        std::fs::create_dir(s.at("tmp-folder")).unwrap();
+        let mut real_mut = real;
+        assert_eq!(put_back(&s.at("tmp-folder"), &s.at("v1.2"), &mut real_mut), s.at("v1.2 (2)"));
+        // Its own name free again: it goes back to it.
+        put(&s.0, "t.tmp", "t");
+        assert_eq!(put_back(&s.at("t.tmp"), &s.at("free.txt"), &mut real_mut), s.at("free.txt"));
+    }
+
+    #[test]
+    fn circles_are_found_only_where_names_go_round() {
+        let t = |v: &[(&str, &str, bool)]| v.iter().map(|(a, b, f)| (a.to_string(), b.to_string(), *f)).collect::<Vec<_>>();
+        // A chain ending at a name nothing here has: none.
+        assert_eq!(name_circle(&t(&[("C:\\3", "C:\\1", false), ("C:\\1", "C:\\2", false), ("C:\\b", "C:\\3", false)])), None);
+        // A circle after a chain into it (in other capitals, with a trailing backslash).
+        let found = name_circle(&t(&[("C:\\x", "C:\\a", false), ("C:\\a", "C:\\B\\", false), ("C:\\b", "c:\\A", false)])).unwrap();
+        assert_eq!(found, vec![1, 2]);
+        // One marked as stuck breaks its circle; the next one is found.
+        assert_eq!(name_circle(&t(&[("C:\\1", "C:\\2", true), ("C:\\2", "C:\\1", false), ("C:\\a", "C:\\b", false), ("C:\\b", "C:\\a", false)])), Some(vec![2, 3]));
+        // A change of capitals only: a circle of one.
+        assert_eq!(name_circle(&t(&[("C:\\a", "C:\\A", false)])), Some(vec![0]));
+    }
+
+    /// The hash lookups find what same_path would: any capitals, a trailing backslash; the first
+    /// spelling seen, in the order first seen.
+    #[test]
+    fn distinct_parents_keep_the_first_spelling_and_order() {
+        let paths: Vec<String> = ["C:\\B\\1", "c:\\a\\2", "C:\\b\\3", "C:\\A\\4", "D:\\Ü\\5", "D:\\ü\\6"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(distinct_parents(&paths), ["C:\\B", "c:\\a", "D:\\Ü"]);
+        assert_eq!(path_key("C:\\X\\"), path_key("c:\\x"));
+        assert!(same_path("C:\\Ü\\", "c:\\ü"));
     }
 
     #[test]

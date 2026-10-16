@@ -30,6 +30,7 @@
 //!                            the *_LOG switches below turn it on too)
 //!   GLINT_FRAME_LOG=1        write how long every frame took to the log
 //!   GLINT_RENDER=software    draw with Windows' software renderer instead of the graphics card
+//!   GLINT_WARM_UP=off        skip warming up the graphics driver, fonts and icons at start (render.rs), to compare
 //!   GLINT_SETTINGS_DIR=dir   keep settings, cache and logs in this folder instead
 //!   GLINT_TEST_CRASH=1       crash on purpose once the window is up, to see the crash report work
 //!   GLINT_WATCH_LOG=1        log every change the folder watch reports, every re-read and drive message
@@ -205,6 +206,11 @@ fn main() {
         settings::set_extra_window();
     }
     let hidden = main && switches.background;
+    // The first frame's one-time costs (the graphics driver, the fonts, the shell's icons) on
+    // threads of their own, while the settings load and the window is made (render.rs).
+    if !hidden {
+        render::warm_up();
+    }
 
     // Glint's files where they belong (a Portable switch moves them now), before anything reads them.
     let unsettled = if main { settings::settle() } else { Vec::new() };
@@ -261,8 +267,8 @@ fn main() {
             life::entered_background(tray_icon);
         }
         // What an update left next to glint.exe (Glint.old.exe) goes (on a thread of its own) - but
-        // not right after an update: the Glint from before stays until a later start, in case the
-        // new one doesn't work out.
+        // not until the new version has been closed normally once: the Glint from before stays in
+        // case the new one doesn't work out.
         update::remove_old_exes(after_update);
     }
     if std::env::var_os("GLINT_TEST_CRASH").is_some_and(|v| !v.is_empty()) {
@@ -309,6 +315,10 @@ fn main() {
     // The window is gone: the tray icon and Win+E go, and the next glint.exe becomes the main one -
     // even while this process still waits for copies to finish (`_finish_file_jobs`).
     life::shutdown();
+    // A normal quit: a version an update just put in place has proven itself (update.rs).
+    if main {
+        update::session_ended_cleanly();
+    }
     // A skin changed just before quitting is still being written: let it finish (at most 3 s).
     skin::wait_for_writes(Duration::from_secs(3));
     // Glint just put a new version of itself in place: it starts now, as the main Glint.

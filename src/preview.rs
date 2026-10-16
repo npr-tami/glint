@@ -13,7 +13,8 @@
 //! - Animated GIFs play by themselves, looping (anim.rs decodes their frames on peek.rs's thread).
 //! - Videos show their thumbnail with a big play button; they play only when the person clicks it
 //!   (or the picture), with play/pause, a seek bar with the time, mute and volume under them
-//!   (video.rs). Space still closes the pane.
+//!   (video.rs). Space still closes the pane. One that turns out broken says it can't be played,
+//!   in place of the play button, and play and the seek bar then do nothing.
 //! - The "i" button in the top bar shows a strip of facts under pictures, GIFs and videos: the
 //!   size in pixels, format, bit depth, DPI, camera and date taken, frames, frame rate, bitrate
 //!   ("PreviewInfo" in settings.json).
@@ -60,6 +61,8 @@ const WHEEL_LINES: f32 = 3.0;
 /// The video controls' height, and one line of the info strip.
 const CONTROLS_H: f32 = 40.0;
 const INFO_LINE: f32 = 18.0;
+/// Said in the player for a video that can't be played (broken, or not a video Windows knows).
+const CANT_PLAY: &str = "This video can't be played";
 
 /// How a picture is sized.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -241,7 +244,9 @@ impl PreviewPane {
         PreviewPane {
             rect: Rect::default(),
             peeker: Peeker::new("space preview"),
-            facts: FactsCache::new(32),
+            // (Text files are read 200 KB at a time here: the last few big ones are kept, or many
+            // small ones, not 32 big ones.)
+            facts: FactsCache::with_budget(32, 2 * 1024 * 1024),
             asked: String::new(),
             full: None,
             zoom: Zoom::Fit,
@@ -602,6 +607,10 @@ impl PreviewPane {
             playing = v.is_playing();
             frame = v.frame();
         }
+        if self.cant_play(one) && self.video.is_some() {
+            // Its engine goes (it would keep the file open, and Windows wouldn't delete it).
+            self.video = None;
+        }
         let shown = frame.or(thumb.filter(|t| !t.is_icon()));
         r.push_clip(area);
         match &shown {
@@ -615,19 +624,20 @@ impl PreviewPane {
                 }
             }
         }
-        if !playing {
+        let c = Point::new(area.x + area.w / 2.0, area.y + area.h / 2.0);
+        if self.cant_play(one) {
+            // No play button (pressing it does nothing now), just why.
+            let note = Rect::new(area.x + 12.0, c.y - 11.0, (area.w - 24.0).max(0.0), 22.0);
+            r.fill_rect(note.inset(0.0, -6.0), theme.window.with_alpha(0.75));
+            r.text(CANT_PLAY, note, &TextStyle::new(theme.text_strong).align(Align::Center));
+        } else if !playing {
             // The big play button.
-            let c = Point::new(area.x + area.w / 2.0, area.y + area.h / 2.0);
             let rad = 30.0f32.min(area.h / 3.0).max(0.0);
             if rad > 8.0 {
                 let hover = self.hover == Hit::View;
                 r.fill_round_rect(Rect::new(c.x - rad, c.y - rad, rad * 2.0, rad * 2.0), rad, theme.accent.with_alpha(if hover { 1.0 } else { 0.85 }));
                 let t = rad * 0.45;
                 r.fill_polygon(&[Point::new(c.x - t * 0.7, c.y - t), Point::new(c.x + t, c.y), Point::new(c.x - t * 0.7, c.y + t)], theme.on_accent);
-            }
-            if self.video_failed && self.video_key == one.key {
-                let note = Rect::new(area.x, c.y + rad + 10.0, area.w, 22.0);
-                r.text("This video can't be played here", note, &TextStyle::new(theme.text_strong).align(Align::Center));
             }
         }
         r.pop_clip();
@@ -704,9 +714,19 @@ impl PreviewPane {
         one.is_file() && video::is_video(&one.entry.ext) && (one.entry.ext != "ts" || self.facts.get(&one.key).is_some_and(|f| f.text.is_none()))
     }
 
-    /// Plays or pauses the video on screen (it's opened the first time).
+    /// Whether the video `one` was found not to play (it isn't tried again until it changes or
+    /// another item is shown).
+    fn cant_play(&self, one: &One) -> bool {
+        self.video_failed && self.video_key == one.key
+    }
+
+    /// Plays or pauses the video on screen (it's opened the first time). Nothing for one that
+    /// can't be played.
     fn toggle_video(&mut self, app: &mut AppState) -> Effect {
         let Some(one) = details::focused(app).filter(|o| self.plays(o)) else { return Effect::None };
+        if self.cant_play(&one) {
+            return Effect::None;
+        }
         if self.video_key != one.key || self.video.is_none() {
             self.video = None;
             self.video_key = one.key.clone();
@@ -732,7 +752,7 @@ impl PreviewPane {
         let share = slider_share(track, x);
         match drag {
             Drag::Seek => {
-                if let Some(v) = self.video.as_mut().filter(|_| self.video_key == self.view_key) {
+                if let Some(v) = self.video.as_mut().filter(|_| self.video_key == self.view_key && !self.video_failed) {
                     let d = v.duration();
                     v.seek(d * share as f64);
                 }
@@ -1071,6 +1091,12 @@ impl PreviewPane {
         if e.button == MouseButton::Left && self.hit(e.pos) == Hit::View && self.shown.is_some() {
             if let Some(one) = details::focused(app).filter(|o| o.key == self.view_key) {
                 self.panning = None;
+                // The button coming up after this isn't a click on the video (it would play it
+                // again), and the preview's copy stops: the file opens in its own player.
+                self.pressed = Hit::None;
+                if let Some(v) = self.video.as_mut().filter(|_| self.video_key == one.key) {
+                    v.pause();
+                }
                 return Effect::Command(Command::OpenEntry(one.index));
             }
         }
@@ -1285,9 +1311,134 @@ mod tests {
         assert_eq!(fit_rect((1600.0, 900.0), Rect::new(0.0, 0.0, 160.0, 160.0)), Rect::new(0.0, 35.0, 160.0, 90.0));
     }
 
+    /// An app showing one folder (in the temp folder) with `name` in it, selected.
+    fn app_with_selected(dir: &std::path::Path, name: &str) -> AppState {
+        let mut app = AppState::for_tests(crate::settings::Settings::default());
+        let entry = folder::Entry {
+            name: name.into(),
+            lower: name.to_lowercase(),
+            kind: folder::EntryKind::File,
+            size: std::fs::metadata(dir.join(name)).map_or(0, |m| m.len()),
+            modified: 0,
+            created: 0,
+            attributes: 0,
+            ext: folder::extension(name),
+            type_name: Arc::from("File"),
+            target: None,
+            free: 0,
+        };
+        let path = dir.to_string_lossy().into_owned();
+        app.tabs[0].path = path.clone();
+        crate::app::apply_listing(&mut app.tabs[0], folder::Folder { path, entries: vec![entry], ..Default::default() });
+        app.tabs[0].select_only_row(0);
+        app
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("glint-preview-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_video_that_cant_be_played_ignores_play_and_seek() {
+        let dir = temp_dir("cant-play");
+        std::fs::write(dir.join("broken.mp4"), b"not a video").unwrap();
+        let mut app = app_with_selected(&dir, "broken.mp4");
+        let one = details::focused(&app).expect("the file is selected");
+        let mut pane = PreviewPane::new();
+        pane.view_key = one.key.clone();
+        pane.video_key = one.key.clone();
+        pane.video_failed = true;
+        assert!(pane.cant_play(&one));
+        // Play (the button, or a click on the picture) does nothing: nothing is opened again.
+        assert!(matches!(pane.toggle_video(&mut app), Effect::None));
+        assert!(pane.video.is_none() && pane.cant_play(&one));
+        // Nor does the seek bar.
+        pane.shown = Some(Shown { view: Rect::new(0.0, 0.0, 400.0, 300.0), picture: None, text: None, controls: Some(Controls::new(Rect::new(0.0, 300.0, 400.0, CONTROLS_H))) });
+        pane.drag_to(Drag::Seek, 200.0);
+        assert!(pane.video.is_none() && pane.cant_play(&one));
+        // Another item (or the same file changed): it's tried again.
+        pane.stop_video();
+        assert!(!pane.cant_play(&one));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_video_that_wont_open_says_so() {
+        // Random bytes named .mp4: Media Foundation won't take it (or, where it's missing, as
+        // under Wine, there's nothing to open it with). Either way the pane knows it can't play.
+        let dir = temp_dir("wont-open");
+        std::fs::write(dir.join("noise.mp4"), (0..4096u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect::<Vec<_>>()).unwrap();
+        let mut app = app_with_selected(&dir, "noise.mp4");
+        let one = details::focused(&app).expect("the file is selected");
+        let mut pane = PreviewPane::new();
+        pane.view_key = one.key.clone();
+        let _ = pane.toggle_video(&mut app);
+        if pane.video.is_none() {
+            assert!(pane.cant_play(&one));
+            assert!(matches!(pane.toggle_video(&mut app), Effect::None));
+        }
+        // (Where an engine was made, its error comes later, from its own thread: see video.rs's
+        // `Watch` tests.) It lets go of the file.
+        video::let_go(pane.video.take());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn zoom_reads_as_a_percentage() {
         assert_eq!(zoom_text(0.93), "93%");
         assert_eq!(zoom_text(1.0), "100%");
     }
+
+    /// Double-clicking a video opens it in its own player: the button coming up after it doesn't
+    /// count as a click on the video (it would start the preview's copy again, and the sound would
+    /// play twice).
+    #[test]
+    fn a_double_click_on_a_video_doesnt_play_it_too() {
+        let dir = temp_dir("double-click");
+        std::fs::write(dir.join("clip (2) & co.mp4"), b"not really a video").unwrap();
+        let mut app = app_with_selected(&dir, "clip (2) & co.mp4");
+        let one = details::focused(&app).expect("the file is selected");
+        let mut pane = PreviewPane::new();
+        pane.rect = Rect::new(0.0, 0.0, 400.0, 400.0);
+        pane.view_key = one.key.clone();
+        let view = Rect::new(0.0, 60.0, 400.0, 240.0);
+        pane.shown = Some(Shown { view, picture: None, text: None, controls: Some(Controls::new(Rect::new(0.0, 300.0, 400.0, CONTROLS_H))) });
+        let at = Point::new(200.0, 180.0);
+        assert_eq!(pane.hit(at), Hit::View);
+        let e = MouseEvent { pos: at, button: MouseButton::Left, mods: crate::ui::Mods::default(), wheel: 0.0 };
+        // The second press of a double-click: down, then the double-click itself, then up.
+        let _ = pane.mouse_down(&e);
+        assert_eq!(pane.pressed, Hit::View);
+        assert!(matches!(pane.double_click(&e, &app), Effect::Command(Command::OpenEntry(0))));
+        assert_eq!(pane.pressed, Hit::None);
+        let _ = pane.mouse_up(&e, &mut app);
+        assert!(pane.video.is_none() && !pane.video_failed, "nothing was played (or even opened)");
+        // Done again (a triple-click), still nothing plays.
+        let _ = pane.mouse_down(&e);
+        let _ = pane.double_click(&e, &app);
+        let _ = pane.mouse_up(&e, &mut app);
+        assert!(pane.video.is_none());
+        // A plain click still plays (or tries to: there's no real video here).
+        let _ = pane.mouse_down(&e);
+        let _ = pane.mouse_up(&e, &mut app);
+        assert!(pane.video.is_some() || pane.video_failed, "a single click still plays");
+        video::let_go(pane.video.take());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_preview_keeps_a_few_big_text_files_not_32() {
+        let mut c = FactsCache::with_budget(32, 2 * 1024 * 1024);
+        let big = || peek::Facts { text: Some(Arc::new(peek::Text { lines: vec!["x".repeat(40); 5000], cut: true })), ..Default::default() };
+        for i in 0..32 {
+            c.insert(format!("log {i}"), big());
+            assert!(c.text_bytes() <= 2 * 1024 * 1024, "at most the budget after {i}");
+            assert!(c.get(&format!("log {i}")).is_some(), "the newest always stays");
+        }
+        assert!(c.get("log 0").is_none() && c.get("log 31").is_some() && c.get("log 30").is_some());
+    }
+
 }

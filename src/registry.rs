@@ -41,7 +41,7 @@ use windows::Win32::System::Registry::{
     RRF_RT_REG_SZ,
 };
 use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLongPathNameW};
-use windows::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
+use windows::Win32::UI::Shell::{AssocQueryStringW, SHChangeNotify, ASSOCF_NONE, ASSOCSTR_FRIENDLYAPPNAME, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
 
 use crate::folder::wide;
 use crate::settings::ZipIcon;
@@ -558,6 +558,35 @@ pub fn archives_in_glint(places: &Places, exe: &str) -> Vec<&'static str> {
     ARCHIVES.into_iter().filter(|ext| chosen_app(places, ext).is_some_and(|p| p.eq_ignore_ascii_case(&ours))).collect()
 }
 
+/// The name of the app files of type `ext` (".zip") open in, as Windows shows it ("WinRAR").
+fn app_name(ext: &str) -> Option<String> {
+    let ext: Vec<u16> = ext.encode_utf16().chain([0]).collect();
+    let mut buf = [0u16; 260];
+    let mut len = buf.len() as u32;
+    unsafe { AssocQueryStringW(ASSOCF_NONE, ASSOCSTR_FRIENDLYAPPNAME, PCWSTR(ext.as_ptr()), PCWSTR::null(), Some(windows::core::PWSTR(buf.as_mut_ptr())), &mut len) }.ok().ok()?;
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..end]).trim().to_string()).filter(|n| !n.is_empty())
+}
+
+/// What Settings says under Zip icon: whether zip and 7z files open in this glint.exe, so the
+/// choice is in use ("Not in use: zip files open in WinRAR").
+pub fn zip_icon_said(places: &Places, exe: &str) -> String {
+    let types = archives_in_glint(places, exe);
+    zip_icon_line(&types, || app_name(".zip"))
+}
+
+fn zip_icon_line(types: &[&str], zip_app: impl FnOnce() -> Option<String>) -> String {
+    match types {
+        [] => match zip_app() {
+            Some(app) if !app.to_lowercase().contains("glint") => format!("Not in use: zip files open in {app}"),
+            _ => "Not in use: zip files don't open in Glint".into(),
+        },
+        [".zip"] => "In use for zip files".into(),
+        [".7z"] => "In use for 7z files".into(),
+        _ => "In use for zip and 7z files".into(),
+    }
+}
+
 /// The icon in glint.exe that zip and 7z files opening in it show for `icon`: one for both types
 /// (they share the app's key), so the red label says 7Z only when 7z files are the only ones.
 fn archive_icon(icon: ZipIcon, types: &[&str]) -> u32 {
@@ -650,6 +679,24 @@ pub fn repair_if_moved(places: &Places, exe: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zip_icon_line_says_whether_its_in_use() {
+        assert_eq!(zip_icon_line(&[], || Some("WinRAR".into())), "Not in use: zip files open in WinRAR");
+        assert_eq!(zip_icon_line(&[], || None), "Not in use: zip files don't open in Glint");
+        // Another glint.exe (a second copy) has them: still not this one.
+        assert_eq!(zip_icon_line(&[], || Some("Glint".into())), "Not in use: zip files don't open in Glint");
+        assert_eq!(zip_icon_line(&[".zip"], || None), "In use for zip files");
+        assert_eq!(zip_icon_line(&[".7z"], || None), "In use for 7z files");
+        assert_eq!(zip_icon_line(&[".zip", ".7z"], || None), "In use for zip and 7z files");
+    }
+
+    #[test]
+    fn app_name_never_panics() {
+        let _ = app_name(".zip");
+        let _ = app_name(".nosuchtype-glint");
+        let _ = app_name("");
+    }
 
     /// A fresh test key per test (they run side by side), removed at the end.
     struct TestRoot(String, Places);
@@ -825,8 +872,11 @@ mod tests {
         assert_eq!(sync_archive_icon(p, EXE, ZipIcon::Page), shows(&[".zip", ".7z"], 5));
         assert_eq!(default_icon(&t).as_deref(), Some(r"C:\Tools\Glint\glint.exe,-5"));
         // A glint.exe elsewhere points it at itself (the icons are in every glint.exe).
-        sync_archive_icon(p, r"D:\Glint\glint.exe", ZipIcon::Folder).unwrap();
-        assert_eq!(default_icon(&t).as_deref(), Some(r"D:\Glint\glint.exe,-4"));
+        // (On the temp folder's drive: a USB stick's D: is refused, as it should be.)
+        let drive: String = std::env::temp_dir().to_string_lossy().chars().take(2).collect();
+        let elsewhere = format!(r"{drive}\Glint elsewhere\glint.exe");
+        sync_archive_icon(p, &elsewhere, ZipIcon::Folder).unwrap();
+        assert_eq!(default_icon(&t), Some(format!("{elsewhere},-4")));
         // Glint's own icon: Glint's DefaultIcon goes, and the key Glint made with it.
         assert_eq!(sync_archive_icon(p, EXE, ZipIcon::Glint), shows(&[".zip", ".7z"], 1));
         assert!(t.key(r"Classes\Applications\glint.exe").is_none());

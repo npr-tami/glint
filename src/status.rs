@@ -104,6 +104,20 @@ fn ms(v: f64) -> String {
     }
 }
 
+/// Duplicates in `view` (each set's files share `free`): how many sets, and the bytes deleting the
+/// extra copies would free.
+pub fn dupes_summary(entries: &[crate::folder::Entry], view: &[u32]) -> (usize, u64) {
+    let mut sets: std::collections::HashMap<u64, (usize, u64)> = std::collections::HashMap::new();
+    for &r in view {
+        let e = &entries[r as usize];
+        let set = sets.entry(e.free).or_default();
+        set.0 += 1;
+        set.1 = e.size;
+    }
+    let extra: u64 = sets.values().map(|&(n, size)| size * (n as u64).saturating_sub(1)).sum();
+    (sets.len(), extra)
+}
+
 impl StatusBar {
     fn left_text(app: &AppState) -> String {
         let tab = app.tab();
@@ -118,15 +132,8 @@ impl StatusBar {
         let total = tab.visible_total;
         let mut s = if let Some(search) = tab.search.as_ref().filter(|s| s.is_dupes()) {
             // Duplicates (dupes.rs): how many sets, and what deleting the extra copies would free.
-            let mut sets: std::collections::HashMap<u64, (usize, u64)> = std::collections::HashMap::new();
-            for &r in &tab.view {
-                let e = &tab.folder.entries[r as usize];
-                let set = sets.entry(e.free).or_default();
-                set.0 += 1;
-                set.1 = e.size;
-            }
-            let extra: u64 = sets.values().map(|&(n, size)| size * (n as u64).saturating_sub(1)).sum();
-            let mut s = match sets.len() {
+            let (sets, extra) = tab.dupes_summary.unwrap_or_else(|| dupes_summary(&tab.folder.entries, &tab.view));
+            let mut s = match sets {
                 0 if !search.done => "Looking for duplicates\u{2026}".to_string(),
                 0 => "No duplicates found".to_string(),
                 1 => "1 set of duplicates".to_string(),
@@ -135,7 +142,7 @@ impl StatusBar {
             if extra > 0 {
                 s.push_str(&format!("  \u{00b7}  {} could be freed", format_size(extra)));
             }
-            if !sets.is_empty() && !search.done {
+            if sets > 0 && !search.done {
                 s.push_str("  \u{00b7}  still looking\u{2026}");
             } else if search.capped {
                 s.push_str(&format!("  \u{00b7}  showing the first {} files", format_count(crate::search::LIMIT)));
@@ -307,6 +314,57 @@ mod tests {
         search.dupes = Some(crate::dupes::Summary { smallest_compared: smallest, ..Default::default() });
         app.tabs[0].search = Some(search);
         StatusBar::left_text(&app)
+    }
+
+    /// The sets and the bytes to free are worked out with the view, and follow it (results coming
+    /// in, a filter typed, a sort), always the same as counting them on the spot.
+    #[test]
+    fn duplicates_summary_follows_the_view() {
+        let mut app = AppState::for_tests(Settings::default());
+        let mut search = crate::search::test_search("C:\\t");
+        search.done = true;
+        search.dupes = Some(crate::dupes::Summary::default());
+        app.tabs[0].search = Some(search);
+        let file = |name: &str, set: u64, size: u64| crate::folder::Entry {
+            name: name.into(),
+            lower: name.to_lowercase(),
+            kind: crate::folder::EntryKind::File,
+            size,
+            modified: 0,
+            created: 0,
+            attributes: 0,
+            ext: crate::folder::extension(name),
+            type_name: std::sync::Arc::from("File"),
+            target: Some(format!("C:\\t\\{set}\\{name}")),
+            free: set,
+        };
+        let tab = &mut app.tabs[0];
+        tab.folder.path = "C:\\t".into();
+        tab.folder.entries = vec![file("a.mp4", 1, 1_048_576), file("b.mp4", 1, 1_048_576), file("c.mp4", 1, 1_048_576), file("x \u{1F600}.txt", 2, 10), file("y.txt", 2, 10)];
+        tab.selected = vec![false; 5];
+        tab.rebuild_view();
+        assert_eq!(tab.dupes_summary, Some((2, 2 * 1_048_576 + 10)));
+        let text = StatusBar::left_text(&app);
+        assert!(text.starts_with("2 sets of duplicates  \u{00b7}  2.0 MB could be freed"), "{text}");
+        let tab = &mut app.tabs[0];
+        tab.filter = "mp4".into();
+        tab.rebuild_view();
+        assert_eq!(tab.dupes_summary, Some((1, 2 * 1_048_576)));
+        assert!(StatusBar::left_text(&app).starts_with("1 set of duplicates"), "{}", StatusBar::left_text(&app));
+        let tab = &mut app.tabs[0];
+        tab.filter = "nothing like it".into();
+        tab.rebuild_view();
+        assert_eq!(tab.dupes_summary, Some((0, 0)));
+        assert!(StatusBar::left_text(&app).starts_with("No duplicates found"));
+        // The same as counting on the spot, whatever the view.
+        let tab = &mut app.tabs[0];
+        tab.filter.clear();
+        tab.rebuild_view();
+        assert_eq!(tab.dupes_summary, Some(dupes_summary(&tab.folder.entries, &tab.view)));
+        // Not a duplicate search: nothing kept.
+        tab.search = None;
+        tab.rebuild_view();
+        assert_eq!(tab.dupes_summary, None);
     }
 
     #[test]

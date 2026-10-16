@@ -13,7 +13,9 @@
 //!
 //! While something is playing, a timer on the window (`wake_in`) repaints it about 30 times a
 //! second; nothing runs when nothing plays. Where Media Foundation isn't there (some Windows N
-//! editions, Wine), `Video::open` fails and the preview says it can't play the file.
+//! editions, Wine), `Video::open` fails and the preview says it can't play the file. It says so too
+//! for a file the engine reports an error on, or never gets going on (some broken files make it go
+//! quiet instead, see `Watch`); play and seek then do nothing.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
@@ -51,6 +53,11 @@ pub const FRAME_MS: u32 = 30;
 /// The window's timers (any number the window's own timers don't use).
 const WAKE_TIMER: usize = 0x6c70;
 const FADE_TIMER: usize = 0x6c71;
+/// A file that hasn't said how long it is and how big its picture is after this long (from being
+/// opened) can't be played: the engine goes quiet on some broken files instead of reporting them.
+const LOAD_TIMEOUT_MS: f64 = 8000.0;
+/// Nor one that has played this long without a single frame and without moving on.
+const START_TIMEOUT_MS: f64 = 5000.0;
 /// DXGI_FORMAT_B8G8R8A8_UNORM: frames come out as BGRA, as Direct2D draws them.
 const BGRA: u32 = 87;
 
@@ -69,6 +76,44 @@ pub fn fade_step(from: f64, to: f64, elapsed_ms: f64, length_ms: f64) -> (f64, b
     }
     let t = (elapsed_ms / length_ms).clamp(0.0, 1.0);
     (from + (to - from) * t, false)
+}
+
+/// Watching a video get going, to give up on one that never does (see `LOAD_TIMEOUT_MS`).
+#[derive(Clone, Copy, Debug)]
+struct Watch {
+    opened: Instant,
+    /// Since when it's been meant to play (None while paused).
+    playing_since: Option<Instant>,
+    /// It has shown a frame or moved on: it plays.
+    started: bool,
+    /// Given up on: it can't be played.
+    gave_up: bool,
+}
+
+impl Watch {
+    fn new(now: Instant) -> Watch {
+        Watch { opened: now, playing_since: None, started: false, gave_up: false }
+    }
+
+    fn playing(&mut self, on: bool, now: Instant) {
+        if !on {
+            self.playing_since = None;
+        } else if self.playing_since.is_none() {
+            self.playing_since = Some(now);
+        }
+    }
+
+    /// Looks again at `now`: whether the engine reported an error, has read the file's size and
+    /// length (`loaded`) and has shown a frame or moved on (`moving`). Returns whether it can't be
+    /// played (and once not, never again).
+    fn check(&mut self, error: bool, loaded: bool, moving: bool, now: Instant) -> bool {
+        self.started |= moving;
+        let ms = |since: Instant| now.saturating_duration_since(since).as_secs_f64() * 1000.0;
+        let never_loaded = !loaded && ms(self.opened) >= LOAD_TIMEOUT_MS;
+        let never_started = loaded && !self.started && self.playing_since.is_some_and(|t| ms(t) >= START_TIMEOUT_MS);
+        self.gave_up |= error || never_loaded || never_started;
+        self.gave_up
+    }
 }
 
 /// What the engine told us (from its own threads).
@@ -135,6 +180,7 @@ pub struct Video {
     fade: Option<Fade>,
     /// Playing, or about to (play was pressed and no pause since).
     wants_play: bool,
+    watch: Watch,
 }
 
 thread_local! {
@@ -184,13 +230,15 @@ impl Video {
                 muted,
                 fade: None,
                 wants_play: false,
+                watch: Watch::new(Instant::now()),
             })
         }
     }
 
-    /// The engine couldn't read the file.
+    /// The engine couldn't read the file: it said so, or never got going (`Watch`). Play and seek
+    /// then do nothing.
     pub fn failed(&self) -> bool {
-        self.events.error.load(Ordering::SeqCst)
+        self.watch.gave_up || self.events.error.load(Ordering::SeqCst)
     }
 
     pub fn is_playing(&self) -> bool {
@@ -199,6 +247,9 @@ impl Video {
 
     /// Plays from where it is (from the start once it has ended), the sound fading in.
     pub fn play(&mut self) {
+        if self.failed() {
+            return;
+        }
         // The "it ended" note goes either way: left behind, `tick` would stop it again at once.
         let ended = self.events.ended.swap(false, Ordering::SeqCst);
         // SAFETY: plain calls on a live engine.
@@ -212,6 +263,7 @@ impl Video {
             self.fade = Some(Fade { from: now, to: engine_volume(self.volume), start: Instant::now(), ms: FADE_IN_MS, then_pause: false });
         }
         self.wants_play = true;
+        self.watch.playing(true, Instant::now());
         wake_in(self.hwnd, FRAME_MS);
     }
 
@@ -221,6 +273,7 @@ impl Video {
             return;
         }
         self.wants_play = false;
+        self.watch.playing(false, Instant::now());
         // SAFETY: a plain call on a live engine.
         let now = unsafe { self.engine.GetVolume() };
         self.fade = Some(Fade { from: now, to: 0.0, start: Instant::now(), ms: FADE_OUT_MS, then_pause: true });
@@ -251,7 +304,7 @@ impl Video {
     /// Jumps to `secs`.
     pub fn seek(&mut self, secs: f64) {
         let d = self.duration();
-        if d > 0.0 {
+        if d > 0.0 && !self.failed() {
             self.events.ended.store(false, Ordering::SeqCst);
             // SAFETY: a plain call on a live engine.
             unsafe {
@@ -314,12 +367,22 @@ impl Video {
                 }
             }
         }
-        // At the end, or when the file can't be played, it stops (and nothing repaints for it).
-        if self.wants_play && (self.events.ended.load(Ordering::SeqCst) || self.failed()) {
-            self.wants_play = false;
-        }
         self.grab(max_px);
-        self.wants_play || self.fade.is_some()
+        // Whether it can't be played after all: the engine said so (asked here too, in case its
+        // event went missing), or it never got going.
+        // SAFETY: plain calls on a live engine.
+        let error = self.events.error.load(Ordering::SeqCst) || unsafe { self.engine.GetError() }.is_ok_and(|e| unsafe { e.GetErrorCode() } != 0);
+        let loaded = self.events.loaded.load(Ordering::SeqCst);
+        let moving = self.frame.is_some() || self.position() > 0.0;
+        let failed = self.watch.check(error, loaded, moving, Instant::now());
+        // At the end, or when the file can't be played, it stops (and nothing repaints for it).
+        if self.wants_play && (self.events.ended.load(Ordering::SeqCst) || failed) {
+            self.wants_play = false;
+            self.watch.playing(false, Instant::now());
+        }
+        // Until it's known whether the file plays, it's looked at again soon (so a file the engine
+        // goes quiet on is given up on in time, even paused).
+        self.wants_play || self.fade.is_some() || (!loaded && !failed)
     }
 
     /// Copies the newest frame out of the engine (when there is a new one).
@@ -328,7 +391,9 @@ impl Video {
         // SAFETY: plain calls on a live engine; the WIC bitmap is ours, locked while copied.
         unsafe {
             let Ok(pts) = self.engine.OnVideoStreamTick() else { return };
-            if pts == self.last_pts && self.frame.is_some() {
+            // (A frame whose bitmap went with a lost graphics device is copied out again, so a
+            // paused video doesn't go blank.)
+            if pts == self.last_pts && self.frame.as_ref().is_some_and(|f| !f.is_lost()) {
                 return;
             }
             let (tw, th) = crate::thumbs::fit_size(w, h, max_px.max(64), u64::MAX);
@@ -349,23 +414,32 @@ impl Video {
             if lock.GetDataPointer(&mut size, &mut data).is_err() || data.is_null() {
                 return;
             }
-            let row = *tw as usize * 4;
-            let mut px = Vec::with_capacity(row * *th as usize);
-            for y in 0..*th as usize {
-                let start = y * stride as usize;
-                if start + row > size as usize {
-                    return;
-                }
-                px.extend_from_slice(std::slice::from_raw_parts(data.add(start), row));
+            let locked = std::slice::from_raw_parts(data as *const u8, size as usize);
+            let fill = |out: &mut [u8]| copy_rows(locked, stride as usize, *tw as usize * 4, out);
+            // The same frame picture is filled again while the size stays (the renderer copies it
+            // into the bitmap it has: no new memory, no new bitmap, every frame). Video has no
+            // see-through parts: the renderer ignores the fourth byte of a frame.
+            let refilled = self.frame.as_ref().is_some_and(|f| (f.width(), f.height()) == (*tw, *th) && f.refill(fill));
+            if !refilled {
+                self.frame = Picture::frame(*tw, *th, fill);
             }
             drop(lock);
-            // Video has no transparency.
-            for p in px.chunks_exact_mut(4) {
-                p[3] = 255;
-            }
-            self.frame = Picture::new(*tw, *th, px, false);
         }
     }
+}
+
+/// Copies rows of `row` bytes, `stride` apart in `from`, one after another into `out` (which
+/// holds a whole number of rows). False when `from` is too short for them.
+fn copy_rows(from: &[u8], stride: usize, row: usize, out: &mut [u8]) -> bool {
+    if row == 0 || stride < row || out.len() % row != 0 {
+        return false;
+    }
+    for (y, line) in out.chunks_exact_mut(row).enumerate() {
+        let start = y * stride;
+        let Some(src) = from.get(start..start + row) else { return false };
+        line.copy_from_slice(src);
+    }
+    true
 }
 
 impl Drop for Video {
@@ -470,6 +544,33 @@ pub fn clock(secs: f64) -> String {
 mod tests {
     use super::*;
 
+    /// A frame's rows come out of the locked bitmap (whose rows can be further apart than a row)
+    /// one after another, into the frame's own buffer; a short bitmap copies nothing.
+    #[test]
+    fn frame_rows_are_copied_whole() {
+        // 2 x 3 pixels, rows 12 bytes apart (8 of pixels, 4 of padding).
+        let locked: Vec<u8> = (0..36).collect();
+        let mut out = vec![0u8; 24];
+        assert!(copy_rows(&locked, 12, 8, &mut out));
+        assert_eq!(&out[..8], &locked[..8]);
+        assert_eq!(&out[8..16], &locked[12..20]);
+        assert_eq!(&out[16..], &locked[24..32]);
+        // Into a refilled frame picture: the same id, the new pixels.
+        let f = Picture::frame(2, 3, |b| copy_rows(&locked, 12, 8, b)).unwrap();
+        let id = f.id();
+        let _ = f.take_pixels();
+        let other: Vec<u8> = (100..136).collect();
+        assert!(f.refill(|b| copy_rows(&other, 12, 8, b)));
+        assert_eq!(f.id(), id);
+        assert_eq!(&f.take_fresh().unwrap()[..8], &other[..8]);
+        // Too short (the last row missing), rows wider than the stride, nothing at all.
+        assert!(!copy_rows(&locked[..30], 12, 8, &mut out));
+        assert!(!copy_rows(&locked, 4, 8, &mut out));
+        assert!(!copy_rows(&locked, 12, 0, &mut out));
+        assert!(!copy_rows(&locked, 12, 8, &mut [0u8; 7]));
+        assert!(copy_rows(&[], 12, 8, &mut []), "no rows: nothing to copy");
+    }
+
     #[test]
     fn times_read_like_a_player() {
         assert_eq!(clock(0.0), "0:00");
@@ -492,6 +593,46 @@ mod tests {
         assert_eq!(engine_volume(0.5), 0.25);
         assert_eq!(engine_volume(2.0), 1.0);
         assert_eq!(engine_volume(-1.0), 0.0);
+    }
+
+    #[test]
+    fn a_video_that_never_gets_going_cant_be_played() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + std::time::Duration::from_millis(ms);
+        // The engine says so: at once.
+        let mut w = Watch::new(t0);
+        assert!(w.check(true, false, false, t0));
+        // It never reads the file's size and length: given up on after a while, not before.
+        let mut w = Watch::new(t0);
+        assert!(!w.check(false, false, false, at(LOAD_TIMEOUT_MS as u64 - 1)));
+        assert!(w.check(false, false, false, at(LOAD_TIMEOUT_MS as u64)));
+        // And once given up on, it stays so (whatever comes later).
+        assert!(w.check(false, true, true, at(LOAD_TIMEOUT_MS as u64 + 10)));
+        // Read, played, but no frame and not moving: given up on after a while of playing.
+        let mut w = Watch::new(t0);
+        assert!(!w.check(false, true, false, at(100)));
+        w.playing(true, at(100));
+        assert!(!w.check(false, true, false, at(100 + START_TIMEOUT_MS as u64 - 1)));
+        assert!(w.check(false, true, false, at(100 + START_TIMEOUT_MS as u64)));
+    }
+
+    #[test]
+    fn a_paused_or_playing_video_is_not_given_up_on() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + std::time::Duration::from_millis(ms);
+        // Read and paused (never played): left alone however long it waits.
+        let mut w = Watch::new(t0);
+        assert!(!w.check(false, true, false, at(60_000)));
+        // Played, paused, played again: only the time playing counts, from the new start.
+        w.playing(true, at(60_000));
+        w.playing(false, at(61_000));
+        w.playing(true, at(70_000));
+        assert!(!w.check(false, true, false, at(70_000 + START_TIMEOUT_MS as u64 - 1)));
+        // A video that showed a frame (or an audio-only one that moved on) plays, however slow.
+        let mut w = Watch::new(t0);
+        w.playing(true, at(10));
+        assert!(!w.check(false, true, true, at(20)));
+        assert!(!w.check(false, true, false, at(60_000)));
     }
 
     #[test]

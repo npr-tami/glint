@@ -14,10 +14,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+use windows::Win32::Foundation::{FILETIME, LPARAM, SYSTEMTIME};
 use windows::Win32::Globalization::{
     GetDateFormatEx, GetLocaleInfoEx, GetTimeFormatEx, DATE_SHORTDATE, ENUM_DATE_FORMATS_FLAGS, LOCALE_SDECIMAL, LOCALE_STHOUSAND,
-    TIME_NOSECONDS,
+    LCMapStringEx, LCMAP_SORTKEY, LINGUISTIC_IGNORECASE, SORT_DIGITSASNUMBERS, TIME_NOSECONDS,
 };
 use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 use windows::Win32::Storage::FileSystem::{
@@ -439,9 +439,165 @@ fn explain(code: u32, system: &str) -> String {
 
 // ---------------------------------------------------------------- sorting
 
-/// Compares two lower-case names the way people count: "file2" before "file10".
+/// Compares two lower-case names the way Explorer does: "file2" before "file10", and letters by
+/// the user's language rather than by their code ("\u{e4} umlaut" among the a's, before "item").
+/// Windows' sort key for each name (CompareStringEx's order, worked out once per name and kept),
+/// or, where Windows can't give keys that order names like that, accented Latin letters counted
+/// as their base letter. Names that still tie go by their text, so the order is always the same.
 pub fn natural_cmp(a: &str, b: &str) -> Ordering {
-    natural_cmp_bytes(a.as_bytes(), b.as_bytes(), false)
+    if a == b {
+        return Ordering::Equal;
+    }
+    let windows = *WINDOWS_KEYS.get_or_init(windows_keys_work);
+    let order = SORT_KEYS.with(|keys| {
+        let mut keys = keys.borrow_mut();
+        if keys.len() > SORT_KEYS_KEPT {
+            keys.clear();
+        }
+        for name in [a, b] {
+            keep_key(&mut keys, name, windows);
+        }
+        let (ka, kb) = (&keys[a], &keys[b]);
+        key_cmp(ka, kb, windows)
+    });
+    order.then_with(|| natural_cmp_bytes(a.as_bytes(), b.as_bytes(), false))
+}
+
+/// Works out and keeps `name`'s sort key, if it isn't kept yet.
+fn keep_key(keys: &mut HashMap<Box<str>, Box<[u8]>>, name: &str, windows: bool) {
+    if !keys.contains_key(name) {
+        let key = if windows { windows_sort_key(name).unwrap_or_default() } else { folded(name).into_bytes() };
+        keys.insert(name.into(), key.into_boxed_slice());
+    }
+}
+
+fn key_cmp(ka: &[u8], kb: &[u8], windows: bool) -> Ordering {
+    if windows { ka.cmp(kb) } else { natural_cmp_bytes(ka, kb, false) }
+}
+
+/// The sort keys of the entries a sort goes through, looked up once each (see [`with_name_keys`])
+/// instead of on every compare.
+pub struct NameKeys<'a> {
+    entries: &'a [Entry],
+    /// By entry index; empty for entries not in the view.
+    keys: Vec<&'a [u8]>,
+    windows: bool,
+}
+
+impl NameKeys<'_> {
+    /// [`natural_cmp`] of the names of entries `x` and `y`.
+    pub fn cmp(&self, x: u32, y: u32) -> Ordering {
+        let (a, b) = (&self.entries[x as usize].lower, &self.entries[y as usize].lower);
+        if a == b {
+            return Ordering::Equal;
+        }
+        key_cmp(self.keys[x as usize], self.keys[y as usize], self.windows).then_with(|| natural_cmp_bytes(a.as_bytes(), b.as_bytes(), false))
+    }
+
+    /// [`name_order`] of entries `x` and `y`.
+    pub fn name_order(&self, x: u32, y: u32) -> Ordering {
+        let (a, b) = (&self.entries[x as usize], &self.entries[y as usize]);
+        self.cmp(x, y).then_with(|| a.name.cmp(&b.name)).then_with(|| natural_cmp_ignore_case(result_folder(a), result_folder(b)))
+    }
+}
+
+/// Calls `f` with the sort keys of the entries in `view`. While `f` runs the kept keys are
+/// borrowed: it mustn't call [`natural_cmp`] (NameKeys::cmp does the same).
+pub fn with_name_keys<R>(entries: &[Entry], view: &[u32], f: impl FnOnce(&NameKeys) -> R) -> R {
+    let windows = *WINDOWS_KEYS.get_or_init(windows_keys_work);
+    SORT_KEYS.with(|cell| {
+        {
+            let mut keys = cell.borrow_mut();
+            if keys.len() > SORT_KEYS_KEPT {
+                keys.clear();
+            }
+            for &i in view {
+                keep_key(&mut keys, &entries[i as usize].lower, windows);
+            }
+        }
+        let kept = cell.borrow();
+        let mut keys: Vec<&[u8]> = vec![&[]; entries.len()];
+        for &i in view {
+            keys[i as usize] = &kept[entries[i as usize].lower.as_str()];
+        }
+        f(&NameKeys { entries, keys, windows })
+    })
+}
+
+/// Whether this Windows gives sort keys that order names as Explorer does (Wine may not): asked
+/// once, so one way of ordering is used throughout.
+static WINDOWS_KEYS: OnceLock<bool> = OnceLock::new();
+
+thread_local! {
+    /// Names' sort keys (Windows' or `folded`), worked out once per name: sorting 20,000 names
+    /// compares them some 300,000 times. Emptied when it grows past SORT_KEYS_KEPT.
+    static SORT_KEYS: std::cell::RefCell<HashMap<Box<str>, Box<[u8]>>> = std::cell::RefCell::new(HashMap::new());
+}
+const SORT_KEYS_KEPT: usize = 200_000;
+
+fn windows_keys_work() -> bool {
+    let ordered = |names: &[&str]| {
+        let keys: Option<Vec<Vec<u8>>> = names.iter().map(|n| windows_sort_key(n)).collect();
+        keys.is_some_and(|k| k.windows(2).all(|w| w[0] < w[1]))
+    };
+    ordered(&["a", "\u{e4}", "b"]) && ordered(&["\u{e4} umlaut", "item"]) && ordered(&["file2", "file10", "filea"])
+}
+
+/// The user's language's sort key for `name`: case ignored, numbers by their value (the order
+/// CompareStringEx gives with LINGUISTIC_IGNORECASE | SORT_DIGITSASNUMBERS). None if Windows says no.
+fn windows_sort_key(name: &str) -> Option<Vec<u8>> {
+    let wide: Vec<u16> = name.encode_utf16().collect();
+    if wide.is_empty() {
+        return Some(Vec::new());
+    }
+    let flags = LCMAP_SORTKEY | LINGUISTIC_IGNORECASE.0 | SORT_DIGITSASNUMBERS.0;
+    // A sort key's length is in bytes, the buffer's too (windows-rs passes the slice's length).
+    let len = unsafe { LCMapStringEx(PCWSTR::null(), flags, &wide, None, None, None, LPARAM(0)) };
+    if len <= 0 {
+        return None;
+    }
+    let mut key = vec![0u8; len as usize + 1];
+    // (Half of `key`'s length in u16s, said to Windows as bytes: within the buffer either way.)
+    let buf = unsafe { std::slice::from_raw_parts_mut(key.as_mut_ptr().cast::<u16>(), len as usize) };
+    let wrote = unsafe { LCMapStringEx(PCWSTR::null(), flags, &wide, Some(buf), None, None, LPARAM(0)) };
+    if wrote <= 0 || wrote > len {
+        return None;
+    }
+    key.truncate(wrote as usize);
+    Some(key)
+}
+
+/// `name` (lower case) with accented Latin letters as their base letter ("\u{e4}" as "a", "\u{df}"
+/// as "ss"), for comparing with natural_cmp_bytes where Windows' sort keys can't be had.
+fn folded(name: &str) -> String {
+    // U+00C0 to U+00FF, then U+0100 to U+017F, a letter each; '.' leaves the letter as it is.
+    const LATIN1: &str = "aaaaaa.ceeeeiiiidnooooo.ouuuuy..aaaaaa.ceeeeiiiidnooooo.ouuuuy.y";
+    const EXTENDED_A: &str =
+        "aaaaaaccccccccddddeeeeeeeeeegggggggghhhhiiiiiiiiii..jjkkkllllllllllnnnnnnnnnoooooo..rrrrrrssssssssttttttuuuuuuuuuuuuwwyyyzzzzzzs";
+    const _: () = assert!(LATIN1.len() == 64 && EXTENDED_A.len() == 128);
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        let two = match c {
+            '\u{c6}' | '\u{e6}' => "ae",
+            '\u{152}' | '\u{153}' => "oe",
+            '\u{132}' | '\u{133}' => "ij",
+            '\u{df}' => "ss",
+            _ => "",
+        };
+        let one = match c as u32 {
+            n @ 0xC0..=0xFF => LATIN1.as_bytes()[n as usize - 0xC0],
+            n @ 0x100..=0x17F => EXTENDED_A.as_bytes()[n as usize - 0x100],
+            _ => b'.',
+        };
+        if !two.is_empty() {
+            out.push_str(two);
+        } else if one != b'.' {
+            out.push(one as char);
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// The same for text that isn't lower case yet (A-Z count as a-z), without making copies: the
@@ -498,7 +654,8 @@ fn natural_cmp_bytes(a: &[u8], b: &[u8], fold: bool) -> Ordering {
 /// size, say) stay in A-to-Z order whichever way the column is sorted, like in Explorer; search
 /// results with the same name then go by their folder.
 pub fn sort_view(entries: &[Entry], view: &mut [u32], key: SortKey, descending: bool, folders_first: bool) {
-    view.sort_unstable_by(|&x, &y| {
+    let order: Vec<u32> = view.to_vec();
+    with_name_keys(entries, &order, |names| view.sort_unstable_by(|&x, &y| {
         let (a, b) = (&entries[x as usize], &entries[y as usize]);
         if folders_first {
             let group = b.is_container().cmp(&a.is_container());
@@ -506,12 +663,14 @@ pub fn sort_view(entries: &[Entry], view: &mut [u32], key: SortKey, descending: 
                 return group;
             }
         }
-        let by_name = || name_order(a, b);
+        let by_name = || names.name_order(x, y);
         let flip = |o: Ordering| if descending { o.reverse() } else { o };
         match key {
             SortKey::Name => flip(by_name()),
             SortKey::Date => flip(a.modified.cmp(&b.modified)).then_with(by_name),
             SortKey::Created => flip(a.created.cmp(&b.created)).then_with(by_name),
+            // (One Arc, as entries of one type share: the same text.)
+            SortKey::Type if Arc::ptr_eq(&a.type_name, &b.type_name) => by_name(),
             SortKey::Type => flip(cmp_ignore_case(&a.type_name, &b.type_name)).then_with(by_name),
             SortKey::Size => flip(a.size.cmp(&b.size)).then_with(by_name),
             SortKey::Folder => flip(natural_cmp_ignore_case(result_folder(a), result_folder(b))).then_with(by_name),
@@ -519,14 +678,15 @@ pub fn sort_view(entries: &[Entry], view: &mut [u32], key: SortKey, descending: 
             // has read. Without them, A to Z.)
             SortKey::Dimensions | SortKey::Length => by_name(),
         }
-    });
+    }));
 }
 
 /// Sorts `view` like [`sort_view`], by a value only some entries have (Picture size and Length,
 /// which media.rs reads in the background): `values` holds each entry's, by its index into
 /// `entries`. Items without one go last whichever way the column is sorted; ties stay A to Z.
 pub fn sort_view_by<K: Ord>(entries: &[Entry], view: &mut [u32], descending: bool, folders_first: bool, values: &[Option<K>]) {
-    view.sort_unstable_by(|&x, &y| {
+    let order: Vec<u32> = view.to_vec();
+    with_name_keys(entries, &order, |names| view.sort_unstable_by(|&x, &y| {
         let (a, b) = (&entries[x as usize], &entries[y as usize]);
         if folders_first {
             let group = b.is_container().cmp(&a.is_container());
@@ -535,15 +695,17 @@ pub fn sort_view_by<K: Ord>(entries: &[Entry], view: &mut [u32], descending: boo
             }
         }
         match (values.get(x as usize).and_then(Option::as_ref), values.get(y as usize).and_then(Option::as_ref)) {
-            (Some(p), Some(q)) => (if descending { q.cmp(p) } else { p.cmp(q) }).then_with(|| name_order(a, b)),
+            (Some(p), Some(q)) => (if descending { q.cmp(p) } else { p.cmp(q) }).then_with(|| names.name_order(x, y)),
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
-            (None, None) => name_order(a, b),
+            (None, None) => names.name_order(x, y),
         }
-    });
+    }));
 }
 
 /// A to Z the way people count, then capitals, then (search results with the same name) by folder.
+/// (What `NameKeys::name_order` does; the tests check one against the other.)
+#[cfg(test)]
 fn name_order(a: &Entry, b: &Entry) -> Ordering {
     natural_cmp(&a.lower, &b.lower).then_with(|| a.name.cmp(&b.name)).then_with(|| natural_cmp_ignore_case(result_folder(a), result_folder(b)))
 }
@@ -855,7 +1017,7 @@ pub fn join(dir: &str, name: &str) -> String {
     }
 }
 
-/// The folder above: "C:\Users\pandora" -> "C:\Users" -> "C:\" -> "" (This PC) -> None.
+/// The folder above: "C:\Users\YourName" -> "C:\Users" -> "C:\" -> "" (This PC) -> None.
 pub fn parent(path: &str) -> Option<String> {
     if path.is_empty() {
         return None;
@@ -993,16 +1155,183 @@ pub fn wide_path(path: &str) -> Vec<u16> {
 mod tests {
     use super::*;
 
+    /// A file for the sort tests: `name`, of type `kind`, `size` bytes.
+    fn sort_entry(name: &str, kind: Arc<str>, size: u64) -> Entry {
+        Entry {
+            name: name.into(),
+            lower: name.to_lowercase(),
+            kind: if kind.is_empty() { EntryKind::Folder } else { EntryKind::File },
+            size,
+            modified: size * 7 % 5,
+            created: 0,
+            attributes: 0,
+            ext: extension(name),
+            type_name: kind,
+            target: None,
+            free: 0,
+        }
+    }
+
+    /// The sorts look each name's key up once; the order is what comparing with natural_cmp on
+    /// every step gives, for every column, either way, folders first or not.
+    #[test]
+    fn sorting_with_keys_looked_up_once_orders_as_before() {
+        let names = ["file10", "file2", "File2", "FILE2", "\u{e4} umlaut", "item", "a", "B", "b", "😀 smile", "😀", "", "x01", "x1", "x001", "Été", "ete", "straße", "strasse", "ΣΟΦΟΣ", "σοφος", "new folder (2)", "new folder (10)", "a.b.c", ".hidden"];
+        let mut entries: Vec<Entry> = Vec::new();
+        for (i, n) in names.iter().enumerate() {
+            let kind: Arc<str> = Arc::from(if i % 5 == 0 { "" } else { "File" });
+            let mut e = sort_entry(n, kind, (i % 4) as u64);
+            entries.push(e.clone());
+            // The same name in two search folders.
+            e.target = Some(format!("C:\\Z{}\\{n}", i % 3));
+            entries.push(e.clone());
+            e.target = Some(format!("C:\\a{}\\{n}", i % 2));
+            entries.push(e);
+        }
+        let old_order = |key: SortKey, descending: bool, folders_first: bool, x: u32, y: u32| {
+            let (a, b) = (&entries[x as usize], &entries[y as usize]);
+            if folders_first {
+                let group = b.is_container().cmp(&a.is_container());
+                if group != Ordering::Equal {
+                    return group;
+                }
+            }
+            let by_name = || name_order(a, b);
+            let flip = |o: Ordering| if descending { o.reverse() } else { o };
+            match key {
+                SortKey::Name => flip(by_name()),
+                SortKey::Date => flip(a.modified.cmp(&b.modified)).then_with(by_name),
+                SortKey::Created => flip(a.created.cmp(&b.created)).then_with(by_name),
+                SortKey::Type => flip(cmp_ignore_case(&a.type_name, &b.type_name)).then_with(by_name),
+                SortKey::Size => flip(a.size.cmp(&b.size)).then_with(by_name),
+                SortKey::Folder => flip(natural_cmp_ignore_case(result_folder(a), result_folder(b))).then_with(by_name),
+                SortKey::Dimensions | SortKey::Length => by_name(),
+            }
+        };
+        let keys = [SortKey::Name, SortKey::Date, SortKey::Created, SortKey::Type, SortKey::Size, SortKey::Folder, SortKey::Dimensions];
+        for key in keys {
+            for (descending, folders_first) in [(false, true), (true, true), (false, false), (true, false)] {
+                let mut view: Vec<u32> = (0..entries.len() as u32).rev().collect();
+                // (Only some in view: the others have no key looked up.)
+                view.retain(|i| i % 7 != 3);
+                let mut want = view.clone();
+                want.sort_by(|&x, &y| old_order(key, descending, folders_first, x, y));
+                sort_view(&entries, &mut view, key, descending, folders_first);
+                assert_eq!(view, want, "{key:?} descending {descending} folders first {folders_first}");
+            }
+        }
+        // By a value only some have.
+        let values: Vec<Option<u32>> = (0..entries.len()).map(|i| (i % 3 != 0).then_some((i % 4) as u32)).collect();
+        for descending in [false, true] {
+            let mut view: Vec<u32> = (0..entries.len() as u32).collect();
+            let mut want = view.clone();
+            want.sort_by(|&x, &y| {
+                let (a, b) = (&entries[x as usize], &entries[y as usize]);
+                b.is_container().cmp(&a.is_container()).then_with(|| match (values[x as usize], values[y as usize]) {
+                    (Some(p), Some(q)) => (if descending { q.cmp(&p) } else { p.cmp(&q) }).then_with(|| name_order(a, b)),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => name_order(a, b),
+                })
+            });
+            sort_view_by(&entries, &mut view, descending, true, &values);
+            assert_eq!(view, want);
+        }
+        // Nothing stays borrowed: one-off compares still work, and an empty view sorts.
+        assert_eq!(natural_cmp("file2", "file10"), Ordering::Less);
+        let mut none: Vec<u32> = Vec::new();
+        sort_view(&entries, &mut none, SortKey::Name, false, true);
+        assert!(none.is_empty());
+    }
+
+    /// Sorting by Type: entries sharing one type's Arc go just as those with copies of the text.
+    #[test]
+    fn by_type_shared_or_not_sorts_the_same() {
+        let kinds = ["Text Document", "TEXT document", "PNG File", "ΣΟΦΟΣ", "σοφος", "😀 File", ""];
+        let shared: Vec<Arc<str>> = kinds.iter().map(|k| Arc::from(*k)).collect();
+        let make = |share: bool| -> Vec<Entry> {
+            (0..80).map(|i| sort_entry(&format!("n{} {}", i % 9, i), if share { shared[i % kinds.len()].clone() } else { Arc::from(kinds[i % kinds.len()]) }, i as u64 % 4)).collect()
+        };
+        let (a, b) = (make(true), make(false));
+        for (descending, folders_first) in [(false, true), (true, true), (false, false), (true, false)] {
+            let mut va: Vec<u32> = (0..80).collect();
+            let mut vb = va.clone();
+            sort_view(&a, &mut va, SortKey::Type, descending, folders_first);
+            sort_view(&b, &mut vb, SortKey::Type, descending, folders_first);
+            assert_eq!(va, vb, "descending {descending}, folders first {folders_first}");
+        }
+    }
+
+    #[test]
+    fn accented_letters_sort_beside_their_letter() {
+        // A name starting with an umlaut is among the a's, as in Explorer, not after the z's.
+        let mut names = vec!["item", "\u{e4} umlaut", "zebra", "a", "b", "\u{e9}t\u{e9}", "eagle", "f"];
+        names.sort_by(|a, b| natural_cmp(a, b));
+        let at = |n: &str| names.iter().position(|x| *x == n).unwrap();
+        assert!(at("a") < at("\u{e4} umlaut") && at("\u{e4} umlaut") < at("b"), "{names:?}");
+        assert!(at("\u{e4} umlaut") < at("item"), "{names:?}");
+        assert!(at("eagle") < at("\u{e9}t\u{e9}") && at("\u{e9}t\u{e9}") < at("f"), "{names:?}");
+        // Numbers still count by their value.
+        let mut numbered = vec!["\u{e4}10", "\u{e4}9", "a10", "a9"];
+        numbered.sort_by(|a, b| natural_cmp(a, b));
+        let at = |n: &str| numbered.iter().position(|x| *x == n).unwrap();
+        assert!(at("a9") < at("a10") && at("\u{e4}9") < at("\u{e4}10"), "{numbered:?}");
+        // Different names never tie, and either way round they agree.
+        assert_ne!(natural_cmp("a", "\u{e4}"), Ordering::Equal);
+        assert_eq!(natural_cmp("a", "\u{e4}"), natural_cmp("\u{e4}", "a").reverse());
+    }
+
+    #[test]
+    fn folding_without_windows_keys() {
+        assert_eq!(folded("\u{e4} umlaut"), "a umlaut");
+        assert_eq!(folded("stra\u{df}e \u{153}uvre \u{142}\u{f3}d\u{17a} \u{17f}"), "strasse oeuvre lodz s");
+        assert_eq!(folded("\u{f7}\u{fe}\u{d7} \u{4e2d}"), "\u{f7}\u{fe}\u{d7} \u{4e2d}");
+        assert_eq!(folded("\u{c0}\u{ff}\u{100}\u{17e}"), "ayaz");
+        assert_eq!(folded("\u{12d}\u{131}\u{135}\u{138}\u{149}\u{14b}\u{177}\u{178}"), "iijknnyy");
+        // Folded names sort as the a's do, numbers counting.
+        let mut names = vec!["item", "\u{e4} umlaut", "a10", "\u{e4}9", "b"];
+        names.sort_by(|a, b| natural_cmp_bytes(folded(a).as_bytes(), folded(b).as_bytes(), false));
+        assert_eq!(names, vec!["\u{e4} umlaut", "\u{e4}9", "a10", "b", "item"]);
+    }
+
+    #[test]
+    fn sorting_many_names_is_quick() {
+        let names: Vec<String> =
+            (0..20_000).map(|n| format!("{} photo {}", ["\u{e4}", "a", "item", "z\u{fc}rich"][n % 4], n * 7919 % 20_000)).collect();
+        let mut sorted = names.clone();
+        let start = Instant::now();
+        sorted.sort_by(|a, b| natural_cmp(a, b));
+        let took = start.elapsed();
+        assert!(took < Duration::from_secs(3), "sorting 20,000 names took {took:?}");
+        assert!(sorted.windows(2).all(|w| natural_cmp(&w[0], &w[1]) == Ordering::Less));
+        let first = |prefix: &str| sorted.iter().position(|x| x.starts_with(prefix)).unwrap();
+        assert!(first("item ") < first("z\u{fc}rich "));
+        assert!(sorted.iter().position(|x| x.starts_with("\u{e4} ")).unwrap() < first("item "));
+        let numbers: Vec<usize> =
+            sorted.iter().filter_map(|x| x.strip_prefix("item photo ")).map(|n| n.parse().unwrap()).collect();
+        assert!(numbers.len() == 5_000 && numbers.windows(2).all(|w| w[0] < w[1]));
+    }
+
     #[test]
     fn natural_order() {
         let mut names = vec!["file10", "file2", "file1", "file02", "a", "file", "b1", "b01"];
         names.sort_by(|a, b| natural_cmp(a, b));
+        // "2" and "02" (and "1" and "01") are the same number: Windows' sort keys decide which of
+        // the two goes first.
+        let at = |n: &str| names.iter().position(|x| *x == n).unwrap();
+        assert_eq!(&names[..1], ["a"]);
+        assert!(at("b1").max(at("b01")) < at("file"), "{names:?}");
+        assert!(at("file") < at("file1") && at("file1") < at("file2").min(at("file02")), "{names:?}");
+        assert!(at("file2").max(at("file02")) < at("file10"), "{names:?}");
+        // Without them, the one with fewer zeros.
+        let mut names = vec!["file10", "file2", "file1", "file02", "a", "file", "b1", "b01"];
+        names.sort_by(|a, b| natural_cmp_bytes(a.as_bytes(), b.as_bytes(), false));
         assert_eq!(names, vec!["a", "b1", "b01", "file", "file1", "file2", "file02", "file10"]);
     }
 
     #[test]
     fn parents() {
-        assert_eq!(parent("C:\\Users\\pandora").as_deref(), Some("C:\\Users"));
+        assert_eq!(parent("C:\\Users\\YourName").as_deref(), Some("C:\\Users"));
         assert_eq!(parent("C:\\Users").as_deref(), Some("C:\\"));
         assert_eq!(parent("C:\\").as_deref(), Some(""));
         assert_eq!(parent(""), None);

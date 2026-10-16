@@ -47,19 +47,20 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use windows::core::{Interface, PCWSTR};
+use windows::core::{w, Interface, PCWSTR};
 use windows::Win32::Foundation::{GENERIC_READ, HWND, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    DeleteObject, GetDC, GetDIBits, GetObjectW, InvalidateRect, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    HBITMAP, HGDIOBJ,
+    DeleteObject, GetDC, GetDIBits, GetMonitorInfoW, GetObjectW, InvalidateRect, MonitorFromWindow, ReleaseDC, BITMAP, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::Graphics::Imaging::{
-    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmapSource, IWICImagingFactory, WICBitmapDitherTypeNone,
-    WICBitmapInterpolationModeFant, WICBitmapPaletteTypeCustom, WICBitmapTransformFlipHorizontal, WICBitmapTransformFlipVertical,
+    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmapFrameDecode, IWICBitmapSource, IWICImagingFactory, WICBitmapDitherTypeNone,
+    WICBitmapCacheOnLoad, WICBitmapInterpolationModeFant, WICBitmapPaletteTypeCustom, WICBitmapTransformFlipHorizontal, WICBitmapTransformFlipVertical,
     WICBitmapTransformOptions, WICBitmapTransformRotate0, WICBitmapTransformRotate180, WICBitmapTransformRotate270,
     WICBitmapTransformRotate90, WICDecodeMetadataCacheOnDemand,
 };
 use windows::Win32::Storage::FileSystem::{GetFileAttributesW, FILE_FLAGS_AND_ATTRIBUTES, INVALID_FILE_ATTRIBUTES};
+use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToUInt32, PROPVARIANT};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
 use windows::Win32::UI::Shell::{
@@ -118,6 +119,15 @@ pub struct Picture {
     /// the picture has to be made again.
     lost: AtomicBool,
     icon: bool,
+    /// A video's frame ([`Picture::frame`]): it has no see-through parts, and it is filled again
+    /// and again ([`Picture::refill`]) - the renderer keeps one bitmap for it and copies each new
+    /// frame into it, instead of making a new picture (and a new bitmap) every frame.
+    frame: bool,
+    /// New pixels are there for the renderer's bitmap (a frame refilled since it was drawn).
+    fresh: AtomicBool,
+    /// A frame's pixel buffer the renderer is done with, kept to be filled again (no new memory
+    /// for every frame).
+    spare: Mutex<Option<Vec<u8>>>,
 }
 
 impl Picture {
@@ -127,7 +137,89 @@ impl Picture {
         if width == 0 || height == 0 || pixels.len() != width as usize * height as usize * 4 {
             return None;
         }
-        Some(Arc::new(Picture { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), width, height, pixels: Mutex::new(Some(pixels)), lost: AtomicBool::new(false), icon }))
+        Some(Arc::new(Picture::make(width, height, pixels, icon, false)))
+    }
+
+    fn make(width: u32, height: u32, pixels: Vec<u8>, icon: bool, frame: bool) -> Picture {
+        Picture {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            width,
+            height,
+            pixels: Mutex::new(Some(pixels)),
+            lost: AtomicBool::new(false),
+            icon,
+            frame,
+            fresh: AtomicBool::new(false),
+            spare: Mutex::new(None),
+        }
+    }
+
+    /// A video's frame, `width` x `height`, filled by `fill` (handed a buffer of exactly
+    /// width x height x 4 bytes, BGRA top-down; false: it couldn't be, and there is no frame).
+    /// Fill it again with [`Picture::refill`]. Its see-through byte is never looked at.
+    pub fn frame(width: u32, height: u32, fill: impl FnOnce(&mut [u8]) -> bool) -> Option<Arc<Picture>> {
+        let len = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+        if len == 0 {
+            return None;
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        buf.try_reserve_exact(len).ok()?;
+        buf.resize(len, 0);
+        fill(&mut buf).then(|| Arc::new(Picture::make(width, height, buf, false, true)))
+    }
+
+    /// A video frame's next pixels, written by `fill` (as in [`Picture::frame`]) into the buffer
+    /// the renderer gave back, or into pixels it hasn't taken yet: no new memory. The renderer
+    /// copies them into the bitmap it already has. False (and nothing changes) when `fill` fails
+    /// or this isn't a frame.
+    pub fn refill(&self, fill: impl FnOnce(&mut [u8]) -> bool) -> bool {
+        if !self.frame {
+            return false;
+        }
+        let len = self.bytes();
+        let mut pixels = self.pixels.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut buf = match pixels.take().or_else(|| self.spare.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()) {
+            Some(b) => b,
+            None => {
+                let mut b = Vec::new();
+                if b.try_reserve_exact(len).is_err() {
+                    return false;
+                }
+                b
+            }
+        };
+        buf.resize(len, 0);
+        if !fill(&mut buf) {
+            *self.spare.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(buf);
+            return false;
+        }
+        *pixels = Some(buf);
+        self.fresh.store(true, Ordering::SeqCst);
+        self.lost.store(false, Ordering::SeqCst);
+        true
+    }
+
+    /// A video's frame (see [`Picture::frame`]).
+    pub fn is_frame(&self) -> bool {
+        self.frame
+    }
+
+    /// For the renderer, which has a bitmap of this picture already: the new pixels of a frame
+    /// refilled since (once). Hand the buffer back with [`Picture::keep_spare`].
+    pub fn take_fresh(&self) -> Option<Vec<u8>> {
+        if !self.fresh.swap(false, Ordering::SeqCst) {
+            return None;
+        }
+        self.take_pixels()
+    }
+
+    /// The renderer is done with a frame's pixels (they are in its bitmap): the buffer is kept to
+    /// be filled again. Any other picture's pixels just go.
+    pub fn keep_spare(&self, pixels: Vec<u8>) {
+        self.fresh.store(false, Ordering::SeqCst);
+        if self.frame {
+            *self.spare.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pixels);
+        }
     }
 
     /// A number no other picture has (the renderer keeps its copies by it).
@@ -221,6 +313,8 @@ pub fn begin_frame() {
 /// Forgets every picture and every request (Glint going to the background gives memory back).
 pub fn clear() {
     SERVICE.with(|s| s.borrow_mut().clear());
+    // The skin's wallpaper too (it is read again when the window comes back).
+    forget_wallpaper();
 }
 
 /// The size actually made for a request of `px`: one of a few steps, so a box that grows by a pixel
@@ -246,6 +340,14 @@ struct Known {
     /// When it was last asked for: the LRU clock, and the frame.
     used: u64,
     frame: u64,
+}
+
+/// Whether `trim` may drop `k` in frame `frame`. Not when it was asked for in the last frame too:
+/// pictures arrive (and the cache is trimmed) at the start of a frame, before it asks for what's
+/// on screen, so "older than this frame" would drop every picture on screen and make them blink
+/// back to icons while they're made again (many pictures plus a big preview went over the budget).
+fn droppable(k: &Known, frame: u64, over_memory: bool) -> bool {
+    k.frame + 1 < frame && k.asked == 0 && (!over_memory || k.picture.is_some())
 }
 
 struct Service {
@@ -421,7 +523,7 @@ impl Service {
     }
 
     /// Drops the least recently used pictures while over the memory budget or the number of
-    /// entries - never one asked for in this frame (it's on screen).
+    /// entries - never one asked for in this frame or the last (it's on screen).
     fn trim(&mut self) {
         let frame = self.shared.frame.load(Ordering::SeqCst);
         while self.bytes > MEMORY_BUDGET || self.known.len() > MAX_ENTRIES {
@@ -429,7 +531,7 @@ impl Service {
             let oldest = self
                 .known
                 .iter()
-                .filter(|(_, k)| k.frame < frame && k.asked == 0 && (!over_memory || k.picture.is_some()))
+                .filter(|(_, k)| droppable(k, frame, over_memory))
                 .min_by_key(|(_, k)| k.used)
                 .map(|(key, _)| key.clone());
             let Some(key) = oldest else { break };
@@ -559,7 +661,9 @@ fn make(path: &str, px: u32, wic: Option<&IWICImagingFactory>) -> (Option<Arc<Pi
     // (Not a cloud file that isn't on this PC: reading it would download it - only Windows' own
     // thumbnail above, which asks the cloud app, may show it.)
     if picture_file && !online_only(&wide) {
-        if let Some(d) = wic.and_then(|w| decode(w, path, px, u64::from(px) * u64::from(px), 0)) {
+        // (Turned the right way up, as Windows' own thumbnail is: a phone's photo is often stored
+        // on its side.)
+        if let Some(d) = wic.and_then(|w| decode(w, path, px, u64::from(px) * u64::from(px), FILE_ORIENTATION)) {
             return (Picture::new(d.width, d.height, d.pixels, false), "decoded with WIC");
         }
     }
@@ -762,28 +866,90 @@ pub fn decode(wic: &IWICImagingFactory, path: &str, max_side: u32, max_pixels: u
         let decoder = wic.CreateDecoderFromFilename(PCWSTR(wide.as_ptr()), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand).ok()?;
         let frame = decoder.GetFrame(0).ok()?;
         let mut source: IWICBitmapSource = frame.cast().ok()?;
+        let orientation = if orientation == FILE_ORIENTATION { frame_orientation(&frame) } else { orientation };
         let turn = transform_for(orientation);
-        if turn != WICBitmapTransformRotate0 {
-            let rotator = wic.CreateBitmapFlipRotator().ok()?;
-            if rotator.Initialize(&source, turn).is_ok() {
-                source = rotator.cast().ok()?;
-            }
-        }
-        let (mut w, mut h) = (0u32, 0u32);
-        source.GetSize(&mut w, &mut h).ok()?;
-        if w == 0 || h == 0 {
+        let (mut sw, mut sh) = (0u32, 0u32);
+        source.GetSize(&mut sw, &mut sh).ok()?;
+        if sw == 0 || sh == 0 {
             return None;
         }
+        // Sizes as the picture shows, turned upright.
+        let (w, h) = upright((sw, sh), orientation);
         let (tw, th) = fit_size(w, h, max_side, max_pixels);
-        if (tw, th) != (w, h) {
+        // Shrink first, as stored (a turn reads the file across its rows, which made WIC decode a
+        // big phone photo over and over: 37 s for one 4032x3024 picture), then turn the small copy.
+        let (stw, sth) = if (5..=8).contains(&orientation) { (th, tw) } else { (tw, th) };
+        if (stw, sth) != (sw, sh) {
             let scaler = wic.CreateBitmapScaler().ok()?;
-            scaler.Initialize(&source, tw, th, WICBitmapInterpolationModeFant).ok()?;
+            scaler.Initialize(&source, stw, sth, WICBitmapInterpolationModeFant).ok()?;
             source = scaler.cast().ok()?;
         }
         let conv = wic.CreateFormatConverter().ok()?;
         conv.Initialize(&source, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom).ok()?;
-        let out = copy_out(&conv.cast().ok()?, tw, th)?;
+        source = conv.cast().ok()?;
+        if turn != WICBitmapTransformRotate0 {
+            // Held whole in memory, so the turn reads pixels, not the file.
+            let held = wic.CreateBitmapFromSource(&source, WICBitmapCacheOnLoad).ok()?;
+            let rotator = wic.CreateBitmapFlipRotator().ok()?;
+            if rotator.Initialize(&held, turn).is_ok() {
+                source = rotator.cast().ok()?;
+            } else {
+                source = held.cast().ok()?;
+            }
+        }
+        let (mut ow, mut oh) = (0u32, 0u32);
+        source.GetSize(&mut ow, &mut oh).ok()?;
+        let out = copy_out(&source, ow, oh)?;
         Some(Decoded { width: out.width, height: out.height, pixels: out.pixels, original: (w, h) })
+    }
+}
+
+/// For [`decode`]: turn the picture the way the file itself says (its EXIF orientation, read
+/// with WIC).
+pub const FILE_ORIENTATION: u32 = u32::MAX;
+
+/// A picture file's size in pixels as stored, and its EXIF orientation (1-8; 0: it says none),
+/// from its header only (nothing is decoded).
+pub fn picture_header(wic: &IWICImagingFactory, path: &str) -> Option<((u32, u32), u32)> {
+    let wide = wide_path(path);
+    // SAFETY: as in `decode`.
+    unsafe {
+        let decoder = wic.CreateDecoderFromFilename(PCWSTR(wide.as_ptr()), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand).ok()?;
+        let frame = decoder.GetFrame(0).ok()?;
+        let (mut w, mut h) = (0u32, 0u32);
+        frame.GetSize(&mut w, &mut h).ok()?;
+        (w > 0 && h > 0).then(|| ((w, h), frame_orientation(&frame)))
+    }
+}
+
+/// A picture frame's EXIF orientation (1-8), from its metadata: a JPEG's, or a TIFF's (and the
+/// formats built like one). 0 when it says none.
+pub(crate) fn frame_orientation(frame: &IWICBitmapFrameDecode) -> u32 {
+    // SAFETY: plain metadata reads on a live frame; the PROPVARIANT is cleared after use and the
+    // names are static strings.
+    unsafe {
+        let Ok(reader) = frame.GetMetadataQueryReader() else { return 0 };
+        for name in [w!("/app1/ifd/{ushort=274}"), w!("/ifd/{ushort=274}")] {
+            let mut v = PROPVARIANT::default();
+            if reader.GetMetadataByName(name, &mut v).is_ok() {
+                let n = PropVariantToUInt32(&v).ok();
+                let _ = PropVariantClear(&mut v);
+                if let Some(n) = n.filter(|n| (1..=8).contains(n)) {
+                    return n;
+                }
+            }
+        }
+        0
+    }
+}
+
+/// A `w` x `h` size as it shows when turned the way EXIF `orientation` says: across and down
+/// swapped for a picture stored on its side (5 to 8).
+pub fn upright((w, h): (u32, u32), orientation: u32) -> (u32, u32) {
+    if (5..=8).contains(&orientation) {
+        (h, w)
+    } else {
+        (w, h)
     }
 }
 
@@ -911,38 +1077,80 @@ const WALL_RETRY: Duration = Duration::from_secs(5);
 
 /// The wallpaper asked for and the one read last, shared with the thread that reads them.
 struct Wall {
-    /// The picture asked for and not read yet (its path; empty: none).
+    /// The picture asked for and not read yet (its path; empty: none), how blurred, and how big
+    /// it's needed.
     asked: String,
+    asked_blur: Blur,
+    asked_need: Need,
     running: bool,
-    /// The last one read: its path, the picture (None: it couldn't be read, or is too big) and
-    /// when.
-    read: Option<(String, Option<Arc<Picture>>, Instant)>,
+    /// The last one read: its path, how blurred, how big it was needed, the picture (None: it
+    /// couldn't be read, or is too big) and when.
+    read: Option<(String, Blur, Need, Option<Arc<Picture>>, Instant)>,
 }
 
-static WALL: Mutex<Wall> = Mutex::new(Wall { asked: String::new(), running: false, read: None });
+/// How a wallpaper is blurred: by how many of its own pixels, and whether its edges blur into the
+/// opposite edges (a tiled picture, whose copies sit side by side: no lines where they meet).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Blur {
+    radius: u32,
+    wrap: bool,
+}
 
-/// A skin's wallpaper: the picture at `path` (theme.rs `wallpaper`), fitting 3840 x 2160. It's read
-/// on a thread of its own, as a picture on a sleeping network drive (or a huge one) would hold the
-/// window up: None until it's there (the window is repainted then), and while it can't be read.
-pub fn wallpaper(path: &str) -> Option<Arc<Picture>> {
+/// The biggest box a wallpaper is ever drawn to cover, in screen pixels (see [`WallFit`]); None:
+/// at its own size (tiled, or "actual"), so it's read as big as wallpapers go.
+type Need = Option<(u32, u32)>;
+
+static WALL: Mutex<Wall> = Mutex::new(Wall { asked: String::new(), asked_blur: Blur { radius: 0, wrap: false }, asked_need: None, running: false, read: None });
+
+/// The most a wallpaper is blurred (theme.rs `wallpaper_blur`), in its own pixels.
+pub const MAX_BLUR: u32 = 50;
+
+/// How big a wallpaper is drawn, so it's read no bigger than that (list.rs `wallpaper_layout`):
+/// it covers at most the list's area - and the list can grow to its screen - times `zoom`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WallFit {
+    /// The list's area now, in screen pixels.
+    pub area: (f32, f32),
+    /// How much bigger than the area it's drawn at most (the skin's zoom and size).
+    pub zoom: f32,
+}
+
+/// A skin's wallpaper: the picture at `path` (theme.rs `wallpaper`), blurred `blur` pixels (0:
+/// sharp), read no bigger than it's drawn (`fit`; None: at its own size, up to 3840 x 2160). It's
+/// read on a thread of its own, as a picture on a sleeping network drive (or a huge one) would hold
+/// the window up: None until it's there (the window is repainted then), and while it can't be read.
+/// Another blur reads it again; so does a bigger screen (the one read shows meanwhile). `tiled`:
+/// its copies sit side by side, so the blur runs on round its edges into the opposite ones.
+pub fn wallpaper(path: &str, blur: u32, tiled: bool, fit: Option<WallFit>) -> Option<Arc<Picture>> {
     if path.is_empty() {
         return None;
     }
+    let radius = blur.min(MAX_BLUR);
+    // (A sharp picture is the same tiled or not.)
+    let blur = Blur { radius, wrap: tiled && radius > 0 };
+    let need = fit.and_then(|f| need_for(f, screen_px()));
     let mut w = WALL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((read, picture, when)) = &w.read {
+    let mut meanwhile = None;
+    if let Some((read, read_blur, read_need, picture, when)) = &w.read {
         // (A picture whose copy went with a lost graphics device is read again.)
         let good = match picture {
             Some(p) => !p.is_lost(),
             None => when.elapsed() < WALL_RETRY,
         };
-        if read == path && good {
-            return picture.clone();
+        if read == path && *read_blur == blur && good {
+            if covers(*read_need, need) {
+                return picture.clone();
+            }
+            // Needed bigger now (a bigger screen): this one shows until that's read.
+            meanwhile = picture.clone();
         }
     }
-    if w.asked == path {
-        return None; // on its way
+    if w.asked == path && w.asked_blur == blur && w.asked_need == need {
+        return meanwhile; // on its way
     }
     w.asked = path.to_string();
+    w.asked_blur = blur;
+    w.asked_need = need;
     if !std::mem::replace(&mut w.running, true) {
         let shared = SERVICE.with(|s| s.borrow().shared.clone());
         if !shell::background("wallpaper", move || read_wallpapers(&shared)) {
@@ -951,7 +1159,75 @@ pub fn wallpaper(path: &str) -> Option<Arc<Picture>> {
             w.asked.clear();
         }
     }
-    None
+    meanwhile
+}
+
+/// Lets go of the wallpaper read last (the skin shows none now, or Glint went to the background):
+/// the renderer's copy of it goes at its next frame. Asking for it again reads it again.
+pub fn forget_wallpaper() {
+    let mut w = WALL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    w.read = None;
+    // (One being read now is thrown away when it's done: see `read_wallpapers`.)
+    w.asked.clear();
+}
+
+/// The screen the window is on, in pixels (None: no window yet).
+fn screen_px() -> Option<(u32, u32)> {
+    let hwnd = SERVICE.with(|s| s.borrow().shared.hwnd.load(Ordering::SeqCst));
+    if hwnd == 0 {
+        return None;
+    }
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    // SAFETY: plain queries; `info` is a valid MONITORINFO with its size set.
+    unsafe {
+        let monitor = MonitorFromWindow(HWND(hwnd as *mut _), MONITOR_DEFAULTTONEAREST);
+        if monitor.is_invalid() || !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return None;
+        }
+    }
+    let r = info.rcMonitor;
+    let (w, h) = ((r.right - r.left).max(0) as u32, (r.bottom - r.top).max(0) as u32);
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+/// The box a wallpaper must cover, in pixels: its screen (the window can be made as big as that),
+/// or the list's area when that's bigger still (a window across two screens; in steps of 256 then,
+/// so one growing doesn't read it again for every pixel), times the zoom. None without a screen.
+fn need_for(fit: WallFit, screen: Option<(u32, u32)>) -> Need {
+    let (sw, sh) = screen?;
+    let zoom = if fit.zoom.is_finite() { f64::from(fit.zoom.max(0.0)) } else { 1.0 };
+    let side = |screen: u32, area: f32| {
+        let area = if area.is_finite() { f64::from(area).clamp(0.0, 1e6).ceil() as u32 } else { 0 };
+        let px = if area > screen { area.div_ceil(256) * 256 } else { screen };
+        (f64::from(px) * zoom).ceil().clamp(1.0, 1e7) as u32
+    };
+    Some((side(sw, fit.area.0), side(sh, fit.area.1)))
+}
+
+/// Whether a wallpaper read for `have` does for `want`.
+fn covers(have: Need, want: Need) -> bool {
+    match (have, want) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some((hw, hh)), Some((ww, wh))) => hw >= ww && hh >= wh,
+    }
+}
+
+/// How big to read a `w` x `h` picture (the right way up) as a wallpaper: the longest side and
+/// the most pixels. As big as wallpapers go (fitting 3840 x 2160), half that when it's blurred (it
+/// has no fine detail to keep) - and no bigger than it's drawn: just big enough to cover `need`
+/// (whatever the shape of the list, since its area can be any shape up to that). Never smaller
+/// than that, so it's never blown up (and no softer) on screen.
+fn wall_read_size(w: u32, h: u32, blurred: bool, need: Need) -> (u32, u64) {
+    let (side, most) = if blurred { (WALL_SIDE / 2, WALL_PIXELS / 4) } else { (WALL_SIDE, WALL_PIXELS) };
+    let Some((nw, nh)) = need else { return (side, most) };
+    let (w, h) = (f64::from(w.max(1)), f64::from(h.max(1)));
+    let k = (f64::from(nw) / w).max(f64::from(nh) / h);
+    if k >= 1.0 {
+        return (side, most);
+    }
+    let longest = (w.max(h) * k).ceil().max(1.0) as u32;
+    (side.min(longest), most)
 }
 
 /// The wallpaper's thread: reads what is asked for (only the newest, when the path changes while
@@ -960,35 +1236,232 @@ fn read_wallpapers(shared: &Shared) {
     let _com = ComGuard::init();
     let wic = wic_factory();
     loop {
-        let path = {
+        let (path, blur, need) = {
             let mut w = WALL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if w.asked.is_empty() {
                 w.running = false;
                 return;
             }
-            w.asked.clone()
+            (w.asked.clone(), w.asked_blur, w.asked_need)
         };
-        // Its size first, from the header: a picture too big isn't decoded at all.
-        let fits = |wic: &IWICImagingFactory| picture_size(wic, &path).is_some_and(|(w, h)| u64::from(w) * u64::from(h) <= WALL_MOST);
-        let picture = wic
-            .as_ref()
-            .filter(|wic| fits(wic))
-            .and_then(|wic| decode(wic, &path, WALL_SIDE, WALL_PIXELS, 0))
-            .and_then(|d| Picture::new(d.width, d.height, d.pixels, false));
+        let picture = wic.as_ref().and_then(|wic| read_wallpaper(wic, &path, blur, need));
         {
             let mut w = WALL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if w.asked == path {
-                w.asked.clear();
+            // Nothing asked any more: it was let go of meanwhile (`forget_wallpaper`).
+            if !w.asked.is_empty() {
+                if w.asked == path && w.asked_blur == blur && w.asked_need == need {
+                    w.asked.clear();
+                }
+                w.read = Some((path, blur, need, picture, Instant::now()));
             }
-            w.read = Some((path, picture, Instant::now()));
         }
         repaint(&shared.hwnd);
+    }
+}
+
+/// Reads one wallpaper (see [`wallpaper`]): None when it can't be read, or is too big.
+fn read_wallpaper(wic: &IWICImagingFactory, path: &str, blur: Blur, need: Need) -> Option<Arc<Picture>> {
+    // Its size first, from the header: a picture too big isn't decoded at all. A photo stored on
+    // its side (a phone's) is turned the right way up, as Windows shows it.
+    let (size, orientation) = picture_header(wic, path).filter(|&((w, h), _)| u64::from(w) * u64::from(h) <= WALL_MOST)?;
+    let orientation = if orientation == 0 { crate::peek::photo_orientation(path) } else { orientation };
+    let (w, h) = upright(size, orientation);
+    let (side, most) = wall_read_size(w, h, blur.radius > 0, need);
+    // (Where it can't be turned - Wine can't - it shows as stored rather than not at all.)
+    let mut d = decode(wic, path, side, most, orientation).or_else(|| (orientation > 1).then(|| decode(wic, path, side, most, 1)).flatten())?;
+    let (w, h) = if (d.width > d.height) == (w > h) { (w, h) } else { (h, w) };
+    let radius = blur_at(blur.radius, d.width, fitted_width(w, h));
+    blur_pixels(&mut d.pixels, d.width as usize, d.height as usize, radius, blur.wrap);
+    Picture::new(d.width, d.height, d.pixels, false)
+}
+
+/// How wide a `w` x `h` picture is as a sharp wallpaper: shrunk to fit WALL_SIDE and WALL_PIXELS,
+/// never made bigger. A wallpaper's blur is in these pixels.
+fn fitted_width(w: u32, h: u32) -> u32 {
+    fit_size(w.max(1), h.max(1), WALL_SIDE, WALL_PIXELS).0.max(1)
+}
+
+/// A blur of `radius` pixels of the sharp wallpaper (`full` wide), for the picture as read (`read`
+/// wide): as much, in that picture's pixels (at least 1 when there is any blur).
+fn blur_at(radius: u32, read: u32, full: u32) -> usize {
+    if radius == 0 {
+        return 0;
+    }
+    ((f64::from(radius) * f64::from(read) / f64::from(full.max(1))).round() as usize).max(1)
+}
+
+/// Blurs premultiplied BGRA pixels (`width` x `height`, top-down) by `radius` pixels: three box
+/// blurs across and down, which come close to a soft (Gaussian) blur. Past the picture's edges its
+/// edge pixels go on (so the edges don't darken) - or, with `wrap`, the opposite edge's pixels come
+/// next (a tiled picture's copies then meet without a line). Nothing happens for radius 0 or no
+/// pixels.
+///
+/// The passes keep 8 more bits than a pixel has, and the end result is dithered a little, so a big
+/// blur (a soft shape spread over many pixels, then shown bigger) fades smoothly instead of in
+/// steps.
+pub(crate) fn blur_pixels(pixels: &mut [u8], width: usize, height: usize, radius: usize, wrap: bool) {
+    if radius == 0 || width == 0 || height == 0 || pixels.len() != width * height * 4 {
+        return;
+    }
+    let mut fine: Vec<u16> = pixels.iter().map(|&b| u16::from(b) << 8).collect();
+    let mut line: Vec<u16> = Vec::with_capacity(width.max(height) * 4);
+    for _ in 0..3 {
+        for y in 0..height {
+            line.clear();
+            line.extend_from_slice(&fine[y * width * 4..(y + 1) * width * 4]);
+            box_line(&line, width, radius, wrap, |x, px| fine[(y * width + x) * 4..][..4].copy_from_slice(&px));
+        }
+        for x in 0..width {
+            line.clear();
+            for y in 0..height {
+                line.extend_from_slice(&fine[(y * width + x) * 4..][..4]);
+            }
+            box_line(&line, height, radius, wrap, |y, px| fine[(y * width + x) * 4..][..4].copy_from_slice(&px));
+        }
+    }
+    // Back to 8 bits, with a 4 x 4 ordered dither; a colour never ends above its see-through
+    // (the pixels stay premultiplied).
+    const BAYER: [u16; 16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+    for y in 0..height {
+        for x in 0..width {
+            let d = BAYER[(y % 4) * 4 + x % 4] * 16 + 8;
+            let at = (y * width + x) * 4;
+            let a = ((u32::from(fine[at + 3]) + u32::from(d)) >> 8).min(255) as u8;
+            pixels[at + 3] = a;
+            for c in 0..3 {
+                pixels[at + c] = (((u32::from(fine[at + c]) + u32::from(d)) >> 8).min(255) as u8).min(a);
+            }
+        }
+    }
+}
+
+/// One box blur along a line of `n` pixels (4 values each): each pixel the average of those within
+/// `radius` of it, the end pixels going on past the ends (with `wrap`: the line going round, its
+/// other end coming next). `put` takes each pixel made.
+fn box_line(line: &[u16], n: usize, radius: usize, wrap: bool, mut put: impl FnMut(usize, [u16; 4])) {
+    let at = |i: isize| if wrap { i.rem_euclid(n as isize) as usize * 4 } else { i.clamp(0, n as isize - 1) as usize * 4 };
+    let r = radius as isize;
+    let count = (2 * radius + 1) as u32;
+    let mut sum = [0u32; 4];
+    for k in -r..=r {
+        let p = at(k);
+        for c in 0..4 {
+            sum[c] += u32::from(line[p + c]);
+        }
+    }
+    for i in 0..n as isize {
+        put(i as usize, std::array::from_fn(|c| ((sum[c] + count / 2) / count) as u16));
+        let (add, take) = (at(i + r + 1), at(i - r));
+        for c in 0..4 {
+            sum[c] = sum[c] + u32::from(line[add + c]) - u32::from(line[take + c]);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_blurred_wallpaper_is_read_smaller_and_blurred_as_much() {
+        // A big photo is shrunk to fit as a sharp wallpaper; read at half that, a 20-pixel blur
+        // is 10 of the smaller picture's pixels.
+        let full = fitted_width(4000, 3000);
+        assert!(full < 4000 && u64::from(full) * u64::from(full) * 3 / 4 <= WALL_PIXELS + 4000);
+        assert_eq!(blur_at(20, full / 2, full), 10);
+        // A small picture isn't made bigger: read at its own size, the blur stays as asked.
+        assert_eq!(fitted_width(800, 600), 800);
+        assert_eq!(blur_at(20, 800, 800), 20);
+        // No blur stays none; any blur stays at least 1; odd sizes don't panic.
+        assert_eq!(blur_at(0, 100, 1000), 0);
+        assert_eq!(blur_at(1, 10, 4000), 1);
+        assert_eq!(fitted_width(1, 1), 1);
+        assert_eq!(fitted_width(0, 0), 1);
+        assert_eq!(fitted_width(100_000, 1), 3840);
+    }
+
+    #[test]
+    fn a_big_blur_fades_in_small_steps() {
+        // A hard edge blurred 30 pixels: across the soft part, no step between neighbours is
+        // bigger than a few levels (8-bit passes made long flat runs and jumps).
+        let (w, h) = (200usize, 8usize);
+        let mut px = Vec::new();
+        for _ in 0..h {
+            for x in 0..w {
+                let v = if x < w / 2 { 30 } else { 230 };
+                px.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        blur_pixels(&mut px, w, h, 30, false);
+        let y = 3;
+        let biggest = (1..w).map(|x| (i32::from(px[(y * w + x) * 4]) - i32::from(px[(y * w + x - 1) * 4])).abs()).max().unwrap();
+        assert!(biggest <= 6, "a step of {biggest}");
+        // Opaque stays opaque; the far ends keep their colours (within the dither).
+        assert!(px.chunks(4).all(|p| p[3] == 255));
+        assert!(i32::from(px[(y * w) * 4]).abs_diff(30) <= 1 && i32::from(px[(y * w + w - 1) * 4]).abs_diff(230) <= 1);
+    }
+
+    #[test]
+    fn a_tiled_wallpaper_blurs_round_its_edges() {
+        // A picture black on its left half, white on its right: tiled, its copies' left edge
+        // (black) meets the right edge (white). Blurred round, the two edges come out alike.
+        let (w, h) = (16usize, 4usize);
+        let mut px = Vec::new();
+        for _ in 0..h {
+            for x in 0..w {
+                let v = if x < w / 2 { 0 } else { 255 };
+                px.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let mut plain = px.clone();
+        blur_pixels(&mut px, w, h, 3, true);
+        blur_pixels(&mut plain, w, h, 3, false);
+        let row = |p: &[u8], x: usize| i32::from(p[x * 4]);
+        // Where two copies meet (the last pixel, then the first) is as soft as the step in the
+        // middle of the picture: no harder line.
+        let seam = (row(&px, 0) - row(&px, w - 1)).abs();
+        let middle = (row(&px, w / 2) - row(&px, w / 2 - 1)).abs();
+        assert!(seam <= middle + 2, "the edges meet softly: {seam} vs {middle}");
+        assert!((row(&plain, 0) - row(&plain, w - 1)).abs() > 200, "not round: a line where copies meet");
+        // One colour stays one colour; a radius bigger than the picture and a 1 x 1 don't panic.
+        let mut flat = [9u8, 9, 9, 255].repeat(5 * 3);
+        blur_pixels(&mut flat, 5, 3, 50, true);
+        assert!(flat.chunks(4).all(|p| p == [9, 9, 9, 255]));
+        let mut one = vec![1u8, 2, 3, 4];
+        blur_pixels(&mut one, 1, 1, 50, true);
+        assert_eq!(one, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn wallpapers_blur_softly_and_stay_whole() {
+        // A 1 x 1 picture stays as it is, at any blur.
+        let mut one = vec![10, 20, 30, 255];
+        blur_pixels(&mut one, 1, 1, 50, false);
+        assert_eq!(one, [10, 20, 30, 255]);
+        // One colour all over stays that colour (the edges go on, they don't darken).
+        let mut flat = [40u8, 80, 120, 255].repeat(7 * 5);
+        blur_pixels(&mut flat, 7, 5, 3, false);
+        assert!(flat.chunks(4).all(|p| p == [40, 80, 120, 255]));
+        // A see-through picture: every pixel stays premultiplied (no colour above its alpha), and
+        // a lone dot spreads out without making anything up.
+        let (w, h) = (15usize, 15usize);
+        let mut px = vec![0u8; w * h * 4];
+        px[(7 * w + 7) * 4..][..4].copy_from_slice(&[200, 100, 50, 200]);
+        px[0..4].copy_from_slice(&[0, 0, 128, 128]);
+        blur_pixels(&mut px, w, h, 2, false);
+        assert!(px.chunks(4).all(|p| p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3]), "premultiplied");
+        assert!(px[(7 * w + 7) * 4 + 3] < 200 && px[(7 * w + 6) * 4 + 3] > 0, "spread out");
+        assert!(px.chunks(4).all(|p| p[3] <= 200 && p[0] <= 200), "never more than was there");
+        assert_eq!(px[(14 * w + 14) * 4..][..4], [0, 0, 0, 0], "too far to reach: still clear");
+        // A radius far past the picture's size, and a picture one pixel tall: no panic.
+        let mut strip = [1u8, 2, 3, 4].repeat(3);
+        blur_pixels(&mut strip, 3, 1, 50, false);
+        assert!(strip.chunks(4).all(|p| p == [1, 2, 3, 4]));
+        // Nothing for no blur, or pixels that don't fit the size.
+        let mut odd = vec![1u8, 2, 3];
+        blur_pixels(&mut odd, 1, 1, 4, false);
+        assert_eq!(odd, [1, 2, 3]);
+    }
 
     #[test]
     fn a_small_icon_in_a_big_square_is_cut_out() {
@@ -1067,8 +1540,319 @@ mod tests {
     }
 
     #[test]
+    fn pictures_on_screen_last_frame_are_kept() {
+        let k = |frame| Known { version: 0, picture: None, made: 0, asked: 0, asked_version: 0, used: 0, frame };
+        // Frame 10 has just begun: what frame 9 drew is still on screen.
+        assert!(!droppable(&k(10), 10, false));
+        assert!(!droppable(&k(9), 10, false));
+        assert!(droppable(&k(8), 10, false));
+        // On its way: kept.
+        assert!(!droppable(&Known { asked: 96, ..k(1) }, 10, false));
+    }
+
+    #[test]
     fn versions_change_with_the_file() {
         assert_ne!(version_of(100, 5), version_of(101, 5));
         assert_ne!(version_of(100, 5), version_of(100, 6));
     }
+
+    /// A video's frame is filled again and again in the same memory (no new buffer, no new
+    /// picture, the same id: the renderer keeps one bitmap for it).
+    #[test]
+    fn a_video_frame_is_filled_again_in_place() {
+        let f = Picture::frame(4, 2, |b| {
+            b.fill(1);
+            true
+        })
+        .unwrap();
+        assert!(f.is_frame() && f.bytes() == 32);
+        assert!(Picture::frame(0, 2, |_| true).is_none() && Picture::frame(4, 2, |_| false).is_none());
+        // The renderer makes its bitmap from the first pixels, and hands the buffer back.
+        let first = f.take_pixels().unwrap();
+        let at = first.as_ptr();
+        f.keep_spare(first);
+        assert!(f.take_fresh().is_none(), "nothing new yet");
+        // The next frame goes into that same buffer.
+        assert!(f.refill(|b| {
+            b.fill(2);
+            true
+        }));
+        let next = f.take_fresh().expect("a new frame");
+        assert_eq!(next.as_ptr(), at, "the same memory");
+        assert!(next.iter().all(|&v| v == 2) && next.len() == 32);
+        assert!(f.take_fresh().is_none(), "once");
+        f.keep_spare(next);
+        // Two frames before the renderer takes one: the newest wins, still in the same memory.
+        assert!(f.refill(|b| {
+            b.fill(3);
+            true
+        }));
+        assert!(f.refill(|b| {
+            b.fill(4);
+            true
+        }));
+        let newest = f.take_fresh().unwrap();
+        assert!(newest.iter().all(|&v| v == 4) && newest.as_ptr() == at);
+        f.keep_spare(newest);
+        // A frame that couldn't be copied changes nothing.
+        assert!(!f.refill(|_| false));
+        assert!(f.take_fresh().is_none());
+        // After a lost graphics device it's filled again and is no longer lost.
+        f.mark_lost();
+        assert!(f.refill(|_| true) && !f.is_lost());
+        // An ordinary picture isn't refilled, and its pixels go once drawn.
+        let p = Picture::new(1, 1, vec![9; 4], false).unwrap();
+        assert!(!p.refill(|_| true) && !p.is_frame());
+        let px = p.take_pixels().unwrap();
+        p.keep_spare(px);
+        assert!(p.take_pixels().is_none() && p.spare.lock().unwrap().is_none());
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("glint-thumbs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The colour of pixel (x, y) of premultiplied BGRA pixels `width` wide, as RGB.
+    fn rgb_at(pixels: &[u8], width: u32, x: u32, y: u32) -> (u8, u8, u8) {
+        let at = ((y * width + x) * 4) as usize;
+        (pixels[at + 2], pixels[at + 1], pixels[at])
+    }
+
+    #[test]
+    fn sizes_turn_with_the_photo() {
+        assert_eq!(upright((4032, 3024), 6), (3024, 4032));
+        assert_eq!(upright((4032, 3024), 8), (3024, 4032));
+        assert_eq!(upright((4032, 3024), 5), (3024, 4032));
+        assert_eq!(upright((4032, 3024), 7), (3024, 4032));
+        for o in [0, 1, 2, 3, 4, 9, u32::MAX] {
+            assert_eq!(upright((4032, 3024), o), (4032, 3024), "orientation {o}");
+        }
+    }
+
+    /// A photo stored on its side, with EXIF orientation 6 (as a phone saves one held upright):
+    /// as a wallpaper, as a thumbnail and in the header it's the right way up.
+    #[test]
+    fn a_photo_on_its_side_is_turned_upright() {
+        let dir = temp_dir("upright");
+        // Stored 4 x 2: its top-left pixel red, the rest blue.
+        let mut rgb = vec![[0u8, 0, 255]; 8];
+        rgb[0] = [255, 0, 0];
+        let path = dir.join("phone photo (1) [portrait] .tif");
+        std::fs::write(&path, tiff_for_tests(4, 2, 6, &rgb)).unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let _com = ComGuard::init();
+        let wic = wic_factory().expect("WIC");
+        let ((w, h), o) = picture_header(&wic, &path).expect("its header");
+        assert_eq!((w, h), (4, 2), "the header says the size as stored");
+        if o == 0 {
+            // (This WIC can't read a TIFF's orientation: nothing more to see here.)
+            eprintln!("WIC read no orientation here");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert_eq!(o, 6);
+        // Told outright, the file's own orientation isn't looked at (the Space preview's way).
+        let as_told = decode(&wic, &path, 64, 64 * 64, 1).expect("decoded as stored");
+        assert_eq!((as_told.width, as_told.height), (4, 2));
+        // Decoded the way the file says: 2 x 4, the red pixel now top right (turned clockwise).
+        let Some(d) = decode(&wic, &path, 64, 64 * 64, FILE_ORIENTATION) else {
+            // (Wine's WIC can't turn pictures: the wallpaper then shows as stored, not at all.)
+            eprintln!("this WIC can't turn a picture");
+            let pic = read_wallpaper(&wic, &path, Blur { radius: 2, wrap: false }, Some((1920, 1080))).expect("shown as stored");
+            assert_eq!((pic.width(), pic.height()), (4, 2));
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        assert_eq!((d.width, d.height), (2, 4));
+        assert_eq!(d.original, (2, 4));
+        assert_eq!(rgb_at(&d.pixels, 2, 1, 0), (255, 0, 0));
+        assert_eq!(rgb_at(&d.pixels, 2, 0, 0), (0, 0, 255));
+        // As a wallpaper, sharp and blurred.
+        let pic = read_wallpaper(&wic, &path, Blur { radius: 0, wrap: false }, None).expect("a wallpaper");
+        assert_eq!((pic.width(), pic.height()), (2, 4));
+        let px = pic.take_pixels().unwrap();
+        assert_eq!(rgb_at(&px, 2, 1, 0), (255, 0, 0));
+        let blurred = read_wallpaper(&wic, &path, Blur { radius: 3, wrap: false }, Some((1920, 1080))).expect("blurred");
+        assert_eq!((blurred.width(), blurred.height()), (2, 4));
+        // As a thumbnail made with WIC (where Windows has none).
+        let thumb = decode(&wic, &path, 256, 256 * 256, FILE_ORIENTATION).unwrap();
+        assert_eq!((thumb.width, thumb.height), (2, 4));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A phone-sized photo on its side turns quickly (turning before shrinking took 37 s for one).
+    #[test]
+    fn a_big_photo_on_its_side_turns_quickly() {
+        let dir = temp_dir("big upright");
+        let (w, h) = (4032u16, 3024u16);
+        // Its top-left quarter red, the rest blue.
+        let rgb: Vec<[u8; 3]> = (0..u32::from(h))
+            .flat_map(|y| (0..u32::from(w)).map(move |x| if x < 2016 && y < 1512 { [255, 0, 0] } else { [0, 0, 255] }))
+            .collect();
+        let path = dir.join("big phone photo.tif");
+        std::fs::write(&path, tiff_for_tests(w, h, 1, &rgb)).unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let _com = ComGuard::init();
+        let wic = wic_factory().expect("WIC");
+        let start = std::time::Instant::now();
+        let d = decode(&wic, &path, WALL_SIDE, WALL_PIXELS, 6);
+        let took = start.elapsed();
+        assert!(took < std::time::Duration::from_secs(5), "turning took {took:?}");
+        let Some(d) = d else {
+            eprintln!("this WIC can't turn a picture");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        assert!(d.height > d.width, "upright: {}x{}", d.width, d.height);
+        assert_eq!(d.original, (u32::from(h), u32::from(w)));
+        // Turned clockwise: the red quarter is now top right.
+        assert_eq!(rgb_at(&d.pixels, d.width, d.width - 2, 1), (255, 0, 0));
+        assert_eq!(rgb_at(&d.pixels, d.width, 1, 1), (0, 0, 255));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_wallpaper_that_cant_be_read_is_none() {
+        let dir = temp_dir("unreadable");
+        let _com = ComGuard::init();
+        let wic = wic_factory().expect("WIC");
+        let sharp = Blur { radius: 0, wrap: false };
+        assert!(read_wallpaper(&wic, &dir.join("missing.png").to_string_lossy(), sharp, Some((1920, 1080))).is_none());
+        std::fs::write(dir.join("junk.png"), b"not a picture").unwrap();
+        assert!(read_wallpaper(&wic, &dir.join("junk.png").to_string_lossy(), sharp, None).is_none());
+        std::fs::write(dir.join("empty.jpg"), b"").unwrap();
+        assert!(read_wallpaper(&wic, &dir.join("empty.jpg").to_string_lossy(), sharp, Some((1, 1))).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A skin without a wallpaper (or Glint going to the background) lets go of the last one, so
+    /// the renderer's copy goes too; asked again, it's read again.
+    #[test]
+    fn a_wallpaper_no_longer_shown_is_let_go_of() {
+        let pic = Picture::new(2, 2, vec![0; 16], false).unwrap();
+        let sharp = Blur { radius: 0, wrap: false };
+        let set = |pic: &Arc<Picture>| {
+            let mut w = WALL.lock().unwrap();
+            w.read = Some(("C:\\wall.png".into(), sharp, None, Some(pic.clone()), Instant::now()));
+        };
+        set(&pic);
+        assert_eq!(Arc::strong_count(&pic), 2);
+        assert!(wallpaper("C:\\wall.png", 0, false, None).is_some_and(|p| p.id() == pic.id()), "kept while shown");
+        forget_wallpaper();
+        assert_eq!(Arc::strong_count(&pic), 1, "nothing holds it now");
+        assert!(WALL.lock().unwrap().read.is_none());
+        forget_wallpaper(); // twice is fine
+        // Going to the background does the same.
+        set(&pic);
+        clear();
+        assert_eq!(Arc::strong_count(&pic), 1);
+        // A read that finishes after it was let go of isn't kept: nothing is asked any more.
+        assert!(WALL.lock().unwrap().asked.is_empty());
+    }
+
+    /// A wallpaper is read no bigger than its screen (times the zoom), never smaller - so it is
+    /// never blown up on screen - and as before when it's drawn at its own size.
+    #[test]
+    fn a_wallpaper_is_read_as_big_as_it_is_drawn() {
+        // A 4K picture on a 1920 x 1080 screen: 1920 x 1080 (a quarter of the memory).
+        let (side, most) = wall_read_size(3840, 2160, false, Some((1920, 1080)));
+        assert_eq!(fit_size(3840, 2160, side, most), (1920, 1080));
+        // On a 4K screen, or tiled / at its own size (no need): as big as before.
+        assert_eq!(wall_read_size(3840, 2160, false, Some((3840, 2160))), (WALL_SIDE, WALL_PIXELS));
+        assert_eq!(wall_read_size(3840, 2160, false, None), (WALL_SIDE, WALL_PIXELS));
+        assert_eq!(wall_read_size(6000, 4000, true, None), (WALL_SIDE / 2, WALL_PIXELS / 4));
+        // Blurred: half of as big as wallpapers go, or the screen's size when that's smaller.
+        assert_eq!(wall_read_size(3840, 2160, true, Some((1280, 720))).0, 1280);
+        assert_eq!(wall_read_size(3840, 2160, true, Some((3840, 2160))), (WALL_SIDE / 2, WALL_PIXELS / 4));
+        // A picture smaller than the screen: at its own size, as before.
+        assert_eq!(fit_size(800, 600, wall_read_size(800, 600, false, Some((1920, 1080))).0, WALL_PIXELS), (800, 600));
+        // Whatever the shapes, what's read covers the need (to the pixel) unless it is as big as
+        // wallpapers go.
+        let pictures = [(3840, 2160), (6000, 4000), (4000, 6000), (2160, 3840), (10000, 1000), (1000, 10000), (5000, 5000), (3, 9000), (9000, 3)];
+        let needs = [(1920, 1080), (1080, 1920), (1366, 768), (2560, 1440), (3000, 600), (600, 3000), (1, 1), (5120, 1440)];
+        for &(w, h) in &pictures {
+            for &need in &needs {
+                for blurred in [false, true] {
+                    let (side, most) = wall_read_size(w, h, blurred, Some(need));
+                    let (rw, rh) = fit_size(w, h, side, most);
+                    let cap = if blurred { fit_size(w, h, WALL_SIDE / 2, WALL_PIXELS / 4) } else { fit_size(w, h, WALL_SIDE, WALL_PIXELS) };
+                    assert!((rw, rh) == cap || (rw + 1 >= need.0.min(w) && rh + 1 >= need.1.min(h)), "{w}x{h} for {need:?} (blurred {blurred}): read {rw}x{rh}");
+                    assert!(u64::from(rw) * u64::from(rh) <= u64::from(cap.0) * u64::from(cap.1), "never bigger than before");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_need_is_the_screen_or_a_bigger_list() {
+        let fit = |w: f32, h: f32, zoom: f32| WallFit { area: (w, h), zoom };
+        // The list is smaller than its screen: the screen (it can be maximised).
+        assert_eq!(need_for(fit(1500.0, 800.0, 1.0), Some((1920, 1080))), Some((1920, 1080)));
+        // Zoomed in, it's drawn bigger; zoomed out, smaller.
+        assert_eq!(need_for(fit(1500.0, 800.0, 2.0), Some((1920, 1080))), Some((3840, 2160)));
+        assert_eq!(need_for(fit(1500.0, 800.0, 0.5), Some((1920, 1080))), Some((960, 540)));
+        // A window across two screens: the list's own size, in steps.
+        assert_eq!(need_for(fit(3000.0, 900.0, 1.0), Some((1920, 1080))), Some((3072, 1080)));
+        assert_eq!(need_for(fit(3001.0, 900.0, 1.0), Some((1920, 1080))), Some((3072, 1080)), "a pixel more reads nothing new");
+        // Odd numbers don't break it.
+        assert_eq!(need_for(fit(f32::NAN, f32::INFINITY, f32::NAN), Some((1920, 1080))), Some((1920, 1080)));
+        assert_eq!(need_for(fit(-5.0, -5.0, -1.0), Some((1920, 1080))), Some((1, 1)));
+        assert!(need_for(fit(1e30, 1e30, 6.0), Some((1920, 1080))).is_some_and(|(w, h)| w <= 10_000_000 && h <= 10_000_000));
+        // No screen known (no window yet): as big as wallpapers go.
+        assert_eq!(need_for(fit(1500.0, 800.0, 1.0), None), None);
+    }
+
+    #[test]
+    fn a_bigger_wallpaper_does_for_a_smaller_need() {
+        assert!(covers(None, None) && covers(None, Some((5000, 5000))));
+        assert!(!covers(Some((1920, 1080)), None));
+        assert!(covers(Some((1920, 1080)), Some((1920, 1080))) && covers(Some((2560, 1440)), Some((1920, 1080))));
+        assert!(!covers(Some((1920, 1080)), Some((2560, 1440))) && !covers(Some((1920, 1080)), Some((1080, 1920))));
+    }
+
+}
+
+/// A small uncompressed TIFF (`w` x `h`, `rgb` row by row, top-down as stored) with EXIF
+/// `orientation`, for tests.
+#[cfg(test)]
+pub(crate) fn tiff_for_tests(w: u16, h: u16, orientation: u16, rgb: &[[u8; 3]]) -> Vec<u8> {
+    let entries: [(u16, u16, u32); 10] = [
+        (256, 3, u32::from(w)),
+        (257, 3, u32::from(h)),
+        (258, 3, 134), // bits per sample: three numbers, kept after the list
+        (259, 3, 1),
+        (262, 3, 2),
+        (273, 4, 140),
+        (274, 3, u32::from(orientation)),
+        (277, 3, 3),
+        (278, 3, u32::from(h)),
+        (279, 4, rgb.len() as u32 * 3),
+    ];
+    let mut b = Vec::new();
+    b.extend_from_slice(b"II*\0");
+    b.extend_from_slice(&8u32.to_le_bytes());
+    b.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for (tag, kind, value) in entries {
+        b.extend_from_slice(&tag.to_le_bytes());
+        b.extend_from_slice(&kind.to_le_bytes());
+        b.extend_from_slice(&(if tag == 258 { 3u32 } else { 1 }).to_le_bytes());
+        if kind == 3 && tag != 258 {
+            b.extend_from_slice(&(value as u16).to_le_bytes());
+            b.extend_from_slice(&[0, 0]);
+        } else {
+            b.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    b.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(b.len(), 134);
+    for _ in 0..3 {
+        b.extend_from_slice(&8u16.to_le_bytes());
+    }
+    for p in rgb {
+        b.extend_from_slice(p);
+    }
+    b
 }

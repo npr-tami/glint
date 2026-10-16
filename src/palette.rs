@@ -169,6 +169,14 @@ pub fn actions(app: &AppState) -> Vec<Item> {
     if app.split.is_some() {
         v.push(Item::new("Switch side", "F6", Run(Command::OtherPane)).guide(G::Tabs, "Moves to the other side of split view"));
     }
+    // Tab sets, as in a tab's right-click menu: save these tabs, open or remove a saved set.
+    v.push(Item::new("Save tabs as a set\u{2026}", "", Run(Command::SaveTabSet)).guide(G::Tabs, "Keeps these tabs, to open them all again later"));
+    for (n, set) in s.tab_sets.iter().enumerate() {
+        v.push(Item::new(&format!("Open tab set: {}", set.name), "", Run(Command::OpenTabSet(n))));
+    }
+    for (n, set) in s.tab_sets.iter().enumerate() {
+        v.push(Item::new(&format!("Remove tab set: {}", set.name), "", Run(Command::DeleteTabSet(n))));
+    }
     // The views, with their Ctrl+Shift+1 to 6.
     const VIEW_KEYS: [&str; 6] = ["Ctrl+Shift+1", "Ctrl+Shift+2", "Ctrl+Shift+3", "Ctrl+Shift+4", "Ctrl+Shift+5", "Ctrl+Shift+6"];
     for (i, (mode, name)) in ViewMode::ALL.iter().enumerate() {
@@ -226,6 +234,11 @@ pub fn actions(app: &AppState) -> Vec<Item> {
     v.push(Item::new("Settings", "Ctrl+,", Run(Command::OpenSettings(None))).guide(G::Glint, "Opens Glint's settings"));
     v.push(Item::new("Quit Glint", "Ctrl+Q", Run(Command::Quit)).guide(G::Glint, "Closes Glint completely"));
     v.push(Item::new("Help", "", Action::Fill("?")));
+    // Every setting, by its title: Settings opens at it. (The guide has one line for them all.)
+    for (title, page) in crate::settingswin::findable(&app.settings) {
+        let name = format!("Setting: {title}");
+        v.push(Item::new(&name, crate::settingswin::PAGES[page], Run(Command::OpenSetting(page, title))));
+    }
     // (The guide has one line for them all.)
     for e in app.skins.entries() {
         v.push(Item::new(&format!("Skin: {}", e.name), "", Action::Skin(e.id.clone())));
@@ -253,6 +266,12 @@ pub fn guide(all: &[Item]) -> Vec<Item> {
     if all.iter().any(|it| matches!(it.action, Action::Skin(_))) {
         v.push(Item::new("Skins", "", Action::Fill("skin ")).guide(Group::Glint, "Type skin to pick a different look"));
     }
+    if all.iter().any(|it| matches!(it.action, Action::Run(Command::OpenTabSet(_)))) {
+        v.push(Item::new("Tab sets", "", Action::Fill("tab set ")).guide(Group::Tabs, "Type tab set to open one you saved"));
+    }
+    if all.iter().any(|it| matches!(it.action, Action::Run(Command::OpenSetting(..)))) {
+        v.push(Item::new("Settings by name", "", Action::Fill("setting ")).guide(Group::Glint, "Type setting and a word to find a setting"));
+    }
     v.sort_by_cached_key(|it| (it.group, it.name.to_lowercase()));
     v
 }
@@ -270,8 +289,9 @@ pub fn looks_like_path(text: &str) -> bool {
 }
 
 /// How well `name` matches what was typed: lower is better, None is no match. Every typed word
-/// must be found in the name (in any order; the start of a word counts most), or the typed letters
-/// must be the first letters of the name's words ("sv" for Split view).
+/// must be found in the name (in any order; the start of a word counts most, and a whole word as
+/// much as the start of the name: "set" finds "Save tabs as a set" as well as "Settings"), or the
+/// typed letters must be the first letters of the name's words ("sv" for Split view).
 pub fn score(name: &str, query: &str) -> Option<u32> {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
@@ -279,17 +299,21 @@ pub fn score(name: &str, query: &str) -> Option<u32> {
     }
     let n = name.to_lowercase();
     if n.starts_with(&q) {
-        return Some(0);
+        let whole = n[q.len()..].chars().next().is_none_or(|c| !c.is_alphanumeric());
+        return Some(if whole { 0 } else { 1 });
     }
     let words: Vec<&str> = n.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
     let mut by_words = Some(1);
     for part in q.split_whitespace() {
-        let s = if words.first().is_some_and(|w| w.starts_with(part)) {
+        let s = if words.first().is_some_and(|w| w.starts_with(part)) || words.contains(&part) {
             0
         } else if words.iter().any(|w| w.starts_with(part)) {
             1
         } else if n.contains(part) {
             3
+        } else if part.len() > 3 && part.strip_suffix('s').is_some_and(|one| words.contains(&one)) {
+            // One typed in the plural ("tab sets" for "Save tabs as a set").
+            1
         } else {
             by_words = None;
             break;
@@ -805,10 +829,11 @@ mod tests {
         for it in all.iter().filter(|it| !it.about.is_empty()) {
             assert_eq!(g.iter().filter(|x| x.name == it.name).count(), 1, "{}", it.name);
         }
-        let quiet: Vec<&str> = all.iter().filter(|it| it.about.is_empty() && !matches!(it.action, Action::Skin(_))).map(|it| it.name.as_str()).collect();
+        let quiet: Vec<&str> = all.iter().filter(|it| it.about.is_empty() && !matches!(it.action, Action::Skin(_) | Action::Run(Command::OpenSetting(..)))).map(|it| it.name.as_str()).collect();
         assert_eq!(quiet, ["Select by pattern\u{2026}", "Help"]);
         assert!(g.iter().any(|it| it.name == "*.pdf" && it.action == Action::Fill("*.")));
         assert!(g.iter().any(|it| it.name == "Skins"));
+        assert!(g.iter().any(|it| it.name == "Settings by name"));
         // By group, things to type first, A to Z in each; a short line each.
         assert_eq!(g[0].group, Group::Typing);
         assert!(g.windows(2).all(|w| (w[0].group, w[0].name.to_lowercase()) <= (w[1].group, w[1].name.to_lowercase())));
@@ -843,6 +868,58 @@ mod tests {
         assert_eq!(b.run(i), Choice::Redraw);
         assert!(!b.guide);
         assert_eq!(b.rows[0].action, Action::SelectPattern("*.".into()));
+    }
+
+    #[test]
+    fn settings_are_found_by_name_and_open_at_their_row() {
+        let app = AppState::for_tests(crate::settings::Settings::default());
+        let all = actions(&app);
+        let rows = rows_for(&all, "hidden");
+        let found = rows.iter().find(|r| r.name == "Setting: Hidden files").expect("found by a word");
+        assert_eq!(found.keys, "Files");
+        assert_eq!(found.action, Action::Run(Command::OpenSetting(2, "Hidden files".into())));
+        // Any setting on any page, once each; the shortcut list isn't one.
+        let settings: Vec<&Item> = all.iter().filter(|i| matches!(i.action, Action::Run(Command::OpenSetting(..)))).collect();
+        for t in ["Setting: Skin", "Setting: Zip icon", "Setting: Open on startup", "Setting: Check for updates automatically"] {
+            assert_eq!(settings.iter().filter(|i| i.name == t).count(), 1, "{t}");
+        }
+        assert!(!settings.iter().any(|i| i.name.contains("Ctrl+")), "no shortcuts");
+        assert!(rows_for(&all, "setting zip").iter().any(|r| r.name == "Setting: Zip icon"));
+    }
+
+    /// Saving the tabs as a set, and each saved set (to open or remove), are found by "tab set",
+    /// "set" or the set's name, as in a tab's right-click menu.
+    #[test]
+    fn tab_sets_are_found() {
+        use crate::settings::{Settings, TabSet};
+        let set = |name: &str| TabSet { name: name.into(), tabs: Vec::new() };
+        let none = AppState::for_tests(Settings::default());
+        let all = actions(&none);
+        for typed in ["tab set", "set", "Tab Sets", "save tabs", "sets", "  TAB   set "] {
+            let rows = rows_for(&all, typed);
+            assert!(rows.iter().any(|r| r.action == Action::Run(Command::SaveTabSet)), "{typed}: {:?}", names(&rows));
+        }
+        assert!(!all.iter().any(|r| matches!(r.action, Action::Run(Command::OpenTabSet(_)))), "no sets, nothing to open");
+        assert!(!guide(&all).iter().any(|r| r.name == "Tab sets"));
+        // Two sets, one with an odd name.
+        let app = AppState::for_tests(Settings { tab_sets: vec![set("Work"), set("Photos & 2024 \u{2014} trip")], ..Default::default() });
+        let all = actions(&app);
+        let rows = rows_for(&all, "tab set");
+        for want in [Command::SaveTabSet, Command::OpenTabSet(0), Command::OpenTabSet(1), Command::DeleteTabSet(0), Command::DeleteTabSet(1)] {
+            assert!(rows.iter().any(|r| r.action == Action::Run(want.clone())), "{want:?}: {:?}", names(&rows));
+        }
+        let rows = rows_for(&all, "set");
+        assert_eq!(rows[0].action, Action::Run(Command::SaveTabSet), "{:?}", names(&rows));
+        assert_eq!(rows[1].action, Action::Run(Command::OpenTabSet(0)), "{:?}", names(&rows));
+        assert_eq!(rows_for(&all, "work")[0].action, Action::Run(Command::OpenTabSet(0)));
+        assert_eq!(rows_for(&all, "open trip")[0].action, Action::Run(Command::OpenTabSet(1)));
+        assert_eq!(rows_for(&all, "remove work")[0].action, Action::Run(Command::DeleteTabSet(0)));
+        // Settings still come first for what starts their name.
+        assert_eq!(rows_for(&all, "settings")[0].name, "Settings");
+        assert_eq!(rows_for(&all, "setting zip")[0].name, "Setting: Zip icon");
+        // The guide tells how to find them.
+        assert!(guide(&all).iter().any(|r| r.name == "Tab sets" && r.group == Group::Tabs && r.action == Action::Fill("tab set ")));
+        assert!(guide(&all).iter().any(|r| r.action == Action::Run(Command::SaveTabSet)));
     }
 
     #[test]

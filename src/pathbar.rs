@@ -33,6 +33,59 @@ const EDIT_ROOM: f32 = 24.0;
 /// Step boxes are this much shorter than the path box, top and bottom.
 const BOX_INSET: f32 = 4.0;
 
+/// A folder name cut short keeps at least this many letters before its "…".
+const MIN_LETTERS: usize = 5;
+/// The least room kept on the right to click to type, when the folder you're in needs the rest.
+const MIN_EDIT_ROOM: f32 = 8.0;
+
+/// How the steps fit the bar.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Fit {
+    /// The first step shown (those before go behind "…", or, with no room for it, out of sight).
+    first: usize,
+    /// "…" is shown.
+    more: bool,
+    /// The width the folder you're in gets.
+    last_w: f32,
+}
+
+/// Fits steps of `widths` into `room` (`spare` more may be taken from the room kept to click to
+/// type). The earliest steps go behind "…" first; then the folder you're in is cut short, but never
+/// below `min_last` (a few letters and "…") while some of `spare` can make up for it: rather than
+/// that, "…" makes way too. Only a bar too narrow for even that cuts it further.
+fn fit_steps(widths: &[f32], min_last: f32, more_w: f32, sep_w: f32, room: f32, spare: f32) -> Fit {
+    let Some(&full_last) = widths.last() else { return Fit { first: 0, more: false, last_w: 0.0 } };
+    let last = widths.len() - 1;
+    let total = |from: usize| -> f32 {
+        let mut t = if from > 0 { more_w + sep_w } else { 0.0 };
+        for (i, w) in widths.iter().enumerate().skip(from) {
+            t += w + if i < last { sep_w } else { 0.0 };
+        }
+        t
+    };
+    let mut first = 0;
+    while first < last && total(first) > room {
+        first += 1;
+    }
+    let more = first > 0;
+    if total(first) <= room {
+        return Fit { first, more, last_w: full_last };
+    }
+    // Only the folder you're in is left, and it's too wide: it's cut short.
+    let min_last = min_last.min(full_last);
+    let behind = if more { more_w + sep_w } else { 0.0 };
+    if room - behind >= min_last {
+        return Fit { first, more, last_w: room - behind };
+    }
+    if room + spare - behind >= min_last {
+        return Fit { first, more, last_w: min_last };
+    }
+    // Not even with "…": it goes, so the name stays readable (and where even that isn't room
+    // enough, it's cut to the bar, still ending in "…").
+    let last_w = if room + spare >= min_last { min_last.max(room) } else { (room + spare).max(0.0) };
+    Fit { first, more: false, last_w: last_w.min(full_last) }
+}
+
 /// One step as laid out.
 #[derive(Clone, Debug)]
 pub struct Crumb {
@@ -144,7 +197,7 @@ impl PathBar {
 
     /// Places the steps for the tab's current path (only measures when something changed).
     /// When they don't fit, the earliest go behind "…" (the folder you're in always stays); when
-    /// even that one doesn't fit, its name is shortened.
+    /// even that one doesn't fit, its name is shortened, keeping its start (`fit_steps`).
     fn layout(&mut self, r: &mut Renderer, app: &AppState) {
         let mut steps = app.path_steps(&app.tab().path);
         let style_now = self.style;
@@ -195,24 +248,21 @@ impl PathBar {
             })
             .collect();
         let more_w = if modern { MORE_W } else { r.measure("...", &style).ceil() + 2.0 * pad + 2.0 };
-        let total = |from: usize, widths: &[f32]| -> f32 {
-            let mut t = if from > 0 { more_w + sep_w } else { 0.0 };
-            for (i, w) in widths.iter().enumerate().skip(from) {
-                t += w + if i < last { sep_w } else { 0.0 };
-            }
-            t
-        };
-        let mut first = 0;
-        while first < last && total(first, &widths) > room {
-            first += 1;
-        }
-        if !widths.is_empty() && total(first, &widths) > room {
-            let rest = room - if first > 0 { more_w + sep_w } else { 0.0 };
-            widths[last] = rest.max(2.0 * pad + 2.0 * lean + 20.0).min(widths[last]);
+        // The least the folder you're in may be cut to: its first few letters and "…" ("glint…").
+        let min_last = steps.last().map_or(0.0, |(name, _)| {
+            let start: String = name.chars().take(MIN_LETTERS).collect();
+            let shown = if start.len() < name.len() { format!("{start}\u{2026}") } else { start };
+            let style = if bold { style.bold() } else { style };
+            r.measure(&shown, &style).ceil() + 2.0 * pad + 2.0 * lean + 2.0
+        });
+        let fit = fit_steps(&widths, min_last, more_w, sep_w, room, EDIT_ROOM - MIN_EDIT_ROOM);
+        let first = fit.first;
+        if let Some(w) = widths.last_mut() {
+            *w = fit.last_w;
         }
 
         let mut x = left;
-        if first > 0 {
+        if fit.more {
             self.hidden.extend(steps[..first].iter().cloned());
             self.crumbs.push(Crumb { path: String::new(), name: "\u{2026}".into(), rect: Rect::new(x, top, more_w, box_h), current: false, more: true });
             x += more_w + sep_w;
@@ -514,4 +564,57 @@ pub fn slanted_contains(rect: Rect, lean: f32, p: Point) -> bool {
 /// A small "›" drawn as two lines, `half` DIPs from its middle to its ends.
 pub fn chevron_right(r: &mut Renderer, c: Point, half: f32, color: Color) {
     r.polyline(&[Point::new(c.x - half * 0.55, c.y - half), Point::new(c.x + half * 0.55, c.y), Point::new(c.x - half * 0.55, c.y + half)], 1.2, color);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// This PC › Local Disk (C:) › glint-qa, as wide as Glint's own steps measure (padding and the
+    /// lean in): the last can be cut to "glint…" at 60.
+    const STEPS: [f32; 3] = [70.0, 110.0, 80.0];
+    const MIN_LAST: f32 = 60.0;
+    const SPARE: f32 = EDIT_ROOM - MIN_EDIT_ROOM;
+
+    fn fit(room: f32) -> Fit {
+        fit_steps(&STEPS, MIN_LAST, MORE_W, SEP_W, room, SPARE)
+    }
+
+    #[test]
+    fn steps_that_fit_are_all_shown() {
+        assert_eq!(fit(400.0), Fit { first: 0, more: false, last_w: 80.0 });
+        // Exactly the room they take.
+        assert_eq!(fit(70.0 + SEP_W + 110.0 + SEP_W + 80.0), Fit { first: 0, more: false, last_w: 80.0 });
+    }
+
+    #[test]
+    fn the_earliest_steps_go_behind_the_dots_first() {
+        // "…" › glint-qa takes 30 + 16 + 80.
+        assert_eq!(fit(150.0), Fit { first: 2, more: true, last_w: 80.0 });
+        assert_eq!(fit(MORE_W + SEP_W + 80.0), Fit { first: 2, more: true, last_w: 80.0 });
+    }
+
+    #[test]
+    fn a_narrow_bar_cuts_the_folder_name_but_keeps_its_start() {
+        // Room for "…" and a cut name: the name takes the rest.
+        assert_eq!(fit(115.0), Fit { first: 2, more: true, last_w: 115.0 - MORE_W - SEP_W });
+        // Less: the name keeps its first letters ("glint…"), taking some of the room to click
+        // to type, rather than being cut to "gl".
+        assert_eq!(fit(100.0), Fit { first: 2, more: true, last_w: MIN_LAST });
+        // Less still: "…" makes way, so the name stays readable.
+        assert_eq!(fit(70.0), Fit { first: 2, more: false, last_w: 70.0 });
+        assert_eq!(fit(50.0), Fit { first: 2, more: false, last_w: MIN_LAST });
+        // No room for even that: cut to the bar (it still ends in "…"), never wider than it.
+        assert_eq!(fit(30.0), Fit { first: 2, more: false, last_w: 30.0 + SPARE });
+    }
+
+    #[test]
+    fn a_short_name_or_a_lone_step_is_never_stretched() {
+        // A name shorter than "glint…" keeps its own width; "…" makes way for it.
+        assert_eq!(fit_steps(&[70.0, 40.0], MIN_LAST, MORE_W, SEP_W, 60.0, SPARE), Fit { first: 1, more: false, last_w: 40.0 });
+        // One step (a drive), too wide: cut to the room.
+        assert_eq!(fit_steps(&[300.0], MIN_LAST, MORE_W, SEP_W, 100.0, SPARE), Fit { first: 0, more: false, last_w: 100.0 });
+        // Nothing at all.
+        assert_eq!(fit_steps(&[], MIN_LAST, MORE_W, SEP_W, 100.0, SPARE), Fit { first: 0, more: false, last_w: 0.0 });
+    }
 }

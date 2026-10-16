@@ -142,6 +142,9 @@ pub struct Toolbar {
     pressed: Option<Part>,
     /// The path step a button went down on; it acts when the button comes up on the same step.
     pressed_step: Option<(usize, MouseButton)>,
+    /// What was typed in the path box when Go went down: Go goes there when it comes up. (Taken at
+    /// once: the click takes the keyboard from the box, which may close before the button is up.)
+    go_text: Option<String>,
     /// Where the mouse is while it is over the path (the step under it is drawn highlighted).
     mouse: Option<Point>,
     path: PathBar,
@@ -179,11 +182,14 @@ impl Toolbar {
         filter_box.pass_shortcuts();
         let path_box = TextBox::new(hwnd, PATH_BOX);
         path_box.pass_shortcuts();
+        // A path pasted with its line break ("X:\glint-qa\r\n") goes there at once, as in Explorer.
+        path_box.go_on_pasted_line();
         Toolbar {
             rect: Rect::default(),
             hover: None,
             pressed: None,
             pressed_step: None,
+            go_text: None,
             mouse: None,
             path: PathBar::default(),
             path_box,
@@ -932,6 +938,7 @@ impl Component for Toolbar {
     fn mouse_down(&mut self, ctx: &Ctx, e: &MouseEvent, app: &mut AppState) -> Effect {
         self.pressed = None;
         self.pressed_step = None;
+        self.go_text = None;
         let part = self.part_at(e.pos, app);
         if e.button == MouseButton::Right {
             // The menu comes on the way up, like everywhere in Windows.
@@ -968,6 +975,14 @@ impl Component for Toolbar {
             Some(Part::Sort) => self.sort_menu(app),
             Some(Part::View) => self.view_menu(app),
             Some(p @ (Part::BackMenu | Part::ForwardMenu)) if self.enabled(p, app) => self.history_menu(p == Part::ForwardMenu, app),
+            Some(Part::Go) if self.path_box.is_visible() => {
+                // Go for what is typed: keep it, and keep the box open (the window took the
+                // keyboard from it for this click) until the button comes up.
+                self.go_text = Some(self.path_box.text());
+                self.path_box.focus();
+                self.pressed = Some(Part::Go);
+                Effect::Redraw
+            }
             Some(p) if self.enabled(p, app) => {
                 self.pressed = Some(p);
                 Effect::Redraw
@@ -986,6 +1001,7 @@ impl Component for Toolbar {
 
     fn mouse_up(&mut self, _ctx: &Ctx, e: &MouseEvent, app: &mut AppState) -> Effect {
         let (pressed, step) = (self.pressed.take(), self.pressed_step.take());
+        let go_text = self.go_text.take();
         if e.button == MouseButton::Right {
             if pressed == Some(Part::Path) && self.part_at(e.pos, app) == Some(Part::Path) {
                 return self.path_menu(e.pos, app);
@@ -1012,13 +1028,14 @@ impl Component for Toolbar {
             return Effect::Redraw;
         }
         match pressed {
-            // Go: to what is typed, or the folder you're in again.
-            Some(Part::Go) if self.path_box.is_visible() => {
-                let text = self.path_box.text();
-                self.hide_path_box(_ctx, true);
-                Effect::Command(Command::Navigate(text))
+            // Go: to what is typed (when it went down), or the folder you're in again.
+            Some(Part::Go) => {
+                let typed = go_text.or_else(|| self.path_box.is_visible().then(|| self.path_box.text()));
+                if typed.is_some() {
+                    self.hide_path_box(_ctx, true);
+                }
+                Effect::Command(go_command(typed))
             }
-            Some(Part::Go) => Effect::Command(Command::Refresh),
             Some(Part::Back) => Effect::Command(Command::Back),
             Some(Part::Forward) => Effect::Command(Command::Forward),
             Some(Part::Up) => Effect::Command(Command::Up),
@@ -1166,5 +1183,27 @@ impl Component for Toolbar {
             self.filter_box.set_hint(if subfolders { "Search subfolders" } else { "Filter" });
         }
         now < self.repaint_until
+    }
+}
+
+/// What Go does: goes to what was typed in the path box, or (nothing typed) loads the folder again.
+fn go_command(typed: Option<String>) -> Command {
+    match typed {
+        Some(text) => Command::Navigate(text),
+        None => Command::Refresh,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn go_goes_to_what_was_typed() {
+        assert!(matches!(go_command(Some("D:\\Work".into())), Command::Navigate(p) if p == "D:\\Work"));
+        assert!(matches!(go_command(Some("C:\\Fotos 📷\\😀".into())), Command::Navigate(p) if p == "C:\\Fotos 📷\\😀"));
+        // An emptied box still goes (the window says what's wrong), never just reloads.
+        assert!(matches!(go_command(Some(String::new())), Command::Navigate(p) if p.is_empty()));
+        assert!(matches!(go_command(None), Command::Refresh));
     }
 }

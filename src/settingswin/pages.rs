@@ -26,7 +26,7 @@ use crate::update;
 use crate::ui::Command;
 
 /// The pages, in the order of the list on the left.
-pub const PAGES: [&str; 5] = ["General", "Appearance", "Files and folders", "Mouse and keyboard", "About"];
+pub const PAGES: [&str; 5] = ["General", "Appearance", "Files", "Mouse & keys", "About"];
 /// The About page (SETTINGS > About Glint opens it).
 pub const ABOUT: usize = 4;
 
@@ -89,6 +89,44 @@ pub const LIVE: &[&str] = &[
     // The shortcuts that work
     "@Keys",
 ];
+
+/// Every setting the command box (Ctrl+U) can find: its title and its page, in the pages' order.
+/// The shortcut list (Mouse & keys' last card) and rows without a title are left out.
+pub fn findable(settings: &Settings) -> Vec<(String, usize)> {
+    let values = match serde_json::to_value(settings) {
+        Ok(Value::Object(m)) => m,
+        _ => Map::new(),
+    };
+    let facts = Facts {
+        values: &values,
+        terminals: None,
+        zip_said: None,
+        config: String::new(),
+        logs: String::new(),
+        cache: String::new(),
+        cache_size: None,
+        cache_said: None,
+        portable_said: None,
+        portable_locked: false,
+        skins: &[],
+        update_said: String::new(),
+        update_busy: false,
+    };
+    let mut out: Vec<(String, usize)> = Vec::new();
+    for i in 0..PAGES.len() {
+        for item in page(i, &facts) {
+            let Item::Card(rows) = item else { continue };
+            for row in rows {
+                let title = row.title.trim();
+                if title.is_empty() || !live(row.key) || matches!(row.ctl, Ctl::Text(_)) || out.iter().any(|(t, _)| t == title) {
+                    continue;
+                }
+                out.push((title.to_string(), i));
+            }
+        }
+    }
+    out
+}
 
 /// Whether the row about `key` works in this version.
 pub fn live(key: &str) -> bool {
@@ -356,6 +394,8 @@ pub struct Facts<'a> {
     pub values: &'a Map<String, Value>,
     /// Which terminals are installed (in `Terminal::ALL`'s order), once looked up.
     pub terminals: Option<[bool; 6]>,
+    /// What the Zip icon row says (whether zip and 7z files open in Glint), once looked up.
+    pub zip_said: Option<&'a str>,
     pub config: String,
     pub logs: String,
     pub cache: String,
@@ -469,7 +509,7 @@ fn appearance(f: &Facts) -> Vec<Item> {
             choice(
                 "ZipIcon",
                 "Zip icon",
-                Some("Shows on zip and 7z files that open in Glint"),
+                Some(f.zip_said.unwrap_or("Shows on zip and 7z files that open in Glint")),
                 &[(S("label"), "Red label"), (S("folder"), "Folder"), (S("page"), "Page"), (S("glint"), "Glint icon")],
             ),
             Row::new("@SkinEditor", "Customise skins", None, Ctl::Button("CUSTOMISE\u{2026}".into(), Act::SkinEditor)),
@@ -589,16 +629,15 @@ fn about(f: &Facts) -> Vec<Item> {
             Row::new("@ReportBug", "Report a bug", None, Ctl::Button("REPORT".into(), Act::ReportBug)),
             Row::new("@Discord", "Discord", None, Ctl::Button("DISCORD".into(), Act::Discord)),
         ]),
-        Item::Heading("Settings and cache"),
+        // The two folders together, then the log switch, the cache, and Portable last (it moves
+        // the files).
+        Item::Heading("Glint's files"),
         Item::Card(vec![
             Row::new("@SettingsFolder", "Settings folder", Some(&f.config), Ctl::Button("OPEN FOLDER".into(), Act::OpenSettingsFolder)),
-            Row::new("@Portable", "Portable", Some(&portable_note), Ctl::Toggle("@Portable")),
-            Row::new("@Cache", "Cache", Some(&cache_note), Ctl::Button(cache_label, Act::ClearCache)),
-        ]),
-        Item::Heading("Error log"),
-        Item::Card(vec![
-            toggle("ErrorLog", "Save errors to a log file", None),
             Row::new("@LogsFolder", "Log folder", Some(&f.logs), Ctl::Button("OPEN FOLDER".into(), Act::OpenLogsFolder)),
+            toggle("ErrorLog", "Save errors to a log file", None),
+            Row::new("@Cache", "Cache", Some(&cache_note), Ctl::Button(cache_label, Act::ClearCache)),
+            Row::new("@Portable", "Portable", Some(&portable_note), Ctl::Toggle("@Portable")),
         ]),
     ]
 }
@@ -612,6 +651,7 @@ mod tests {
         Facts {
             values,
             terminals: Some([true, false, true, true, true, false]),
+            zip_said: None,
             config: "C:\\c".into(),
             logs: "C:\\l".into(),
             cache: "C:\\k".into(),

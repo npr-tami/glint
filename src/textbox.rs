@@ -5,7 +5,11 @@
 //! The box tells its owner what happens through [`TextEvent`]s, which the window hands to every
 //! part's `text_event` (see ui.rs): `Changed` while typing, `Enter`, `Escape`, `LostFocus`.
 //! Colours come from the theme (`input` background, `text` colour); window.rs answers the EDIT's
-//! WM_CTLCOLOREDIT with them.
+//! WM_CTLCOLOREDIT with them. Windows' folder suggestions under the path box (SHAutoComplete's
+//! list) follow dark skins too, and never show as an empty strip (`set_suggestion_colors`).
+//!
+//! A paste is one tidy line: the first line with something on it, without the spaces round it; in
+//! the path box a whole line (copied with its line break) goes there at once, as in Explorer.
 
 use std::cell::{Cell, RefCell};
 
@@ -18,13 +22,13 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{EM_GETSEL, EM_REPLACESEL, EM_SETCUEBANNER, EM_SETMARGINS, EM_SETSEL};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, SetFocus, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F5, VK_MENU, VK_OEM_3, VK_OEM_COMMA, VK_RETURN, VK_TAB,
+    GetFocus, GetKeyState, SetFocus, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F5, VK_INSERT, VK_MENU, VK_OEM_3, VK_OEM_COMMA, VK_RETURN, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, GetParent, GetWindowTextLengthW, GetWindowTextW, PostMessageW, SendMessageW, SetWindowPos,
     SetWindowTextW, ShowWindow, ES_AUTOHSCROLL, ES_LEFT, HMENU, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR, WM_KEYDOWN, WM_KILLFOCUS, WM_SETFONT, WS_CHILD,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR, WM_KEYDOWN, WM_KILLFOCUS, WM_PASTE, WM_SETFONT, WS_CHILD,
 };
 
 use crate::ui::Rect;
@@ -91,6 +95,31 @@ thread_local! {
 
 /// In the subclass data next to the box's id: this box passes window shortcuts on.
 const PASS_SHORTCUTS: usize = 0x1_0000;
+/// ...and: a pasted line that ends in a line break goes at once, as if Enter was pressed (see
+/// `TextBox::go_on_pasted_line`).
+const GO_ON_PASTED_LINE: usize = 0x2_0000;
+
+/// What a paste puts in a box (they're one line): the first line with something on it, without
+/// the spaces and line breaks around it, and whether a line break came after it (the line was
+/// copied whole: "X:\glint-qa\r\n"). None: the text goes in as it is (one line, nothing round it).
+pub fn tidy_paste(text: &str) -> Option<(String, bool)> {
+    let breaks = ['\r', '\n'];
+    if !text.contains(breaks) && text.trim() == text {
+        return None;
+    }
+    let mut rest = text;
+    loop {
+        let (line, after) = match rest.find(breaks) {
+            Some(i) => (&rest[..i], Some(&rest[i..])),
+            None => (rest, None),
+        };
+        let line = line.trim();
+        match after {
+            Some(after) if line.is_empty() => rest = after.trim_start_matches(breaks),
+            _ => return Some((line.to_string(), after.is_some())),
+        }
+    }
+}
 
 /// Whether a change notification right now comes from [`TextBox::set_text`] (window.rs checks this).
 pub fn setting_text() -> bool {
@@ -108,6 +137,174 @@ pub fn set_font_family(name: &str) {
     });
     if changed {
         FAMILY_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
+    }
+}
+
+// ---------------------------------------------------------------- Windows' path suggestions
+
+/// The window class of the list Windows shows under a box with SHAutoComplete (the path box's
+/// folder suggestions, toolbar.rs). It is Windows' own, drawn white whatever the skin.
+const SUGGESTIONS_CLASS: &str = "Auto-Suggest Dropdown";
+
+/// How Windows' suggestion list is dressed: the visual style for its list and scroll bars (None:
+/// Windows' own) and its colours as COLORREFs, background then text (None: Windows' own).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SuggestionLook {
+    pub style: Option<&'static str>,
+    pub colors: Option<(u32, u32)>,
+}
+
+/// The look for a skin: in a dark one, Windows' dark list and scroll bars in the boxes' colours
+/// (`bg`, `fg`, as the path box has them); in a light one, Windows' list just as it comes.
+pub fn suggestion_look(dark: bool, bg: u32, fg: u32) -> SuggestionLook {
+    if dark {
+        SuggestionLook { style: Some("DarkMode_Explorer"), colors: Some((bg, fg)) }
+    } else {
+        SuggestionLook { style: None, colors: None }
+    }
+}
+
+thread_local! {
+    /// The look the suggestion list gets each time it shows (None until a dark skin was used:
+    /// light skins never touch it).
+    static SUGGESTIONS: Cell<Option<SuggestionLook>> = const { Cell::new(None) };
+    /// The hook that sees the list show (`watch_suggestions`).
+    static SUGGESTIONS_HOOK: Cell<isize> = const { Cell::new(0) };
+    /// The suggestion list hidden here for being empty (0: none), shown again once it has rows.
+    static HIDDEN_EMPTY: Cell<isize> = const { Cell::new(0) };
+}
+
+/// Follows the skin with Windows' suggestion list under the path box (window.rs calls this with
+/// the boxes' colours whenever the skin changes). It's dressed each time it shows.
+pub fn set_suggestion_colors(dark: bool, bg: u32, fg: u32) {
+    // (Watched in light skins too: an empty list is hidden in any skin.)
+    watch_suggestions();
+    if !dark && SUGGESTIONS.with(|s| s.get()).is_none() {
+        return; // never dark: Windows' list stays exactly as it looks
+    }
+    SUGGESTIONS.with(|s| s.set(Some(suggestion_look(dark, bg, fg))));
+}
+
+/// Whether the suggestion list should be hidden: it's showing with no suggestion in it (Windows
+/// shows an empty strip when what's typed is exactly a folder's path and there's nothing more).
+pub fn hide_suggestions(visible: bool, rows: usize) -> bool {
+    visible && rows == 0
+}
+
+/// Hides the suggestion list `list` if it shows nothing, or shows it again if it was hidden here
+/// and has suggestions now (Windows still takes it for shown, so it wouldn't show it itself).
+fn hide_if_empty(list: HWND) {
+    use windows::Win32::UI::Controls::LVM_GETITEMCOUNT;
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, IsWindowVisible, SW_SHOWNOACTIVATE};
+    // SAFETY: plain queries and messages to the live list and its own list view, on their thread.
+    unsafe {
+        let Ok(view) = FindWindowExW(Some(list), None, w!("SysListView32"), PCWSTR::null()) else { return };
+        let rows = SendMessageW(view, LVM_GETITEMCOUNT, None, None).0.max(0) as usize;
+        if hide_suggestions(IsWindowVisible(list).as_bool(), rows) {
+            let _ = ShowWindow(list, SW_HIDE);
+            HIDDEN_EMPTY.with(|h| h.set(list.0 as isize));
+        } else if rows > 0 && HIDDEN_EMPTY.with(|h| h.get()) == list.0 as isize {
+            HIDDEN_EMPTY.with(|h| h.set(0));
+            let _ = ShowWindow(list, SW_SHOWNOACTIVATE);
+        }
+    }
+}
+
+/// Starts watching for the suggestion list showing (once; the hook stays for the life of the
+/// thread). The list is made and shown by the box's own thread, this one.
+fn watch_suggestions() {
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowsHookExW, WH_CALLWNDPROCRET};
+    SUGGESTIONS_HOOK.with(|h| {
+        if h.get() != 0 {
+            return;
+        }
+        // SAFETY: a hook on our own thread, with a procedure of the right signature.
+        if let Ok(hook) = unsafe { SetWindowsHookExW(WH_CALLWNDPROCRET, Some(suggestions_hook), None, GetCurrentThreadId()) } {
+            h.set(hook.0 as isize);
+        }
+    });
+}
+
+/// Whether `hwnd`'s window class is `class`.
+fn class_is(hwnd: HWND, class: &str) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+    let mut name = [0u16; 64];
+    // SAFETY: a plain query into our buffer.
+    let n = unsafe { GetClassNameW(hwnd, &mut name) }.max(0) as usize;
+    name[..n].iter().copied().eq(class.encode_utf16())
+}
+
+/// The hook: a window was shown (ShowWindow, or SetWindowPos with SWP_SHOWWINDOW, which Windows'
+/// list uses); if it's the suggestion list, it gets the skin's look. Each time the list is shown,
+/// moved or sized, or its list view told how many suggestions there are, an empty list is hidden.
+unsafe extern "system" fn suggestions_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    use windows::Win32::UI::Controls::LVM_SETITEMCOUNT;
+    use windows::Win32::UI::WindowsAndMessaging::{CallNextHookEx, CWPRETSTRUCT, HHOOK, SWP_SHOWWINDOW, WINDOWPOS, WM_SHOWWINDOW, WM_WINDOWPOSCHANGED};
+    // SAFETY: (the whole body) for a hook code of 0 or more, lparam points to the message's
+    // CWPRETSTRUCT, and a WM_WINDOWPOSCHANGED's own lparam to its WINDOWPOS; the window is one of
+    // this thread's.
+    unsafe {
+        if code >= 0 && lparam.0 != 0 {
+            let m = &*(lparam.0 as *const CWPRETSTRUCT);
+            match m.message {
+                WM_SHOWWINDOW | WM_WINDOWPOSCHANGED if class_is(m.hwnd, SUGGESTIONS_CLASS) => {
+                    let shown = match m.message {
+                        WM_SHOWWINDOW => m.wParam.0 != 0,
+                        _ => m.lParam.0 != 0 && (*(m.lParam.0 as *const WINDOWPOS)).flags.contains(SWP_SHOWWINDOW),
+                    };
+                    if shown {
+                        HIDDEN_EMPTY.with(|h| h.set(0)); // Windows showed it again itself
+                        if let Some(look) = SUGGESTIONS.with(|s| s.get()) {
+                            dress_suggestions(m.hwnd, look);
+                        }
+                    }
+                    hide_if_empty(m.hwnd);
+                }
+                LVM_SETITEMCOUNT => {
+                    if let Some(list) = GetParent(m.hwnd).ok().filter(|p| class_is(*p, SUGGESTIONS_CLASS)) {
+                        hide_if_empty(list);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let hook = SUGGESTIONS_HOOK.with(|h| h.get());
+        CallNextHookEx(Some(HHOOK(hook as *mut _)), code, wparam, lparam)
+    }
+}
+
+/// Gives the suggestion list (its list view and scroll bars) `look`.
+fn dress_suggestions(list: HWND, look: SuggestionLook) {
+    use windows::Win32::Foundation::TRUE;
+    use windows::Win32::UI::WindowsAndMessaging::EnumChildWindows;
+    unsafe extern "system" fn each(child: HWND, lparam: LPARAM) -> windows::core::BOOL {
+        use windows::Win32::Graphics::Gdi::{GetSysColor, InvalidateRect, COLOR_WINDOW, COLOR_WINDOWTEXT};
+        use windows::Win32::UI::Controls::{SetWindowTheme, LVM_SETBKCOLOR, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR};
+        // SAFETY: lparam is the `look` below, alive for the whole walk.
+        let look = unsafe { *(lparam.0 as *const SuggestionLook) };
+        let style: Vec<u16> = look.style.unwrap_or_default().encode_utf16().chain([0]).collect();
+        // SAFETY: plain calls and messages to a live child window of the list, on its own thread;
+        // the style name outlives the call. (Both names null: Windows' own style back.)
+        unsafe {
+            let style = if look.style.is_some() { PCWSTR(style.as_ptr()) } else { PCWSTR::null() };
+            if class_is(child, "SysListView32") {
+                let _ = SetWindowTheme(child, style, PCWSTR::null());
+                let (bg, fg) = look.colors.unwrap_or_else(|| (GetSysColor(COLOR_WINDOW), GetSysColor(COLOR_WINDOWTEXT)));
+                SendMessageW(child, LVM_SETBKCOLOR, Some(WPARAM(0)), Some(LPARAM(bg as isize)));
+                SendMessageW(child, LVM_SETTEXTBKCOLOR, Some(WPARAM(0)), Some(LPARAM(bg as isize)));
+                SendMessageW(child, LVM_SETTEXTCOLOR, Some(WPARAM(0)), Some(LPARAM(fg as isize)));
+                let _ = InvalidateRect(Some(child), None, true);
+            } else if class_is(child, "ScrollBar") {
+                let _ = SetWindowTheme(child, style, PCWSTR::null());
+                let _ = InvalidateRect(Some(child), None, true);
+            }
+        }
+        TRUE
+    }
+    // SAFETY: walks the list's own children with a callback of the right signature.
+    unsafe {
+        let _ = EnumChildWindows(Some(list), Some(each), LPARAM(&look as *const SuggestionLook as isize));
     }
 }
 
@@ -161,9 +358,22 @@ impl TextBox {
     /// Z, the arrows, Delete, Backspace) stay the box's. For the path and filter boxes; not for the
     /// name box, where a tab opening would end the renaming.
     pub fn pass_shortcuts(&self) {
-        // SAFETY: the same subclass as in `new`, with the flag added to its data.
+        self.add_flag(PASS_SHORTCUTS);
+    }
+
+    /// A whole line pasted in (a path copied with its line break, "X:\glint-qa\r\n") is taken at
+    /// once, as Explorer's address bar does: the box tells Enter. For the path box.
+    pub fn go_on_pasted_line(&self) {
+        self.add_flag(GO_ON_PASTED_LINE);
+    }
+
+    fn add_flag(&self, flag: usize) {
+        use windows::Win32::UI::Shell::GetWindowSubclass;
+        // SAFETY: the same subclass as in `new`, its data read back and the flag added to it.
         unsafe {
-            let _ = SetWindowSubclass(self.hwnd, Some(edit_proc), 1, self.id as usize | PASS_SHORTCUTS);
+            let mut data = self.id as usize;
+            let _ = GetWindowSubclass(self.hwnd, Some(edit_proc), 1, Some(&mut data));
+            let _ = SetWindowSubclass(self.hwnd, Some(edit_proc), 1, data | flag);
         }
     }
 
@@ -367,6 +577,38 @@ fn delete_word_before(hwnd: HWND) {
     }
 }
 
+/// Whether a message to a box asks it to paste: WM_PASTE, Ctrl+V's character, Shift+Insert.
+fn is_paste(msg: u32, wparam: WPARAM) -> bool {
+    match msg {
+        WM_PASTE => true,
+        WM_CHAR => wparam.0 == 0x16 && ctrl_only(),
+        // SAFETY: plain key-state queries.
+        WM_KEYDOWN => wparam.0 == VK_INSERT.0 as usize && unsafe { GetKeyState(VK_SHIFT.0 as i32) < 0 && GetKeyState(VK_CONTROL.0 as i32) >= 0 },
+        _ => false,
+    }
+}
+
+/// Pastes the clipboard's text into a box, tidied (`tidy_paste`); a whole line goes at once in a box
+/// that wants it (`post` tells Enter). False for text that needs no tidying, or no text: the box's
+/// own paste does it then.
+fn pasted(hwnd: HWND, data: usize, post: impl Fn(TextEventKind)) -> bool {
+    let tidy = crate::codebox::clipboard_text(hwnd).as_deref().and_then(tidy_paste);
+    let Some((line, whole)) = tidy else { return false };
+    if line.is_empty() {
+        return true; // only spaces and line breaks: nothing to paste
+    }
+    let wide: Vec<u16> = line.encode_utf16().chain([0]).collect();
+    // SAFETY: a plain message to our own EDIT; the text outlives the call. As a normal edit, so the
+    // box reports the change and Ctrl+Z takes it back.
+    unsafe {
+        SendMessageW(hwnd, EM_REPLACESEL, Some(WPARAM(1)), Some(LPARAM(wide.as_ptr() as isize)));
+    }
+    if whole && !line.is_empty() && data & GO_ON_PASTED_LINE != 0 {
+        post(TextEventKind::Enter);
+    }
+    true
+}
+
 /// Whether Ctrl is held without Alt: AltGr, which types letters, holds both.
 fn ctrl_only() -> bool {
     // SAFETY: plain key-state queries.
@@ -452,9 +694,68 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         // Swallow the characters of Enter, Escape, Ctrl+A and Ctrl+Backspace so the EDIT doesn't
         // beep or type them.
         WM_CHAR if matches!(wparam.0, 0x0d | 0x1b | 0x01 | 0x7f) => return LRESULT(0),
-        WM_KILLFOCUS => post(TextEventKind::LostFocus),
+        WM_KILLFOCUS => {
+            // Typing is over: a suggestion list hidden for being empty stays hidden.
+            HIDDEN_EMPTY.with(|h| h.set(0));
+            post(TextEventKind::LostFocus);
+        }
+        // A paste (Ctrl+V, Shift+Insert, the right-click menu's Paste): one tidy line. (Text that
+        // needs no tidying: the box pastes it as usual.)
+        WM_PASTE | WM_CHAR | WM_KEYDOWN if is_paste(msg, wparam) && pasted(hwnd, data, post) => return LRESULT(0),
         _ => {}
     }
     // SAFETY: hands everything else to the EDIT's own handling.
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suggestions_are_dark_only_in_dark_skins() {
+        // A dark skin: Windows' dark list and scroll bars, in the path box's own colours.
+        let dark = suggestion_look(true, 0x0020_2020, 0x00f0_f0f0);
+        assert_eq!(dark, SuggestionLook { style: Some("DarkMode_Explorer"), colors: Some((0x0020_2020, 0x00f0_f0f0)) });
+        // A light one: Windows' own list, untouched.
+        assert_eq!(suggestion_look(false, 0x00ff_ffff, 0), SuggestionLook { style: None, colors: None });
+    }
+
+    #[test]
+    fn light_skins_leave_the_list_alone_until_a_dark_one_was_used() {
+        // (Each test runs on a thread of its own, so this one starts with nothing set.)
+        set_suggestion_colors(false, 0x00ff_ffff, 0);
+        assert_eq!(SUGGESTIONS.with(|s| s.get()), None);
+        set_suggestion_colors(true, 0x0020_2020, 0x00f0_f0f0);
+        assert_eq!(SUGGESTIONS.with(|s| s.get()), Some(suggestion_look(true, 0x0020_2020, 0x00f0_f0f0)));
+        // Back to a light skin: the list gets Windows' own look back the next time it shows.
+        set_suggestion_colors(false, 0x00ff_ffff, 0);
+        assert_eq!(SUGGESTIONS.with(|s| s.get()), Some(SuggestionLook { style: None, colors: None }));
+    }
+
+    #[test]
+    fn an_empty_suggestion_list_is_hidden() {
+        // An exact match with nothing more to suggest: Windows' empty strip goes.
+        assert!(hide_suggestions(true, 0));
+        // Suggestions to show, or nothing showing: left alone.
+        assert!(!hide_suggestions(true, 3));
+        assert!(!hide_suggestions(false, 0));
+    }
+
+    #[test]
+    fn a_pasted_path_is_one_tidy_line() {
+        // One line with nothing round it: pasted as it is.
+        assert_eq!(tidy_paste("X:\\glint-qa"), None);
+        assert_eq!(tidy_paste("my notes"), None);
+        // Copied with its line break: the path, taken at once.
+        assert_eq!(tidy_paste("X:\\glint-qa\r\n"), Some(("X:\\glint-qa".to_string(), true)));
+        assert_eq!(tidy_paste("X:\\glint-qa\n"), Some(("X:\\glint-qa".to_string(), true)));
+        // Spaces round it go, but it isn't a whole line.
+        assert_eq!(tidy_paste("  X:\\glint qa\t"), Some(("X:\\glint qa".to_string(), false)));
+        // Several lines: the first with something on it.
+        assert_eq!(tidy_paste("C:\\one\r\nC:\\two\r\n"), Some(("C:\\one".to_string(), true)));
+        assert_eq!(tidy_paste("\r\n  \r\n C:\\after blank lines \nmore"), Some(("C:\\after blank lines".to_string(), true)));
+        // Nothing but line breaks and spaces: nothing goes in, and nothing happens.
+        assert_eq!(tidy_paste(" \r\n\t\n"), Some((String::new(), false)));
+    }
 }

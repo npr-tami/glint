@@ -16,13 +16,13 @@
 //!   hidden and lets it show itself (WM_APP_PROMPT_SHOW), and closes it with a posted message, so
 //!   the activation moving between the two never arrives while the main window is busy.
 //! - **Closing it** (×, Esc, Alt+F4) is "Remind me again later" - or, with the box ticked, "Don't
-//!   remind me about this update". "Turn off automatic updates" closes it too, and Glint stops
+//!   remind me about this update". "Stop checking for updates" closes it too, and Glint stops
 //!   looking by itself ("CheckForUpdates" off; Settings > About can still look, and turn it on
 //!   again). While installing it stays open, says so, and shows what went wrong if it did (the
 //!   window quits and the new Glint starts when it went well).
 //!
 //! Keyboard: with Glint in front, it pops up without taking the keyboard (the person may be typing
-//! a name there). Tab / Shift+Tab go round the checkbox, "Turn off automatic updates" and the two
+//! a name there). Tab / Shift+Tab go round the checkbox, "Stop checking for updates" and the two
 //! buttons; Enter presses UPDATE (or the button that has the keyboard), Space presses or ticks what
 //! has the keyboard - neither in the first second after it pops up, when the person may still be
 //! typing in another window; the arrows, PgUp / PgDn, Home / End scroll what's new; Esc closes
@@ -76,7 +76,7 @@ const BOX_SCROLLBAR: f32 = 10.0;
 const HEADING_FONT: f32 = 18.0;
 const CHECK_ROW_H: f32 = 24.0;
 const BUTTON_GAP: f32 = 6.0;
-/// "Turn off automatic updates": the room round its words, and the least room between it and the
+/// "Stop checking for updates": the room round its words, and the least room between it and the
 /// buttons when it sits beside them (otherwise it goes on a line of its own above them).
 const QUIET_PAD: f32 = 4.0;
 const QUIET_GAP: f32 = 16.0;
@@ -93,9 +93,11 @@ const WM_APP_PROMPT_QUIT: u32 = WM_APP + 72;
 const RETRY_TIMER: usize = 1;
 /// The words of the choices (buttons in capitals, like every button of Glint's).
 const UPDATE: &str = "UPDATE";
+/// UPDATE on a required fix.
+const UPDATE_NOW: &str = "UPDATE NOW";
 const LATER: &str = "REMIND ME AGAIN LATER";
 const SKIP: &str = "Don't remind me about this update";
-const OFF: &str = "Turn off automatic updates";
+const OFF: &str = "Stop checking for updates";
 
 /// The prompt's controls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,6 +110,13 @@ enum Ctl {
 
 /// Their Tab order: as they read, the checkbox, then the bottom line from the left.
 const TAB_ORDER: [Ctl; 4] = [Ctl::Check, Ctl::Off, Ctl::Update, Ctl::Later];
+
+/// Where a required fix's one button goes: UPDATE NOW at the right edge, where REMIND ME AGAIN
+/// LATER is otherwise (as wide as UPDATE NOW needs, which is narrower).
+fn later_or_update(update: Rect, later: Rect) -> Rect {
+    let w = update.w + 36.0;
+    Rect::new(later.right() - w, later.y, w, later.h)
+}
 
 /// What is under the mouse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -269,6 +278,9 @@ struct Prompt {
     /// An older Windows' scroll bar arrow or track held down, repeating.
     holding: kit::Holding,
     skip: bool,
+    /// A hotfix of the version Glint has: UPDATE is the only choice (closing just puts it away
+    /// until the next check).
+    required: bool,
     focus: Ctl,
     /// Show the keyboard's outline (after a key was used, as in Windows).
     cues: bool,
@@ -348,6 +360,7 @@ pub fn open(owner: HWND, theme: &Theme, release: &Release, ours: &str) -> bool {
         scroller: Scroller::default(),
         holding: kit::Holding::default(),
         skip: false,
+        required: false,
         focus: Ctl::Update,
         cues: false,
         hover: None,
@@ -613,6 +626,10 @@ impl Prompt {
         }
         self.version = release.version.clone();
         self.ours = ours.to_string();
+        self.required = release.required;
+        if self.required && self.focus != Ctl::Update {
+            self.focus = Ctl::Update;
+        }
         let mut b = blocks(&release.changelog);
         if b.is_empty() {
             b.push(Block { kind: Kind::Text, depth: 0, text: "This version came without a list of what's new.".into(), aside: String::new() });
@@ -644,7 +661,7 @@ impl Prompt {
         (update, later)
     }
 
-    /// "Turn off automatic updates": at the bottom left, beside the buttons - or, in a window too
+    /// "Stop checking for updates": at the bottom left, beside the buttons - or, in a window too
     /// narrow for that, on a line of its own just above them.
     fn off_rect(&mut self) -> Rect {
         let (update, _) = self.buttons();
@@ -680,7 +697,9 @@ impl Prompt {
     fn changelog_rect(&mut self) -> Rect {
         let top = size::TITLE_H + 18.0 + 28.0 + 22.0;
         let status = self.status_lines().len() as f32 * STATUS_LINE;
-        let bottom = self.check_row().y - 12.0 - if status > 0.0 { status + 8.0 } else { 0.0 };
+        // (A required fix has no checkbox: the box reaches down to the button.)
+        let above = if self.required { self.buttons().1.y - 6.0 } else { self.check_row().y };
+        let bottom = above - 12.0 - if status > 0.0 { status + 8.0 } else { 0.0 };
         Rect::new(PAD, top, self.inner_w(), (bottom - top).max(40.0))
     }
 
@@ -796,8 +815,17 @@ impl Prompt {
     fn paint_body(&mut self, theme: &Theme) {
         let w = self.inner_w();
         let top = size::TITLE_H + 18.0;
-        let heading = if self.installing { format!("Installing Glint {}…", self.version) } else { format!("Glint {} is ready", self.version) };
-        let sub = format!("You have Glint {}. What's new:", self.ours);
+        let heading = match (self.installing, self.required) {
+            (true, _) => format!("Installing Glint {}…", self.version),
+            (false, true) => format!("Glint {} is a required fix", self.version),
+            (false, false) => format!("Glint {} is ready", self.version),
+        };
+        let sub = if self.required {
+            format!("It fixes a problem in your Glint {}. What's new:", self.ours)
+        } else {
+            format!("You have Glint {}. What's new:", self.ours)
+        };
+        let required = self.required;
         let b = self.changelog_rect();
         let status = self.status_lines();
         let (update, later) = self.buttons();
@@ -846,6 +874,12 @@ impl Prompt {
             y += STATUS_LINE;
         }
 
+        // A required fix has only UPDATE (where REMIND ME AGAIN LATER would be).
+        if required {
+            kit::primary_button(r, theme, later_or_update(update, later), UPDATE_NOW, update_look);
+            return;
+        }
+
         // The checkbox and its words.
         let boxr = Rect::new(check.x + 1.0, check.y + (check.h - ksize::CHECK) / 2.0, ksize::CHECK, ksize::CHECK);
         kit::checkbox(r, theme, boxr, ticked, check_look);
@@ -870,6 +904,9 @@ impl Prompt {
             }
         }
         let (update, later) = self.buttons();
+        if self.required {
+            return kit::button_contains(later_or_update(update, later), p).then_some(Hot::Ctl(Ctl::Update));
+        }
         if kit::button_contains(update, p) {
             return Some(Hot::Ctl(Ctl::Update));
         }
@@ -989,7 +1026,7 @@ impl Prompt {
 
     /// A control was clicked, or Space / Enter was pressed on it.
     fn press(&mut self, c: Ctl, acts: &mut Vec<Act>) {
-        if self.installing {
+        if self.installing || (self.required && c != Ctl::Update) {
             return;
         }
         match c {
@@ -1017,7 +1054,8 @@ impl Prompt {
 
     /// Closed without updating: remind later - or never about this version, with the box ticked.
     fn dismiss(&mut self, acts: &mut Vec<Act>) {
-        if !self.installing {
+        // (A required fix remembers nothing: it asks again at the next check.)
+        if !self.installing && !self.required {
             acts.push(Act::Answer(if self.skip { ANSWER_SKIP } else { ANSWER_LATER }));
         }
         acts.push(Act::Destroy);
@@ -1034,6 +1072,10 @@ impl Prompt {
         let view = (self.changelog_rect().h - 2.0 * BOX_PAD).max(40.0);
         match () {
             _ if is(VK_ESCAPE) => self.dismiss(acts),
+            _ if is(VK_TAB) && self.required => {
+                self.cues = true;
+                self.invalidate();
+            }
             _ if is(VK_TAB) => {
                 let n = TAB_ORDER.len() as i32;
                 let at = TAB_ORDER.iter().position(|c| *c == self.focus).unwrap_or(2) as i32;
@@ -1202,7 +1244,7 @@ impl Prompt {
     }
 }
 
-/// A quiet button ("Turn off automatic updates"): only its words, muted, lit and underlined under
+/// A quiet button ("Stop checking for updates"): only its words, muted, lit and underlined under
 /// the mouse - clearly there, but not competing with UPDATE.
 fn quiet_button(r: &mut Renderer, theme: &Theme, rect: Rect, label: &str, look: Look) {
     let lit = look.enabled && (look.hover || look.pressed);

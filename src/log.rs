@@ -81,6 +81,33 @@ pub fn line(text: &str) {
     }
 }
 
+/// Where the time of one piece of work went, for the timing log: `mark` after each step, then
+/// `summary` ("begin 41.2, titlebar 3.1, ..."). Does nothing (and costs nothing) when `on` is false.
+pub struct Marks {
+    last: Option<std::time::Instant>,
+    steps: Vec<(&'static str, f64)>,
+}
+
+impl Marks {
+    pub fn new(on: bool) -> Marks {
+        Marks { last: on.then(std::time::Instant::now), steps: Vec::new() }
+    }
+
+    /// The step `name` just ended.
+    pub fn mark(&mut self, name: &'static str) {
+        if let Some(last) = self.last {
+            let now = std::time::Instant::now();
+            self.steps.push((name, (now - last).as_secs_f64() * 1000.0));
+            self.last = Some(now);
+        }
+    }
+
+    /// The steps and their milliseconds, in order (empty when off).
+    pub fn summary(&self) -> String {
+        self.steps.iter().map(|(n, ms)| format!("{n} {ms:.1}")).collect::<Vec<_>>().join(", ")
+    }
+}
+
 // ---------------------------------------------------------------- the error log
 
 /// Whether the error log is on (SETTINGS > Error log). On until the settings say otherwise.
@@ -198,6 +225,18 @@ fn tell_about_crash(message: &str, saved: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marks_say_where_the_time_went_only_when_on() {
+        let mut off = Marks::new(false);
+        off.mark("begin");
+        assert_eq!(off.summary(), "");
+        let mut on = Marks::new(true);
+        on.mark("begin");
+        on.mark("end");
+        let s = on.summary();
+        assert!(s.starts_with("begin ") && s.contains(", end "), "{s}");
+    }
 
     #[test]
     fn entries_have_time_version_text_and_place() {

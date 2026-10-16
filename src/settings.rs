@@ -93,6 +93,37 @@ fn find_folders() -> Folders {
     find_in(exe_dir().as_deref(), &installed_dirs().0)
 }
 
+/// Whose files this glint.exe uses, to tell Glints with different files apart (life.rs: a glint.exe
+/// hands its folder only to a running Glint with the same files). None for the installed Glint's
+/// (%APPDATA%\Glint); else GLINT_SETTINGS_DIR, or glint.exe's folder when it's portable (also
+/// before `settle` has moved an older Glint's files into `Glint data`). Worked out afresh, so it
+/// doesn't fix the folders before `settle`.
+///
+/// Two answers: whose the files are now, and whose they will be once `settle` has made a move
+/// asked for in Settings (Portable, MOVE_NOTE). They differ only while such a move waits: the
+/// Glint that asked for it still runs under the first, and the next main Glint moves them and so
+/// runs under the second (life.rs picks).
+pub fn whose_files() -> (Option<PathBuf>, Option<PathBuf>) {
+    if let Some(dir) = std::env::var_os("GLINT_SETTINGS_DIR").filter(|d| !d.is_empty()) {
+        return (Some(PathBuf::from(dir.clone())), Some(PathBuf::from(dir)));
+    }
+    let Some(exe_dir) = exe_dir() else { return (None, None) };
+    let (now, after) = portable_now_and_after(&exe_dir, &installed_dirs().0);
+    (now.then(|| exe_dir.clone()), after.then_some(exe_dir))
+}
+
+/// Whether Glint's files are portable now, and once `settle` has made a move asked for in Settings
+/// (the same test `settle_in` makes before it moves them).
+fn portable_now_and_after(exe_dir: &Path, home: &Path) -> (bool, bool) {
+    let found = find_in(Some(exe_dir), home);
+    let mine = if found.portable { exe_dir.join(PORTABLE_FOLDER) } else { home.to_path_buf() };
+    let after = match move_wanted(&found.config) {
+        Some(to_portable) if found.config == mine.join("config") => to_portable,
+        _ => found.portable,
+    };
+    (found.portable, after)
+}
+
 fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf))
 }
@@ -1608,6 +1639,29 @@ fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
     }
 }
 
+/// settings.json as it is on disk now, to merge a save with (None: there is no file yet, or it
+/// can't be made sense of, and is written afresh). A file that is there but can't be read (another
+/// program has it open for a moment: a virus scanner, a sync tool) is tried a few times, as `load`
+/// does; if it still can't be read, that's an error.
+fn read_disk(path: &Path) -> std::io::Result<Option<Map<String, Value>>> {
+    let mut tries = 0;
+    let bytes = loop {
+        match std::fs::read(path) {
+            Ok(b) => break b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) if tries < 3 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(60));
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    Ok(match serde_json::from_str::<Value>(decode(&bytes).trim_start_matches('\u{feff}')) {
+        Ok(Value::Object(m)) => Some(m),
+        _ => None,
+    })
+}
+
 /// One save, in order: skipped when a newer one already reached the disk. Returns false if the
 /// file couldn't be written.
 fn write_in_order(s: &Settings, number: u64) -> bool {
@@ -1616,10 +1670,19 @@ fn write_in_order(s: &Settings, number: u64) -> bool {
         return true;
     }
     let path = file_path();
-    let disk = std::fs::read(&path).ok().and_then(|b| match serde_json::from_str::<Value>(decode(&b).trim_start_matches('\u{feff}')) {
-        Ok(Value::Object(m)) => Some(m),
-        _ => None,
-    });
+    let disk = match read_disk(&path) {
+        Ok(disk) => disk,
+        Err(e) => {
+            // Written without what's in the file, the other windows' choices would be lost - and an
+            // extra window would wipe the main window's tabs. Tried again a little later.
+            let problem = format!("Couldn't read the settings in {} to save them ({e}). Glint tries again shortly.", path.display());
+            if w.last_problem.as_deref() != Some(problem.as_str()) {
+                log::error(&problem);
+                w.last_problem = Some(problem);
+            }
+            return false;
+        }
+    };
     let (merged, extra) = merge(s, w.synced.as_ref(), disk, is_extra_window());
     let text = serde_json::to_string_pretty(&WithExtras { settings: &merged, extra: &extra }).unwrap_or_else(|_| s.to_json());
     match write_atomically(&path, &text) {
@@ -2014,6 +2077,37 @@ mod tests {
     }
 
     #[test]
+    fn whose_files_tells_where_a_waiting_move_goes() {
+        let base = std::env::temp_dir().join(format!("glint-whose-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (exe, home, local) = (base.join("Glint tools (x86)"), base.join("Roaming").join("Glint"), base.join("Local").join("Glint"));
+        let glint_settings = serde_json::to_string_pretty(&Settings::default()).unwrap();
+        std::fs::create_dir_all(&exe).unwrap();
+        std::fs::create_dir_all(home.join("config")).unwrap();
+        std::fs::write(home.join("config").join(FILE_NAME), &glint_settings).unwrap();
+        assert_eq!(portable_now_and_after(&exe, &home), (false, false));
+        // Portable on, asked for: still installed now, portable once the next start has settled.
+        std::fs::write(home.join("config").join(MOVE_NOTE), "portable\r\n").unwrap();
+        assert_eq!(portable_now_and_after(&exe, &home), (false, true));
+        assert!(settle_in(&exe, &home, &local).is_empty());
+        // What every later glint.exe works out is what the settled Glint worked out before it moved.
+        assert_eq!(portable_now_and_after(&exe, &home), (true, true));
+        // Switched on and straight back off (the note says where they are): nothing changes.
+        let config = exe.join(PORTABLE_FOLDER).join("config");
+        std::fs::write(config.join(MOVE_NOTE), "portable\r\n").unwrap();
+        assert_eq!(portable_now_and_after(&exe, &home), (true, true));
+        // Off again.
+        std::fs::write(config.join(MOVE_NOTE), "installed\r\n").unwrap();
+        assert_eq!(portable_now_and_after(&exe, &home), (true, false));
+        assert!(settle_in(&exe, &home, &local).is_empty());
+        assert_eq!(portable_now_and_after(&exe, &home), (false, false));
+        // A note with nonsense in it is no move.
+        std::fs::write(home.join("config").join(MOVE_NOTE), "sideways\r\n").unwrap();
+        assert_eq!(portable_now_and_after(&exe, &home), (false, false));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn portable_moves_the_files_at_the_next_start() {
         let base = std::env::temp_dir().join(format!("glint-portable-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -2299,5 +2393,40 @@ mod tests {
         many.tidy();
         assert_eq!(many.tab_sets.len(), MAX_TAB_SETS);
         assert_eq!(many.tab_sets.last().map(|t| t.name.as_str()), Some("s39"));
+    }
+
+    #[test]
+    fn a_settings_file_that_cant_be_read_is_not_written_over() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("glint-read-disk-test-{} x y", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE_NAME);
+        // No file yet: nothing to merge with.
+        assert!(read_disk(&path).unwrap().is_none());
+        // A file: what's in it.
+        std::fs::write(&path, "\u{feff}{\"Tabs\": [\"C:\\\\Work\"], \"ShowHidden\": true}").unwrap();
+        let disk = read_disk(&path).unwrap().unwrap();
+        assert_eq!(disk.get("ShowHidden"), Some(&Value::Bool(true)));
+        // Held by another program with no sharing: an error, never "no file" (which would let a
+        // save write over it without the other window's tabs).
+        {
+            let _held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+            assert!(read_disk(&path).is_err());
+        }
+        // Let go of within the tries: read.
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+        let let_go = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(70));
+            drop(held);
+        });
+        assert!(read_disk(&path).unwrap().is_some());
+        let_go.join().unwrap();
+        // Broken: written afresh (as before), so a broken file gets mended.
+        std::fs::write(&path, "{ not json").unwrap();
+        assert!(read_disk(&path).unwrap().is_none());
+        std::fs::write(&path, "").unwrap();
+        assert!(read_disk(&path).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

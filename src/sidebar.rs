@@ -932,7 +932,10 @@ impl Component for Sidebar {
         // Bin's is looked up again when it turns full or empty.
         self.icons.set_window(ctx.hwnd);
         self.icons.receive(&app.icons);
-        self.icons.ask(app.drives.iter().map(|d: &Drive| (d.root.as_str(), d.name.as_str())));
+        // (Not a network drive's own icon: asking Windows for it waits on the server, up to 10 s
+        // when it's switched off, and holds up Windows' other icon lookups meanwhile. Windows'
+        // standard network drive icon shows instead.)
+        self.icons.ask(app.drives.iter().filter(|d| d.kind_name != "Network Drive").map(|d: &Drive| (d.root.as_str(), d.name.as_str())));
         let bin_state = match recycle::seen_full() {
             Some(true) => "full",
             Some(false) => "empty",

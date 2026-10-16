@@ -2,15 +2,25 @@
 
 The newest version is at the top.
 
-**Version numbers** look like **1.0.12-beta.2** while Glint is in beta:
-- **1.0** stays the same through the betas.
-- **12** is the release: it goes up by one with every new release, features and fixes alike.
-- **-beta.2** is the build of that release: a rebuild of the same release (a quick fix to it)
-  only bumps this number.
+## 1.0.20-beta.1 · 16/10/2026 21:25
 
-Each new number counts as newer than the one before it (1.0.12-beta.1, 1.0.12-beta.2,
-1.0.13-beta.1, ...), so the updater offers them in that order. Versions up to 0.11.0 used
-MAJOR.MINOR.PATCH, where a new feature bumped the middle number.
+- Added a settings search to the command box (Ctrl+U)
+- Added more wallpaper options for skins: blur, fade, zoom and size
+
+- Changed the skin list to show Glint's skins and yours in two groups
+- Changed hotfixes to be required updates
+
+- Fixed pictures flickering in the big preview
+- Fixed phone photos showing sideways as a wallpaper
+- Fixed slow start-up when a network drive is switched off
+- Fixed USB sticks showing as hard disks with older icons
+- Fixed videos playing twice in the preview
+- Fixed Rename many mixing up names
+- Fixed imported skins missing their pictures
+
+- Improved 7z packing: about 7 times faster
+- Improved zip speed, start-up and scrolling
+- Some other improvements and bugfixes
 
 ## 1.0.19-beta.2 · 15/10/2026 18:19
 

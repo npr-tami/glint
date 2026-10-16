@@ -1423,7 +1423,7 @@ mod tests {
     #[test]
     fn paths_are_cut_in_the_middle() {
         assert_eq!(fit_path("C:\\a\\b", 50.0, &mut chars), "C:\\a\\b");
-        let fitted = fit_path("C:\\Users\\pandora\\Pictures\\2026\\Holiday", 20.0, &mut chars);
+        let fitted = fit_path("C:\\Users\\YourName\\Pictures\\2026\\Holiday", 20.0, &mut chars);
         assert!(fitted.starts_with("C:\\\u{2026}"), "{fitted}");
         assert!(fitted.ends_with("Holiday"));
         assert!(chars(&fitted) <= 20.0);

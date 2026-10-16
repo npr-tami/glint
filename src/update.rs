@@ -46,9 +46,10 @@
 //!
 //! The download is deleted once the new Glint is in place; one left by an install that didn't work
 //! goes with the next download (or Settings > About > Cache). The Glint from before stays as
-//! `Glint.old.exe` while the new one runs for the first time; a crash message then says it's there.
-//! A later start of the main Glint deletes it (`remove_old_exes`, on a thread, trying again for a
-//! minute while the old process may still be finishing).
+//! `Glint.old.exe` until the new one has been closed normally once (`Glint.old.keep` says it waits);
+//! a crash message says it's there meanwhile. The next start of the main Glint after that deletes it
+//! (`remove_old_exes`, on a thread, trying again for a minute while the old process may still be
+//! finishing).
 //!
 //! `glint.exe --version` prints the version and ends (no window). `GLINT_TEST_VERSION=0.2.9` makes Glint
 //! take itself for that version (for testing; never passed on to the exe it starts).
@@ -174,6 +175,13 @@ impl Version {
     pub fn is_beta(&self) -> bool {
         !self.pre.is_empty()
     }
+
+    /// Whether `theirs` is a hotfix of this version: the same release number, a later beta
+    /// (1.0.19-beta.2 for 1.0.19-beta.1). Those fix something the release broke, so the update is
+    /// required; a newer release number (1.0.20 for 1.0.19) stays a choice.
+    pub fn hotfixed_by(&self, theirs: &Version) -> bool {
+        self.is_beta() && theirs.numbers == self.numbers && theirs > self
+    }
 }
 
 impl Ord for Version {
@@ -283,6 +291,8 @@ pub struct Release {
     pub url: String,
     /// How big that Glint.exe is, in bytes: the download must be exactly this.
     pub size: u64,
+    /// A hotfix of the version Glint has (Version::hotfixed_by): the prompt can't be put off.
+    pub required: bool,
 }
 
 /// Everything the windows show about updates.
@@ -348,6 +358,7 @@ pub fn about(main: bool, auto: bool) -> (String, bool) {
                 Some(v) if v < ours => format!("You have Glint {ours}, newer than the newest release ({theirs}). Checked at {at}."),
                 _ => format!("You have the newest Glint ({ours}). Checked at {at}."),
             },
+            Some((Found::Newer(r), at)) if r.required => format!("Glint {} is a required fix for your version ({ours}). Found at {at}.", r.version),
             Some((Found::Newer(r), at)) => format!("Glint {} is ready (you have {ours}). Found at {at}.", r.version),
             Some((Found::NotReady(v), at)) => format!("Glint {v} is coming but isn't ready yet. Checked at {at}."),
         }
@@ -444,7 +455,8 @@ impl Schedule {
 /// said not to be reminded about it, or to be reminded later (automatic checks only).
 pub fn should_prompt(found: &Found, s: &Settings, asked: bool, now: u64) -> bool {
     let Found::Newer(r) = found else { return false };
-    if asked {
+    // (A required hotfix asks every time: "later" and "don't remind me" don't apply to it.)
+    if asked || r.required {
         return true;
     }
     let skipped = s.skipped_update.as_deref().and_then(Version::parse);
@@ -703,7 +715,8 @@ fn read_release(release: ReleaseJson, ours: &Version) -> Found {
         return Found::Failed(format!("the new Glint.exe is far too big ({} MB)", exe.size / (1024 * 1024)));
     }
     let text = release.body.as_deref().unwrap_or("").trim();
-    Found::Newer(Release { version: theirs.to_string(), changelog: shorten(text, MAX_CHANGELOG), tag: tag.to_string(), url: exe.browser_download_url.clone(), size: exe.size })
+    let required = ours.hotfixed_by(&theirs);
+    Found::Newer(Release { version: theirs.to_string(), changelog: shorten(text, MAX_CHANGELOG), tag: tag.to_string(), url: exe.browser_download_url.clone(), size: exe.size, required })
 }
 
 /// What's new in a release (version `theirs`) for Glint at `ours`: the sections of `changelog`
@@ -1154,23 +1167,76 @@ pub const AFTER_UPDATE: &str = "--after-update";
 /// At the main Glint's start: deletes what an update left next to glint.exe (`Glint.old.exe`, and a
 /// copy that never got put in place), on a thread of its own. The old process may still be ending
 /// (waiting for a copy to finish), so a file still in use is tried again for a minute.
-/// `just_updated` (started with --after-update): the Glint from before the update stays as
-/// Glint.old.exe until a later start, so it's still there if the new one turns out not to work.
+/// The Glint from before the update stays as Glint.old.exe until the new one has proven itself: a
+/// session that ended in a normal quit (`session_ended_cleanly`). Until then a crash message says
+/// it's there, and starting Glint again to see whether the crash comes back mustn't take it away.
+/// `just_updated` (started with --after-update) starts that wait (KEEP_NOTE).
 pub fn remove_old_exes(just_updated: bool) {
     let Ok(ours) = std::env::current_exe() else { return };
-    shell::background("update: remove old exe", move || {
-        for attempt in 0..12 {
-            let left = old_exes(&ours, just_updated).into_iter().filter(|p| std::fs::remove_file(p).is_err() && p.exists()).count();
-            if left == 0 {
-                return;
-            }
-            if attempt == 11 {
-                log::line(&format!("update: {left} old exe(s) next to glint.exe are still in use; deleted at a later start"));
-                return;
-            }
-            std::thread::sleep(Duration::from_secs(5));
+    shell::background("update: remove old exe", move || remove_old_exes_of(&ours, just_updated, Duration::from_secs(5)));
+}
+
+/// `remove_old_exes` for the Glint at `ours`, waiting `pause` between tries.
+fn remove_old_exes_of(ours: &Path, just_updated: bool, pause: Duration) {
+    let note = keep_note(ours);
+    if just_updated {
+        let text = format!("{}\r\nThe Glint from before the update ({}) is kept until Glint {} has been closed normally once.\r\n", ours_version(), format!("{}.old.exe", plain_stem(ours)), ours_version());
+        if let Err(e) = std::fs::write(&note, text) {
+            log::line(&format!("update: couldn't write {} ({e})", note.display()));
         }
-    });
+    }
+    let keep_old = just_updated || note.exists();
+    for attempt in 0..12 {
+        let left = old_exes(ours, keep_old).into_iter().filter(|p| std::fs::remove_file(p).is_err() && p.exists()).count();
+        if left == 0 {
+            return;
+        }
+        if attempt == 11 {
+            log::line(&format!("update: {left} old exe(s) next to glint.exe are still in use; deleted at a later start"));
+            return;
+        }
+        std::thread::sleep(pause);
+    }
+}
+
+/// The main Glint quit normally (no crash ended it): if it is the version an update just put in
+/// place, it has proven itself, and the next start may delete the Glint from before.
+pub fn session_ended_cleanly() {
+    if let Ok(ours) = std::env::current_exe() {
+        proven(&ours);
+    }
+}
+
+fn proven(ours: &Path) {
+    let note = keep_note(ours);
+    // Only the new version proves itself: Glint.old.exe started to get round a crash doesn't.
+    let waits_for_us = std::fs::read_to_string(&note).is_ok_and(|t| t.lines().next().map(str::trim) == Some(ours_version().as_str()));
+    if waits_for_us && !is_old_exe(ours) {
+        let _ = std::fs::remove_file(&note);
+    }
+}
+
+/// The version this Glint is, as the keep note has it.
+fn ours_version() -> String {
+    log::VERSION.to_string()
+}
+
+/// "<name>.old.keep" next to `ours`: while it is there, the Glint from before the update stays.
+/// The plain name ("Glint"), also when `ours` is "Glint.old.exe" itself.
+fn keep_note(ours: &Path) -> PathBuf {
+    ours.with_file_name(format!("{}.old.keep", plain_stem(ours)))
+}
+
+fn plain_stem(ours: &Path) -> String {
+    let stem = ours.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    match stem.len().checked_sub(4) {
+        Some(n) if stem.is_char_boundary(n) && stem[n..].eq_ignore_ascii_case(".old") => stem[..n].to_string(),
+        _ => stem,
+    }
+}
+
+fn is_old_exe(ours: &Path) -> bool {
+    ours.file_stem().is_some_and(|s| s.to_string_lossy().to_lowercase().ends_with(".old"))
 }
 
 /// The Glint from before the last update, when it's still next to `ours` (for the crash message).
@@ -1327,8 +1393,10 @@ mod tests {
         let b2 = latest_json("v1.0.12-beta.2", &exe("v1.0.12-beta.2"));
         let b10 = latest_json("v1.0.12-beta.10", &exe("v1.0.12-beta.10")).replace("\"prerelease\": false", "\"prerelease\": true");
         let list = format!("[{b2},{b10},{draft}]");
-        assert!(matches!(read_releases(list.as_bytes(), &beta), Found::Newer(r) if r.version == "1.0.12-beta.10"));
-        assert!(matches!(read_releases(list.as_bytes(), &ours), Found::Newer(r) if r.version == "1.0.12-beta.2"));
+        assert!(matches!(read_releases(list.as_bytes(), &beta), Found::Newer(r) if r.version == "1.0.12-beta.10" && r.required));
+        assert!(matches!(read_releases(list.as_bytes(), &ours), Found::Newer(r) if r.version == "1.0.12-beta.2" && !r.required));
+        // A release behind: the newer release is a choice, not required.
+        assert!(matches!(read_releases(list.as_bytes(), &v("1.0.11-beta.1")), Found::Newer(r) if !r.required));
         assert_eq!(read_releases(format!("[{b2}]").as_bytes(), &v("1.0.12-beta.2")), Found::UpToDate("1.0.12-beta.2".into()));
         // 0.11.0 is older than any 1.0.x beta.
         assert!(matches!(read_releases(format!("[{b2}]").as_bytes(), &v("0.11.0")), Found::Newer(_)));
@@ -1434,6 +1502,32 @@ mod tests {
         assert!(!should_prompt(&release("9.0.1"), &s, false, 999));
         assert!(should_prompt(&release("9.0.1"), &s, false, 1000));
         assert!(should_prompt(&release("9.0.1"), &s, true, 999));
+        // A required hotfix asks even when skipped or put off.
+        s.skipped_update = Some("9.0.1".into());
+        let hotfix = Found::Newer(Release { version: "9.0.1".into(), required: true, ..Default::default() });
+        assert!(should_prompt(&hotfix, &s, false, 0));
+    }
+
+    #[test]
+    fn only_a_later_beta_of_the_same_release_is_a_required_hotfix() {
+        let v = |t: &str| Version::parse(t).unwrap();
+        let cases = [
+            ("1.0.19-beta.1", "1.0.19-beta.2", true),
+            ("1.0.19-beta.1", "1.0.19-beta.3", true),
+            ("1.0.19-beta.2", "1.0.19-beta.10", true),
+            ("1.0.19-beta.2", "1.0.19-beta.2", false), // the same
+            ("1.0.19-beta.2", "1.0.19-beta.1", false), // older
+            ("1.0.18-beta.2", "1.0.19-beta.2", false), // a release behind: a choice
+            ("1.0.18-beta.1", "1.0.19-beta.1", false),
+            ("1.0.19-beta.2", "1.0.20-beta.1", false),
+            ("1.0.19-beta.2", "1.1.0", false),
+            ("1.0.19", "1.0.19", false),
+            ("1.1.0", "1.1.1", false), // past the betas: no hotfix numbers
+            ("v1.0.19-beta.1", "1.0.19-beta.2+build", true),
+        ];
+        for (ours, theirs, want) in cases {
+            assert_eq!(v(ours).hotfixed_by(&v(theirs)), want, "{ours} -> {theirs}");
+        }
     }
 
     #[test]
@@ -1494,6 +1588,55 @@ mod tests {
         let gone = install_into(&d.join("missing.exe"), &ours, |_| Ok(()));
         assert!(gone.is_err());
         assert_eq!(std::fs::read(&ours).unwrap(), b"working glint");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_glint_from_before_stays_until_the_new_one_quits_cleanly() {
+        let d = test_dir("keep old");
+        let ours = d.join("Glint.exe");
+        let old = d.join("Glint.old.exe");
+        let fill = || {
+            std::fs::write(&ours, b"new").unwrap();
+            std::fs::write(&old, b"old").unwrap();
+            std::fs::write(d.join("Glint.update-77.exe"), b"copy").unwrap();
+        };
+        fill();
+        let quick = Duration::from_millis(1);
+        // Started after the update: the old one stays, the copy goes.
+        remove_old_exes_of(&ours, true, quick);
+        assert!(old.exists() && !d.join("Glint.update-77.exe").exists());
+        assert!(keep_note(&ours).exists());
+        // It crashed (no clean quit), and is started again the normal way, more than once: still there.
+        for _ in 0..3 {
+            remove_old_exes_of(&ours, false, quick);
+            assert!(old.exists(), "a start after a crash keeps the Glint from before");
+        }
+        // The old one, started to get round the crash and closed normally, proves nothing.
+        proven(&old);
+        remove_old_exes_of(&ours, false, quick);
+        assert!(old.exists());
+        // Glint.old.exe running finds the same note.
+        assert_eq!(keep_note(&old), keep_note(&ours));
+        // The new one quits normally: the next start deletes it, and the note.
+        proven(&ours);
+        assert!(!keep_note(&ours).exists());
+        remove_old_exes_of(&ours, false, quick);
+        assert!(!old.exists() && ours.exists());
+        // A note left by another version doesn't count as this one's clean quit.
+        fill();
+        std::fs::write(keep_note(&ours), "0.0.1\r\n").unwrap();
+        proven(&ours);
+        remove_old_exes_of(&ours, false, quick);
+        assert!(old.exists());
+        // Quitting twice, or with no note at all, is fine.
+        let _ = std::fs::remove_file(keep_note(&ours));
+        proven(&ours);
+        proven(&ours);
+        remove_old_exes_of(&ours, false, quick);
+        assert!(!old.exists());
+        assert_eq!(plain_stem(Path::new("C:\\x\\GLINT.OLD.exe")), "GLINT");
+        assert_eq!(plain_stem(Path::new("C:\\x\\Glänt.exe")), "Glänt");
         let _ = std::fs::remove_dir_all(&d);
     }
 

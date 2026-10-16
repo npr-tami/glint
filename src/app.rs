@@ -128,6 +128,9 @@ pub struct Tab {
     /// Which of the Picture size and Length columns something in the view can fill (media::here):
     /// they only show then.
     pub media_here: crate::media::Columns,
+    /// Duplicates shown: how many sets and the bytes their extra copies take (status.rs), worked
+    /// out with the view instead of on every frame.
+    pub dupes_summary: Option<(usize, u64)>,
     /// The list's scroll offset in DIPs. The list view owns the animation; it lives here so each
     /// tab keeps its place.
     pub scroll: f32,
@@ -211,6 +214,7 @@ impl Tab {
             opens_file: None,
             visible_total: 0,
             media_here: Default::default(),
+            dupes_summary: None,
             scroll: 0.0,
             reveal_focus: false,
             loading: None,
@@ -328,6 +332,7 @@ impl Tab {
             tree::nest(&self.folder, &self.tree, &mut self.view);
         }
         self.media_here = crate::media::here(entries, &self.view, &self.folder.path);
+        self.dupes_summary = self.search.as_ref().is_some_and(|s| s.is_dupes()).then(|| crate::status::dupes_summary(entries, &self.view));
         self.pos = vec![u32::MAX; entries.len()];
         for (row, &i) in self.view.iter().enumerate() {
             self.pos[i as usize] = row as u32;
@@ -1814,14 +1819,15 @@ impl AppState {
             // A favorite on another computer that looks like a file by its name: going there shows
             // it if it's a folder after all, and opens it if it's a file (see `go`).
             self.navigate(&path);
+        } else if crate::archive::is_archive_name(&e.name) {
+            // A .zip or .7z opens like a folder (archive.rs) - one inside another too, at its path
+            // inside that one ("outer.zip\sub\inner.zip"), so Up, Back and the path bar go back
+            // into the outer archive, not to Glint's temporary folder it's read from.
+            self.navigate(&path);
         } else if let Some((archive, inner)) = crate::archive::split(&t.folder.path) {
-            // A file inside a .zip or .7z: taken out to Glint's temporary folder, then opened there
-            // (or, a zip inside the zip, looked into like a folder from there).
+            // A file inside a .zip or .7z: taken out to Glint's temporary folder, then opened there.
             let item = if inner.is_empty() { e.name.clone() } else { format!("{inner}\\{}", e.name) };
             self.extract_then(archive, vec![item], Then::Open);
-        } else if crate::archive::is_archive_name(&e.name) {
-            // A .zip or .7z opens like a folder (archive.rs).
-            self.navigate(&path);
         } else {
             shell::open(&path);
         }
@@ -2319,7 +2325,14 @@ fn take_results(t: &mut Tab, batch: search::Batch) {
     if t.anchor.is_none() {
         t.anchor = t.focus;
     }
-    if t.selected_entries().is_empty() && !t.view.is_empty() {
+    if t.search.as_ref().is_some_and(|s| s.is_dupes()) {
+        // Duplicates: the cursor starts on the first, but nothing is chosen for you (Del would
+        // delete it, and Esc would only clear it instead of going back to the folder).
+        if t.focus.is_none() && !t.view.is_empty() {
+            t.focus = t.index_at(0);
+            t.anchor = t.focus;
+        }
+    } else if t.selected_entries().is_empty() && !t.view.is_empty() {
         t.select_only_row(0);
     }
 }
@@ -2744,6 +2757,99 @@ mod tests {
         assert_eq!(a.tab().path, "C:\\a\\b\\c");
     }
 
+    /// Waits for the tab's folder to be read, and takes it in.
+    fn settle(a: &mut AppState) {
+        for _ in 0..1000 {
+            a.receive();
+            if a.tab().loading.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("{} wasn't read in time", a.tab().path);
+    }
+
+    /// Opens the item called `name` in the tab's folder, as a double-click does, and waits for
+    /// what it shows.
+    fn open_named(a: &mut AppState, name: &str) {
+        let i = a.tab().folder.entries.iter().position(|e| e.name == name).unwrap_or_else(|| panic!("no {name} in {}", a.tab().path));
+        a.open_entry(i);
+        settle(a);
+    }
+
+    /// The names the tab shows, sorted, and its error.
+    fn showing(a: &AppState) -> (Vec<String>, Option<String>) {
+        let mut names: Vec<String> = a.tab().folder.entries.iter().map(|e| e.name.clone()).collect();
+        names.sort();
+        (names, a.tab().folder.error.clone())
+    }
+
+    fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, data) in entries {
+            w.start_file(*name, zip::write::SimpleFileOptions::default()).expect("start");
+            w.write_all(data).expect("write");
+        }
+        w.finish().expect("finish").into_inner()
+    }
+
+    #[test]
+    fn up_back_and_forward_from_a_zip_in_a_zip_stay_inside_the_outer_zip() {
+        let dir = std::env::temp_dir().join(format!("glint-app-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // outer #1.zip > sub > mid #2.zip > level2 > deep #3.zip > deep.txt
+        let deep = zip_of(&[("deep.txt", b"bottom")]);
+        let mid = zip_of(&[("level2/deep #3.zip", &deep), ("two.txt", b"2")]);
+        std::fs::write(dir.join("outer #1.zip"), zip_of(&[("sub/mid #2.zip", &mid), ("one.txt", b"1")])).expect("write");
+        let home = dir.to_string_lossy().into_owned();
+        let outer = format!("{home}\\outer #1.zip");
+        let mut a = AppState::for_tests(Settings::default());
+        a.navigate(&outer);
+        settle(&mut a);
+        assert_eq!(showing(&a), (vec!["one.txt".into(), "sub".into()], None));
+        for name in ["sub", "mid #2.zip", "level2", "deep #3.zip"] {
+            open_named(&mut a, name);
+        }
+        // The path is the way in, through the outer zip: not Glint's temporary folder.
+        let deepest = format!("{outer}\\sub\\mid #2.zip\\level2\\deep #3.zip");
+        assert_eq!(a.tab().path, deepest);
+        assert_eq!(showing(&a), (vec!["deep.txt".into()], None));
+        // Up from each level, back to the folder that holds the outer zip.
+        let ups = [
+            (format!("{outer}\\sub\\mid #2.zip\\level2"), vec!["deep #3.zip"]),
+            (format!("{outer}\\sub\\mid #2.zip"), vec!["level2", "two.txt"]),
+            (format!("{outer}\\sub"), vec!["mid #2.zip"]),
+            (outer.clone(), vec!["one.txt", "sub"]),
+            (home.clone(), vec!["outer #1.zip"]),
+        ];
+        for (path, names) in &ups {
+            a.up();
+            settle(&mut a);
+            assert_eq!(a.tab().path, *path);
+            assert_eq!(showing(&a), (names.iter().map(|n| n.to_string()).collect(), None), "{path}");
+        }
+        // Back the same way down again, then Forward up again.
+        for (path, names) in ups.iter().rev().skip(1).chain([&(deepest.clone(), vec!["deep.txt"])]) {
+            a.back();
+            settle(&mut a);
+            assert_eq!(a.tab().path, *path);
+            assert_eq!(showing(&a), (names.iter().map(|n| n.to_string()).collect(), None), "{path}");
+        }
+        for (path, names) in &ups {
+            a.forward();
+            settle(&mut a);
+            assert_eq!(a.tab().path, *path);
+            assert_eq!(showing(&a), (names.iter().map(|n| n.to_string()).collect(), None), "{path}");
+        }
+        // Typed into the path bar, the deepest one opens the same way.
+        a.navigate(&format!("{deepest}\\"));
+        settle(&mut a);
+        assert_eq!(showing(&a), (vec!["deep.txt".into()], None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_folder_that_vanishes_and_comes_back() {
         let mut t = tab_with(&["a.txt"]);
@@ -2791,6 +2897,38 @@ mod tests {
         // Outside a search, an item's key is its name.
         let plain = tab_with(&["A.txt"]);
         assert_eq!(plain.item_key(0), "a.txt");
+    }
+
+    /// Find duplicates: nothing is selected for you as the sets come in (so the first Esc goes back
+    /// to the folder, and Del deletes nothing unasked); the cursor is on the first file, and what
+    /// you select yourself stays selected.
+    #[test]
+    fn duplicates_come_in_with_nothing_selected() {
+        let mut t = Tab::new(1, "C:\\x".into());
+        t.folder.path = "C:\\x".into();
+        let mut s = search::test_search("C:\\x");
+        s.dupes = Some(Default::default());
+        t.search = Some(s);
+        let batch = |paths: &[&str], done: bool| search::Batch { entries: paths.iter().map(|p| result(p)).collect(), done, capped: false, summary: None };
+        take_results(&mut t, batch(&["C:\\x\\a.txt", "C:\\x\\sub\\a.txt"], false));
+        assert!(t.selected_entries().is_empty());
+        assert_eq!(t.focus_row(), Some(0));
+        // The cursor moved, then more sets came: it stays where it was.
+        t.focus = t.index_at(1);
+        take_results(&mut t, batch(&["C:\\x\\b.txt", "C:\\x\\c.txt"], false));
+        assert_eq!((t.focus_row(), t.selected_entries().len()), (Some(1), 0));
+        let row_b = (0..t.view.len()).find(|&r| t.entry_at(r).is_some_and(|e| e.target.as_deref() == Some("C:\\x\\b.txt"))).unwrap();
+        t.select_only_row(row_b);
+        take_results(&mut t, batch(&[], true));
+        assert_eq!(selected_paths(&t), vec!["C:\\x\\b.txt"]);
+        // None found: no cursor.
+        let mut empty = Tab::new(2, "C:\\y".into());
+        empty.search = t.search.take();
+        if let Some(s) = empty.search.as_mut() {
+            s.fresh = false;
+        }
+        take_results(&mut empty, batch(&[], true));
+        assert_eq!((empty.focus, empty.selected_entries().len()), (None, 0));
     }
 
     #[test]

@@ -302,6 +302,22 @@ pub enum CaptionStyle {
     Tiles,
 }
 
+/// How a skin's wallpaper is made to fit the list: the skin's `wallpaper-fit`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WallpaperFit {
+    /// It covers the whole list, cut to fit.
+    #[default]
+    Fill,
+    /// All of it shows, as big as fits, at its side.
+    Whole,
+    /// Pulled to the list's exact size, whatever its shape.
+    Stretch,
+    /// Repeated across the list at its own size (times the zoom).
+    Tile,
+    /// One copy at its own size (times the zoom).
+    Actual,
+}
+
 /// How the tabs sit in the title bar: the skin's `tabs`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TabStyle {
@@ -577,14 +593,26 @@ pub struct Theme {
     /// Which side of it stays in view when the list is narrower than the picture: 0 its left, 0.5
     /// its middle, 1 its right (`wallpaper-position`).
     pub wallpaper_at: f32,
-    /// Show the whole picture, as big as fits, at `wallpaper_at`'s side, instead of filling the
-    /// list with it (`wallpaper-fit: whole`). Best for a picture on a plain background.
-    pub wallpaper_whole: bool,
+    /// How it's made to fit the list (`wallpaper-fit`): filling it (the standard), all of it at
+    /// `wallpaper_at`'s side (best for a picture on a plain background), stretched, tiled, or at
+    /// its own size.
+    pub wallpaper_fit: WallpaperFit,
     /// Which edge stays in view up and down: 0 its top, 0.5 its middle, 1 its bottom (the top,
-    /// middle or bottom word of `wallpaper-position`, in either order); None: the top when filling, the bottom when whole.
+    /// middle or bottom word of `wallpaper-position`, in either order); None: the top when filling
+    /// or tiling, the bottom otherwise.
     pub wallpaper_at_y: Option<f32>,
     /// How big it is next to its fitted size, 1/6 to 6 (`wallpaper-zoom`: -500 to 500, 0 for 1).
     pub wallpaper_zoom: f32,
+    /// How wide it is as a part of the list's width, instead of the fit's size (`wallpaper-size`:
+    /// 1% to 400%); None: the fit decides. The zoom goes on top.
+    pub wallpaper_size: Option<f32>,
+    /// How far it's moved across and down after it's placed, in DIPs (`wallpaper-offset`).
+    pub wallpaper_offset: (f32, f32),
+    /// How blurred it is, in the picture's own pixels (`wallpaper-blur`: 0 for none, up to 50).
+    pub wallpaper_blur: u32,
+    /// How much of the list's width and height it fades out over at the list's edges, 0 (none) to
+    /// 0.5 (`wallpaper-fade`: 0 to 50).
+    pub wallpaper_fade: f32,
 
     // ---- Older Windows. Each is off (or follows an older colour) unless the skin sets it.
     /// Which older Windows the skin dresses Glint as (`era`), and whose icons it shows (`icons`).

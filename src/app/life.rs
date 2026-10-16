@@ -42,7 +42,6 @@ impl AppState {
     pub fn back_from_background(&mut self, open: Option<&Target>, seen: bool) {
         self.hidden = false;
         if self.settings.startup != Startup::Restore && (seen || open.is_some()) {
-            let (fresh, active) = settings::initial_tabs(&self.settings, open.map(|t| t.folder.as_str()), &self.settings.home_place());
             let mut old = std::mem::take(&mut self.tabs);
             // Pinned tabs stay as they are, first in the row.
             let mut i = 0;
@@ -54,6 +53,15 @@ impl AppState {
                 }
             }
             let pinned = self.tabs.len();
+            // The folder from outside is a pinned tab's: that tab comes forward and no other opens,
+            // as at a fresh start. (The saved tabs `initial_tabs` looks through are empty while
+            // Glint runs: the pinned tabs open now are looked through here.)
+            let opened = open.map(|t| t.folder.as_str());
+            let at_pinned = opened.and_then(|dir| self.tabs.iter().position(|t| crate::fileops::same_path(&t.path, dir)));
+            let (fresh, active) = match at_pinned {
+                Some(i) => (Vec::new(), i),
+                None => settings::initial_tabs(&self.settings, opened, &self.settings.home_place()),
+            };
             for saved in fresh.iter().filter(|t| !t.pinned) {
                 let mut tab = self.make_tab(saved.path.clone());
                 tab.sort = settings::sort_key(saved.sort_column);
@@ -74,6 +82,7 @@ impl AppState {
             // (`active` is a place in `fresh`, whose saved pinned tabs made way for the ones open now.)
             let saved_pinned = fresh.iter().filter(|t| t.pinned).count();
             self.active = match active.checked_sub(saved_pinned) {
+                _ if at_pinned.is_some() => active,
                 Some(k) => pinned + k,
                 // The folder from outside is a pinned tab's: the pinned tab showing it comes forward
                 // (or, when none does any more, it opens in a tab of its own).
@@ -167,6 +176,34 @@ mod tests {
         b.tab_mut().search = Some(done);
         b.go_to_background();
         assert!(b.tab().is_searching() && b.searches_stopped.is_empty());
+    }
+
+    /// A folder from outside that a pinned tab shows: that tab comes forward, with no second tab
+    /// for it (as at a fresh start). Another folder opens in a tab of its own after the pinned ones.
+    #[test]
+    fn a_pinned_tabs_folder_from_outside_brings_that_tab_forward() {
+        use crate::life::Target;
+        let target = |f: &str| Target { folder: f.into(), select: Some("a.txt".into()) };
+        let mut a = AppState::for_tests(Settings::default());
+        a.hidden = true; // (no folder watch in a test)
+        let t = a.tab_mut();
+        (t.path, t.folder.path, t.pinned) = ("D:\\Work".into(), "D:\\Work".into(), true);
+        let other = a.make_tab("D:\\Other".into());
+        a.tabs.push(other);
+        let first = a.tabs[0].id;
+        // Twice, in other capitals and with a backslash at the end the second time.
+        for folder in ["D:\\Work", "d:\\work\\"] {
+            a.go_to_background();
+            a.back_from_background(Some(&target(folder)), true);
+            assert_eq!(a.tabs.len(), 1, "no second tab for D:\\Work: {:?}", a.tabs.iter().map(|t| &t.path).collect::<Vec<_>>());
+            assert_eq!((a.active, a.tab().id, a.tab().pinned), (0, first, true));
+            assert_eq!(a.tab().select_after_load.as_deref(), Some("a.txt"));
+        }
+        // A folder no pinned tab shows: its own tab, after the pinned one, and that's the one on screen.
+        a.go_to_background();
+        a.back_from_background(Some(&target("D:\\Else")), true);
+        assert_eq!(a.tabs.iter().map(|t| (t.path.as_str(), t.pinned)).collect::<Vec<_>>(), [("D:\\Work", true), ("D:\\Else", false)]);
+        assert_eq!(a.active, 1);
     }
 
     #[test]

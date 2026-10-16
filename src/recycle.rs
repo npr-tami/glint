@@ -508,6 +508,19 @@ pub fn run(job: BinJob) -> Outcome {
     out
 }
 
+/// The newest item in the bin from each place, by [`fileops::path_key`] of where it came from (as
+/// `same_path` compares). Of equally new ones, the last listed (as `max_by_key` picks).
+fn newest_from<E>(pairs: &[(E, BinItem)]) -> std::collections::HashMap<String, &BinItem> {
+    let mut newest: std::collections::HashMap<String, &BinItem> = std::collections::HashMap::with_capacity(pairs.len());
+    for (_, item) in pairs {
+        let key = fileops::path_key(&item.original);
+        if newest.get(&key).is_none_or(|had| item.deleted >= had.deleted) {
+            newest.insert(key, item);
+        }
+    }
+    newest
+}
+
 /// Puts back the items last deleted from these full paths (Ctrl+Z after a delete, Ctrl+Y after
 /// undoing a copy or a new folder): for each path, the newest item in the bin that came from there.
 /// Restored items are reported as made, so the list selects them. An item whose name is taken now
@@ -523,6 +536,7 @@ pub fn restore_paths(paths: &[String]) -> Outcome {
         Ok(p) => p,
         Err(why) => return Outcome { note: Some(why), ..Default::default() },
     };
+    let newest = newest_from(&pairs);
     let mut items: Vec<BinItem> = Vec::new();
     let mut missing = 0;
     let mut taken: Vec<String> = Vec::new();
@@ -531,8 +545,8 @@ pub fn restore_paths(paths: &[String]) -> Outcome {
             taken.push(p.clone());
             continue;
         }
-        match pairs.iter().map(|(_, item)| item).filter(|item| same_path(&item.original, p)).max_by_key(|item| item.deleted) {
-            Some(item) => items.push(item.clone()),
+        match newest.get(&fileops::path_key(p)) {
+            Some(item) => items.push((*item).clone()),
             None => missing += 1,
         }
     }
@@ -551,9 +565,11 @@ pub fn restore_paths(paths: &[String]) -> Outcome {
     }
     // Restored into one folder (nearly always): select them there.
     if let [dir] = out.changed.iter().filter(|c| !is_bin(c)).collect::<Vec<_>>().as_slice() {
+        let taken: std::collections::HashSet<&String> = taken.iter().collect();
+        let dir_key = fileops::path_key(dir);
         let names = paths
             .iter()
-            .filter(|p| !taken.contains(p) && parent(p).is_some_and(|d| same_path(&d, dir)))
+            .filter(|p| !taken.contains(p) && parent(p).is_some_and(|d| fileops::path_key(&d) == dir_key))
             .map(|p| file_name(p).to_string())
             .collect();
         out.created = Some((dir.to_string(), names));
@@ -970,6 +986,32 @@ fn watch_thread(on_change: impl Fn()) {
 mod tests {
     use super::*;
     use crate::folder;
+
+    /// Ctrl+Z of a delete picks, for each path, what the old search over the whole bin picked: the
+    /// newest item from that path (any capitals, a trailing backslash), the last listed of equally
+    /// new ones.
+    #[test]
+    fn the_newest_item_from_each_place_is_picked() {
+        let item = |original: &str, deleted: u64, real: &str| BinItem { original: original.into(), location: String::new(), real: Some(real.into()), info: None, deleted };
+        let pairs: Vec<((), BinItem)> = [
+            item("C:\\x\\a.txt", 5, "old"),
+            item("C:\\X\\A.TXT", 9, "newest"),
+            item("c:\\x\\a.txt\\", 3, "older"),
+            item("C:\\x\\b 😀.txt", 7, "first of two"),
+            item("C:\\x\\B 😀.txt", 7, "second of two"),
+            item("", 0, "nowhere"),
+        ]
+        .into_iter()
+        .map(|i| ((), i))
+        .collect();
+        let newest = newest_from(&pairs);
+        let old_way = |p: &str| pairs.iter().map(|(_, i)| i).filter(|i| same_path(&i.original, p)).max_by_key(|i| i.deleted).and_then(|i| i.real.clone());
+        for p in ["C:\\x\\a.txt", "c:\\X\\a.txt", "C:\\x\\b 😀.txt", "C:\\x\\missing.txt", ""] {
+            assert_eq!(newest.get(&fileops::path_key(p)).and_then(|i| i.real.clone()), old_way(p), "{p}");
+        }
+        assert_eq!(newest[&fileops::path_key("C:\\x\\a.txt")].real.as_deref(), Some("newest"));
+        assert_eq!(newest[&fileops::path_key("C:\\x\\b 😀.txt")].real.as_deref(), Some("second of two"));
+    }
 
     #[test]
     fn typed_names_of_the_bin() {

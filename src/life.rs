@@ -3,7 +3,9 @@
 //!
 //! **One main Glint.** The first glint.exe to start becomes the main one: it holds a named mutex
 //! (`Local\Glint.Main`, one per Windows session) and opens the "door", a hidden window of its
-//! own that other glint.exe's find by its class name. A glint.exe started later (a double-clicked
+//! own that other glint.exe's find by its class name ("GlintDoor"). One per set of files, in fact:
+//! a portable Glint, or one with GLINT_SETTINGS_DIR (a test run), has a name of its own for both
+//! (`own_name`), so it neither takes folders from nor quits the installed Glint, nor the other way. A glint.exe started later (a double-clicked
 //! folder, Win+E, a shortcut, a terminal) hands its folder through the door with WM_COPYDATA and
 //! ends; the main Glint opens the folder in a new tab and comes to the front. If the main one doesn't
 //! answer (it is just quitting, or hung), the newcomer waits a moment to become the main one itself,
@@ -34,6 +36,7 @@
 //!   "Make Glint default.bat" and "Restore File Explorer.bat".
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -42,7 +45,7 @@ use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GetProcessHeap, HeapCompact, HEAP_FLAGS};
-use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, SetProcessWorkingSetSize};
+use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, OpenMutexW, SetProcessWorkingSetSize, SYNCHRONIZATION_SYNCHRONIZE};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowW, GetWindowThreadProcessId, IsWindow,
@@ -68,10 +71,10 @@ const WM_APP_WIN_E_CHANGED: u32 = WM_APP + 43;
 
 /// The switch for an extra window (Ctrl+N).
 pub const NEW_WINDOW_SWITCH: &str = "--new-window";
-/// One main Glint per Windows session.
-const MUTEX_NAME: PCWSTR = w!("Local\\Glint.Main");
-/// The door's window class.
-const DOOR_CLASS: PCWSTR = w!("GlintDoor");
+/// One main Glint per Windows session (and set of files: `own_name`).
+const MUTEX_NAME: &str = "Local\\Glint.Main";
+/// The door's window class (`own_name` too).
+const DOOR_CLASS: &str = "GlintDoor";
 /// Marks Glint's WM_COPYDATA messages ("GLNT").
 const MAGIC: usize = 0x474C_4E54;
 /// The longest message the door takes, in bytes (two long paths and some).
@@ -83,6 +86,63 @@ const SEND_WAIT: Duration = Duration::from_secs(3);
 /// hasn't opened its door yet: its window is being made). Two folders double-clicked at once on a
 /// slow, cold start would otherwise open two windows.
 const STARTING_WAIT: Duration = Duration::from_secs(10);
+
+/// `name` for the Glint whose files are in `files` (settings::whose_files): the installed Glint's
+/// (None) as it always was, so it and older versions of it still find each other; any other gets
+/// the folder's hash added, the same for the same folder however it's written.
+fn own_name(name: &str, files: Option<&std::path::Path>) -> String {
+    let Some(files) = files else { return name.to_string() };
+    let text = files.to_string_lossy().replace('/', "\\").to_lowercase();
+    // FNV-1a: the same in every build of Glint (Rust's own hasher promises no such thing).
+    let hash = text.trim_end_matches('\\').bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3));
+    format!("{name}.{hash:016x}")
+}
+
+/// This Glint's mutex and door class names, worked out once (NUL-ended, for Windows).
+fn own_names() -> &'static (Vec<u16>, Vec<u16>) {
+    static NAMES: std::sync::OnceLock<(Vec<u16>, Vec<u16>)> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let (now, after) = crate::settings::whose_files();
+        let files = pick_files(now, after, mutex_exists);
+        (wide(&own_name(MUTEX_NAME, files.as_deref())), wide(&own_name(DOOR_CLASS, files.as_deref())))
+    })
+}
+
+/// Whose files to go by, from whose they are `now` and whose they are `after` the next main Glint
+/// has made a move asked for in Settings > About > Portable (settings::whose_files). While such a
+/// move waits, the Glint that asked for it may still run (hidden in the background) under the
+/// names of `now`: a glint.exe started then goes to it. Otherwise this one becomes the main Glint
+/// and moves the files, so it takes the names of `after`, the ones every later glint.exe works out.
+fn pick_files(now: Option<PathBuf>, after: Option<PathBuf>, running: impl Fn(&str) -> bool) -> Option<PathBuf> {
+    if now != after && running(&own_name(MUTEX_NAME, now.as_deref())) {
+        now
+    } else {
+        after
+    }
+}
+
+/// Whether some process holds the mutex `name`.
+fn mutex_exists(name: &str) -> bool {
+    let name = wide(name);
+    // SAFETY: `name` is NUL-terminated and outlives the call; a handle we get is closed at once.
+    unsafe {
+        match OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name.as_ptr())) {
+            Ok(h) => {
+                let _ = CloseHandle(h);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+fn mutex_name() -> PCWSTR {
+    PCWSTR(own_names().0.as_ptr())
+}
+
+fn door_class() -> PCWSTR {
+    PCWSTR(own_names().1.as_ptr())
+}
 
 // ---------------------------------------------------------------- switches
 
@@ -323,14 +383,14 @@ pub fn open_door(main_window: HWND) -> Option<HWND> {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(door_proc),
             hInstance: instance.into(),
-            lpszClassName: DOOR_CLASS,
+            lpszClassName: door_class(),
             ..Default::default()
         };
         RegisterClassExW(&class);
         TASKBAR_CREATED.with(|t| t.set(RegisterWindowMessageW(w!("TaskbarCreated"))));
         // A hidden top-level window rather than a message-only one: those don't get the
         // "TaskbarCreated" broadcast, and the tray menu needs a window that can be in front.
-        let door = CreateWindowExW(WS_EX_TOOLWINDOW, DOOR_CLASS, w!("Glint"), WS_POPUP, 0, 0, 0, 0, None, None, Some(instance.into()), None).ok()?;
+        let door = CreateWindowExW(WS_EX_TOOLWINDOW, door_class(), w!("Glint"), WS_POPUP, 0, 0, 0, 0, None, None, Some(instance.into()), None).ok()?;
         DOOR.with(|d| d.set(Some(door)));
         Some(door)
     }
@@ -341,20 +401,20 @@ pub fn door() -> Option<HWND> {
     DOOR.with(Cell::get)
 }
 
-/// Whether a main Glint's door is open (in this Windows session).
+/// Whether a main Glint's door is open (in this Windows session, with these files).
 fn door_open() -> bool {
     // SAFETY: a plain lookup by class name.
-    unsafe { FindWindowW(DOOR_CLASS, PCWSTR::null()) }.is_ok_and(|d| !d.is_invalid())
+    unsafe { FindWindowW(door_class(), PCWSTR::null()) }.is_ok_and(|d| !d.is_invalid())
 }
 
-/// Sends a request to the main Glint of this session. False if there is none, or it didn't answer.
+/// Sends a request to the main Glint of this session (with these files). False if there is none, or it didn't answer.
 /// `find_wait`: how long to look for its door (a main Glint that is just starting opens it a moment
 /// after it took the mutex).
 pub fn send(r: &Request, find_wait: Duration) -> bool {
     let started = Instant::now();
     let door = loop {
         // SAFETY: plain lookup by class name.
-        match unsafe { FindWindowW(DOOR_CLASS, PCWSTR::null()) } {
+        match unsafe { FindWindowW(door_class(), PCWSTR::null()) } {
             Ok(d) if !d.is_invalid() => break d,
             _ if started.elapsed() < find_wait => std::thread::sleep(Duration::from_millis(50)),
             _ => return false,
@@ -388,7 +448,7 @@ fn take_main() -> bool {
     // SAFETY: a named mutex is only used to see whether it exists already; the handle is kept until
     // `release_main` (or the process ends, which closes it).
     unsafe {
-        let Ok(h) = CreateMutexW(None, false, MUTEX_NAME) else { return false };
+        let Ok(h) = CreateMutexW(None, false, mutex_name()) else { return false };
         if GetLastError() == ERROR_ALREADY_EXISTS {
             let _ = CloseHandle(h);
             return false;
@@ -655,7 +715,7 @@ pub fn apply_win_e(on: bool) -> Result<(), String> {
 fn tell_main_win_e_changed() {
     // SAFETY: plain lookup and a post to a window handle (fails harmlessly if it's gone).
     unsafe {
-        if let Ok(main_door) = FindWindowW(DOOR_CLASS, PCWSTR::null()) {
+        if let Ok(main_door) = FindWindowW(door_class(), PCWSTR::null()) {
             let _ = PostMessageW(Some(main_door), WM_APP_WIN_E_CHANGED, WPARAM(0), LPARAM(0));
         }
     }
@@ -679,6 +739,48 @@ pub fn apply_default_explorer(on: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_glint_with_the_same_files_is_reached() {
+        use std::path::Path;
+        // The installed Glint's names are what they always were.
+        assert_eq!(own_name(MUTEX_NAME, None), "Local\\Glint.Main");
+        assert_eq!(own_name(DOOR_CLASS, None), "GlintDoor");
+        // Others have their own, the same for the same folder however it's written.
+        let a = own_name(DOOR_CLASS, Some(Path::new("C:\\Tools\\Glint")));
+        assert!(a.starts_with("GlintDoor.") && a.len() == "GlintDoor.".len() + 16, "{a}");
+        assert_eq!(a, own_name(DOOR_CLASS, Some(Path::new("c:/tools/glint/"))));
+        assert_ne!(a, own_name(DOOR_CLASS, Some(Path::new("C:\\Tools\\Glint2"))));
+        assert_ne!(own_name(MUTEX_NAME, Some(Path::new("C:\\Tools\\Glint"))), "Local\\Glint.Main");
+        assert!(own_name(MUTEX_NAME, Some(Path::new("C:\\x"))).starts_with("Local\\Glint.Main."));
+        // A test run (GLINT_SETTINGS_DIR, as cargo test may have it) never has the installed Glint's.
+        if crate::settings::test_folders() {
+            assert_ne!(String::from_utf16_lossy(&own_names().1), "GlintDoor\0");
+        }
+    }
+
+    #[test]
+    fn a_waiting_portable_move_picks_the_right_names() {
+        let exe = Some(PathBuf::from("C:\\Tools\\Glint"));
+        let nobody = |_: &str| false;
+        // No move waiting: the one answer.
+        assert_eq!(pick_files(None, None, nobody), None);
+        assert_eq!(pick_files(exe.clone(), exe.clone(), |_: &str| true), exe);
+        // Portable on, asked for, and the Glint that asked has quit: this one moves the files and
+        // takes the portable names.
+        assert_eq!(pick_files(None, exe.clone(), nobody), exe);
+        // ...but while that Glint still runs under the installed names, this goes to it.
+        let installed_running = |n: &str| n == "Local\\Glint.Main";
+        assert_eq!(pick_files(None, exe.clone(), installed_running), None);
+        // And the same the other way (Portable off).
+        assert_eq!(pick_files(exe.clone(), None, nobody), None);
+        let portable_running = |n: &str| n == own_name(MUTEX_NAME, exe.as_deref());
+        assert_eq!(pick_files(exe.clone(), None, portable_running), exe);
+        // A Glint under the other names doesn't count.
+        assert_eq!(pick_files(exe.clone(), None, installed_running), None);
+        // A made-up mutex name exists nowhere.
+        assert!(!mutex_exists("Local\\GlintTest.NoSuchMutex.\u{1F600}"));
+    }
 
     #[test]
     fn switches() {

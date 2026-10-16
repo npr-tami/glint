@@ -70,12 +70,12 @@ use crate::icons;
 use crate::media;
 use crate::recycle::{self, BinItem};
 use crate::pathbar::{fill_box_paint, outline_box};
-use crate::render::{Align, Renderer, TextStyle};
+use crate::render::{Align, Renderer, TextStyle, WallDraw};
 use crate::settings::{DateFormat, ListSize, SizeFormat, ViewMode};
 use crate::thumbs;
 use crate::views::{Flow, Geometry, Step, Tile, LIST_COLUMN_W, NAME_LINE_H, SCROLL_GUTTER, TILE_PAD, TILE_TEXT_GAP};
 use crate::textbox::{TextBox, TextEvent, TextEventKind};
-use crate::theme::{size, ButtonStyle, Color, Paint, Theme};
+use crate::theme::{size, ButtonStyle, Color, Paint, Theme, WallpaperFit};
 use crate::ui::{Anim, Command, Component, Ctx, CursorKind, Effect, Menu, MenuItem, MouseButton, MouseEvent, Point, Rect};
 // The right-click menus (menu.rs) and their keys.
 use crate::menu;
@@ -265,6 +265,19 @@ struct ClickOpen {
     at: Point,
 }
 
+/// What the list draws lit up because of where the mouse is.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct HoverKey {
+    /// The item under it (a row, tile or name).
+    item: Option<usize>,
+    /// The column title under it.
+    column: Option<Col>,
+    /// Near the scroll bar: its thumb shows.
+    track: bool,
+    /// Home: the tile, line, chevron or pill under it.
+    spot: Option<home::Spot>,
+}
+
 /// A mouse button went down on the list and hasn't come up yet.
 #[derive(Clone, Debug)]
 struct Press {
@@ -343,6 +356,9 @@ pub struct ListView {
     /// How far in the column titles sit (98 / 2000: inside the list's 2 DIP sunken edge).
     edge_in: f32,
     mouse: Option<Point>,
+    /// What the mouse lit up in the last frame painted: a move that changes none of it needs no
+    /// new frame.
+    painted_hover: HoverKey,
     drag: Drag,
     /// The scroll bar's held arrow or track, repeating (an older Windows).
     repeat: crate::retroctl::Repeat,
@@ -466,6 +482,7 @@ impl ListView {
             arrows: 0.0,
             edge_in: 0.0,
             mouse: None,
+            painted_hover: HoverKey::default(),
             drag: Drag::None,
             repeat: crate::retroctl::Repeat::default(),
             anim: Anim::default(),
@@ -1583,6 +1600,26 @@ impl ListView {
         }
     }
 
+    /// Everything the paint lights up because of where the mouse is (see `painted_hover`).
+    fn hover_key(&self, tab: &Tab) -> HoverKey {
+        let track = self.thumb(tab).is_some() && self.mouse.is_some_and(|p| self.near_track(p));
+        if self.home_on {
+            // (As home::paint finds it, in the area `paint` gives it.)
+            let area = Rect::new(self.rect.x, self.rect.y, self.rect.w - SCROLL_GUTTER.min(12.0), self.rect.h);
+            let scroll = tab.scroll.clamp(0.0, (self.home.layout.height - self.rect.h).max(0.0));
+            let spot = self
+                .mouse
+                .filter(|p| self.drag == Drag::None && area.contains(*p))
+                .and_then(|p| self.home.layout.spot_at(Point::new(p.x - area.x, p.y - area.y + scroll)));
+            return HoverKey { spot, track, ..Default::default() };
+        }
+        let column = match self.drag {
+            Drag::None if self.flow == Flow::Rows => self.mouse.and_then(|p| if self.edge_at(p).is_some() { None } else { self.column_at(p) }),
+            _ => None,
+        };
+        HoverKey { item: self.hovered(tab), column, track, spot: None }
+    }
+
     /// The item under the mouse, to draw highlighted (not while dragging something in the list).
     fn hovered(&self, tab: &Tab) -> Option<usize> {
         if self.drag != Drag::None || self.band.as_ref().is_some_and(|b| b.active) {
@@ -1592,9 +1629,11 @@ impl ListView {
     }
 
     /// Whether an item is cut to the clipboard (drawn faded until it's pasted, as in Explorer).
-    /// Items of folders open in the tree view aren't marked (names repeat across folders).
+    /// Items of folders open in the tree view aren't marked (names repeat across folders), nor
+    /// search results or duplicates from other folders that share a cut item's name.
     fn is_cut(tab: &Tab, cut: Option<&std::collections::HashSet<String>>, e: &Entry) -> bool {
-        cut.is_some_and(|c| c.contains(&e.lower)) && !(tab.tree.is_open() && e.target.is_some())
+        cut.is_some_and(|c| c.contains(&e.lower))
+            && (e.target.is_none() || (!tab.tree.is_open() && crate::fileops::same_path(folder::result_folder(e), &tab.folder.path)))
     }
 
     /// 98 / 2000 mark a selected item by its name only, its icon blended half way into the
@@ -1863,30 +1902,23 @@ impl ListView {
     /// An item's picture, in the box `b`: its thumbnail (pictures, videos, PDFs: filling the box,
     /// with a thin frame) or Windows' big icon (at its own size at most) - made in the background
     /// (thumbs.rs), with the list's own icon meanwhile. Returns where it was drawn.
-    /// The skin's wallpaper, filling the list (cut to fit, keeping `wallpaper_at`'s side and its
-    /// top in view), faint enough for the names to read over it. It's read in the background
-    /// (thumbs.rs): none until it's there.
+    /// The skin's wallpaper (filling the list unless the skin says otherwise, see
+    /// [`wallpaper_layout`]), faint enough for the names to read over it. It's read in the
+    /// background (thumbs.rs): none until it's there.
     fn paint_wallpaper(&self, r: &mut Renderer, theme: &Theme) {
         if theme.wallpaper.is_empty() || theme.wallpaper_opacity <= 0.0 {
+            // (The last skin's picture, if there was one, needn't stay in memory.)
+            thumbs::forget_wallpaper();
             return;
         }
-        let Some(pic) = thumbs::wallpaper(&theme.wallpaper) else { return };
-        let (w, h) = (pic.width() as f32, pic.height() as f32);
-        // In split view the picture lies across both halves, as one (each shows its part).
+        // In split view the picture lies across both halves, as one (each shows its part), and
+        // so does its fade.
         let b = self.wall_area.unwrap_or(self.rect);
-        // Filling covers the list (its top in view); whole fits all of it in (at the bottom).
-        // Then the zoom, then whatever spills over the list is cut off.
-        let fit = if theme.wallpaper_whole { (b.w / w).min(b.h / h) } else { (b.w / w).max(b.h / h) };
-        let k = fit * theme.wallpaper_zoom;
-        let (dw, dh) = (w * k, h * k);
-        let at_y = theme.wallpaper_at_y.unwrap_or(if theme.wallpaper_whole { 1.0 } else { 0.0 });
-        let (x, y) = (b.x + (b.w - dw) * theme.wallpaper_at, b.y + (b.h - dh) * at_y);
-        let (x0, y0, x1, y1) = (x.max(b.x), y.max(b.y), (x + dw).min(b.right()), (y + dh).min(b.bottom()));
-        if x1 <= x0 || y1 <= y0 {
-            return;
-        }
-        let src = Rect::new((x0 - x) / k, (y0 - y) / k, (x1 - x0) / k, (y1 - y0) / k);
-        r.picture(&pic, Rect::new(x0, y0, x1 - x0, y1 - y0), Some(src), theme.wallpaper_opacity, true);
+        // It's read no bigger than it's drawn.
+        let fit = wallpaper_fit(theme, (b.w * self.scale, b.h * self.scale));
+        let Some(pic) = thumbs::wallpaper(&theme.wallpaper, theme.wallpaper_blur, theme.wallpaper_fit == WallpaperFit::Tile, fit) else { return };
+        let Some(how) = wallpaper_layout(b, (pic.width() as f32, pic.height() as f32), theme, 1.0 / self.scale.max(0.1)) else { return };
+        r.wallpaper(&pic, how, b, theme.wallpaper_opacity, theme.wallpaper_fade);
     }
 
     /// Split view: the wallpaper is laid out over `area` (both halves) instead of this list alone.
@@ -1925,10 +1957,7 @@ impl ListView {
         let at = match row {
             Some(r) => {
                 self.reveal(tab, r);
-                let cell = self.geo(tab).cell(r, tab.scroll);
-                let x = if self.flow == Flow::Rows { left + 16.0 } else { cell.x + cell.w / 2.0 };
-                // (max: a clamp whose ends are the wrong way round panics.)
-                Point::new(x.clamp(area.x, area.right().max(area.x)), cell.bottom().clamp(area.y, area.bottom().max(area.y)))
+                self.item_menu_at(tab, r)
             }
             None => Point::new(left, area.y + 4.0),
         };
@@ -1938,6 +1967,24 @@ impl ListView {
         } else {
             menu::for_background(app, at, how)
         }
+    }
+
+    /// Where the keyboard's menu for the item in row `r` opens: below it (Home: below the middle
+    /// of its tile or line on the page).
+    fn item_menu_at(&self, tab: &Tab, r: usize) -> Point {
+        let area = self.rows_area();
+        // (max: a clamp whose ends are the wrong way round panics.)
+        let inside = |x: f32, y: f32| Point::new(x.clamp(area.x, area.right().max(area.x)), y.clamp(area.y, area.bottom().max(area.y)));
+        if self.home_on {
+            if let Some(rc) = tab.index_at(r).and_then(|i| self.home.layout.rect_of(i)) {
+                let scroll = tab.scroll.clamp(0.0, self.max_scroll(tab));
+                return inside(self.rect.x + rc.x + rc.w / 2.0, self.rect.y + rc.y - scroll + rc.h);
+            }
+        }
+        let left = area.x + ROW_PAD + self.icon + 8.0;
+        let cell = self.geo(tab).cell(r, tab.scroll);
+        let x = if self.flow == Flow::Rows { left + 16.0 } else { cell.x + cell.w / 2.0 };
+        inside(x, cell.bottom())
     }
 
     /// The rectangle being dragged, on screen.
@@ -2336,6 +2383,7 @@ impl Component for ListView {
                 paint_scrollbar(r, theme, self.lane(), thumb, state, room);
             }
             r.pop_clip();
+            self.painted_hover = self.hover_key(tab);
             return;
         }
         if self.flow == Flow::Rows {
@@ -2343,6 +2391,7 @@ impl Component for ListView {
         }
         self.paint_rows(r, theme, app, tab);
         r.pop_clip();
+        self.painted_hover = self.hover_key(tab);
         if theme.bevels {
             crate::pathbar::bevel(r, theme, self.rect, false, theme.window);
         }
@@ -2413,6 +2462,11 @@ impl Component for ListView {
                 // Kept at the normal text size (see `text_growth`).
                 self.wanted.insert(col.key(), w.min(max_w) / self.text_growth());
                 self.place_columns(app);
+            }
+            // Only hovering: a new frame only when what is lit up changes (a frame for every
+            // pixel moved would redraw the whole window at the screen's rate).
+            Drag::None if self.press.is_none() && self.band.is_none() => {
+                return if self.hover_key(tab) != self.painted_hover { Effect::Redraw } else { Effect::None };
             }
             Drag::Bar | Drag::None => {}
         }
@@ -2898,6 +2952,69 @@ impl Component for ListView {
     }
 }
 
+/// How big the skin's wallpaper is drawn at most, for reading it no bigger (thumbs.rs
+/// `WallFit`; `area`: the list's, in screen pixels). None when it's drawn at its own size (tiled,
+/// or `actual`, with no `wallpaper-size`): then how big it is decides how big it shows.
+pub(crate) fn wallpaper_fit(theme: &Theme, area: (f32, f32)) -> Option<thumbs::WallFit> {
+    if theme.wallpaper_size.is_none() && matches!(theme.wallpaper_fit, WallpaperFit::Tile | WallpaperFit::Actual) {
+        return None;
+    }
+    // Filling, whole or stretched, it covers at most the area (in its longer direction, whatever
+    // the area's shape) times the zoom; a size is a part of the area's width.
+    let part = theme.wallpaper_size.unwrap_or(1.0).max(1.0);
+    Some(thumbs::WallFit { area, zoom: theme.wallpaper_zoom * part })
+}
+
+/// Where a skin's wallpaper `pic` (its size in pixels) goes in `area` (the list, or both halves in
+/// split view), as the skin says (theme.rs `wallpaper_*`): None when none of it would show.
+/// `dip_per_px` is how big one of the screen's pixels is (`tile` and `actual` show the picture at
+/// its own size in those).
+///
+/// - Its size: `fill` covers the area (cut to fit), `whole` fits all of it in, `tile` and `actual`
+///   are its own size; `wallpaper-size` (a part of the area's width) decides instead when set, the
+///   shape kept. Then the zoom. `stretch` is the area's size times the zoom, whatever its shape.
+/// - Its place: `wallpaper_at` across and `wallpaper_at_y` down (0 the left or top, 1 the right
+///   or bottom: that side of the picture against that side of the area), then the offset. Up and
+///   down is the top unless said, for `whole` and `actual` the bottom.
+/// - `tile` repeats it all over the area from there; the others show it once, cut to the area.
+pub(crate) fn wallpaper_layout(area: Rect, pic: (f32, f32), theme: &Theme, dip_per_px: f32) -> Option<WallDraw> {
+    let (w, h) = pic;
+    if !(w > 0.0 && h > 0.0 && area.w > 0.0 && area.h > 0.0) {
+        return None;
+    }
+    let fit = theme.wallpaper_fit;
+    let zoom = theme.wallpaper_zoom;
+    let (dw, dh) = if fit == WallpaperFit::Stretch {
+        (area.w * zoom, area.h * zoom)
+    } else {
+        let k = match (theme.wallpaper_size, fit) {
+            (Some(part), _) => area.w * part / w,
+            (None, WallpaperFit::Whole) => (area.w / w).min(area.h / h),
+            (None, WallpaperFit::Tile | WallpaperFit::Actual) => dip_per_px,
+            (None, _) => (area.w / w).max(area.h / h),
+        };
+        (w * k * zoom, h * k * zoom)
+    };
+    if !(dw.is_finite() && dh.is_finite() && dw > 0.0 && dh > 0.0) {
+        return None;
+    }
+    let at_y = theme.wallpaper_at_y.unwrap_or(if matches!(fit, WallpaperFit::Whole | WallpaperFit::Actual) { 1.0 } else { 0.0 });
+    let (dx, dy) = theme.wallpaper_offset;
+    let x = area.x + (area.w - dw) * theme.wallpaper_at + dx;
+    let y = area.y + (area.h - dh) * at_y + dy;
+    if fit == WallpaperFit::Tile {
+        return Some(WallDraw::Tiled { fill: area, origin: Point::new(x, y), tile: (dw, dh) });
+    }
+    let (x0, y0, x1, y1) = (x.max(area.x), y.max(area.y), (x + dw).min(area.right()), (y + dh).min(area.bottom()));
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    // The part of the picture that shows, in its pixels.
+    let (kx, ky) = (dw / w, dh / h);
+    let src = Rect::new((x0 - x) / kx, (y0 - y) / ky, (x1 - x0) / kx, (y1 - y0) / ky);
+    Some(WallDraw::Once { dest: Rect::new(x0, y0, x1 - x0, y1 - y0), src })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2976,6 +3093,27 @@ mod tests {
         assert_eq!(name(&tab).as_deref(), Some("cherry.txt"), "and on from there: \"ch\"");
     }
 
+    /// A cut file fades only itself: search results and duplicates of the same name elsewhere don't.
+    #[test]
+    fn only_the_cut_file_fades_not_others_of_its_name() {
+        let mut tab = Tab::new(1, "C:\\Work".into());
+        tab.folder.path = "C:\\Work".into();
+        let cut: std::collections::HashSet<String> = ["notes.txt".to_string(), "\u{1F600} é.txt".to_string()].into();
+        let at = |name: &str, path: Option<&str>| Entry { target: path.map(str::to_string), ..file(name) };
+        let is = |e: &Entry| ListView::is_cut(&tab, Some(&cut), e);
+        assert!(is(&at("notes.txt", None)), "the folder's own item");
+        assert!(is(&at("Notes.TXT", None)), "by its lower-case name");
+        assert!(is(&at("notes.txt", Some("C:\\Work\\notes.txt"))), "the result that is the cut file");
+        assert!(is(&at("notes.txt", Some("c:\\work\\notes.txt"))), "capitals don't matter");
+        assert!(!is(&at("notes.txt", Some("C:\\Work\\a\\notes.txt"))), "same name, another folder");
+        assert!(!is(&at("notes.txt", Some("C:\\Workshop\\notes.txt"))), "a folder that only starts the same");
+        assert!(!is(&at("notes.txt", Some("D:\\notes.txt"))));
+        assert!(is(&at("\u{1F600} é.txt", Some("C:\\Work\\\u{1F600} é.txt"))));
+        assert!(!is(&at("\u{1F600} é.txt", Some("C:\\Work\\b\\\u{1F600} é.txt"))));
+        assert!(!is(&at("other.txt", None)));
+        assert!(!ListView::is_cut(&tab, None, &at("notes.txt", None)), "nothing cut");
+    }
+
     /// Home's page scrolls with the wheel (its height is the page's, not the rows').
     #[test]
     fn home_scrolls() {
@@ -3006,11 +3144,248 @@ mod tests {
         assert_eq!(app.tabs[0].scroll, scrolled, "still scrolled");
     }
 
+    /// Moving the mouse over the list asks for a new frame only when what is lit up changes:
+    /// another row, a column title, the scroll bar, Home's tiles; drags and bands always do.
+    #[test]
+    fn hovering_redraws_only_when_the_highlight_changes() {
+        let _turn = media::test_turn();
+        let mut app = AppState::for_tests(crate::settings::Settings::default());
+        let names: Vec<String> = (0..200).map(|i| format!("f{i} \u{1F600}.txt")).collect();
+        let folder = crate::folder::Folder { path: "C:\\x".into(), entries: names.iter().map(|n| file(n)).collect(), ..Default::default() };
+        crate::app::apply_listing(&mut app.tabs[0], folder);
+        let mut list = ListView::new();
+        let ctx = Ctx { hwnd: HWND::default(), scale: 1.0, now: 0.0, maximized: false, active: true };
+        list.layout(Rect::new(0.0, 0.0, 600.0, 400.0), &ctx, &app);
+        list.tick(0.0, &mut app);
+        list.take_size(&app);
+        list.place_columns(&app);
+        assert_eq!(list.flow, Flow::Rows);
+        let ev = |x: f32, y: f32| MouseEvent { pos: Point::new(x, y), button: MouseButton::Left, mods: crate::ui::Mods::default(), wheel: 0.0 };
+        let paint = |list: &mut ListView, app: &AppState| list.painted_hover = list.hover_key(app.tab());
+        let redraws = |list: &mut ListView, app: &mut AppState, x: f32, y: f32| matches!(list.mouse_move(&ctx, &ev(x, y), app), Effect::Redraw);
+        let area = list.rows_area();
+        let row_h = list.geo(app.tab()).cell(1, 0.0).y - list.geo(app.tab()).cell(0, 0.0).y;
+        let y0 = list.geo(app.tab()).cell(0, 0.0).y + 2.0;
+        // Onto the first row: lit up.
+        assert!(redraws(&mut list, &mut app, 100.0, y0));
+        paint(&mut list, &app);
+        assert_eq!(list.painted_hover.item, Some(0));
+        // Along the same row: nothing new to draw.
+        for dx in 1..30 {
+            assert!(!redraws(&mut list, &mut app, 100.0 + dx as f32, y0 + (dx % 3) as f32), "moved {dx} along row 0");
+        }
+        // To the next row: drawn again, once.
+        assert!(redraws(&mut list, &mut app, 100.0, y0 + row_h));
+        paint(&mut list, &app);
+        assert!(!redraws(&mut list, &mut app, 120.0, y0 + row_h + 1.0));
+        // Not painted yet since a change: still asks (the frame shows the old one).
+        assert!(redraws(&mut list, &mut app, 100.0, y0 + 2.0 * row_h));
+        assert!(redraws(&mut list, &mut app, 101.0, y0 + 2.0 * row_h));
+        paint(&mut list, &app);
+        // Up to the column titles, from one to another.
+        let header = list.header();
+        let cols: Vec<(f32, f32)> = list.cols.iter().map(|c| (c.x, c.w)).collect();
+        assert!(redraws(&mut list, &mut app, cols[0].0 + 10.0, header.y + header.h / 2.0));
+        paint(&mut list, &app);
+        assert!(list.painted_hover.column.is_some());
+        assert!(!redraws(&mut list, &mut app, cols[0].0 + 12.0, header.y + header.h / 2.0));
+        if cols.len() > 1 {
+            assert!(redraws(&mut list, &mut app, cols[1].0 + cols[1].1 / 2.0, header.y + header.h / 2.0));
+            paint(&mut list, &app);
+        }
+        // Near the scroll bar: its thumb lights up.
+        let near = area.right() - 2.0;
+        if list.thumb(app.tab()).is_some() {
+            assert!(redraws(&mut list, &mut app, near, area.y + 50.0));
+            paint(&mut list, &app);
+            assert!(list.painted_hover.track);
+            assert!(!redraws(&mut list, &mut app, near, area.y + 51.0));
+        }
+        // Scrolled under a still pointer: the next frame paints the new row, and moving on that
+        // row after it needs nothing more.
+        assert!(redraws(&mut list, &mut app, 100.0, y0));
+        paint(&mut list, &app);
+        app.tabs[0].scroll = 3.0 * row_h;
+        assert_ne!(list.hover_key(app.tab()), list.painted_hover, "another row under it now");
+        paint(&mut list, &app);
+        assert!(!redraws(&mut list, &mut app, 101.0, y0));
+        // A press that becomes a band, and a column edge dragged: every move draws.
+        list.band = Some(Band { tab_id: app.tabs[0].id, start: Point::new(500.0, y0), now: Point::new(500.0, y0), base: vec![false; 200], active: false, at: 0.0 });
+        assert!(!matches!(list.mouse_move(&ctx, &ev(501.0, y0), &mut app), Effect::None));
+        app.tabs[0].scroll = 0.0;
+        list.band = Some(Band { tab_id: app.tabs[0].id, start: Point::new(500.0, y0), now: Point::new(500.0, y0), base: vec![false; 200], active: false, at: 0.0 });
+        assert!(redraws(&mut list, &mut app, 501.0, y0), "a press not yet a band");
+        assert!(matches!(list.mouse_move(&ctx, &ev(560.0, y0 + 60.0), &mut app), Effect::Animate), "a band");
+        list.band = None;
+        list.drag = Drag::Bar;
+        assert!(redraws(&mut list, &mut app, 102.0, y0));
+        list.drag = Drag::None;
+        // Leaving: the highlight goes.
+        assert!(matches!(list.mouse_leave(&ctx, &mut app), Effect::Redraw));
+        assert_eq!(list.hover_key(app.tab()).item, None);
+    }
+
+    /// Home: tiles, lines and the chevrons light up one by one, not on every pixel.
+    #[test]
+    fn hovering_home_redraws_only_when_the_spot_changes() {
+        let _turn = media::test_turn();
+        let mut app = AppState::for_tests(crate::settings::Settings::default());
+        let names: Vec<String> = (0..30).map(|i| format!("f{i}.txt")).collect();
+        let entries = names.iter().map(|n| Entry { target: Some(format!("C:\\x\\{n}")), ..file(n) }).collect();
+        let parts = crate::recent::Parts { pinned: 6, recent: 6, favorites: 30 };
+        let folder = crate::folder::Folder { path: crate::recent::LOCATION.into(), entries, home: Some(Box::new(parts)), ..Default::default() };
+        crate::app::apply_listing(&mut app.tabs[0], folder);
+        let mut list = ListView::new();
+        let ctx = Ctx { hwnd: HWND::default(), scale: 1.0, now: 0.0, maximized: false, active: true };
+        list.layout(Rect::new(0.0, 0.0, 600.0, 300.0), &ctx, &app);
+        list.tick(0.0, &mut app);
+        assert!(list.home_on);
+        let tab = &app.tabs[0];
+        list.home.layout = home::layout(600.0 - SCROLL_GUTTER.min(12.0), parts, tab.folder.entries.len(), &list.home, |i| tab.row_of(i).is_some());
+        let ev = |p: Point| MouseEvent { pos: p, button: MouseButton::Left, mods: crate::ui::Mods::default(), wheel: 0.0 };
+        let spots: Vec<(home::Spot, Rect)> = list.home.layout.spots.clone();
+        let mut lit = 0;
+        for (spot, rc) in spots.iter().filter(|(_, rc)| rc.bottom() < 290.0 && rc.w > 6.0 && rc.h > 6.0).take(12) {
+            let inside = Point::new(rc.x + rc.w / 2.0, rc.y + rc.h / 2.0);
+            let moved = matches!(list.mouse_move(&ctx, &ev(inside), &mut app), Effect::Redraw);
+            if moved {
+                lit += 1;
+            }
+            list.painted_hover = list.hover_key(app.tab());
+            assert_eq!(list.painted_hover.spot, Some(*spot));
+            assert!(matches!(list.mouse_move(&ctx, &ev(Point::new(inside.x + 1.0, inside.y + 1.0)), &mut app), Effect::None), "{spot:?} again");
+        }
+        assert!(lit >= 2, "spots lit up: {lit}");
+    }
+
+    /// The Apps key on Home opens the menu at the chosen tile or line, scrolled or not.
+    #[test]
+    fn home_keyboard_menu_opens_at_the_item() {
+        let _turn = media::test_turn();
+        let mut app = AppState::for_tests(crate::settings::Settings::default());
+        let names: Vec<String> = (0..65).map(|i| format!("f{i} \u{1F600}.txt")).collect();
+        let entries = names.iter().map(|n| Entry { target: Some(format!("C:\\x\\{n}")), ..file(n) }).collect();
+        let parts = crate::recent::Parts { pinned: 6, recent: 6, favorites: 65 };
+        let folder = crate::folder::Folder { path: crate::recent::LOCATION.into(), entries, home: Some(Box::new(parts)), ..Default::default() };
+        crate::app::apply_listing(&mut app.tabs[0], folder);
+        let mut list = ListView::new();
+        let ctx = Ctx { hwnd: HWND::default(), scale: 1.0, now: 0.0, maximized: false, active: true };
+        list.layout(Rect::new(10.0, 40.0, 600.0, 300.0), &ctx, &app);
+        list.tick(0.0, &mut app);
+        assert!(list.home_on);
+        let tab = &app.tabs[0];
+        list.home.layout = home::layout(592.0, parts, tab.folder.entries.len(), &list.home, |i| tab.row_of(i).is_some());
+        for (index, scroll) in [(0usize, 0.0f32), (3, 0.0), (8, 0.0), (40, 0.0), (60, 0.0)] {
+            let tab = &mut app.tabs[0];
+            tab.scroll = scroll;
+            let row = tab.row_of(index).expect("shown");
+            list.reveal(tab, row);
+            let at = list.item_menu_at(tab, row);
+            let rc = list.home.layout.rect_of(index).expect("on the page");
+            let s = tab.scroll;
+            // Just above the menu's corner is the item itself, on screen.
+            let probe = Point::new(at.x, at.y - 2.0);
+            assert!(list.rect.contains(probe), "item {index}: {at:?} in {:?}", list.rect);
+            assert_eq!(list.home.layout.spot_at(list.home_point(tab, probe)), Some(home::Spot::Item(index)), "item {index} at {rc:?}, scroll {s}: menu {at:?}");
+        }
+    }
+
     #[test]
     fn a_name_typed_before_loses_the_hidden_extension() {
         assert_eq!(strip_extension("draft.PDF", ".pdf"), "draft");
         assert_eq!(strip_extension("draft", ".pdf"), "draft");
         assert_eq!(strip_extension("é.pdf", ".pdf"), "é");
         assert_eq!(strip_extension("x", ""), "x");
+    }
+
+    /// A theme with the wallpaper settings given (the rest standard).
+    fn wall_theme(fit: WallpaperFit, at: (f32, Option<f32>), zoom: f32, size: Option<f32>, offset: (f32, f32)) -> Theme {
+        let mut t = Theme::dark();
+        (t.wallpaper_fit, t.wallpaper_at, t.wallpaper_at_y, t.wallpaper_zoom, t.wallpaper_size, t.wallpaper_offset) = (fit, at.0, at.1, zoom, size, offset);
+        t
+    }
+
+    fn once(d: Option<WallDraw>) -> (Rect, Rect) {
+        match d {
+            Some(WallDraw::Once { dest, src }) => (dest, src),
+            other => panic!("not once: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wallpapers_are_placed_as_the_skin_says() {
+        let area = Rect::new(0.0, 0.0, 400.0, 400.0);
+        let pic = (200.0, 100.0);
+        let standard = (1.0, None);
+        // Filling: as big as covers it (4 times), its right side and top in view.
+        let (dest, src) = once(wallpaper_layout(area, pic, &wall_theme(WallpaperFit::Fill, standard, 1.0, None, (0.0, 0.0)), 1.0));
+        assert_eq!((dest, src), (area, Rect::new(100.0, 0.0, 100.0, 100.0)));
+        // Whole: all of it (twice as big), at the bottom.
+        let (dest, src) = once(wallpaper_layout(area, pic, &wall_theme(WallpaperFit::Whole, standard, 1.0, None, (0.0, 0.0)), 1.0));
+        assert_eq!((dest, src), (Rect::new(0.0, 200.0, 400.0, 200.0), Rect::new(0.0, 0.0, 200.0, 100.0)));
+        // Stretch: all of it, to the area's shape; a size doesn't change that.
+        let (dest, src) = once(wallpaper_layout(area, pic, &wall_theme(WallpaperFit::Stretch, standard, 1.0, Some(0.25), (0.0, 0.0)), 1.0));
+        assert_eq!((dest, src), (area, Rect::new(0.0, 0.0, 200.0, 100.0)));
+        // Actual: its own size in the screen's pixels (at 200%: half as many DIPs), bottom right.
+        let (dest, _) = once(wallpaper_layout(area, pic, &wall_theme(WallpaperFit::Actual, standard, 1.0, None, (0.0, 0.0)), 0.5));
+        assert_eq!(dest, Rect::new(300.0, 350.0, 100.0, 50.0));
+        // A size: half the area's width, its shape kept; the zoom on top; then the offset.
+        let (dest, _) = once(wallpaper_layout(area, pic, &wall_theme(WallpaperFit::Actual, (0.0, Some(0.0)), 1.0, Some(0.5), (0.0, 0.0)), 1.0));
+        assert_eq!(dest, Rect::new(0.0, 0.0, 200.0, 100.0));
+        let (dest, _) = once(wallpaper_layout(area, pic, &wall_theme(WallpaperFit::Actual, (0.0, Some(0.0)), 1.5, Some(0.5), (20.0, -10.0)), 1.0));
+        assert_eq!(dest, Rect::new(20.0, 0.0, 300.0, 140.0), "moved 20 across and 10 up, its top cut off");
+        // Percentages: 25% across, 75% down.
+        let (dest, _) = once(wallpaper_layout(area, pic, &wall_theme(WallpaperFit::Actual, (0.25, Some(0.75)), 1.0, None, (0.0, 0.0)), 1.0));
+        assert_eq!(dest, Rect::new(50.0, 225.0, 200.0, 100.0));
+        // Moved all the way off: nothing to draw.
+        assert_eq!(wallpaper_layout(area, pic, &wall_theme(WallpaperFit::Actual, standard, 1.0, None, (2000.0, 0.0)), 1.0), None);
+        assert_eq!(wallpaper_layout(area, pic, &wall_theme(WallpaperFit::Fill, standard, 1.0, None, (0.0, -2000.0)), 1.0), None);
+    }
+
+    #[test]
+    fn awkward_wallpapers_still_place_sensibly() {
+        let standard = (1.0, None);
+        let plain = |fit| wall_theme(fit, standard, 1.0, None, (0.0, 0.0));
+        // A 1 x 1 picture filling a huge area.
+        let huge = Rect::new(0.0, 0.0, 100_000.0, 60_000.0);
+        let (dest, src) = once(wallpaper_layout(huge, (1.0, 1.0), &plain(WallpaperFit::Fill), 1.0));
+        assert_eq!(dest, huge);
+        assert!(src.w > 0.0 && src.w <= 1.0 && src.h > 0.0 && src.h <= 1.0, "{src:?}");
+        // An area smaller than the picture, at its own size: the bottom right corner of it shows.
+        let small = Rect::new(50.0, 50.0, 10.0, 10.0);
+        let (dest, src) = once(wallpaper_layout(small, (4000.0, 3000.0), &plain(WallpaperFit::Actual), 1.0));
+        assert_eq!((dest, src), (small, Rect::new(3990.0, 2990.0, 10.0, 10.0)));
+        // Tiles: from where the picture would sit, as big as zoomed (a sixth, at -500).
+        let area = Rect::new(10.0, 20.0, 300.0, 200.0);
+        match wallpaper_layout(area, (1.0, 1.0), &wall_theme(WallpaperFit::Tile, (0.0, Some(0.0)), 1.0 / 6.0, None, (0.0, 0.0)), 1.0) {
+            Some(WallDraw::Tiled { fill, origin, tile }) => {
+                assert_eq!((fill, origin), (area, Point::new(10.0, 20.0)));
+                assert!((tile.0 - 1.0 / 6.0).abs() < 1e-6 && (tile.1 - 1.0 / 6.0).abs() < 1e-6, "{tile:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Tiles moved by the offset, and placed from the right side.
+        match wallpaper_layout(area, (64.0, 32.0), &wall_theme(WallpaperFit::Tile, standard, 1.0, None, (5.0, -5.0)), 1.0) {
+            Some(WallDraw::Tiled { origin, tile, .. }) => assert_eq!((origin, tile), (Point::new(10.0 + 300.0 - 64.0 + 5.0, 15.0), (64.0, 32.0))),
+            other => panic!("{other:?}"),
+        }
+        // Nothing to place: no picture, or no room.
+        assert_eq!(wallpaper_layout(area, (0.0, 10.0), &plain(WallpaperFit::Fill), 1.0), None);
+        assert_eq!(wallpaper_layout(Rect::new(0.0, 0.0, 0.0, 100.0), (10.0, 10.0), &plain(WallpaperFit::Fill), 1.0), None);
+        assert_eq!(wallpaper_layout(area, (10.0, 10.0), &plain(WallpaperFit::Tile), 0.0), None, "no size at all");
+        // Split view: both halves are given the same area, so they place it the same.
+        let both = Rect::new(0.0, 0.0, 800.0, 400.0);
+        let theme = plain(WallpaperFit::Whole);
+        assert_eq!(wallpaper_layout(both, (300.0, 200.0), &theme, 1.0), wallpaper_layout(both, (300.0, 200.0), &theme, 1.0));
+    }
+
+    #[test]
+    fn a_wallpapers_fade_runs_in_from_each_edge() {
+        use crate::render::fade_stops;
+        assert_eq!(fade_stops(0.1), [(0.0, 0.0), (0.1, 1.0), (0.9, 1.0), (1.0, 0.0)]);
+        assert_eq!(fade_stops(0.5), [(0.0, 0.0), (0.5, 1.0), (0.5, 1.0), (1.0, 0.0)], "the most: fades from the middle");
+        assert_eq!(fade_stops(0.9), fade_stops(0.5));
+        assert_eq!(fade_stops(-1.0), fade_stops(0.0));
+        assert!(fade_stops(0.3).windows(2).all(|p| p[0].0 <= p[1].0), "stops in order");
     }
 }

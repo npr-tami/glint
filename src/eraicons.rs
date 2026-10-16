@@ -135,6 +135,26 @@ pub fn drive_kind(kind_name: &str, root: &str) -> DriveKind {
     }
 }
 
+/// The kind of drive `root` ("E:") is, as Windows says it is now (a USB stick, a DVD drive, a
+/// network drive...). Asking Windows for the type of a drive is always quick: it never wakes the
+/// drive or waits on the network.
+fn kind_of_drive(root: &str) -> DriveKind {
+    let root_w: Vec<u16> = format!("{}\\", root.trim_end_matches('\\')).encode_utf16().chain(Some(0)).collect();
+    // SAFETY: `root_w` is NUL-terminated and outlives the call.
+    let t = unsafe { windows::Win32::Storage::FileSystem::GetDriveTypeW(windows::core::PCWSTR(root_w.as_ptr())) };
+    drive_kind(drive_type_name(t), root)
+}
+
+/// What Windows calls a drive of type `t` (GetDriveTypeW), as folder.rs names drives.
+fn drive_type_name(t: u32) -> &'static str {
+    match t {
+        2 => "Removable Disk",
+        4 => "Network Drive",
+        5 => "CD Drive",
+        _ => "Local Disk",
+    }
+}
+
 /// What a place (a folder's path, "" for This PC, Glint's Home, the Recycle Bin) shows.
 pub fn role_of_path(path: &str) -> Role {
     if path.is_empty() || path.eq_ignore_ascii_case(crate::details::THIS_PC_ID) {
@@ -148,7 +168,7 @@ pub fn role_of_path(path: &str) -> Role {
     }
     let trimmed = path.trim_end_matches('\\');
     if trimmed.len() == 2 && trimmed.ends_with(':') {
-        return Role::Drive(if trimmed.to_lowercase() == system_drive() { DriveKind::System } else { DriveKind::Fixed });
+        return Role::Drive(kind_of_drive(trimmed));
     }
     let lower = trimmed.to_lowercase();
     known_places().iter().find(|(p, _)| *p == lower).map_or(Role::Folder, |(_, r)| *r)
@@ -1842,6 +1862,11 @@ mod xp {
         if hard {
             c.fill(&rect(10.0, 12.0, 10.0, 2.0), &flat(0x1c1c22));
             c.fill(&rect(18.0, 20.0, 10.0, 4.0), &flat(0x26262c));
+        } else if kind == DriveKind::Removable {
+            // A USB stick or card reader: a long dark slot across the front and a blue tag on top,
+            // so it reads apart from a hard disk even at 16 pixels.
+            c.fill(&rect(5.0, 20.0, 22.0, 4.0), &flat(0x1c1c22));
+            c.paint(&rect(9.0, 14.5, 10.0, 3.0), &lin((9.0, 0.0), (19.0, 0.0), &[(0.0, 0x8fb4e0), (1.0, 0x2f6fc0)]), &flat(0x2a5a9a));
         } else {
             c.fill(&rect(16.0, 20.0, 12.0, 4.0), &lin((16.0, 0.0), (28.0, 0.0), &[(0.0, 0x5a5a62), (1.0, 0x202024)]));
         }
@@ -2275,7 +2300,12 @@ mod aero {
         c.fill(&oval(x + w - 4.0, y + h * 0.62, 2.4, 2.0), &flat_a(0x9bf29b, 0.7));
         c.fill(&oval(x + w - 4.0, y + h * 0.62, 1.3, 1.2), &flat(0x3bd23b));
         if kind == DriveKind::Removable {
-            c.paint(&rect(x + 3.0, y + 2.5, 7.0, 3.0), &lin((x, y), (x + 10.0, y), &[(0.0, 0x8fb4e0), (1.0, 0x2f6fc0)]), &flat(0x2a5a9a));
+            if big {
+                c.paint(&rect(x + 3.0, y + 2.5, 7.0, 3.0), &lin((x, y), (x + 10.0, y), &[(0.0, 0x8fb4e0), (1.0, 0x2f6fc0)]), &flat(0x2a5a9a));
+            } else {
+                // At 16 pixels a wide blue band, so a USB stick reads apart from a hard disk.
+                c.paint(&rect(x + 2.0, y + 2.0, w - 9.0, 5.0), &lin((x, y), (x + w, y), &[(0.0, 0x8fb4e0), (1.0, 0x2f6fc0)]), &flat(0x2a5a9a));
+            }
         }
         if kind == DriveKind::Network {
             let pipe = lin((0.0, 28.0), (0.0, 31.0), &[(0.0, 0x3baa3b), (1.0, 0x167a16)]);
@@ -2412,5 +2442,32 @@ mod tests {
         assert_eq!(drive_kind("Removable Disk", "E:\\"), DriveKind::Removable);
         assert_eq!(drive_kind("CD Drive", "D:\\"), DriveKind::Optical);
         assert_eq!(drive_kind("Network Drive", "N:\\"), DriveKind::Network);
+    }
+
+    #[test]
+    fn a_usb_stick_looks_apart_from_a_hard_disk_at_16_pixels() {
+        for set in [IconSet::Xp, IconSet::Aero] {
+            let (usb, disk) = (pixels(set, Role::Drive(DriveKind::Removable), 16), pixels(set, Role::Drive(DriveKind::Fixed), 16));
+            let differ = usb.chunks(4).zip(disk.chunks(4)).filter(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| x.abs_diff(*y) > 40)).count();
+            assert!(differ >= 12, "{set:?}: only {differ} pixels differ");
+        }
+    }
+
+    #[test]
+    fn a_drive_root_shows_the_drive_it_is() {
+        // Windows' drive types map to the same kinds as the sidebar's (folder.rs names).
+        assert_eq!(drive_kind(drive_type_name(2), "E:"), DriveKind::Removable);
+        assert_eq!(drive_kind(drive_type_name(4), "Z:"), DriveKind::Network);
+        assert_eq!(drive_kind(drive_type_name(5), "D:"), DriveKind::Optical);
+        assert_eq!(drive_kind(drive_type_name(3), "Q:"), DriveKind::Fixed);
+        assert_eq!(drive_kind(drive_type_name(1), "Q:"), DriveKind::Fixed); // no such drive
+        // The system drive keeps its own picture, with or without the backslash, any case.
+        let sys = system_drive().to_uppercase();
+        for p in [sys.clone(), format!("{sys}\\"), sys.to_lowercase()] {
+            assert_eq!(role_of_path(&p), Role::Drive(DriveKind::System), "{p}");
+        }
+        // Not a drive root: no drive picture.
+        assert_eq!(role_of_path("E:\\Photos 📷"), Role::Folder);
+        assert_eq!(role_of_path("\\\\server\\share"), Role::Folder);
     }
 }

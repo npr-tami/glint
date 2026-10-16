@@ -247,9 +247,11 @@ fn same_content(paths: Vec<String>, size: u64, buf: &mut Buffers, cancel: &Atomi
             continue;
         }
         let paths: Vec<&str> = run.iter().map(|h| h.2.as_str()).collect();
-        // A small file's head is all of it; a bigger one gets a hash of the whole content.
+        // A small file's head is all of it; a bigger one gets a hash of the whole content - except
+        // when only two are left: the byte compare below decides them anyway, so hashing first
+        // would read both files twice.
         let mut whole: Vec<(u64, &str)> = Vec::with_capacity(paths.len());
-        if size as usize <= HEAD {
+        if size as usize <= HEAD || paths.len() == 2 {
             whole.extend(paths.iter().map(|p| (0, *p)));
         } else {
             for p in paths {
@@ -268,7 +270,7 @@ fn same_content(paths: Vec<String>, size: u64, buf: &mut Buffers, cancel: &Atomi
                 let mut same = vec![first.to_string()];
                 let mut other = Vec::new();
                 for &p in &left[1..] {
-                    match equal(first, p, buf, cancel)? {
+                    match equal(first, p, size, buf, cancel)? {
                         true => same.push(p.to_string()),
                         false => other.push(p),
                     }
@@ -327,7 +329,11 @@ fn fill(f: &mut File, buf: &mut [u8], cancel: &AtomicBool) -> Option<usize> {
         }
         match f.read(&mut buf[n..]) {
             Ok(0) | Err(_) => break,
-            Ok(k) => n += k,
+            Ok(k) => {
+                n += k;
+                #[cfg(test)]
+                tests::READ.with(|r| r.set(r.get() + k as u64));
+            }
         }
     }
     Some(n)
@@ -350,18 +356,21 @@ fn hash_file(path: &str, size: u64, buf: &mut [u8], cancel: &AtomicBool) -> Opti
     Some((read == size).then(|| h.finish(read)))
 }
 
-/// Whether two files have the same bytes (false if either can't be read through). None when
-/// cancelled.
-fn equal(a: &str, b: &str, buf: &mut Buffers, cancel: &AtomicBool) -> Option<bool> {
+/// Whether two files have the same bytes and are still `size` long (false if either can't be read
+/// through). None when cancelled.
+fn equal(a: &str, b: &str, size: u64, buf: &mut Buffers, cancel: &AtomicBool) -> Option<bool> {
     let (Ok(mut fa), Ok(mut fb)) = (File::open(a), File::open(b)) else { return Some(false) };
+    let mut read = 0u64;
     loop {
         let na = fill(&mut fa, &mut buf.a, cancel)?;
         let nb = fill(&mut fb, &mut buf.b, cancel)?;
         if na != nb || buf.a[..na] != buf.b[..nb] {
             return Some(false);
         }
+        read += na as u64;
         if na < buf.a.len() {
-            return Some(true);
+            // (Both grew or shrank alike since the listing: no longer the size it showed.)
+            return Some(read == size);
         }
     }
 }
@@ -586,6 +595,51 @@ mod tests {
         assert_eq!(sets, vec![vec![p("big1"), p("big2")]]);
         // Cancelled: nothing.
         assert!(same_content(vec![p("big1"), p("big2")], 150_000, &mut buffers, &AtomicBool::new(true)).is_none());
+    }
+
+    thread_local! {
+        /// Bytes read from files on this thread (by `fill`).
+        pub(super) static READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Two big files left after the head check are compared byte by byte once, not hashed first.
+    #[test]
+    fn a_pair_of_big_files_is_read_once() {
+        const SIZE: usize = 200_000;
+        let same: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
+        let mut late = same.clone();
+        late[SIZE - 1] ^= 1;
+        let t = Tree::new("bigpair", &[("a.bin", &same), ("x b.bin", &same), ("late.bin", &late)]);
+        let p = |n: &str| format!("{}\\{n}", t.path());
+        let mut buffers = Buffers { a: vec![0u8; CHUNK], b: vec![0u8; CHUNK] };
+        let never = AtomicBool::new(false);
+        let read = |f: &mut dyn FnMut()| {
+            READ.with(|r| r.set(0));
+            f();
+            READ.with(|r| r.get())
+        };
+        let mut sets = Vec::new();
+        let bytes = read(&mut || sets = same_content(vec![p("a.bin"), p("x b.bin")], SIZE as u64, &mut buffers, &never).unwrap());
+        let mut want = vec![p("a.bin"), p("x b.bin")];
+        want.sort_by_cached_key(|p| p.to_lowercase());
+        assert_eq!(sets, vec![want.clone()]);
+        assert!(bytes <= (2 * HEAD + 2 * SIZE) as u64, "read {bytes} bytes");
+        // Different only in the last byte: not a set, again in one pass.
+        let bytes = read(&mut || sets = same_content(vec![p("a.bin"), p("late.bin")], SIZE as u64, &mut buffers, &never).unwrap());
+        assert!(sets.is_empty());
+        assert!(bytes <= (2 * HEAD + 2 * SIZE) as u64, "read {bytes} bytes");
+        // Three: still split by the hash, the odd one out left out.
+        let sets = same_content(vec![p("late.bin"), p("a.bin"), p("x b.bin")], SIZE as u64, &mut buffers, &never).unwrap();
+        assert_eq!(sets, vec![want.clone()]);
+        // Both grew alike since the listing: not the size it showed, so not a set.
+        let mut grown = same.clone();
+        grown.extend_from_slice(b"more");
+        std::fs::write(p("g1.bin"), &grown).unwrap();
+        std::fs::write(p("g2.bin"), &grown).unwrap();
+        assert!(same_content(vec![p("g1.bin"), p("g2.bin")], SIZE as u64, &mut buffers, &never).unwrap().is_empty());
+        // One missing by now: no set; asked to stop: nothing.
+        assert!(same_content(vec![p("a.bin"), p("gone.bin")], SIZE as u64, &mut buffers, &never).unwrap().is_empty());
+        assert!(same_content(vec![p("a.bin"), p("x b.bin")], SIZE as u64, &mut buffers, &AtomicBool::new(true)).is_none());
     }
 
     #[test]

@@ -163,8 +163,8 @@ impl Icons {
             EntryKind::Drive => self.drive(e.target.as_deref().unwrap_or(""), &e.type_name),
             EntryKind::Folder => self.generic_sized("\\folder", "folder", FILE_ATTRIBUTE_DIRECTORY, large),
             EntryKind::File if OWN_ICON.contains(&e.ext.as_str()) => {
-                let path = e.path_in(dir);
-                let key = if large { format!("{LARGE_MARK}{path}") } else { path };
+                // (Kept per version of the file: a changed shortcut or program shows its new icon.)
+                let key = own_key(&e.path_in(dir), e.modified, e.size, large);
                 if let Some(&id) = self.inner.borrow().by_key.get(&key) {
                     return id;
                 }
@@ -496,11 +496,30 @@ fn place_icon(name: &str) -> Option<HICON> {
     }
 }
 
-/// What the icon thread is asked for: a path, or LARGE_MARK and a path for its big icon.
+/// Ends an own-icon file's cache key: the file's modified time and size follow it.
+const STAMP_MARK: char = '\u{0}';
+
+/// The cache key of a file's own icon: its path and the version of it the listing saw (modified
+/// time and size), so a file that changed is looked up again; LARGE_MARK first for the big one.
+fn own_key(path: &str, modified: u64, size: u64, large: bool) -> String {
+    let mark = if large { LARGE_MARK.to_string() } else { String::new() };
+    format!("{mark}{path}{STAMP_MARK}{modified:x}.{size:x}")
+}
+
+/// The path in a key the icon thread is given, and whether it wants the big icon.
+fn queued_path(key: &str) -> (&str, bool) {
+    let (key, large) = match key.strip_prefix(LARGE_MARK) {
+        Some(rest) => (rest, true),
+        None => (key, false),
+    };
+    (key.split(STAMP_MARK).next().unwrap_or(key), large)
+}
+
+/// What the icon thread is asked for: an `own_key`.
 fn load_queued_icon(key: &str) -> Option<LoadedIcon> {
-    match key.strip_prefix(LARGE_MARK) {
-        Some(path) => shell_icon(path, FILE_ATTRIBUTE_NORMAL, false, true).map(LoadedIcon),
-        None => load_path_icon(key),
+    match queued_path(key) {
+        (path, true) => shell_icon(path, FILE_ATTRIBUTE_NORMAL, false, true).map(LoadedIcon),
+        (path, false) => load_path_icon(path),
     }
 }
 
@@ -617,6 +636,48 @@ pub fn type_name(ext: &str, is_dir: bool) -> Arc<str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn own_icons_are_looked_up_again_when_the_file_changes() {
+        for path in ["C:\\x\\app.lnk", "C:\\\u{1F600} é\\setup 2.exe", "\\\\server\\share\\a.ico"] {
+            for large in [false, true] {
+                let key = own_key(path, 0x1d9_0000_0000, 4096, large);
+                assert_eq!(queued_path(&key), (path, large), "{key:?}");
+                assert_eq!(key, own_key(path, 0x1d9_0000_0000, 4096, large), "the same file, the same key");
+                assert_ne!(key, own_key(path, 0x1d9_0000_0001, 4096, large), "changed: looked up again");
+                assert_ne!(key, own_key(path, 0x1d9_0000_0000, 4097, large), "other size: looked up again");
+                assert_ne!(key, own_key(path, 0x1d9_0000_0000, 4096, !large));
+            }
+        }
+        // Never the same as another path's key, nor a generic one's.
+        assert_ne!(own_key("C:\\a1", 0, 0, false), own_key("C:\\a", 0x10, 0, false));
+        assert!(!own_key("C:\\a.exe", 0, 0, false).starts_with('\u{1}'));
+
+        // The cache: the icon stored for one version isn't drawn for the next, but is for it again
+        // (undo puts the old file back).
+        let icons = Icons::new();
+        let mut e = crate::folder::Entry {
+            name: "app.lnk".into(),
+            lower: "app.lnk".into(),
+            kind: EntryKind::File,
+            size: 10,
+            modified: 1,
+            created: 0,
+            attributes: 0,
+            ext: "lnk".into(),
+            type_name: Arc::from("Shortcut"),
+            target: None,
+            free: 0,
+        };
+        let dir = std::env::temp_dir().join("glint-icon-test-missing").to_string_lossy().into_owned();
+        let old = icons.store(own_key(&e.path_in(&dir), 1, 10, false), None);
+        assert_eq!(icons.for_entry(&dir, &e), old);
+        e.modified = 2;
+        assert_ne!(icons.for_entry(&dir, &e), old, "changed since");
+        assert!(icons.inner.borrow().asked.contains(&own_key(&e.path_in(&dir), 2, 10, false)), "its new icon is asked for");
+        e.modified = 1;
+        assert_eq!(icons.for_entry(&dir, &e), old);
+    }
 
     #[test]
     fn zip_and_7z_files_follow_the_icon_glint_gave_them() {

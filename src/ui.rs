@@ -368,6 +368,9 @@ pub enum Command {
     /// Open the Settings window (Ctrl+, and SETTINGS), or bring it to the front - at this page
     /// (settingswin::ABOUT for "About Glint"). Handled by the window.
     OpenSettings(Option<usize>),
+    /// Open Settings at this page with the keyboard on the row with this title (found with the
+    /// command box).
+    OpenSetting(usize, String),
     /// Open the skin customiser (Settings > Appearance > CUSTOMISE…), or bring it to the front.
     /// Handled by the window.
     OpenSkinEditor,
@@ -427,6 +430,22 @@ pub struct MenuItem {
     pub submenu: Vec<MenuItem>,
     /// A round dot of this colour beside the text (Tag ›'s colours), where Windows draws the menu.
     pub dot: Option<Color>,
+    /// A little picture beside the text (Settings' Logo and Zip icon lists), where Windows draws
+    /// the menu.
+    pub picture: Option<MenuPicture>,
+    /// In bold (the menu's default item): the skin in use in Settings' skin list.
+    pub bold: bool,
+}
+
+/// A little picture beside a menu item's words; popup.rs makes it at the menu's DPI.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MenuPicture {
+    /// One of glint.exe's icons, by its number in res/glint.rc.
+    Icon(u16),
+    /// The chrome wordmark (logo.rs): "glint", or GLiNT with `caps`, for a dark or a light menu.
+    Wordmark { caps: bool, dark: bool },
+    /// The slanted box logo, in this colour.
+    Box(Color),
 }
 
 impl MenuItem {
@@ -449,6 +468,10 @@ impl MenuItem {
     /// With a dot of `color` beside the text.
     pub fn dot(mut self, color: Color) -> MenuItem {
         self.dot = Some(color);
+        self
+    }
+    pub fn picture(mut self, picture: MenuPicture) -> MenuItem {
+        self.picture = Some(picture);
         self
     }
     pub fn separator() -> MenuItem {
