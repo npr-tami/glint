@@ -173,7 +173,7 @@ fn main() {
         log::ask_for_timing_log();
     }
     log::tidy_timing_log();
-    // "Make Glint default.bat" / "Restore File Explorer.bat": registry only, no settings needed.
+    // --set-default / --restore-explorer: registry only, no settings needed.
     if let Some(code) = life::registry_switch(&switches) {
         std::process::exit(code);
     }

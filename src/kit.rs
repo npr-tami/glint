@@ -665,6 +665,16 @@ pub fn heading(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str) {
 /// list (the skin's edge and tint) - or, when the skin's sidebar is in panels, like the place
 /// you're in there (a rounded selection inside the list).
 pub fn nav_item(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str, selected: bool, look: Look) {
+    nav_entry(r, theme, rect, text, selected, look, false);
+}
+
+/// A page's name in a row of tabs along the top (a narrow Settings window): the name sits in the
+/// middle of its tab, so every tab has the same space on both sides.
+pub fn nav_tab(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str, selected: bool, look: Look) {
+    nav_entry(r, theme, rect, text, selected, look, true);
+}
+
+fn nav_entry(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str, selected: bool, look: Look, middle: bool) {
     // 98 and 2000: a list box's line, inside the sunken well (`page_list_well`).
     let rect = if theme.era.classic() { Rect::new(rect.x + 9.0, rect.y, (rect.w - 18.0).max(0.0), rect.h) } else { rect };
     if panels(theme) {
@@ -678,7 +688,11 @@ pub fn nav_item(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str, selecte
         let color = if selected { theme.sidebar_selection_text } else { theme.sidebar_text };
         let style = TextStyle::new(color).size(size::NAV_FONT);
         let style = if selected { style.semibold() } else { style };
-        r.text(text, Rect::new(rect.x + 18.0, rect.y, (rect.w - 26.0).max(0.0), rect.h), &style);
+        if middle {
+            r.text(text, pill, &style.align(Align::Center));
+        } else {
+            r.text(text, Rect::new(rect.x + 18.0, rect.y, (rect.w - 26.0).max(0.0), rect.h), &style);
+        }
         if look.focused {
             focus_ring(r, theme, pill, 0.0);
         }
@@ -693,7 +707,11 @@ pub fn nav_item(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str, selecte
     let color = if selected { theme.selection_text } else { theme.sidebar_text };
     let style = TextStyle::new(color).size(size::NAV_FONT);
     let style = if selected { style.semibold() } else { style };
-    r.text(text, Rect::new(rect.x + 18.0, rect.y, (rect.w - 26.0).max(0.0), rect.h), &style);
+    if middle {
+        r.text(text, rect, &style.align(Align::Center));
+    } else {
+        r.text(text, Rect::new(rect.x + 18.0, rect.y, (rect.w - 26.0).max(0.0), rect.h), &style);
+    }
     if look.focused {
         focus_ring(r, theme, rect.inset(2.0, 2.0), 0.0);
     }

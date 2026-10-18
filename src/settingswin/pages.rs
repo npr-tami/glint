@@ -246,7 +246,7 @@ pub fn after_change(key: &str, before: &Settings, app: &mut AppState) -> Option<
 }
 
 /// What the registry said about the "@" switches, and when: looked up again after a second at the
-/// most (they're drawn every frame; a .bat file may have changed them meanwhile).
+/// most (they're drawn every frame; another Glint or a command line may have changed them meanwhile).
 static OUTSIDE: Mutex<Option<(Instant, bool, bool)>> = Mutex::new(None);
 
 /// The value of a switch kept by Windows rather than settings.json ("@Folders": folders and drives

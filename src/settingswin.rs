@@ -1064,9 +1064,19 @@ impl SettingsWindow {
         self.pills.clear();
         if self.narrow() {
             let (mut x, mut y) = (PILL_PAD, self.title_h() + PILL_PAD);
-            for name in PAGES {
-                let w = self.renderer.measure(name, &TextStyle::new(Color::hex(0)).size(ksize::NAV_FONT).semibold()).ceil() + 36.0;
-                if x > PILL_PAD && x + w > self.size.0 - PILL_PAD {
+            let style = TextStyle::new(Color::hex(0)).size(ksize::NAV_FONT).semibold();
+            let texts: Vec<f32> = PAGES.iter().map(|name| self.renderer.measure(name, &style).ceil()).collect();
+            // Less room around each name before one goes to a second line (a skin with bigger text).
+            let room = self.size.0 - 2.0 * PILL_PAD - texts.iter().sum::<f32>();
+            let around = (room / PAGES.len() as f32).clamp(16.0, 36.0);
+            // On one line they sit in the middle, with the same space left and right.
+            let left = room - around * PAGES.len() as f32;
+            if left >= 0.0 {
+                x += left / 2.0;
+            }
+            for text in texts {
+                let w = text + around;
+                if x > PILL_PAD && x + w > self.size.0 - PILL_PAD + 0.5 {
                     (x, y) = (PILL_PAD, y + ksize::NAV_ITEM_H);
                 }
                 self.pills.push(Rect::new(x, y, w, ksize::NAV_ITEM_H));
@@ -1231,7 +1241,8 @@ impl SettingsWindow {
         for (i, name) in PAGES.iter().enumerate() {
             let rect = self.nav_rect(i);
             let look = Look { hover: self.hover == Some(Hot::Nav(i)), focused: self.cues && self.focus == Spot::Nav && i == self.page, ..Look::enabled() };
-            kit::nav_item(&mut self.renderer, theme, rect, name, i == self.page, look);
+            let draw = if self.narrow() { kit::nav_tab } else { kit::nav_item };
+            draw(&mut self.renderer, theme, rect, name, i == self.page, look);
         }
     }
 

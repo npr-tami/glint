@@ -13,7 +13,7 @@
 //!   `Software\Glint\RegistryBackup` and put back when the setting is turned off.
 //!
 //! There is only one "default file explorer": turning it on points it at this glint.exe, and turning
-//! it off (or "Restore File Explorer.bat") gives everything back to File Explorer, whichever
+//! it off (or `glint.exe --restore-explorer`, or the README's steps by hand) gives everything back to File Explorer, whichever
 //! glint.exe it pointed at. A setting counts as "on" only when it points at *this* glint.exe.
 //!
 //! **Start with Windows** is the "Glint" value of `...\CurrentVersion\Run`:
@@ -316,7 +316,7 @@ pub fn same_exe(a: &str, b: &str) -> bool {
 
 /// Why `exe` shouldn't become what folders, drives or Win+E open: it sits where it may soon be gone.
 /// Pointed at an exe that is gone, Windows can't open any folder with a double-click (on the
-/// desktop, in a shortcut, from another program) until "Restore File Explorer.bat" is run. So it's
+/// desktop, in a shortcut, from another program) until the README's steps to undo it by hand are followed. So it's
 /// refused for a temporary folder (a glint.exe started from inside a zip file runs from one, and
 /// Windows empties those), a removable drive, a CD, or a network drive. None: a place it can stay.
 pub fn risky_place(exe: &str) -> Option<&'static str> {

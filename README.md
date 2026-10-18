@@ -1,55 +1,226 @@
 # Glint
 
-Glint is a fast, lightweight file explorer for Windows 10 and 11. It draws everything itself with
-Direct2D, so it opens instantly, stays out of your way and needs nothing installed: it's a single
-`Glint.exe` of a few megabytes.
+A fast, small file explorer for Windows 10 and 11.
+Tabs, split view, previews and skins, all in one `Glint.exe` of a few megabytes.
+Nothing to install, and it opens instantly.
 
-<!-- Screenshots: coming soon -->
+**[Download Glint.exe](https://github.com/npr-tami/glint/releases/latest)** · [What's new](CHANGELOG.md) · [Report a bug](https://github.com/npr-tami/glint/issues)
 
-## What it does
+> Glint is in beta and made by one person for fun. I use it every day, but expect rough edges.
 
-- **Tabs** that come back next time, a **sidebar** with Quick access, pinned folders and your
-  drives, and a clickable path you can also type into (`~`, `%VARIABLES%` and `shell:` places work).
-- **A details panel** (Alt+P) and a **Space preview** for pictures (zoom and pan), text files and
-  more.
-- **View modes**: extra large, large and medium icons with thumbnails, list, details and a tree.
-- **Working with files**, as in File Explorer: copy, cut, paste, rename, delete and the Recycle
-  Bin, all through Windows' own copy engine (so Ctrl+Z in File Explorer still works), drag and drop
-  to and from other apps, and right-click menus with other apps' items.
-- **A filter that searches as you type**, also through every subfolder.
-- **Skins**: AMD Radeon, NVIDIA, Chrome and Gunmetal (with light and dark versions), or your own, made in the built-in
-  **skin customiser** or in Notepad (skins are small `.glint` text files).
-- **Custom sort order**: write your own order, like `-folder_first -newest_first -image`, or rules for
-  one folder between `in Downloads (` and `)` (the lines after the `)` are for every folder), the same
-  rules for several folders with `in = (` and their paths, one per line, and `and_subfolders` to give
-  a folder's rules to every folder inside it. The editor has **suggestions as you type**, line
-  numbers, tips in plain words with one-click fixes, says which rules sort the folder you're in,
-  and can stay beside Glint or go anywhere (DETACH). A folder with no rules sorts by its column.
-- **A view for each folder**: put `-large_icons` (or `-details`, `-list`, `-tree`…) in a folder's rules and it
-  always opens that way, keeping the order every other folder uses; the other folders keep the view
-  you picked.
-- **Your default file explorer**, if you like: folders, drives and Win+E open in Glint.
-- **Background mode**: closing the window keeps Glint ready in the tray, so the next window opens
-  instantly. It can start with Windows too.
-- **Updates itself** from GitHub Releases: it tells you when there's a new version and puts it in
-  place when you say so.
+<p align="center">
+  <img src="res/screenshots/home.png" width="880" alt="Glint's Home page with pinned folders, recent files and a text preview">
+</p>
 
-## Download
+**On this page:** [Features](#features) · [Screenshots](#screenshots) · [Get started](#get-started) ·
+[Shortcuts](#keyboard-shortcuts) · [Default file explorer](#make-glint-your-default-file-explorer) ·
+[Settings files](#where-glint-keeps-its-settings) · [Build it yourself](#build-it-yourself)
 
-Get `Glint.exe` from the [Releases page](https://github.com/npr-tami/glint/releases). It's a single
-file: put it in a folder of its own and run it. Windows may warn that it doesn't know the program
-("Windows protected your PC": More info, then Run anyway).
+## Features
 
-**Portable mode:** switch on Settings > About > Portable (or make an empty folder called
-`Glint data` next to `Glint.exe`), and Glint keeps all its files in `Glint data` next to itself, so
-the whole folder can go on a USB stick. Switching it moves the files when Glint next starts.
+### Getting around
+
+- **Tabs**, with pinned tabs and saved tab sets.
+- **Split view**: two folders side by side (Ctrl+\\).
+- **Sidebar** with Quick access, pinned folders and your drives.
+- **Path bar** you can click or type into.
+- **Home** with your folders, recent files and Favorites.
+- **Command box** (Ctrl+U): type a command, a setting, a folder or a search word.
+
+### Seeing your files
+
+- **Views**: icons with thumbnails, list, details and a tree.
+- **Preview** pictures, GIFs, videos and text with Space.
+- **Details panel** (Alt+P).
+- **Folder sizes** and **colour tags**.
+- **Zip and 7z** files open like folders.
+
+### Working with files
+
+- Copy, move, rename and delete the Windows way, so the Recycle Bin still works.
+- **Undo and redo** (Ctrl+Z, Ctrl+Y).
+- **Copy queue** you can pause.
+- **Filter as you type**, in subfolders too, or across all your drives.
+- **Rename many** (F2 with several files selected).
+- **Find duplicates** (right-click empty space).
+
+### Making it yours
+
+- **Skins**: AMD Radeon, NVIDIA, Chrome and Gunmetal, with light versions.
+- **Skin customiser** to make your own, even with a wallpaper.
+- **Your own sort order and views** per folder: [how it works](docs/sort-order.md).
+- **Default file explorer**, if you want: folders, drives and Win+E open in Glint.
+- **Background mode**: Glint waits in the tray, so new windows open instantly.
+- **Updates itself** when you say so.
+
+## Screenshots
+
+<p align="center">
+  <img src="res/screenshots/skins.gif" width="880" alt="Switching skins in Settings > Appearance: AMD Radeon, NVIDIA, their light versions, Chrome and Gunmetal">
+  <br><sub>Switching skins in <b>Settings > Appearance</b></sub>
+</p>
+
+<table>
+  <tr>
+    <td align="center" valign="top" width="50%">
+      <img src="res/screenshots/sort-menu.png" width="264" alt="The SORT menu"><br><sub>SORT menu</sub>
+    </td>
+    <td align="center" valign="top" width="50%">
+      <img src="res/screenshots/view-menu.png" width="337" alt="The VIEW menu"><br><sub>VIEW menu</sub>
+    </td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="res/screenshots/preview.png" width="880" alt="A Pictures folder with the Space preview open on a picture">
+  <br><sub>Space preview</sub>
+</p>
+
+<table>
+  <tr>
+    <td align="center" valign="top">
+      <img src="res/screenshots/skin-editor.png" width="357" alt="The skin customiser"><br><sub>Skin customiser</sub>
+    </td>
+    <td align="center" valign="top">
+      <img src="res/screenshots/settings-general.png" width="217" alt="Settings > General"><br><sub>Settings > General</sub>
+    </td>
+    <td align="center" valign="top">
+      <img src="res/screenshots/settings-files.png" width="173" alt="Settings > Files"><br><sub>Settings > Files</sub>
+    </td>
+  </tr>
+</table>
+
+<details>
+<summary>A quick tour of Settings (GIF, 5 MB)</summary>
+<p align="center">
+  <img src="res/screenshots/tour.gif" width="880" alt="Home with pinned folders, then the Settings pages">
+</p>
+</details>
+
+## Get started
+
+1. Download `Glint.exe` from the [latest release](https://github.com/npr-tami/glint/releases/latest).
+2. Put it in a folder of its own.
+3. Double-click it.
+
+**"Windows protected your PC"?** Glint is new and not signed, so Windows asks first.
+Click **More info**, then **Run anyway**.
+
+**Going online:** Glint only checks GitHub for updates. You can turn that off in **Settings > About**.
+
+**Portable:** turn on **Settings > About > Portable**. Glint then keeps everything next to
+`Glint.exe`, so it can live on a USB stick.
+
+**To remove Glint:**
+1. If you made Glint your default file explorer, turn that off first.
+2. Delete `Glint.exe`.
+3. Delete the `%APPDATA%\Glint` folder.
+
+## Keyboard shortcuts
+
+The ones you'll use most:
+
+| Keys | What they do |
+|---|---|
+| Ctrl+T, Ctrl+W | New tab, close tab |
+| Space | Preview |
+| Ctrl+F | Filter |
+| Ctrl+Z, Ctrl+Y | Undo, redo |
+| Ctrl+U | Command box |
+| Ctrl+, | Settings |
+
+<details>
+<summary>All shortcuts</summary>
+
+| Keys | What they do |
+|---|---|
+| Ctrl+T, Ctrl+W, Ctrl+Shift+T | New tab, close tab, reopen closed tab |
+| Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+1…9 | Next tab, previous tab, go to a tab |
+| Alt+Left / Alt+Right, Alt+Up, Backspace | Back / forward, up a folder |
+| Ctrl+L (or F4, Alt+D) | Type a path |
+| Ctrl+F (or F3), Ctrl+Shift+F | Filter, search subfolders too |
+| Ctrl+C, Ctrl+X, Ctrl+V, Ctrl+A | Copy, cut, paste, select all |
+| Ctrl+Z, Ctrl+Y | Undo, redo |
+| Del, Shift+Del, F2 | Delete, delete for good, rename |
+| Ctrl+Shift+N | New folder |
+| Ctrl+Shift+C | Copy the selected paths as text |
+| F5 (or Ctrl+R), Alt+Enter | Refresh, Properties |
+| Space, Alt+P | Preview, details panel |
+| Ctrl+Shift+1…6 | Views: extra large, large, medium icons, tree, list, details |
+| Ctrl+B, Ctrl+D, Ctrl+H | Sidebar, pin the folder, hidden files |
+| Ctrl+Shift+L | Switch between the skin's light and dark versions |
+| Ctrl+` | Open a terminal here |
+| Ctrl+\\, F6 | Split view, go to the other side |
+| Shift+right-click | Windows' full right-click menu |
+| Ctrl+U | Command box |
+| Ctrl+N, Ctrl+Q | New window, quit Glint |
+| Ctrl+, | Settings |
+
+</details>
+
+## Make Glint your default file explorer
+
+This is optional.
+
+**To switch it on:** go to **Settings > General** and turn on **Open folders and drives in Glint**.
+Turn on **Open with Win+E** too, if you like.
+
+**What changes:** folders and drives you double-click open in Glint.
+Control Panel, phones and similar still open in File Explorer.
+Only your own Windows account is changed, and no admin rights are needed.
+
+**Keep Glint.exe where it is.** If you move it, start it once from the new place.
+It can't be switched on from a USB stick, a network drive or straight from inside a zip.
+
+**To switch it off:** turn the same settings off. Whatever was there before comes back.
+
+<details>
+<summary>If Glint won't start or is gone</summary>
+
+If Glint.exe is still there, run this in a command prompt. It gives folders, drives and Win+E back
+to File Explorer:
+
+```
+glint.exe --restore-explorer
+```
+
+If Glint.exe is gone, press Win+R, type `cmd`, press Enter, and paste these lines.
+They only remove Glint's own entries, for your account.
+
+```
+reg delete "HKCU\Software\Classes\Directory\shell\glint" /f
+reg delete "HKCU\Software\Classes\Drive\shell\glint" /f
+reg query "HKCU\Software\Classes\Directory\shell" /ve | find /i "glint" && reg delete "HKCU\Software\Classes\Directory\shell" /ve /f
+reg query "HKCU\Software\Classes\Drive\shell" /ve | find /i "glint" && reg delete "HKCU\Software\Classes\Drive\shell" /ve /f
+reg query "HKCU\Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\opennewwindow\command" /v GlintOwned && reg delete "HKCU\Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\opennewwindow" /f
+```
+
+Folders then open in File Explorer again.
+
+</details>
+
+## Where Glint keeps its settings
+
+Everything is in one folder: `%APPDATA%\Glint`.
+When portable, it's the `Glint data` folder next to Glint.exe.
+
+| What | Folder inside it |
+|---|---|
+| Settings and your skins | `config` |
+| Cache | `cache` |
+| Error log | `logs` |
+
+**Settings > About** has buttons to open these folders.
 
 ## Build it yourself
 
-1. Install Rust from [rustup.rs](https://rustup.rs) with the default (MSVC) toolchain, and the
-   [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with
-   **"Desktop development with C++"**.
-2. Build:
+<details>
+<summary>How to build Glint from the source</summary>
+
+1. Install Rust from [rustup.rs](https://rustup.rs) with the default (MSVC) toolchain.
+2. Install the [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+   with **"Desktop development with C++"**.
+3. Build:
 
    ```
    git clone https://github.com/npr-tami/glint
@@ -57,7 +228,7 @@ the whole folder can go on a USB stick. Switching it moves the files when Glint 
    cargo build --release
    ```
 
-3. The program is `target\release\glint.exe`.
+4. The program is `target\release\glint.exe`.
 
 Cross-compiling from Linux works too, with mingw-w64 installed:
 
@@ -66,58 +237,13 @@ rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-## Where it keeps settings
+</details>
 
-Everything is in one folder: `%APPDATA%\Glint`, or `Glint data` next to Glint.exe when portable.
+## Bugs and ideas
 
-| What | In that folder |
-|---|---|
-| Settings (`settings.json`) and your skins | `config` |
-| Cache | `cache` |
-| Error log | `logs` |
-
-Settings > About shows where they are, with a button to open the folder.
-
-## Making Glint your default file explorer
-
-In **Settings > General**, turn on **Open folders and drives in Glint** (and, if you like,
-**Open with Win+E**). Folders and drives you double-click then open in Glint; Control Panel,
-phones and similar still open in File Explorer. Only your own Windows account is changed, and no
-admin rights are needed. Keep Glint.exe where it is; if you move it, start it once from the new
-place.
-
-You can also use the two `.bat` files in this repository: put them next to `Glint.exe` and run
-**Make Glint default.bat**.
-
-**To undo it**, turn the settings off again, or run **Restore File Explorer.bat** (it works even
-if Glint.exe is gone). Whatever was there before is put back.
-
-## Status: beta
-
-Glint is in beta (versions like 1.0.12-beta.1, see [CHANGELOG.md](CHANGELOG.md)): it's used every day, but expect rough edges. Bug reports and ideas are
-welcome in [Issues](https://github.com/npr-tami/glint/issues).
-
-The most useful keyboard shortcuts:
-
-| Keys | What they do |
-|---|---|
-| Ctrl+T, Ctrl+W, Ctrl+Shift+T | New tab, close tab, reopen closed tab |
-| Ctrl+Tab, Ctrl+1…9 | Next tab, go to a tab |
-| Alt+Left / Alt+Right, Alt+Up | Back / forward, up a folder |
-| Ctrl+L (or F4, Alt+D) | Type a path |
-| Ctrl+F (or F3), Ctrl+Shift+F | Filter, search subfolders too |
-| Ctrl+C, Ctrl+X, Ctrl+V | Copy, cut, paste |
-| Del, Shift+Del, F2 | Delete, delete for good, rename |
-| Ctrl+Shift+N | New folder |
-| Ctrl+Shift+C | Copy the selected paths as text |
-| Space, Alt+P | Preview, details panel |
-| Ctrl+Shift+1…6 | Views: extra large, large, medium icons, tree, list, details |
-| Ctrl+B, Ctrl+D, Ctrl+H | Sidebar, pin the folder, hidden files |
-| Ctrl+Shift+L | Switch between the skin's light and dark versions |
-| Ctrl+` | Open a terminal here |
-| Ctrl+N, Ctrl+Q | New window, quit Glint |
-| Ctrl+, | Settings |
+Welcome in [Issues](https://github.com/npr-tami/glint/issues).
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). Glint isn't connected to AMD, NVIDIA or Google. Some skins are just inspired by
+their looks.

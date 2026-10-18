@@ -4,6 +4,8 @@
 // Colours: #rrggbb, #rrggbbaa (see-through), another colour's name ("tab-line: accent"),
 // or one at a strength ("accent 16%"). Anything left out comes from AMD Radeon
 // (or AMD Radeon (Light) for a light skin).
+// A skin can have a wallpaper too: "wallpaper: picture.png", with wallpaper-opacity, -position,
+// -fit, -zoom, -offset, -size, -blur and -fade.
 
 name: AMD Radeon
 description: Glint's own look: layered charcoal, one red accent, slanted buttons

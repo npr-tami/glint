@@ -2,13 +2,18 @@
 
 The newest version is at the top.
 
+## 1.0.21-beta.1 · 18/10/2026 21:23
+
+- Updated the README with pictures and a short tour
+- Fixed Settings tabs going onto two rows
+- Removed the .bat files
+- Some other improvements and bugfixes
+
 ## 1.0.20-beta.1 · 17/10/2026 00:14
 
 - Added a settings search to the command box (Ctrl+U)
 - Added more wallpaper options for skins: blur, fade, zoom and size
-
 - Changed the skin list into groups
-
 - Fixed pictures flickering in the big preview
 - Fixed phone photos showing sideways as a wallpaper
 - Fixed slow start-up when a network drive is switched off
@@ -16,7 +21,6 @@ The newest version is at the top.
 - Fixed videos playing twice in the preview
 - Fixed Rename many mixing up names
 - Fixed imported skins missing their pictures
-
 - Improved 7z packing: about 7 times faster
 - Improved zip speed, start-up and scrolling
 - Some other improvements and bugfixes
@@ -44,13 +48,10 @@ The newest version is at the top.
 - Added Ctrl + scroll wheel to change the view, like File Explorer (Settings > Mouse and keyboard)
 - Added Report a bug in Settings > About
 - Added a second logo and a choice of zip icon in Settings > Appearance
-
 - Improved searching subfolders: Glint now looks in several folders at once, so results come in faster
-
 - Changed VIEW > Views for folders… to VIEW > Edit custom views…, and VIEW > Custom views turns them on or off
 - Changed double-clicking a program in the Recycle Bin: Glint asks you to restore it first
 - Changed Glint to stop saving a speed-test log in Windows' temp folder (the old one is deleted)
-
 - Fixed Glint closing when a broken or huge GIF was previewed
 - Fixed Glint closing when typing AltGr letters (like @)
 - Fixed Home crashing on folder names with Chinese, Japanese or accented letters
@@ -66,7 +67,6 @@ The newest version is at the top.
 - Fixed Home opening slowly when a network drive is offline
 - Fixed pinned drives not showing in Home
 - Fixed Settings opening off-screen after unplugging a monitor
-
 - Some other improvements and bugfixes
 
 ## 1.0.18-beta.2 (2026-10-13): Quick fix

@@ -62,7 +62,7 @@ All code is in `src/`.
 | `tags.rs` | Colour tags: kept in their own file, the dot by a name, the `tag:` filter, and following moves and renames. |
 | `foldersize.rs` | Folder sizes in the Size column, worked out in the background. |
 | `views.rs` | Where items go in each view (rows, columns, tiles) and how the arrow keys move. |
-| `status.rs` | The status bar, the notes box when it's off, and the memory figure. |
+| `status.rs` | The status bar, the notes box when it's off, the memory figure and the red "Update needed" bar. |
 | `side.rs` | The pane right of the list: details panel or Space preview, and its splitter. |
 | `details.rs` | The details panel (Alt+P): preview, name, chips, dates, and its buttons. |
 | `preview.rs` | The Space preview: pictures with zoom and pan, text with line numbers, other files' details. |
@@ -112,7 +112,7 @@ All code is in `src/`.
 | `tray.rs` | The tray icon while Glint is hidden. |
 | `winekey.rs` | Catching Win+E while Glint runs. |
 | `update.rs` | Looking for new versions and putting them in place. |
-| `updatewin.rs` | The update prompt window. |
+| `updatewin.rs` | The update prompt window (a required fix can only be installed, not skipped). |
 | `log.rs` | The timing log (only when a switch asks for it) and the error log, with the crash report. |
 
 Outside `src/`:

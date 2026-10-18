@@ -32,8 +32,7 @@
 //! - `--quit` asks the running Glint to quit completely and waits (up to 5 s) until it has;
 //! - `--new-window "folder"` opens an extra window;
 //! - `--set-default [--with-win-e]` and `--restore-explorer` change the registry and end (exit code
-//!   0 = done); they read no settings, so they work even when settings.json is broken. Used by
-//!   "Make Glint default.bat" and "Restore File Explorer.bat".
+//!   0 = done); they read no settings, so they work even when settings.json is broken.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
