@@ -276,8 +276,8 @@ pub const OTHERS: &[(&str, &str)] = &[
     ("title-bar-across", "The title bar's gradient runs left to right: true or false"),
     ("see-through", "How much shows through the glass title bar (era 7, Windows 11): 0 to 90"),
     ("wallpaper", "A picture behind the files: its file name (next to the skin, or in the skins folder), or a full path"),
-    ("wallpaper-opacity", "How strongly the wallpaper shows: 0 to 100 (40 if not set)"),
-    ("wallpaper-position", "Which side of the wallpaper stays in view: left, middle or right, then top, middle or bottom if you like; or two percentages, across then down (30% 70%)"),
+    ("wallpaper-opacity", "How strongly the wallpaper shows: 0 to 100 (50 if not set)"),
+    ("wallpaper-position", "Which side of the wallpaper stays in view: left, middle or right, then top, middle or bottom if you like; or two percentages, across then down (30% 70%). The middle if not set"),
     ("wallpaper-zoom", "Zoom the wallpaper: -500 to 500 (0 is its usual size, 100 twice as big)"),
     ("wallpaper-fit", "fill (fills the list), whole (all of it, at its side), stretch (to the list's shape), tile (repeated) or actual (its own size)"),
     ("wallpaper-size", "The wallpaper's width as a part of the list's, 1 to 400 (50% is half). Instead of the fit's size; the zoom goes on top"),
@@ -393,15 +393,41 @@ fn without_note(line: &str) -> Option<&str> {
     if t.is_empty() || t.starts_with("//") || t.starts_with('#') || t.starts_with(';') {
         return None;
     }
-    let mut end = t.len();
-    let bytes = t.as_bytes();
-    for i in 1..bytes.len().saturating_sub(1) {
-        if bytes[i] == b'/' && bytes[i + 1] == b'/' && bytes[i - 1].is_ascii_whitespace() {
-            end = i;
-            break;
-        }
-    }
+    let end = note_start(t).unwrap_or(t.len());
     Some(t[..end].trim())
+}
+
+/// Where a line's note (" // ...") starts, if it has one. A " //" inside a quoted value isn't a
+/// note ("Night // Day"), nor is a value that starts with "//" and goes on (`//server/share/a.png`).
+fn note_start(t: &str) -> Option<usize> {
+    let bytes = t.as_bytes();
+    let value = t.find([':', '=']).map_or(0, |at| at + 1);
+    let value = value + (t[value..].len() - t[value..].trim_start().len());
+    let rest = &t[value..];
+    let mut from = value;
+    if let Some(q) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') {
+        // The quote that ends the value: the one followed by nothing, a note, or a ";" or ",".
+        let close = rest.char_indices().skip(1).filter(|(_, c)| *c == q).map(|(i, _)| value + i).find(|&j| {
+            let after = t[j + 1..].trim_start();
+            after.is_empty() || after.starts_with("//") || after.starts_with([';', ','])
+        });
+        if let Some(j) = close {
+            from = j + 1;
+        }
+    } else if rest.starts_with("//") && rest[2..].starts_with(|c: char| !c.is_whitespace()) {
+        from = value + 2;
+    }
+    (from.max(1)..bytes.len().saturating_sub(1)).find(|&i| bytes[i] == b'/' && bytes[i + 1] == b'/' && bytes[i - 1].is_ascii_whitespace())
+}
+
+/// `value` as a skin's line can hold it: in quotes when it would change on the way back in (spaces
+/// round it, quotes round it, a ";" or "," at its end, a " //" in it that would be a note).
+pub fn quoted(value: &str) -> String {
+    if clean_value(value) != value || note_start(&format!("x: {value}")).is_some() {
+        format!("\"{value}\"")
+    } else {
+        value.to_string()
+    }
 }
 
 /// Splits a line into its name and value, or None when it has neither ":" nor "=".
@@ -412,9 +438,14 @@ fn split_line(t: &str) -> Option<(&str, &str)> {
 
 /// A value without the frills: the spaces, a ";" or "," at the end, quotes round it.
 fn clean_value(v: &str) -> String {
-    let v = v.trim().trim_end_matches([';', ',']).trim();
-    let unquoted = if v.len() >= 2 && ((v.starts_with('"') && v.ends_with('"')) || (v.starts_with('\'') && v.ends_with('\''))) { &v[1..v.len() - 1] } else { v };
-    unquoted.to_string()
+    unquoted(v.trim().trim_end_matches([';', ','])).to_string()
+}
+
+/// `v` without the spaces round it, and without one pair of quotes round it ("a" or 'a'): what's
+/// inside the quotes stays as it is (" sea.png" keeps its space, "'90s.png" its quote).
+pub fn unquoted(v: &str) -> &str {
+    let v = v.trim();
+    if v.len() >= 2 && ((v.starts_with('"') && v.ends_with('"')) || (v.starts_with('\'') && v.ends_with('\''))) { &v[1..v.len() - 1] } else { v }
 }
 
 /// The settings in `text`, in order, and notes about lines that aren't settings.
@@ -760,6 +791,13 @@ fn parse_in(text: &str, fallback_name: &str, dir: Option<&Path>) -> Parsed {
         }),
         None => guess_dark(&own),
     };
+    // Called "X (Light)" but dark: it never pairs up with X (a light version is the light one).
+    if let Some((name, line)) = own.get("name").filter(|(n, _)| dark && base_name(n) != n.trim()) {
+        notes.push(Note {
+            line: *line,
+            text: format!("A dark skin called \u{201c}{}\u{201d} isn't {}'s light version: set dark: false, or take \u{201c}(Light)\u{201d} off its name.", name.trim(), base_name(name)),
+        });
+    }
     let base_text = BUILT_IN.iter().find(|(id, _)| *id == if dark { DEFAULT } else { DEFAULT_LIGHT }).map_or("", |(_, t)| t);
     let base: HashMap<String, String> = read_lines(base_text, &mut Vec::new()).into_iter().map(|l| (l.key, l.value)).collect();
 
@@ -889,8 +927,8 @@ fn parse_in(text: &str, fallback_name: &str, dir: Option<&Path>) -> Parsed {
         title_across: false,
         see_through: 0.0,
         wallpaper: String::new(),
-        wallpaper_opacity: 0.4,
-        wallpaper_at: 1.0,
+        wallpaper_opacity: 0.5,
+        wallpaper_at: 0.5,
         wallpaper_fit: WallpaperFit::Fill,
         wallpaper_at_y: None,
         wallpaper_zoom: 1.0,
@@ -1046,15 +1084,17 @@ fn parse_in(text: &str, fallback_name: &str, dir: Option<&Path>) -> Parsed {
     }
     let (mine, theirs) = value("wallpaper");
     let written = mine.as_ref().map(|(v, _)| v.clone()).or(theirs).unwrap_or_default();
-    let written = written.trim().trim_matches(['"', '\'']);
+    let written = written.as_str();
     theme.wallpaper = wallpaper_path(written, dir);
     // A picture the skin names that isn't there: noted (the skin still loads, without it). A
     // network path isn't looked for (nor one on a drive that is a network share): a server that's
     // away would hold up the window.
     if let Some((_, line)) = mine {
         let path = theme.wallpaper.as_str();
-        if !path.is_empty() && !on_network(path) && !Path::new(path).exists() {
-            let text = if Path::new(written).is_absolute() || written.starts_with('\\') {
+        if !path.is_empty() && !on_network(path) && !Path::new(path).is_file() {
+            let text = if Path::new(path).is_dir() {
+                format!("\u{201c}{written}\u{201d} is a folder, not a picture. Showing none.")
+            } else if Path::new(written).is_absolute() || written.starts_with('\\') {
                 format!("{WALLPAPER_MISSING} \u{201c}{written}\u{201d}. Showing none.")
             } else {
                 format!("{WALLPAPER_MISSING} \u{201c}{written}\u{201d}: put it next to the skin, or in the skins folder. Showing none.")
@@ -1294,16 +1334,16 @@ fn wallpaper_path_in(v: &str, dir: Option<&Path>, skins: &Path) -> String {
         return v.to_string();
     }
     // Next to the skin: another skin's folder may have a picture of the same name.
-    if let Some(next_to) = dir.map(|d| d.join(v)).filter(|p| p.exists()) {
+    if let Some(next_to) = dir.map(|d| d.join(v)).filter(|p| p.is_file()) {
         return next_to.to_string_lossy().into_owned();
     }
     // Else in the skins folder itself, or in one of its folders (a skin kept in a folder of its
     // own, with its pictures).
     let here = skins.join(v);
-    if here.exists() {
+    if here.is_file() {
         return here.to_string_lossy().into_owned();
     }
-    let inside = std::fs::read_dir(skins).into_iter().flatten().flatten().filter(|i| i.file_type().is_ok_and(|t| t.is_dir())).map(|i| i.path().join(v)).find(|p| p.exists());
+    let inside = std::fs::read_dir(skins).into_iter().flatten().flatten().filter(|i| i.file_type().is_ok_and(|t| t.is_dir())).map(|i| i.path().join(v)).find(|p| p.is_file());
     inside.unwrap_or(here).to_string_lossy().into_owned()
 }
 
@@ -1377,12 +1417,13 @@ pub fn value_in(text: &str, key: &str) -> Option<String> {
 /// other line stay as they are); a skin that doesn't set it yet gets a new line at the end.
 pub fn with_value(text: &str, key: &str, value: &str) -> String {
     let key = normalize_key(key);
+    let value = quoted(value);
     let mut lines: Vec<String> = text.trim_start_matches('\u{feff}').lines().map(str::to_string).collect();
     let target = lines.iter().rposition(|l| without_note(l).and_then(split_line).is_some_and(|(k, _)| normalize_key(k) == key));
     let new_line = |old: &str| {
         let indent: String = old.chars().take_while(|c| c.is_whitespace()).collect();
         // The note at the end, with the spaces before it.
-        let note = old.find(" //").map(|i| old[old[..i].trim_end().len()..].to_string()).unwrap_or_default();
+        let note = note_start(old).map(|i| old[old[..i].trim_end().len()..].to_string()).unwrap_or_default();
         format!("{indent}{key}: {value}{note}")
     };
     match target {
@@ -1394,6 +1435,16 @@ pub fn with_value(text: &str, key: &str, value: &str) -> String {
             lines.push(format!("{key}: {value}"));
         }
     }
+    let mut out = lines.join("\r\n");
+    out.push_str("\r\n");
+    out
+}
+
+/// `text` without the lines that set `key` (every other line stays as it is).
+pub fn without_value(text: &str, key: &str) -> String {
+    let key = normalize_key(key);
+    let lines: Vec<&str> =
+        text.trim_start_matches('\u{feff}').lines().filter(|l| without_note(l).and_then(split_line).is_none_or(|(k, _)| normalize_key(k) != key)).collect();
     let mut out = lines.join("\r\n");
     out.push_str("\r\n");
     out
@@ -1456,6 +1507,19 @@ pub fn id_or_default(id: &str) -> String {
     }
 }
 
+/// A skin's name as twins are paired by it: its spaces tidied (two in a row are one), in small
+/// letters of any kind ("Élan" and "élan (Light)" pair up).
+fn pair_key(name: &str) -> String {
+    name.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// The [`pair_key`] of the light (`dark` false) or dark version of the skin called `name`.
+fn twin_name(name: &str, dark: bool) -> String {
+    let key = pair_key(name);
+    let base = base_name(&key);
+    if dark { base.to_string() } else { format!("{base} (light)") }
+}
+
 /// The name a light version has: "X (Light)" for "X".
 fn base_name(name: &str) -> &str {
     let t = name.trim();
@@ -1500,6 +1564,9 @@ static WRITTEN: Mutex<Vec<Result<String, String>>> = Mutex::new(Vec::new());
 /// Files the worker wouldn't write over (a skin file Glint didn't know was there), for the library
 /// to move its skin away from (`take_written`), with the skin's own file when it was a rename.
 static REFUSED: Mutex<Vec<(PathBuf, Option<PathBuf>)>> = Mutex::new(Vec::new());
+/// Skin files the worker couldn't write (read-only, a full disk): their skins keep the
+/// customiser's text as not saved, so a listing of the folder doesn't put the old file's text back.
+static UNWRITTEN: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 /// Every such file, lower case, for as long as Glint runs: a later save to one is refused too, until
 /// Glint itself makes or renames a file there.
 static NOT_OURS: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -1596,15 +1663,13 @@ impl Library {
         if let Some(o) = self.entries.iter().find(|o| o.dark == dark && named(o, &e.twin)) {
             return o.id.clone();
         }
-        if let Some(o) = self.entries.iter().find(|o| o.dark == dark && named(e, &o.twin)) {
+        // Its other half by name ("X" and "X (Light)") comes before another skin whose `twin` line
+        // names it: a skin of the person's can't take NVIDIA's light side from NVIDIA (Light).
+        let want = twin_name(&e.name, dark);
+        if let Some(o) = self.entries.iter().find(|o| o.built_in() == e.built_in() && o.dark == dark && pair_key(&o.name) == want) {
             return o.id.clone();
         }
-        let base = base_name(&e.name);
-        let want = if dark { base.to_string() } else { format!("{base} (Light)") };
-        self.entries
-            .iter()
-            .find(|o| o.built_in() == e.built_in() && o.dark == dark && o.name.trim().eq_ignore_ascii_case(&want))
-            .map_or_else(|| e.id.clone(), |o| o.id.clone())
+        self.entries.iter().find(|o| o.dark == dark && named(e, &o.twin)).map_or_else(|| e.id.clone(), |o| o.id.clone())
     }
 
     /// The look of skin `id`; a skin that isn't there (its file was deleted) looks like AMD Radeon,
@@ -1725,9 +1790,18 @@ impl Library {
         }
         // (In the folder it's in: a skin in a folder of its own stays next to its pictures.)
         let new_file = old_file.with_file_name(format!("{}.{EXTENSION}", file_stem(new_name)));
-        let text = with_value(&self.entries[at].text, "name", new_name);
+        let mut text = with_value(&self.entries[at].text, "name", new_name);
+        // Called "X (Light)", it's X's light version: a dark copy renamed so (as Ctrl+Shift+L's
+        // hint says to make one) says it's light, or it stays dark and never pairs up with X.
+        let light_name = base_name(new_name) != new_name;
+        if light_name && self.entries[at].dark {
+            text = with_value(&text, "dark", "false");
+        }
         self.dirty.remove(id);
         let e = &mut self.entries[at];
+        if light_name {
+            e.dark = false;
+        }
         e.text = text.clone();
         e.name = new_name.to_string();
         e.id = new_id.clone();
@@ -1800,7 +1874,7 @@ impl Library {
         // (Light, dark) when the two are a pair.
         let light_dark = |names: &[String]| if import.skins[0].dark { (names[1].clone(), names[0].clone()) } else { (names[0].clone(), names[1].clone()) };
         let by_name = |(light, dark): (String, String)| {
-            base_name(&light).eq_ignore_ascii_case(dark.trim()) && light.trim().eq_ignore_ascii_case(&format!("{} (Light)", base_name(&dark)))
+            pair_key(&light) == twin_name(&dark, false) && pair_key(&dark) == twin_name(&light, true)
         };
         let wanted: Vec<String> = import.skins.iter().map(|s| s.name.clone()).collect();
         let mut names: Vec<String> = Vec::new();
@@ -1958,6 +2032,13 @@ impl Library {
         let refused: Vec<(PathBuf, Option<PathBuf>)> = std::mem::take(&mut *REFUSED.lock().unwrap_or_else(PoisonError::into_inner));
         let moved = refused.iter().flat_map(|(file, from)| self.move_off(file, from.as_deref())).collect();
         let results: Vec<Result<String, String>> = std::mem::take(&mut *WRITTEN.lock().unwrap_or_else(PoisonError::into_inner));
+        // A skin whose file couldn't be written keeps its changes (not saved yet), as on screen.
+        for file in std::mem::take(&mut *UNWRITTEN.lock().unwrap_or_else(PoisonError::into_inner)) {
+            let key = file.to_string_lossy().to_lowercase();
+            if let Some(e) = self.entries.iter().find(|e| e.file.as_ref().is_some_and(|f| f.to_string_lossy().to_lowercase() == key)) {
+                self.dirty.insert(e.id.clone());
+            }
+        }
         let mut problems = Vec::new();
         for r in results {
             self.ops_done += 1;
@@ -2058,11 +2139,15 @@ pub fn file_stem(name: &str) -> String {
     if stem.is_empty() {
         stem = "My skin".into();
     }
-    let upper = stem.to_uppercase();
-    let device = ["CON", "PRN", "AUX", "NUL"].contains(&upper.as_str())
-        || ((upper.starts_with("COM") || upper.starts_with("LPT")) && upper.len() == 4 && upper.as_bytes()[3].is_ascii_digit());
+    // Windows takes a device's name with anything after a dot as the device too ("NUL.dark",
+    // "Con.Light"): " skin" goes right after the device's name.
+    let head_len = stem.find('.').unwrap_or(stem.len());
+    let head = stem[..head_len].trim_end().to_uppercase();
+    let numbered = |p: &str| head.strip_prefix(p).is_some_and(|n| matches!(n, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "\u{b9}" | "\u{b2}" | "\u{b3}"));
+    let device = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&head.as_str()) || numbered("COM") || numbered("LPT");
     if device {
-        stem.push_str(" skin");
+        let at = stem[..head_len].trim_end().len();
+        stem.insert_str(at, " skin");
     }
     stem
 }
@@ -2094,7 +2179,7 @@ pub fn decode(bytes: &[u8]) -> String {
 
 /// Whether `path` is somewhere on the network: a \\server\share path, or one on a drive letter
 /// that is a network share (asking Windows about the drive doesn't reach the server).
-fn on_network(path: &str) -> bool {
+pub fn on_network(path: &str) -> bool {
     if path.starts_with(r"\\") || path.starts_with("//") || path.starts_with(r"\/") || path.starts_with(r"/\") {
         return true;
     }
@@ -2292,7 +2377,7 @@ pub fn prepare_import(file: &Path, skins: &Path) -> Result<Import, String> {
 
 /// The skin's `wallpaper` line as written, without its quotes ("" for none).
 fn wallpaper_written(text: &str) -> String {
-    value_in(text, "wallpaper").unwrap_or_default().trim().trim_matches(['"', '\'']).to_string()
+    value_in(text, "wallpaper").unwrap_or_default()
 }
 
 /// The picture a skin's text names next to it (in `from`), when it names one by a file name or a
@@ -2317,13 +2402,12 @@ fn find_twin(me: &Neighbour, from: &Path) -> Option<Neighbour> {
         .collect();
     files.sort_by_cached_key(|p| p.to_string_lossy().to_lowercase());
     let others: Vec<Neighbour> = files.iter().take(MAX_TWIN_CANDIDATES).filter_map(|f| Neighbour::read(f).ok()).filter(|o| o.dark != me.dark).collect();
-    let base = base_name(&me.name);
-    let want = if me.dark { format!("{base} (Light)") } else { base.to_string() };
+    let want = twin_name(&me.name, !me.dark);
     let at = others
         .iter()
         .position(|o| o.named(&me.twin))
-        .or_else(|| others.iter().position(|o| me.named(&o.twin)))
-        .or_else(|| others.iter().position(|o| o.name.trim().eq_ignore_ascii_case(&want)))?;
+        .or_else(|| others.iter().position(|o| pair_key(&o.name) == want))
+        .or_else(|| others.iter().position(|o| me.named(&o.twin)))?;
     others.into_iter().nth(at)
 }
 
@@ -2589,7 +2673,7 @@ fn run_job(job: FileJob) -> Result<String, String> {
                 refuse(&file, None);
                 return Err(format!("Couldn't save the skin \u{201c}{name}\u{201d}: {} is another file (it was left as it is)", file.display()));
             }
-            write_atomic(&file, &text).map_err(|e| format!("Couldn't save the skin \u{201c}{name}\u{201d}: {e}"))?;
+            write_atomic(&file, &text).map_err(|e| unwritten(&file, format!("Couldn't save the skin \u{201c}{name}\u{201d}: {e}")))?;
             ours_now(&file);
             Ok(format!("Saved {name}"))
         }
@@ -2607,7 +2691,7 @@ fn run_job(job: FileJob) -> Result<String, String> {
             if from.exists() && from != to {
                 std::fs::rename(&from, &to).map_err(|e| format!("Couldn't rename the skin's file: {e}"))?;
             }
-            write_atomic(&to, &text).map_err(|e| format!("Couldn't save the skin \u{201c}{name}\u{201d}: {e}"))?;
+            write_atomic(&to, &text).map_err(|e| unwritten(&to, format!("Couldn't save the skin \u{201c}{name}\u{201d}: {e}")))?;
             ours_now(&to);
             Ok(format!("Saved {name}"))
         }
@@ -2635,6 +2719,12 @@ fn run_job(job: FileJob) -> Result<String, String> {
 
 /// A file Glint won't write over: the library moves its skin away from it (`REFUSED`), and later
 /// saves to it are refused too (`NOT_OURS`).
+/// `problem`, with `file` noted as not written (see UNWRITTEN).
+fn unwritten(file: &Path, problem: String) -> String {
+    UNWRITTEN.lock().unwrap_or_else(PoisonError::into_inner).push(file.to_path_buf());
+    problem
+}
+
 fn refuse(file: &Path, from: Option<&Path>) {
     REFUSED.lock().unwrap_or_else(PoisonError::into_inner).push((file.to_path_buf(), from.map(Path::to_path_buf)));
     let key = file.to_string_lossy().to_lowercase();
@@ -3025,6 +3115,13 @@ mod tests {
         assert_eq!(file_stem("My: skin?"), "My skin");
         assert_eq!(file_stem(" ..con "), "con skin");
         assert_eq!(file_stem("COM1"), "COM1 skin");
+        // A device's name with a dot after it is the device too.
+        assert_eq!(file_stem("NUL.dark"), "NUL skin.dark");
+        assert_eq!(file_stem("Con.Light"), "Con skin.Light");
+        assert_eq!(file_stem("COM1.x"), "COM1 skin.x");
+        assert_eq!(file_stem("lpt\u{b9}"), "lpt\u{b9} skin");
+        assert_eq!(file_stem("Console"), "Console");
+        assert_eq!(file_stem("COM10"), "COM10");
         assert_eq!(file_stem("///"), "My skin");
         assert_eq!(id_for("Night / Day"), "file:Night Day");
         assert_eq!(base_name("Moss (Light)"), "Moss");
@@ -3351,12 +3448,41 @@ mod tests {
         assert_eq!(lib.twin("file:Morning glow", true), "file:Dusk");
         assert_eq!(lib.twin("file:Night", false), "chrome");
         assert_eq!(lib.twin("file:Wrong", false), "file:Wrong", "a twin that's dark too isn't the light version");
+        // A light skin of the person's naming NVIDIA doesn't take NVIDIA's light side.
+        lib.add_for_tests("file:Mine light", "name: Mine light\ndark: false\ntwin: NVIDIA\n");
+        assert_eq!(lib.twin("nvidia", false), "nvidia-light");
+        // Names pair up whatever the spaces and capitals, in any letters.
+        lib.add_for_tests("file:Moss", "name: Moss\ndark: true\n");
+        lib.add_for_tests("file:Moss light", "name: Moss  (Light)\ndark: false\n");
+        lib.add_for_tests("file:Elan", "name: \u{c9}lan\ndark: true\n");
+        lib.add_for_tests("file:elan light", "name: \u{e9}lan (Light)\ndark: false\n");
+        assert_eq!((lib.twin("file:Moss", false), lib.twin("file:Moss light", true)), ("file:Moss light".into(), "file:Moss".into()));
+        assert_eq!((lib.twin("file:Elan", false), lib.twin("file:elan light", true)), ("file:elan light".into(), "file:Elan".into()));
+        // A dark skin called "X (Light)" says why it doesn't pair up.
+        assert_eq!(parse("name: Moss (Light)\ndark: true\n", "x").notes.len(), 1);
+        assert!(parse("name: Moss (Light)\ndark: false\n", "x").notes.is_empty());
         // A copy is a skin of its own: it doesn't take the original's other half.
         let copy = copy_text(BUILT_IN[4].1, "My chrome", "Chrome");
         let p = parse(&copy, "x");
         assert!(p.notes.is_empty(), "{:?}", p.notes);
         assert_eq!((p.twin.as_str(), p.name.as_str()), ("", "My chrome"));
         assert_eq!(p.theme, built_in_theme("chrome"));
+    }
+
+    #[test]
+    fn values_come_back_as_written() {
+        for name in ["Night // Day", "Moss;", "\"Moss\"", "'Moss'", "Moss,", " Moss", "a // b // c", "Plain"] {
+            let t = with_value("dark: true\n", "name", name);
+            assert_eq!(value_in(&t, "name").as_deref(), Some(name), "{t}");
+            assert!(parse(&t, "x").notes.is_empty(), "{t}");
+        }
+        // Plain values aren't quoted; a note after a quoted value stays a note.
+        assert_eq!(with_value("", "name", "Plain"), "name: Plain\r\n");
+        assert_eq!(value_in("name: \"Night // Day\" // my note\n", "name").as_deref(), Some("Night // Day"));
+        let t = with_value("name: x // my note\n", "name", "Night // Day");
+        assert_eq!(t, "name: \"Night // Day\" // my note\r\n");
+        // A network path written without quotes is a value, not a note.
+        assert_eq!(value_in("wallpaper: //server/share/a.png\n", "wallpaper").as_deref(), Some("//server/share/a.png"));
     }
 
     #[test]
@@ -3462,14 +3588,14 @@ mod tests {
                 }
             }
         }
-        for (v, at) in [("30% 70%", (0.3, Some(0.7))), ("0% 100%", (0.0, Some(1.0))), ("100%, 0%", (1.0, Some(0.0))), ("bottom", (1.0, Some(1.0))), ("centre", (0.5, None))] {
+        for (v, at) in [("30% 70%", (0.3, Some(0.7))), ("0% 100%", (0.0, Some(1.0))), ("100%, 0%", (1.0, Some(0.0))), ("bottom", (0.5, Some(1.0))), ("centre", (0.5, None))] {
             let p = parse(&format!("wallpaper-position: {v}\n"), "x");
             assert_eq!((p.theme.wallpaper_at, p.theme.wallpaper_at_y, p.notes.len()), (at.0, at.1, 0), "{v}");
         }
         for bad in ["sideways", "left wobble", "left right", "top bottom", "left top middle", "150% 20%", "-10% 20%", "30%", "30% left", "x% 20%", "left left"] {
             let p = parse(&format!("wallpaper-position: {bad}\n"), "x");
             assert_eq!(noted(&p), [1], "{bad}: {:?}", p.notes);
-            assert_eq!((p.theme.wallpaper_at, p.theme.wallpaper_at_y), (1.0, None), "{bad}: the standard place");
+            assert_eq!((p.theme.wallpaper_at, p.theme.wallpaper_at_y), (0.5, None), "{bad}: the standard place");
         }
     }
 
@@ -3484,8 +3610,8 @@ mod tests {
         assert_eq!(opacity("100"), (1.0, 0));
         assert_eq!(opacity("150"), (1.0, 1));
         assert_eq!(opacity("-5"), (0.0, 1));
-        assert_eq!(opacity("lots"), (0.4, 1), "the standard 40");
-        assert_eq!(opacity(""), (0.4, 1));
+        assert_eq!(opacity("lots"), (0.5, 1), "the standard 50");
+        assert_eq!(opacity(""), (0.5, 1));
         let zoom = |v: &str| {
             let p = parse(&format!("wallpaper-zoom: {v}\n"), "x");
             (p.theme.wallpaper_zoom, p.notes.len())
@@ -3920,6 +4046,30 @@ mod tests {
         // An id of nothing finds nothing; a built-in id isn't mistaken for a file's.
         assert!(lib.find("file:nothing").is_none() && lib.find("file:").is_none() && lib.find("file").is_none() && lib.find("").is_none());
         assert!(lib.find(DEFAULT).is_some_and(|e| e.built_in()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A dark skin renamed "X (Light)" becomes X's light version: its text says so, and light and
+    /// dark switch between the two.
+    #[test]
+    fn a_dark_skin_renamed_to_a_light_name_becomes_light() {
+        let (base, skins, _) = import_test("rename-light");
+        std::fs::write(skins.join("Moss.glint"), "name: Moss\ndark: true\n").unwrap();
+        std::fs::write(skins.join("Moss copy.glint"), "name: Moss copy\ndark: true\n").unwrap();
+        let mut lib = library_of(&skins);
+        let light = lib.rename("file:Moss copy", "Moss (Light)").unwrap();
+        let e = lib.find(&light).unwrap();
+        assert!(!e.dark);
+        assert_eq!(value_in(&e.text, "dark").as_deref().map(str::trim), Some("false"));
+        assert_eq!(lib.twin("file:Moss", false), light);
+        assert_eq!(lib.twin(&light, true), "file:Moss");
+        wait_for_writes(Duration::from_secs(10));
+        lib.take_written();
+        assert!(std::fs::read_to_string(skins.join("Moss (Light).glint")).unwrap().contains("dark: false"));
+        // Any other name leaves it as it is.
+        let night = lib.rename("file:Moss", "Night").unwrap();
+        assert!(lib.find(&night).unwrap().dark);
+        wait_for_writes(Duration::from_secs(10));
         let _ = std::fs::remove_dir_all(&base);
     }
 

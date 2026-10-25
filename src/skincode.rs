@@ -75,7 +75,7 @@ fn values_for(key: &str) -> &'static [(&'static str, &'static str)] {
         "tab-line-width" | "toolbar-line-width" => &[("0", "No line"), ("1", "Thin"), ("2", "Standard"), ("3", "Thick")],
         "scrollbar-width" => &[("6", "Thin"), ("8", "Standard"), ("12", "Wide"), ("17", "Older Windows'")],
         "see-through" => &[("0", "None"), ("30", "A little"), ("60", "Half"), ("90", "Most")],
-        "wallpaper-opacity" => &[("20", "Faint"), ("40", "Standard"), ("70", "Strong"), ("100", "Full")],
+        "wallpaper-opacity" => &[("20", "Faint"), ("50", "Standard"), ("70", "Strong"), ("100", "Full")],
         _ => &[],
     }
 }

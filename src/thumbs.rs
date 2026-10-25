@@ -1071,6 +1071,11 @@ const WALL_PIXELS: u64 = 3840 * 2160;
 /// A picture with more pixels than this isn't made a wallpaper (100 million: a big camera's photo):
 /// it would take long to decode, and a small PNG file can hold gigapixels.
 const WALL_MOST: u64 = 100_000_000;
+
+/// Whether the picture at `path` has too many pixels to be a wallpaper (from its header only).
+pub fn too_big_for_wallpaper(wic: &IWICImagingFactory, path: &str) -> bool {
+    picture_header(wic, path).is_some_and(|((w, h), _)| u64::from(w) * u64::from(h) > WALL_MOST)
+}
 /// A wallpaper that couldn't be read is tried again after this long (its drive may be connected
 /// by then, or the picture copied in).
 const WALL_RETRY: Duration = Duration::from_secs(5);

@@ -2,6 +2,13 @@
 
 The newest version is at the top.
 
+## 1.0.22-beta.1 · 25/10/2026 04:09
+
+- Added a Wallpaper section to the skin customiser
+- Changed new wallpapers to sit in the middle, at 50% strength
+- Fixed a skin renamed to "X (Light)" not becoming X's light version
+- Some other improvements and bugfixes
+
 ## 1.0.21-beta.1 · 18/10/2026 21:23
 
 - Updated the README with pictures and a short tour

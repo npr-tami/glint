@@ -2965,6 +2965,23 @@ pub(crate) fn wallpaper_fit(theme: &Theme, area: (f32, f32)) -> Option<thumbs::W
     Some(thumbs::WallFit { area, zoom: theme.wallpaper_zoom * part })
 }
 
+/// How big a skin's wallpaper `pic` (its size in pixels) is drawn in `area` (DIPs), before it's
+/// cut to the area: see [`wallpaper_layout`].
+pub(crate) fn wallpaper_drawn_size(area: Rect, pic: (f32, f32), theme: &Theme, dip_per_px: f32) -> (f32, f32) {
+    let (w, h) = (pic.0.max(0.001), pic.1.max(0.001));
+    let (fit, zoom) = (theme.wallpaper_fit, theme.wallpaper_zoom);
+    if fit == WallpaperFit::Stretch {
+        return (area.w * zoom, area.h * zoom);
+    }
+    let k = match (theme.wallpaper_size, fit) {
+        (Some(part), _) => area.w * part / w,
+        (None, WallpaperFit::Whole) => (area.w / w).min(area.h / h),
+        (None, WallpaperFit::Tile | WallpaperFit::Actual) => dip_per_px,
+        (None, _) => (area.w / w).max(area.h / h),
+    };
+    (w * k * zoom, h * k * zoom)
+}
+
 /// Where a skin's wallpaper `pic` (its size in pixels) goes in `area` (the list, or both halves in
 /// split view), as the skin says (theme.rs `wallpaper_*`): None when none of it would show.
 /// `dip_per_px` is how big one of the screen's pixels is (`tile` and `actual` show the picture at
@@ -2974,8 +2991,8 @@ pub(crate) fn wallpaper_fit(theme: &Theme, area: (f32, f32)) -> Option<thumbs::W
 ///   are its own size; `wallpaper-size` (a part of the area's width) decides instead when set, the
 ///   shape kept. Then the zoom. `stretch` is the area's size times the zoom, whatever its shape.
 /// - Its place: `wallpaper_at` across and `wallpaper_at_y` down (0 the left or top, 1 the right
-///   or bottom: that side of the picture against that side of the area), then the offset. Up and
-///   down is the top unless said, for `whole` and `actual` the bottom.
+///   or bottom: that side of the picture against that side of the area), then the offset. Either
+///   way not said is the middle.
 /// - `tile` repeats it all over the area from there; the others show it once, cut to the area.
 pub(crate) fn wallpaper_layout(area: Rect, pic: (f32, f32), theme: &Theme, dip_per_px: f32) -> Option<WallDraw> {
     let (w, h) = pic;
@@ -2983,22 +3000,11 @@ pub(crate) fn wallpaper_layout(area: Rect, pic: (f32, f32), theme: &Theme, dip_p
         return None;
     }
     let fit = theme.wallpaper_fit;
-    let zoom = theme.wallpaper_zoom;
-    let (dw, dh) = if fit == WallpaperFit::Stretch {
-        (area.w * zoom, area.h * zoom)
-    } else {
-        let k = match (theme.wallpaper_size, fit) {
-            (Some(part), _) => area.w * part / w,
-            (None, WallpaperFit::Whole) => (area.w / w).min(area.h / h),
-            (None, WallpaperFit::Tile | WallpaperFit::Actual) => dip_per_px,
-            (None, _) => (area.w / w).max(area.h / h),
-        };
-        (w * k * zoom, h * k * zoom)
-    };
+    let (dw, dh) = wallpaper_drawn_size(area, pic, theme, dip_per_px);
     if !(dw.is_finite() && dh.is_finite() && dw > 0.0 && dh > 0.0) {
         return None;
     }
-    let at_y = theme.wallpaper_at_y.unwrap_or(if matches!(fit, WallpaperFit::Whole | WallpaperFit::Actual) { 1.0 } else { 0.0 });
+    let at_y = theme.wallpaper_at_y.unwrap_or(0.5);
     let (dx, dy) = theme.wallpaper_offset;
     let x = area.x + (area.w - dw) * theme.wallpaper_at + dx;
     let y = area.y + (area.h - dh) * at_y + dy;
@@ -3320,15 +3326,15 @@ mod tests {
         // Filling: as big as covers it (4 times), its right side and top in view.
         let (dest, src) = once(wallpaper_layout(area, pic, &wall_theme(WallpaperFit::Fill, standard, 1.0, None, (0.0, 0.0)), 1.0));
         assert_eq!((dest, src), (area, Rect::new(100.0, 0.0, 100.0, 100.0)));
-        // Whole: all of it (twice as big), at the bottom.
+        // Whole: all of it (twice as big), half way down.
         let (dest, src) = once(wallpaper_layout(area, pic, &wall_theme(WallpaperFit::Whole, standard, 1.0, None, (0.0, 0.0)), 1.0));
-        assert_eq!((dest, src), (Rect::new(0.0, 200.0, 400.0, 200.0), Rect::new(0.0, 0.0, 200.0, 100.0)));
+        assert_eq!((dest, src), (Rect::new(0.0, 100.0, 400.0, 200.0), Rect::new(0.0, 0.0, 200.0, 100.0)));
         // Stretch: all of it, to the area's shape; a size doesn't change that.
         let (dest, src) = once(wallpaper_layout(area, pic, &wall_theme(WallpaperFit::Stretch, standard, 1.0, Some(0.25), (0.0, 0.0)), 1.0));
         assert_eq!((dest, src), (area, Rect::new(0.0, 0.0, 200.0, 100.0)));
-        // Actual: its own size in the screen's pixels (at 200%: half as many DIPs), bottom right.
+        // Actual: its own size in the screen's pixels (at 200%: half as many DIPs), right, half way down.
         let (dest, _) = once(wallpaper_layout(area, pic, &wall_theme(WallpaperFit::Actual, standard, 1.0, None, (0.0, 0.0)), 0.5));
-        assert_eq!(dest, Rect::new(300.0, 350.0, 100.0, 50.0));
+        assert_eq!(dest, Rect::new(300.0, 175.0, 100.0, 50.0));
         // A size: half the area's width, its shape kept; the zoom on top; then the offset.
         let (dest, _) = once(wallpaper_layout(area, pic, &wall_theme(WallpaperFit::Actual, (0.0, Some(0.0)), 1.0, Some(0.5), (0.0, 0.0)), 1.0));
         assert_eq!(dest, Rect::new(0.0, 0.0, 200.0, 100.0));
@@ -3351,10 +3357,10 @@ mod tests {
         let (dest, src) = once(wallpaper_layout(huge, (1.0, 1.0), &plain(WallpaperFit::Fill), 1.0));
         assert_eq!(dest, huge);
         assert!(src.w > 0.0 && src.w <= 1.0 && src.h > 0.0 && src.h <= 1.0, "{src:?}");
-        // An area smaller than the picture, at its own size: the bottom right corner of it shows.
+        // An area smaller than the picture, at its own size: its right side, half way down, shows.
         let small = Rect::new(50.0, 50.0, 10.0, 10.0);
         let (dest, src) = once(wallpaper_layout(small, (4000.0, 3000.0), &plain(WallpaperFit::Actual), 1.0));
-        assert_eq!((dest, src), (small, Rect::new(3990.0, 2990.0, 10.0, 10.0)));
+        assert_eq!((dest, src), (small, Rect::new(3990.0, 1495.0, 10.0, 10.0)));
         // Tiles: from where the picture would sit, as big as zoomed (a sixth, at -500).
         let area = Rect::new(10.0, 20.0, 300.0, 200.0);
         match wallpaper_layout(area, (1.0, 1.0), &wall_theme(WallpaperFit::Tile, (0.0, Some(0.0)), 1.0 / 6.0, None, (0.0, 0.0)), 1.0) {
@@ -3364,9 +3370,9 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        // Tiles moved by the offset, and placed from the right side.
+        // Tiles moved by the offset, and placed from the right side, half way down.
         match wallpaper_layout(area, (64.0, 32.0), &wall_theme(WallpaperFit::Tile, standard, 1.0, None, (5.0, -5.0)), 1.0) {
-            Some(WallDraw::Tiled { origin, tile, .. }) => assert_eq!((origin, tile), (Point::new(10.0 + 300.0 - 64.0 + 5.0, 15.0), (64.0, 32.0))),
+            Some(WallDraw::Tiled { origin, tile, .. }) => assert_eq!((origin, tile), (Point::new(10.0 + 300.0 - 64.0 + 5.0, 20.0 + (200.0 - 32.0) / 2.0 - 5.0), (64.0, 32.0))),
             other => panic!("{other:?}"),
         }
         // Nothing to place: no picture, or no room.

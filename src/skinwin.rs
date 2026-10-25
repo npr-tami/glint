@@ -38,7 +38,7 @@
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use windows::core::{w, HSTRING, PCWSTR};
@@ -54,12 +54,13 @@ use windows::Win32::UI::Controls::Dialogs::{ChooseColorW, CC_ANYCOLOR, CC_FULLOP
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_CONTROL, VK_DELETE,
-    VK_DOWN, VK_END, VK_ESCAPE, VK_F2, VK_F4, VK_HOME, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_BACK, VK_CONTROL, VK_DELETE,
+    VK_DOWN, VK_END, VK_ESCAPE, VK_F2, VK_F4, VK_HOME, VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB,
+    VK_UP,
 };
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
-    FileOpenDialog, FileSaveDialog, IFileOpenDialog, IFileSaveDialog, FOS_FILEMUSTEXIST,
+    FileOpenDialog, FileSaveDialog, IFileOpenDialog, IFileSaveDialog, IShellItem, SHCreateItemFromParsingName, FOS_FILEMUSTEXIST,
     FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -83,8 +84,9 @@ use crate::render::{Align, FrameResult, Renderer, TextStyle};
 use crate::shell;
 use crate::skin::{self, Entry};
 use crate::textbox::{self, TextBox, TextEvent, TextEventKind, WM_APP_TEXT};
+use crate::thumbs;
 use crate::settings::LogoStyle;
-use crate::theme::{size, ButtonStyle, CaptionStyle, Color, Era, IconSet, Paint, Shape, SidebarStyle, Stop, TabStyle, Theme};
+use crate::theme::{size, ButtonStyle, CaptionStyle, Color, Era, IconSet, Paint, Shape, SidebarStyle, Stop, TabStyle, Theme, WallpaperFit};
 use crate::ui::{Command, Menu, MenuItem, Point, Rect};
 use crate::winutil::{hi_word, lo_word, place_visible, visible_rect};
 
@@ -114,6 +116,30 @@ const HEX_W: f32 = 196.0;
 const NONE_W: f32 = 54.0;
 const DROPDOWN_W: f32 = 200.0;
 const LOGO_FIELD_W: f32 = 140.0;
+/// The wallpaper's BROWSE… button, a slider, and the number after it.
+const BROWSE_W: f32 = 96.0;
+const SLIDER_W: f32 = 200.0;
+/// A press this near a slider's knob (across) grabs the knob where it is.
+const KNOB_GRAB: f32 = 8.0;
+const VALUE_W: f32 = 64.0;
+const VALUE_GAP: f32 = 10.0;
+/// The pictures next to the skin, as small pictures to click: their size, the gap between, how
+/// many at most, and their row's height.
+const THUMB_W: f32 = 72.0;
+const THUMB_H: f32 = 46.0;
+const THUMB_GAP: f32 = 8.0;
+const MAX_THUMBS: usize = 8;
+const THUMBS_H: f32 = 72.0;
+/// Where the wallpaper sits: the pad with its dot, the 3x3 squares, and their row's height.
+const PAD_H: f32 = 100.0;
+/// The pad is the list's shape, between these wide.
+const PAD_MIN_W: f32 = 120.0;
+const PAD_MAX_W: f32 = 220.0;
+const GRID_CELL: f32 = 24.0;
+const GRID_GAP: f32 = 4.0;
+const PLACE_H: f32 = 124.0;
+/// What the wallpaper's box says while the skin has none.
+const PICTURE_HINT: &str = "None";
 /// What the Logo box says while it's empty: no word means the chrome wordmark.
 const LOGO_HINT: &str = "GLINT";
 /// What Glint couldn't understand in the skin's text, under the text.
@@ -314,6 +340,13 @@ const ERAS: [(Era, &str, &str); 5] = [(Era::None, "none", "None"), (Era::Win98, 
 const ICON_SETS: [(IconSet, &str, &str); 4] = [(IconSet::Windows, "windows", "Windows"), (IconSet::Classic, "classic", "Classic"), (IconSet::Xp, "xp", "XP"), (IconSet::Aero, "aero", "Aero")];
 /// The Logo setting (as Settings > Appearance offers it).
 const LOGOS: [(LogoStyle, &str); 4] = [(LogoStyle::Box, "Box"), (LogoStyle::Chrome, "Chrome"), (LogoStyle::Caps, "GLiNT"), (LogoStyle::None, "None")];
+const FITS: [(WallpaperFit, &str, &str); 5] = [
+    (WallpaperFit::Fill, "fill", "Fill"),
+    (WallpaperFit::Whole, "whole", "Whole"),
+    (WallpaperFit::Stretch, "stretch", "Stretch"),
+    (WallpaperFit::Tile, "tile", "Tile"),
+    (WallpaperFit::Actual, "actual", "Actual"),
+];
 /// DIPs in a point (9 pt = 12 DIPs).
 const PT: f32 = 96.0 / 72.0;
 /// A colour row's note when the colour follows another: the row shows which ("follows Accent").
@@ -352,7 +385,37 @@ enum Ctl {
     Icons,
     /// The Logo setting (not part of the skin).
     Logo,
+    /// The wallpaper: its picture (the box, BROWSE… and NONE), how it fits, and its sliders.
+    Picture,
+    /// The pictures next to the skin, to click.
+    Thumbs,
+    Fit,
+    /// Where it sits: the pad (across and down at once), the 3x3 squares and the two numbers.
+    Place,
+    Slide(Slide),
 }
+
+/// A wallpaper slider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Slide {
+    Opacity,
+    Zoom,
+    /// The two halves of `wallpaper-position`: across, then down (0 to 100%).
+    Across,
+    Down,
+    Blur,
+    Fade,
+}
+
+/// Each slider: its setting, smallest and biggest, a key's step and PageUp / PageDown's.
+const SLIDES: [(Slide, &str, f32, f32, f32, f32); 6] = [
+    (Slide::Opacity, "wallpaper-opacity", 0.0, 100.0, 1.0, 10.0),
+    (Slide::Zoom, "wallpaper-zoom", -500.0, 500.0, 5.0, 50.0),
+    (Slide::Across, "wallpaper-position", 0.0, 100.0, 1.0, 10.0),
+    (Slide::Down, "wallpaper-position", 0.0, 100.0, 1.0, 10.0),
+    (Slide::Blur, "wallpaper-blur", 0.0, 50.0, 1.0, 5.0),
+    (Slide::Fade, "wallpaper-fade", 0.0, 50.0, 1.0, 5.0),
+];
 
 /// Which part of a control: the main one (a colour's swatch), a colour's #hex box, or its NONE
 /// button.
@@ -361,6 +424,10 @@ enum Part {
     Main,
     Hex,
     Clear,
+    /// One of the wallpaper's 3x3 squares (0 the top left, 8 the bottom right).
+    Grid(u8),
+    /// One of the pictures next to the skin.
+    Thumb(u8),
 }
 
 /// The buttons under the list.
@@ -427,6 +494,48 @@ enum Editing {
     LogoText(String),
     /// Renaming this skin (its id).
     Rename(String),
+    /// The wallpaper's file name, with what the skin had before.
+    Picture(String),
+    /// A slider's number typed in its box, with the value before (Esc puts it back).
+    Number(Slide, f32),
+}
+
+/// A slider being dragged: which, and the skin's text before the drag (taken at its first
+/// change, with the skin's id: Esc puts it back).
+#[derive(Clone, Debug, PartialEq)]
+struct Sliding {
+    slide: Slide,
+    /// The position pad (across and down at once), not a slider: where it was grabbed, the place
+    /// then (0 to 100 each way), and how much room the picture has to move in the pad each way.
+    pad: bool,
+    grab: Option<(Point, (f32, f32), (f32, f32))>,
+    before: Option<(String, String)>,
+    /// A slider grabbed by its knob: how far right of the knob's middle the mouse was (the knob
+    /// moves with the mouse from there, without jumping to it).
+    dx: f32,
+}
+
+impl Sliding {
+    fn new(slide: Slide) -> Sliding {
+        Sliding { slide, pad: false, grab: None, before: None, dx: 0.0 }
+    }
+
+    fn pad(at: Point, place: (f32, f32), room: (f32, f32)) -> Sliding {
+        Sliding { slide: Slide::Across, pad: true, grab: Some((at, place, room)), before: None, dx: 0.0 }
+    }
+
+    /// The drag is about to change skin `id`, whose text is `text` now: kept, the first time.
+    fn changing(&mut self, id: &str, text: &str) {
+        if self.before.is_none() {
+            self.before = Some((id.to_string(), text.to_string()));
+        }
+    }
+
+    /// What Esc puts back: the text before the drag - only into the skin it was taken from, and
+    /// only if that's still the one in use.
+    fn put_back(&self, in_use: &str) -> Option<(&str, &str)> {
+        self.before.as_ref().filter(|(id, _)| id.eq_ignore_ascii_case(in_use)).map(|(id, t)| (id.as_str(), t.as_str()))
+    }
 }
 
 /// A colour as it was when its box was clicked.
@@ -468,6 +577,8 @@ pub enum Job {
     Import,
     /// Windows' "Save as" dialog, suggesting this file name.
     Export(String),
+    /// Windows' "Open" dialog for a wallpaper, starting in this folder.
+    Picture(Option<PathBuf>),
     /// Put the window here (after a DPI change).
     Place(RECT),
     Close,
@@ -483,6 +594,7 @@ pub enum JobDone {
     Colour(usize, u32),
     Import(PathBuf),
     Export(PathBuf),
+    Picture(PathBuf),
 }
 
 /// What the main window should do after this window handled something.
@@ -502,6 +614,9 @@ enum Bg {
     Imported(Result<skin::Import, String>),
     /// The skins folder exists now: open it in a tab.
     Open(PathBuf),
+    /// The pictures next to the skin (folder `dir`), newest first, small, and the wallpaper in use
+    /// (`current`), small, for the position pad.
+    Pictures { dir: PathBuf, current: String, list: Vec<(PathBuf, Option<Arc<thumbs::Picture>>)>, current_pic: Option<(Arc<thumbs::Picture>, (f32, f32))>, too_big: bool },
 }
 
 /// Background results waiting for their window: (the window's number, the result).
@@ -572,6 +687,9 @@ pub struct SkinWindow {
     /// The one-line text box, and what it's editing.
     edit_box: TextBox,
     editing: Option<Editing>,
+    /// The skin the box was opened for, and its text then: what it types goes only into that skin,
+    /// and Esc puts that text back.
+    editing_for: Option<(String, String)>,
     edit_at: Option<Rect>,
     /// The one-line box was just given its text and isn't in its place yet.
     edit_fresh: bool,
@@ -603,6 +721,11 @@ pub struct SkinWindow {
     /// The group changes join while a box is being edited.
     edit_group: Option<u64>,
     next_group: u64,
+    /// The group a key held down joins (Windows repeating it): one undo step for the whole hold.
+    key_group: Option<u64>,
+    /// The group of the last press on a slider or the pad: a double-click's reset joins it, so one
+    /// undo puts back what was there before the first click moved the knob.
+    press_group: Option<u64>,
     /// A line under the skin's name: what just happened (a copy made, a problem).
     status: Option<(String, bool)>,
     /// The status is this window's own (not the file worker's "Saved…"), which it doesn't hide.
@@ -634,6 +757,15 @@ pub struct SkinWindow {
     /// worked out for.
     colours: Vec<Shown>,
     colours_for: (u64, u64, String),
+    /// A wallpaper slider being dragged.
+    sliding: Option<Sliding>,
+    /// The pictures next to the skin, small (None while one is being read), the folder and
+    /// wallpaper they were read for, and the wallpaper in use, small.
+    thumbs: Vec<(PathBuf, Option<Arc<thumbs::Picture>>)>,
+    thumbs_for: Option<(PathBuf, String)>,
+    current_pic: Option<(Arc<thumbs::Picture>, (f32, f32))>,
+    /// The main window's file list, roughly (DIPs): the pad is a small copy of it.
+    list_size: (f32, f32),
 }
 
 /// Registers the window class (once; registering again just fails harmlessly).
@@ -718,6 +850,7 @@ pub fn create(owner: HWND, theme: &Theme) -> Option<SkinWindow> {
             seen: (0, 0, String::new()),
             edit_box,
             editing: None,
+            editing_for: None,
             edit_at: None,
             edit_fresh: false,
             advanced: false,
@@ -735,6 +868,8 @@ pub fn create(owner: HWND, theme: &Theme) -> Option<SkinWindow> {
             undo_group: None,
             edit_group: None,
             next_group: 1,
+            key_group: None,
+            press_group: None,
             status: None,
             status_mine: false,
             menu_for: None,
@@ -750,6 +885,11 @@ pub fn create(owner: HWND, theme: &Theme) -> Option<SkinWindow> {
             holding: kit::Holding::default(),
             colours: Vec::new(),
             colours_for: (0, 0, String::new()),
+            sliding: None,
+            thumbs: Vec::new(),
+            thumbs_for: None,
+            current_pic: None,
+            list_size: (900.0, 560.0),
         };
         window.apply_theme(theme);
         let mut rc = RECT::default();
@@ -788,6 +928,7 @@ pub fn run_job(hwnd: HWND, scale: f32, job: Job, show_menu: fn(HWND, &Menu, f32)
             Job::Colour { at, initial } => return pick_colour(hwnd, initial).map_or(JobDone::Nothing, |c| JobDone::Colour(at, c)),
             Job::Import => return open_file(hwnd).map_or(JobDone::Nothing, JobDone::Import),
             Job::Export(name) => return save_file(hwnd, &name).map_or(JobDone::Nothing, JobDone::Export),
+            Job::Picture(start) => return open_picture(hwnd, start.as_deref()).map_or(JobDone::Nothing, JobDone::Picture),
             Job::Place(r) => {
                 let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
             }
@@ -843,6 +984,34 @@ fn open_file(owner: HWND) -> Option<PathBuf> {
         let _ = dialog.SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
         let _ = dialog.SetTitle(w!("Import a skin"));
         let _ = dialog.SetFileTypes(&filters());
+        dialog.Show(Some(owner)).ok()?;
+        let name = dialog.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let text = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as *const _));
+        text.filter(|t| !t.is_empty()).map(PathBuf::from)
+    }
+}
+
+/// Windows' "Open" dialog for a wallpaper, starting in `start` (the skin's folder). None if
+/// cancelled.
+fn open_picture(owner: HWND, start: Option<&std::path::Path>) -> Option<PathBuf> {
+    // SAFETY: as in `open_file`; the folder's name is NUL-terminated and outlives the call.
+    unsafe {
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let options = dialog.GetOptions().ok()?;
+        let _ = dialog.SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+        let _ = dialog.SetTitle(w!("Pick a wallpaper"));
+        let types = [
+            COMDLG_FILTERSPEC { pszName: w!("Pictures"), pszSpec: w!("*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.webp;*.tif;*.tiff;*.jxr;*.heic") },
+            COMDLG_FILTERSPEC { pszName: w!("All files"), pszSpec: w!("*.*") },
+        ];
+        let _ = dialog.SetFileTypes(&types);
+        if let Some(dir) = start.filter(|d| d.is_dir()) {
+            let wide: Vec<u16> = dir.as_os_str().to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+            if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide.as_ptr()), None) {
+                let _ = dialog.SetFolder(&item);
+            }
+        }
         dialog.Show(Some(owner)).ok()?;
         let name = dialog.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
         let text = name.to_string().ok();
@@ -1102,6 +1271,264 @@ fn number(x: f32) -> String {
     }
 }
 
+/// A slider's setting, smallest, biggest and steps (SLIDES).
+fn slide_spec(s: Slide) -> (&'static str, f32, f32, f32, f32) {
+    let &(_, key, min, max, step, page) = SLIDES.iter().find(|x| x.0 == s).unwrap_or(&SLIDES[0]);
+    (key, min, max, step, page)
+}
+
+/// Where a wallpaper sits up and down when its skin doesn't say: the middle, whatever the fit
+/// (list.rs).
+fn default_down(_fit: WallpaperFit) -> f32 {
+    0.5
+}
+
+/// What slider `s` shows for skin `t`, as the skin writes it (opacity 0 to 100, zoom -500 to 500,
+/// across and down 0 to 100%...).
+fn slide_value(s: Slide, t: &Theme) -> f32 {
+    let v = match s {
+        Slide::Opacity => t.wallpaper_opacity * 100.0,
+        // 0 its usual size, 100 twice as big, -100 half as big (skin.rs reads it so).
+        Slide::Zoom if t.wallpaper_zoom >= 1.0 => (t.wallpaper_zoom - 1.0) * 100.0,
+        Slide::Zoom => 100.0 * (1.0 - 1.0 / t.wallpaper_zoom.max(0.001)),
+        Slide::Across => t.wallpaper_at * 100.0,
+        Slide::Down => t.wallpaper_at_y.unwrap_or_else(|| default_down(t.wallpaper_fit)) * 100.0,
+        Slide::Blur => t.wallpaper_blur as f32,
+        Slide::Fade => t.wallpaper_fade * 100.0,
+    };
+    let (_, min, max, ..) = slide_spec(s);
+    v.round().clamp(min, max)
+}
+
+/// `wallpaper-position` for `across` and `down` (0 to 1; down None: not said). Words where they
+/// say it exactly ("left", "right bottom", "middle top"), else two percentages ("30% 70%").
+fn position_text(across: f32, down: Option<f32>, fit: WallpaperFit) -> String {
+    let near = |a: f32, b: f32| (a - b).abs() < 0.001;
+    let word = |v: f32, ends: [&'static str; 2]| {
+        if near(v, 0.0) {
+            Some(ends[0])
+        } else if near(v, 0.5) {
+            Some("middle")
+        } else if near(v, 1.0) {
+            Some(ends[1])
+        } else {
+            None
+        }
+    };
+    let x = word(across, ["left", "right"]);
+    match (x, down) {
+        (Some(x), None) => x.to_string(),
+        (Some(x), Some(y)) if word(y, ["top", "bottom"]).is_some() => format!("{x} {}", word(y, ["top", "bottom"]).unwrap_or("middle")),
+        _ => {
+            let y = down.unwrap_or_else(|| default_down(fit));
+            format!("{}% {}%", number(across * 100.0), number(y * 100.0))
+        }
+    }
+}
+
+/// What slider `s` at `v` writes in skin `t`'s text (nothing for a value that isn't a number).
+/// The value is kept to the slider's ends and to whole steps.
+fn slide_changes(s: Slide, v: f32, t: &Theme) -> Vec<(&'static str, String)> {
+    if !v.is_finite() {
+        return Vec::new();
+    }
+    let (key, min, max, ..) = slide_spec(s);
+    let v = v.round().clamp(min, max);
+    let value = match s {
+        Slide::Across => position_text(v / 100.0, t.wallpaper_at_y, t.wallpaper_fit),
+        Slide::Down => position_text(t.wallpaper_at, Some(v / 100.0), t.wallpaper_fit),
+        _ => number(v),
+    };
+    vec![(key, value)]
+}
+
+/// Slider `s` at the point `x` along its track `area`: the value there - or its default
+/// `standard` when that's very near, like a notch (within 1% of the slider, or 4 DIPs of the
+/// track, whichever is less). Only the mouse snaps: a number typed stays as typed.
+fn slide_at(s: Slide, area: Rect, x: f32, standard: f32) -> f32 {
+    let (_, min, max, ..) = slide_spec(s);
+    let track = (area.w - 14.0).max(1.0);
+    let share = ((x - area.x - 7.0) / track).clamp(0.0, 1.0);
+    let v = min + share * (max - min);
+    let notch = ((max - min) * 0.01).min(4.0 / track * (max - min));
+    if (v - standard).abs() <= notch {
+        standard
+    } else {
+        v.round()
+    }
+}
+
+/// What slider `s` is when the skin doesn't say (`t`: across and down follow its fit).
+fn slide_default(s: Slide, t: &Theme) -> f32 {
+    match s {
+        Slide::Opacity => 50.0,
+        Slide::Across => 50.0,
+        Slide::Down => default_down(t.wallpaper_fit) * 100.0,
+        Slide::Zoom | Slide::Blur | Slide::Fade => 0.0,
+    }
+}
+
+/// The skin's text with slider `s` back to its default: its line goes (across and down share one:
+/// the other half stays).
+fn slide_reset(text: &str, s: Slide, t: &Theme) -> String {
+    let (key, ..) = slide_spec(s);
+    match (s, t.wallpaper_at_y) {
+        (Slide::Across, Some(y)) => skin::with_value(text, key, &position_text(0.5, Some(y), t.wallpaper_fit)),
+        (Slide::Down, _) if (t.wallpaper_at - 0.5).abs() > 0.001 => skin::with_value(text, key, &position_text(t.wallpaper_at, None, t.wallpaper_fit)),
+        _ => skin::without_value(text, key),
+    }
+}
+
+/// A number typed in slider `s`'s box: "40", "-50", "+20", "30%", " 7.6 " (rounded). None while
+/// it isn't one yet ("", "-", "abc"). Past either end it's that end.
+fn typed_number(s: Slide, typed: &str) -> Option<f32> {
+    let t = typed.trim().trim_end_matches('%').trim();
+    let t = t.strip_prefix('+').unwrap_or(t).replace(',', ".");
+    let v: f32 = t.parse().ok().filter(|v: &f32| v.is_finite())?;
+    let (_, min, max, ..) = slide_spec(s);
+    Some(v.round().clamp(min, max))
+}
+
+/// Where square `i` of the 3x3 puts the wallpaper: across and down, 0, 50 or 100.
+fn grid_place(i: usize) -> (f32, f32) {
+    ((i % 3) as f32 * 50.0, (i / 3 % 3) as f32 * 50.0)
+}
+
+/// The part of a picture `pic` big (pixels) that fills `dest` big without being pulled out of
+/// shape: its middle, cut to `dest`'s shape.
+fn cover_src(pic: (f32, f32), dest: (f32, f32)) -> Rect {
+    let (pw, ph) = (pic.0.max(1.0), pic.1.max(1.0));
+    let k = (dest.0 / pw).max(dest.1 / ph).max(0.0001);
+    let (sw, sh) = ((dest.0 / k).min(pw), (dest.1 / k).min(ph));
+    Rect::new((pw - sw) / 2.0, (ph - sh) / 2.0, sw, sh)
+}
+
+/// Whether `a` and `b` name the same file (as Windows reads names: any capitals, either slash).
+fn same_path(a: &std::path::Path, b: &str) -> bool {
+    let tidy = |t: &str| t.replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    !b.is_empty() && tidy(&a.to_string_lossy()) == tidy(b)
+}
+
+/// The pictures in `dir` (not in its folders), newest first, at most `most`.
+fn nearby_pictures(dir: &std::path::Path, most: usize) -> Vec<PathBuf> {
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| thumbs::is_picture(&x.to_string_lossy().to_lowercase())))
+        .map(|p| (std::fs::metadata(&p).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), p))
+        .collect();
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    found.into_iter().take(most).map(|(_, p)| p).collect()
+}
+
+/// Reads the pictures next to the skin small (background thread), and the wallpaper in use
+/// (`current`, its full path) small for the position pad. A picture on another computer isn't
+/// read: a server that's away would hold this up. Also whether the wallpaper is too big to show
+/// (then it isn't on the pad either).
+#[allow(clippy::type_complexity)]
+fn read_nearby(dir: &std::path::Path, current: &str) -> (Vec<(PathBuf, Option<Arc<thumbs::Picture>>)>, Option<(Arc<thumbs::Picture>, (f32, f32))>, bool) {
+    let _com = shell::ComGuard::init();
+    let wic = thumbs::wic_factory();
+    // Small, with the size it is on disk.
+    let small = |path: &std::path::Path, side: u32| {
+        let wic = wic.as_ref()?;
+        let d = thumbs::decode(wic, &path.to_string_lossy(), side, u64::from(side) * u64::from(side), thumbs::FILE_ORIENTATION)?;
+        let size = (d.original.0 as f32, d.original.1 as f32);
+        thumbs::Picture::new(d.width, d.height, d.pixels, false).map(|p| (p, size))
+    };
+    let list: Vec<_> = nearby_pictures(dir, MAX_THUMBS).into_iter().map(|p| {
+        let pic = small(&p, 200).map(|(pic, _)| pic);
+        (p, pic)
+    }).collect();
+    let local = !current.is_empty() && !skin::on_network(current);
+    let too_big = local && wic.as_ref().is_some_and(|wic| thumbs::too_big_for_wallpaper(wic, current));
+    let current_pic = if local && !too_big { small(std::path::Path::new(current), 480) } else { None };
+    (list, current_pic, too_big)
+}
+
+/// The place (0 to 100 across and down) after the picture on the pad was grabbed at `from` and
+/// dragged by `delta`: it moves with the mouse, as far as its `room` in the pad goes (negative
+/// room: the picture is bigger than the pad, and its other side shows). No room: it stays. Very
+/// near the default (`standard`, within 1%) it lands on it, like a notch.
+fn pan_place(from: (f32, f32), delta: (f32, f32), room: (f32, f32), standard: (f32, f32)) -> (f32, f32) {
+    let one = |at: f32, d: f32, room: f32, standard: f32| {
+        if room.abs() < 1.0 || !d.is_finite() {
+            return at;
+        }
+        let v = (at + d / room * 100.0).clamp(0.0, 100.0);
+        if (v - standard).abs() <= 1.0 {
+            standard
+        } else {
+            v.round()
+        }
+    };
+    (one(from.0, delta.0, room.0, standard.0), one(from.1, delta.1, room.1, standard.1))
+}
+
+/// A slider's number, as shown after it.
+fn slide_label(s: Slide, v: f32) -> String {
+    match s {
+        Slide::Zoom if v > 0.0 => format!("+{}", number(v)),
+        Slide::Across | Slide::Down => format!("{}%", number(v)),
+        _ => number(v),
+    }
+}
+
+/// The wallpaper as the skin's text names it (its own line, without quotes; "" for none).
+fn picture_of(text: &str) -> String {
+    skin::value_in(text, "wallpaper").unwrap_or_default()
+}
+
+/// A wallpaper's name typed in its box, tidied (quotes and spaces round it gone). None for what a
+/// skin's line can't hold (a line break, a note).
+fn typed_picture(typed: &str) -> Option<String> {
+    let v = skin::unquoted(typed);
+    (!v.contains(['\n', '\r']) && !v.contains(" //")).then(|| v.to_string())
+}
+
+/// How the skin names a picture picked with BROWSE…: by its file name when it's next to the skin
+/// (in `skin_dir`, else the skins folder `skins`, where a skin without a folder of its own is);
+/// anywhere else by its full path - a bare name would find a picture of that name next to the
+/// skin first, not the one picked.
+fn written_picture(path: &std::path::Path, skin_dir: Option<&std::path::Path>, skins: &std::path::Path) -> String {
+    let same = |a: &std::path::Path, b: &std::path::Path| {
+        let tidy = |p: &std::path::Path| p.to_string_lossy().trim_end_matches(['\\', '/']).replace('/', "\\").to_lowercase();
+        tidy(a) == tidy(b)
+    };
+    match (path.parent(), path.file_name()) {
+        (Some(dir), Some(name)) if same(skin_dir.unwrap_or(skins), dir) => name.to_string_lossy().into_owned(),
+        _ => path.to_string_lossy().into_owned(),
+    }
+}
+
+/// A slider: a thin track and a round knob on it (bigger under the mouse), with the keyboard's
+/// ring round the knob.
+fn slider(r: &mut Renderer, theme: &Theme, area: Rect, share: f32, standard: f32, look: Look) {
+    if area.w < 16.0 {
+        return;
+    }
+    let y = area.y + area.h / 2.0;
+    let track = Rect::new(area.x + 7.0, y - 2.0, area.w - 14.0, 4.0);
+    r.fill_round_rect(track, 2.0, theme.bar_track);
+    let ink = if look.enabled { theme.accent } else { theme.muted.with_alpha(theme.muted.a * 0.5) };
+    let x = track.x + track.w * share.clamp(0.0, 1.0);
+    // A small mark under the track where the skin's default is (double-click goes back to it),
+    // left out only when the slider is at the default; drawn first, so the knob covers it.
+    let d = track.x + track.w * standard.clamp(0.0, 1.0);
+    if (share - standard).abs() > 0.0005 {
+        r.fill_rect(Rect::new((d - 1.0).round(), track.bottom() + 4.0, 2.0, 4.0), theme.muted.with_alpha(theme.muted.a * if look.enabled { 0.9 } else { 0.4 }));
+    }
+    let k = if look.enabled && (look.hover || look.pressed) { 8.0 } else { 6.5 };
+    let knob = Rect::new(x - k, y - k, k * 2.0, k * 2.0);
+    r.fill_round_rect(knob, k, ink);
+    if look.focused {
+        kit::focus_ring_round(r, theme, knob, k, 0.0);
+    }
+}
+
 impl SkinWindow {
     /// Docked beside the main window again (it moved or changed size, or the customiser did).
     pub fn follow_owner(&mut self) {
@@ -1355,12 +1782,91 @@ impl SkinWindow {
             (Ctl::Colour(_), Part::Hex) => Some(Rect::new(right - HEX_W, mid(ksize::FIELD_H), HEX_W, ksize::FIELD_H)),
             (Ctl::Colour(_), Part::Main) => Some(Rect::new(right - HEX_W - 10.0 - SWATCH, mid(SWATCH), SWATCH, SWATCH)),
             (Ctl::Colour(_), Part::Clear) => Some(Rect::new(right - HEX_W - 10.0 - SWATCH - 8.0 - NONE_W, mid(ksize::FIELD_H), NONE_W, ksize::FIELD_H)),
-            (Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Era | Ctl::Icons | Ctl::Logo, Part::Main) => {
+            (Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Era | Ctl::Icons | Ctl::Logo | Ctl::Fit, Part::Main) => {
                 Some(Rect::new(right - DROPDOWN_W, mid(ksize::FIELD_H), DROPDOWN_W, ksize::FIELD_H))
             }
             (Ctl::LogoText, Part::Main) => Some(Rect::new(right - LOGO_FIELD_W, mid(ksize::FIELD_H), LOGO_FIELD_W, ksize::FIELD_H)),
+            // The wallpaper: NONE, BROWSE… and its name.
+            (Ctl::Picture, Part::Hex) => Some(Rect::new(right - HEX_W, mid(ksize::FIELD_H), HEX_W, ksize::FIELD_H)),
+            (Ctl::Picture, Part::Main) => Some(Rect::new(right - HEX_W - 8.0 - BROWSE_W, mid(ksize::FIELD_H), BROWSE_W, ksize::FIELD_H)),
+            (Ctl::Picture, Part::Clear) => Some(Rect::new(right - HEX_W - 8.0 - BROWSE_W - 8.0 - NONE_W, mid(ksize::FIELD_H), NONE_W, ksize::FIELD_H)),
+            // A slider, then its number.
+            (Ctl::Slide(_), Part::Main) => Some(Rect::new(right - VALUE_W - VALUE_GAP - SLIDER_W, mid(ksize::FIELD_H), SLIDER_W, ksize::FIELD_H)),
+            (Ctl::Slide(_), Part::Hex) => Some(Rect::new(right - VALUE_W, mid(ksize::FIELD_H), VALUE_W, ksize::FIELD_H)),
+            // Position: the pad, then the 3x3 squares (the sliders under it say the numbers).
+            (Ctl::Place, Part::Main) => {
+                let grid = 3.0 * GRID_CELL + 2.0 * GRID_GAP;
+                let w = self.pad_w();
+                Some(Rect::new(right - grid - 22.0 - w, mid(PAD_H), w, PAD_H))
+            }
+            (Ctl::Place, Part::Grid(i)) => {
+                let grid = 3.0 * GRID_CELL + 2.0 * GRID_GAP;
+                let (x0, y0) = (right - grid, mid(grid));
+                let (c, r) = ((i % 3) as f32, (i / 3) as f32);
+                (i < 9).then(|| Rect::new(x0 + c * (GRID_CELL + GRID_GAP), y0 + r * (GRID_CELL + GRID_GAP), GRID_CELL, GRID_CELL))
+            }
+            // The pictures, right to left from the newest.
+            (Ctl::Thumbs, Part::Thumb(i)) => {
+                let n = self.thumb_count(row);
+                let i = i as usize;
+                (i < n).then(|| {
+                    let x0 = right - n as f32 * THUMB_W - (n as f32 - 1.0) * THUMB_GAP;
+                    Rect::new(x0 + i as f32 * (THUMB_W + THUMB_GAP), mid(THUMB_H), THUMB_W, THUMB_H)
+                })
+            }
             (Ctl::Dark | Ctl::Grip, Part::Main) => Some(Rect::new(right - ksize::TOGGLE_W, mid(ksize::TOGGLE_H), ksize::TOGGLE_W, ksize::TOGGLE_H)),
             _ => None,
+        }
+    }
+
+    /// The pad's width: the file list's shape at PAD_H tall.
+    fn pad_w(&self) -> f32 {
+        let (w, h) = self.list_size;
+        (PAD_H * w / h.max(1.0)).clamp(PAD_MIN_W, PAD_MAX_W)
+    }
+
+    /// The main window's file list, roughly: its window less the sidebar, the bars at the top and
+    /// the status bar.
+    fn read_list_size(&mut self) {
+        let mut rc = RECT::default();
+        // SAFETY: plain queries on our owner window with a valid out-struct.
+        let ok = unsafe { GetWindow(self.hwnd, GW_OWNER).is_ok_and(|o| GetClientRect(o, &mut rc).is_ok()) };
+        if ok && rc.right > rc.left && rc.bottom > rc.top {
+            let s = self.scale();
+            let (w, h) = ((rc.right - rc.left) as f32 / s, (rc.bottom - rc.top) as f32 / s);
+            self.list_size = ((w - 230.0).max(200.0), (h - 120.0).max(150.0));
+        }
+    }
+
+    /// The wallpaper as the pad shows it: where it's drawn in `pad` (as in the list, made small),
+    /// and how big it is there. None without a picture.
+    fn pad_wallpaper(&self, app: &AppState, pad: Rect) -> Option<(Arc<thumbs::Picture>, Option<crate::render::WallDraw>, (f32, f32))> {
+        let (pic, (ow, oh)) = self.current_pic.as_ref().filter(|_| !app.theme.wallpaper.is_empty())?;
+        let (tw, th) = (pic.width() as f32, pic.height() as f32);
+        // The pad is the list made small: everything in it (the picture at its own size, the
+        // offset) shrinks the same.
+        let k = pad.w / self.list_size.0.max(1.0);
+        let mut t = app.theme.clone();
+        t.wallpaper_offset = (t.wallpaper_offset.0 * k, t.wallpaper_offset.1 * k);
+        let dip_per_px = ow / tw.max(1.0) * k / self.scale();
+        let _ = oh;
+        let how = crate::list::wallpaper_layout(pad, (tw, th), &t, dip_per_px);
+        let size = crate::list::wallpaper_drawn_size(pad, (tw, th), &t, dip_per_px);
+        Some((pic.clone(), how, size))
+    }
+
+    /// How many of the pictures next to the skin fit in their row.
+    fn thumb_count(&self, row: &Row) -> usize {
+        let room = ((row.rect.w - 2.0 * ROW_PAD_X - 140.0 + THUMB_GAP) / (THUMB_W + THUMB_GAP)).floor().max(0.0) as usize;
+        self.thumbs.len().min(room)
+    }
+
+    /// A row's parts besides the main one, its box and its NONE: the 3x3 squares, the pictures.
+    fn extra_parts(&self, row: &Row) -> Vec<Part> {
+        match row.ctl {
+            Ctl::Place => (0..9).map(Part::Grid).collect(),
+            Ctl::Thumbs => (0..self.thumb_count(row) as u8).map(Part::Thumb).collect(),
+            _ => Vec::new(),
         }
     }
 
@@ -1405,7 +1911,12 @@ impl SkinWindow {
                 if i > 0 {
                     blocks.push(Block::Line(Rect::new(x0 + 1.0, *y, card_w - 2.0, 1.0)));
                 }
-                let h = if n.is_empty() { ROW_H } else { ROW_NOTE_H };
+                let h = match ctl {
+                    Ctl::Place => PLACE_H,
+                    Ctl::Thumbs => THUMBS_H,
+                    _ if n.is_empty() => ROW_H,
+                    _ => ROW_NOTE_H,
+                };
                 rows.push(Row { ctl: *ctl, rect: Rect::new(x0, *y, card_w, h), title: t, note: n });
                 *y += h;
             }
@@ -1437,6 +1948,19 @@ impl SkinWindow {
             (Ctl::Icons, "Icons", ""),
         ];
         card("Style", &style, &mut y, &mut blocks, &mut rows);
+        let wallpaper = [
+            (Ctl::Picture, "Picture", ""),
+            (Ctl::Thumbs, "Nearby", "Click one to use it"),
+            (Ctl::Fit, "Fit", ""),
+            (Ctl::Place, "Position", "Drag the picture"),
+            (Ctl::Slide(Slide::Across), "Across (X)", ""),
+            (Ctl::Slide(Slide::Down), "Down (Y)", ""),
+            (Ctl::Slide(Slide::Opacity), "Opacity", ""),
+            (Ctl::Slide(Slide::Zoom), "Zoom", ""),
+            (Ctl::Slide(Slide::Blur), "Blur", ""),
+            (Ctl::Slide(Slide::Fade), "Soft edges", ""),
+        ];
+        card("Wallpaper", &wallpaper, &mut y, &mut blocks, &mut rows);
         let mut from = 0;
         for (title, n) in COLOUR_GROUPS {
             card(title, &colours[from..from + n], &mut y, &mut blocks, &mut rows);
@@ -1464,6 +1988,14 @@ impl SkinWindow {
         }
         if self.layout_dirty {
             self.layout(app);
+        }
+        if !self.advanced {
+            self.read_pictures(app);
+            let was = self.pad_w();
+            self.read_list_size();
+            if (self.pad_w() - was).abs() > 0.5 {
+                self.edit_at = None;
+            }
         }
         let now = self.now();
         let mut more = self.list.tick(now) | self.page.tick(now) | self.flips.tick(now) || now < self.repaint_until;
@@ -1755,6 +2287,7 @@ impl SkinWindow {
                 Block::Line(rect) => kit::separator(r, theme, rect.x, rect.y + dy, rect.w),
             }
         }
+        let has_picture = !app.theme.wallpaper.is_empty();
         for i in 0..self.rows.len() {
             let row = self.rows[i].clone();
             let rect = shift(row.rect);
@@ -1764,6 +2297,7 @@ impl SkinWindow {
             // (A colour's name ends a little before its NONE button.)
             let text_w = match row.ctl {
                 Ctl::Colour(_) => rect.w - 2.0 * ROW_PAD_X - HEX_W - 10.0 - SWATCH - 8.0 - NONE_W - 8.0,
+                Ctl::Picture => rect.w - 2.0 * ROW_PAD_X - HEX_W - 8.0 - BROWSE_W - 8.0 - NONE_W - 8.0,
                 _ => rect.w - 2.0 * ROW_PAD_X - HEX_W - SWATCH - 40.0,
             }
             .max(80.0);
@@ -1781,12 +2315,23 @@ impl SkinWindow {
             let main = self.part_rect(&row, Part::Main).map(shift);
             let hex = self.part_rect(&row, Part::Hex).map(shift);
             // The Logo setting isn't the skin's: it can always be changed.
+            // How the wallpaper looks means nothing until it has a picture.
+            let enabled = enabled && (has_picture || !matches!(row.ctl, Ctl::Fit | Ctl::Slide(_) | Ctl::Place));
             let main_look = self.look_of(row.ctl, Part::Main, enabled || row.ctl == Ctl::Logo);
             let hex_look = self.look_of(row.ctl, Part::Hex, enabled);
             let clear = self.part_rect(&row, Part::Clear).map(shift);
-            let clear_on = enabled && matches!(row.ctl, Ctl::Colour(c) if self.colours.get(c).is_some_and(|s| s.text != "none"));
+            let picture = if row.ctl == Ctl::Picture { app.skins.find(&app.settings.skin).map(|e| picture_of(&e.text)).unwrap_or_default() } else { String::new() };
+            let clear_on = enabled
+                && match row.ctl {
+                    Ctl::Colour(c) => self.colours.get(c).is_some_and(|s| s.text != "none"),
+                    Ctl::Picture => !picture.is_empty(),
+                    _ => false,
+                };
             let clear_look = self.look_of(row.ctl, Part::Clear, clear_on);
             let label = self.choice_label(row.ctl, &app.theme);
+            let extra: Vec<(Part, Rect, Look)> = self.extra_parts(&row).into_iter().filter_map(|part| Some((part, shift(self.part_rect(&row, part)?), self.look_of(row.ctl, part, enabled)))).collect();
+            let place_drag = self.sliding.as_ref().is_some_and(|d| d.pad);
+            let pad_wall = if row.ctl == Ctl::Place { main.and_then(|m| self.pad_wallpaper(app, m)) } else { None };
             let r = &mut self.renderer;
             match row.ctl {
                 Ctl::Colour(i) => {
@@ -1802,7 +2347,7 @@ impl SkinWindow {
                         kit::field(r, theme, hx, (!editing).then_some(c.text.as_str()), editing, hex_look);
                     }
                 }
-                Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Era | Ctl::Icons | Ctl::Logo => {
+                Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Era | Ctl::Icons | Ctl::Logo | Ctl::Fit => {
                     if let Some(m) = main {
                         kit::dropdown(r, theme, m, &label, main_look);
                     }
@@ -1823,6 +2368,97 @@ impl SkinWindow {
                 Ctl::Dark => {
                     if let Some(m) = main {
                         kit::toggle(r, theme, m, dark, main_look);
+                    }
+                }
+                Ctl::Picture => {
+                    if let Some(n) = clear {
+                        kit::button(r, theme, n, "NONE", clear_look);
+                    }
+                    if let Some(b) = main {
+                        kit::button(r, theme, b, "BROWSE\u{2026}", main_look);
+                    }
+                    if let Some(hx) = hex {
+                        let editing = matches!(self.editing, Some(Editing::Picture(_)));
+                        kit::field(r, theme, hx, (!editing && !picture.is_empty()).then_some(picture.as_str()), editing, hex_look);
+                        if !editing && picture.is_empty() {
+                            let grey = if hex_look.enabled { theme.muted } else { theme.muted.with_alpha(theme.muted.a * 0.38) };
+                            r.text(PICTURE_HINT, Rect::new(hx.x + 8.0, hx.y, (hx.w - 16.0).max(0.0), hx.h), &TextStyle::new(grey));
+                        }
+                    }
+                }
+                Ctl::Slide(s) => {
+                    if let Some(m) = main {
+                        let (_, min, max, ..) = slide_spec(s);
+                        let v = slide_value(s, &app.theme);
+                        let share = (v - min) / (max - min);
+                        let look = Look { pressed: main_look.pressed || self.sliding.as_ref().is_some_and(|d| d.slide == s), ..main_look };
+                        let standard = (slide_default(s, &app.theme) - min) / (max - min);
+                        slider(r, theme, m, share, standard, look);
+                    }
+                    if let Some(hx) = hex {
+                        let editing = matches!(self.editing, Some(Editing::Number(j, _)) if j == s);
+                        let v = slide_value(s, &app.theme);
+                        kit::field(r, theme, hx, (!editing).then_some(slide_label(s, v).as_str()), editing, hex_look);
+                    }
+                }
+                Ctl::Thumbs => {
+                    if self.thumbs.is_empty() && self.thumbs_for.is_some() {
+                        let at = Rect::new(rect.x + 150.0, rect.y, (rect.w - 150.0 - ROW_PAD_X).max(0.0), rect.h);
+                        r.text("No pictures next to this skin yet", at, &TextStyle::new(theme.muted).size(ksize::NOTE_FONT).align(Align::Right));
+                    }
+                    for (part, at, look) in &extra {
+                        let Part::Thumb(i) = part else { continue };
+                        let Some((path, pic)) = self.thumbs.get(*i as usize) else { continue };
+                        r.fill_rect(*at, theme.input);
+                        if let Some(pic) = pic {
+                            r.picture(pic, *at, Some(cover_src((pic.width() as f32, pic.height() as f32), (at.w, at.h))), 1.0, true);
+                        }
+                        if same_path(path, &app.theme.wallpaper) {
+                            r.stroke_rect(at.inset(-1.0, -1.0), 2.0, theme.accent);
+                        } else {
+                            r.stroke_rect(*at, 1.0, if look.hover { theme.text } else { theme.line });
+                        }
+                        if look.focused {
+                            kit::focus_ring(r, theme, at.inset(-2.0, -2.0), 0.0);
+                        }
+                    }
+                }
+                Ctl::Place => {
+                    let (x, y) = (slide_value(Slide::Across, &app.theme), slide_value(Slide::Down, &app.theme));
+                    let _ = has_picture;
+                    if let Some(pad) = main {
+                        // The file list in small: its background, the wallpaper exactly where it
+                        // lies (fit, size, zoom, place, offset, strength, soft edges), and faint
+                        // rows over it.
+                        r.fill_rect(pad, theme.window);
+                        r.push_clip(pad);
+                        if let Some((pic, Some(how), _)) = &pad_wall {
+                            let strength = app.theme.wallpaper_opacity * if enabled { 1.0 } else { 0.4 };
+                            r.wallpaper(pic, *how, pad, strength, app.theme.wallpaper_fade);
+                        }
+                        let ink = theme.text.with_alpha(if enabled { 0.28 } else { 0.12 });
+                        for n in 0..6 {
+                            let y = pad.y + 10.0 + n as f32 * 14.0;
+                            let w = pad.w * [0.55, 0.42, 0.62, 0.36, 0.5, 0.45][n];
+                            r.fill_rect(Rect::new(pad.x + 10.0, y, 7.0, 7.0), ink);
+                            r.fill_rect(Rect::new(pad.x + 22.0, y + 1.5, w, 4.0), ink);
+                        }
+                        r.pop_clip();
+                        let edge = if enabled && (main_look.hover || place_drag) { theme.accent } else { theme.line };
+                        r.stroke_rect(pad, if place_drag { 2.0 } else { 1.0 }, edge);
+                        if main_look.focused {
+                            kit::focus_ring(r, theme, pad.inset(-2.0, -2.0), 0.0);
+                        }
+                    }
+                    for (part, at, look) in &extra {
+                        let Part::Grid(i) = part else { continue };
+                        let (gx, gy) = grid_place(*i as usize);
+                        let on = enabled && (gx - x).abs() < 0.5 && (gy - y).abs() < 0.5;
+                        r.fill_rect(*at, if on { theme.accent } else { theme.input });
+                        r.stroke_rect(*at, 1.0, if on { theme.accent } else if look.hover && look.enabled { theme.text } else { theme.line });
+                        if look.focused {
+                            kit::focus_ring(r, theme, *at, 0.0);
+                        }
                     }
                 }
                 Ctl::Grip => {
@@ -1854,6 +2490,7 @@ impl SkinWindow {
             Ctl::Era => label_of(&ERAS, t.era),
             Ctl::Icons => label_of(&ICON_SETS, t.icons),
             Ctl::Logo => LOGOS.iter().find(|(l, _)| *l == t.logo_style).map_or("", |(_, l)| l).to_string(),
+            Ctl::Fit => label_of(&FITS, t.wallpaper_fit),
             _ => String::new(),
         }
     }
@@ -1864,6 +2501,8 @@ impl SkinWindow {
         let want = match &self.editing {
             Some(Editing::Hex(i, _)) => self.rows.iter().find(|r| r.ctl == Ctl::Colour(*i)).and_then(|r| self.part_rect(r, Part::Hex)).map(|r| self.on_page(r)),
             Some(Editing::LogoText(_)) => self.rows.iter().find(|r| r.ctl == Ctl::LogoText).and_then(|r| self.part_rect(r, Part::Main)).map(|r| self.on_page(r)),
+            Some(Editing::Picture(_)) => self.rows.iter().find(|r| r.ctl == Ctl::Picture).and_then(|r| self.part_rect(r, Part::Hex)).map(|r| self.on_page(r)),
+            Some(Editing::Number(s, _)) => self.rows.iter().find(|r| r.ctl == Ctl::Slide(*s)).and_then(|r| self.part_rect(r, Part::Hex)).map(|r| self.on_page(r)),
             Some(Editing::Rename(id)) => self.items.iter().find(|i| i.id == *id).map(|i| self.item_on_screen(i.rect).inset(6.0, 3.0)),
             None => None,
         };
@@ -1955,11 +2594,14 @@ impl SkinWindow {
             }
         }
         for row in &self.rows {
-            for part in [Part::Clear, Part::Main, Part::Hex] {
+            for part in [Part::Clear, Part::Main, Part::Hex].into_iter().chain(self.extra_parts(row)) {
                 let Some(r) = self.part_rect(row, part).map(|r| self.on_page(r)) else { continue };
                 let hit = match (row.ctl, part) {
                     (Ctl::Dark | Ctl::Grip, _) => kit::toggle_contains(r, p),
-                    (_, Part::Clear) => kit::button_contains(r, p),
+                    // (The pad's dot can sit on its edge: a little room round it.)
+                    (Ctl::Place, Part::Main) => r.inset(-8.0, -8.0).contains(p),
+                    (Ctl::Place | Ctl::Thumbs, _) => r.contains(p),
+                    (_, Part::Clear) | (Ctl::Picture, Part::Main) => kit::button_contains(r, p),
                     _ => r.contains(p),
                 };
                 if hit {
@@ -1975,7 +2617,7 @@ impl SkinWindow {
         Point::new((lparam.0 & 0xffff) as i16 as f32 / s - b, ((lparam.0 >> 16) & 0xffff) as i16 as f32 / s - b)
     }
 
-    fn mouse_move(&mut self, p: Point) {
+    fn mouse_move(&mut self, p: Point, app: &mut AppState) -> Vec<Ask> {
         if !self.tracking {
             let mut tme = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: self.hwnd, dwHoverTime: 0 };
             // SAFETY: a valid struct for our own window.
@@ -1985,11 +2627,14 @@ impl SkinWindow {
             if self.ask.mouse_move(p) == Answer::Redraw {
                 self.invalidate();
             }
-            return;
+            return Vec::new();
         }
         if self.holding.active() {
             self.holding.at = p;
-            return;
+            return Vec::new();
+        }
+        if let Some((s, pad)) = self.sliding.as_ref().map(|d| (d.slide, d.pad)) {
+            return if pad { self.place_to_point(p, app) } else { self.slide_to_point(s, p, app) };
         }
         if self.code.busy() || (self.advanced && self.asking.is_none()) {
             let busy = self.code.busy();
@@ -1997,7 +2642,7 @@ impl SkinWindow {
                 self.invalidate();
             }
             if busy {
-                return;
+                return Vec::new();
             }
         }
         if let Some((which, grab)) = self.drag {
@@ -2007,13 +2652,14 @@ impl SkinWindow {
                 scroller.jump_to(to);
                 self.invalidate();
             }
-            return;
+            return Vec::new();
         }
         let hover = self.target_at(p);
         if hover != self.hover {
             self.hover = hover;
             self.invalidate();
         }
+        Vec::new()
     }
 
     fn mouse_down(&mut self, p: Point, double: bool, app: &mut AppState) -> Vec<Ask> {
@@ -2067,6 +2713,51 @@ impl SkinWindow {
             }
             Some(Hot::Button(b)) => self.focus = Spot::Button(b),
             Some(Hot::Advanced) => self.focus = Spot::Advanced,
+            // A slider: its knob jumps to the click, and follows the mouse while it's held.
+            // The pad: the dot jumps to the click and follows the mouse; a double-click puts it back.
+            Some(Hot::Ctl(Ctl::Place, Part::Main)) if double => {
+                self.focus = Spot::Ctl(Ctl::Place, Part::Main);
+                asks.extend(self.reset_place(app));
+            }
+            Some(Hot::Ctl(Ctl::Place, Part::Main)) => {
+                self.focus = Spot::Ctl(Ctl::Place, Part::Main);
+                if app.skins.find(&app.settings.skin).is_some() && !app.theme.wallpaper.is_empty() {
+                    // Grabbed where it is: it moves with the mouse from there (nothing jumps).
+                    let pad = self.rows.iter().find(|r| r.ctl == Ctl::Place).and_then(|r| self.part_rect(r, Part::Main)).map(|r| self.on_page(r));
+                    let size = pad.and_then(|pad| self.pad_wallpaper(app, pad).map(|w| (pad, w.2)));
+                    let room = size.map_or((0.0, 0.0), |(pad, (w, h))| (pad.w - w, pad.h - h));
+                    let place = (slide_value(Slide::Across, &app.theme), slide_value(Slide::Down, &app.theme));
+                    self.sliding = Some(Sliding::pad(p, place, room));
+                    self.edit_group = Some(self.next_group);
+                    self.next_group += 1;
+                }
+            }
+            Some(Hot::Ctl(Ctl::Slide(s), Part::Main)) if double => {
+                self.focus = Spot::Ctl(Ctl::Slide(s), Part::Main);
+                // The first click may have moved the knob: one undo puts back what was there before it.
+                self.edit_group = self.press_group.take();
+                asks.extend(self.reset_slide(s, app));
+                self.edit_group = None;
+            }
+            Some(Hot::Ctl(Ctl::Slide(s), part @ Part::Main)) => {
+                self.focus = Spot::Ctl(Ctl::Slide(s), part);
+                if app.skins.find(&app.settings.skin).is_some() && !app.theme.wallpaper.is_empty() {
+                    // On the knob: grabbed where it is (nothing jumps); elsewhere on the track the
+                    // knob jumps to the click.
+                    let mut sliding = Sliding::new(s);
+                    let knob = self.knob_x(s, app).filter(|x| (p.x - x).abs() <= KNOB_GRAB);
+                    if let Some(x) = knob {
+                        sliding.dx = p.x - x;
+                    }
+                    self.sliding = Some(sliding);
+                    self.edit_group = Some(self.next_group);
+                    self.press_group = self.edit_group;
+                    self.next_group += 1;
+                    if knob.is_none() {
+                        asks.extend(self.slide_to_point(s, p, app));
+                    }
+                }
+            }
             Some(Hot::Ctl(c, part)) => self.focus = Spot::Ctl(c, part),
             Some(Hot::Code) => {
                 self.focus = Spot::Text;
@@ -2104,6 +2795,7 @@ impl SkinWindow {
         }
         let was = self.pressed.take();
         self.drag = None;
+        self.end_sliding();
         self.code.mouse_up();
         // SAFETY: releasing our own capture.
         unsafe {
@@ -2120,9 +2812,148 @@ impl SkinWindow {
                 self.set_advanced(!self.advanced, app);
                 Vec::new()
             }
+            Some(Hot::Ctl(Ctl::Slide(_) | Ctl::Place, Part::Main)) => Vec::new(),
             Some(Hot::Ctl(c, part)) => self.activate(c, part, app),
             _ => Vec::new(),
         }
+    }
+
+    /// Slider `s` set from the mouse at `p`.
+    fn slide_to_point(&mut self, s: Slide, p: Point, app: &mut AppState) -> Vec<Ask> {
+        let Some(area) = self.rows.iter().find(|r| r.ctl == Ctl::Slide(s)).and_then(|r| self.part_rect(r, Part::Main)).map(|r| self.on_page(r)) else { return Vec::new() };
+        let standard = slide_default(s, &app.theme);
+        let dx = self.sliding.as_ref().map_or(0.0, |d| d.dx);
+        self.slide_to(s, slide_at(s, area, p.x - dx, standard), app)
+    }
+
+    /// Where slider `s`'s knob is across, on screen (None when it isn't laid out).
+    fn knob_x(&self, s: Slide, app: &AppState) -> Option<f32> {
+        let area = self.rows.iter().find(|r| r.ctl == Ctl::Slide(s)).and_then(|r| self.part_rect(r, Part::Main)).map(|r| self.on_page(r))?;
+        let (_, min, max, ..) = slide_spec(s);
+        let share = ((slide_value(s, &app.theme) - min) / (max - min)).clamp(0.0, 1.0);
+        Some(area.x + 7.0 + (area.w - 14.0).max(1.0) * share)
+    }
+
+    /// The group for a change made by a key: a new one, or while Windows repeats a key held down,
+    /// the one its first press made.
+    fn held_key_group(&mut self, repeat: bool) -> u64 {
+        let g = match self.key_group.filter(|_| repeat) {
+            Some(g) => g,
+            None => {
+                self.next_group += 1;
+                self.next_group - 1
+            }
+        };
+        self.key_group = Some(g);
+        g
+    }
+
+    /// Slider `s` set to `v`: the skin's text gets it (unless it already says so).
+    fn slide_to(&mut self, s: Slide, v: f32, app: &mut AppState) -> Vec<Ask> {
+        if app.skins.find(&app.settings.skin).is_none() || app.theme.wallpaper.is_empty() || !v.is_finite() {
+            return Vec::new();
+        }
+        let (_, min, max, ..) = slide_spec(s);
+        if (v.round().clamp(min, max) - slide_value(s, &app.theme)).abs() < 0.5 {
+            return Vec::new();
+        }
+        let changes = slide_changes(s, v, &app.theme);
+        self.drag_change(app, &changes)
+    }
+
+    /// The picture on the pad dragged to the point `p`.
+    fn place_to_point(&mut self, p: Point, app: &mut AppState) -> Vec<Ask> {
+        let Some((from, place, room)) = self.sliding.as_ref().and_then(|d| d.grab) else { return Vec::new() };
+        let standard = (slide_default(Slide::Across, &app.theme), slide_default(Slide::Down, &app.theme));
+        let (x, y) = pan_place(place, (p.x - from.x, p.y - from.y), room, standard);
+        self.place_to(x, y, app)
+    }
+
+    /// The wallpaper at `x` across and `y` down (0 to 100): one line for both.
+    fn place_to(&mut self, x: f32, y: f32, app: &mut AppState) -> Vec<Ask> {
+        if app.skins.find(&app.settings.skin).is_none() || app.theme.wallpaper.is_empty() || !x.is_finite() || !y.is_finite() {
+            return Vec::new();
+        }
+        let (x, y) = (x.round().clamp(0.0, 100.0), y.round().clamp(0.0, 100.0));
+        if (x - slide_value(Slide::Across, &app.theme)).abs() < 0.5 && (y - slide_value(Slide::Down, &app.theme)).abs() < 0.5 {
+            return Vec::new();
+        }
+        let value = position_text(x / 100.0, Some(y / 100.0), app.theme.wallpaper_fit);
+        self.drag_change(app, &[("wallpaper-position", value)])
+    }
+
+    /// The wallpaper's place back to the skin's default (double-click on the pad, Delete).
+    fn reset_place(&mut self, app: &mut AppState) -> Vec<Ask> {
+        if app.skins.find(&app.settings.skin).is_none() || app.theme.wallpaper.is_empty() {
+            return Vec::new();
+        }
+        self.change_text(app, |text| skin::without_value(text, "wallpaper-position"))
+    }
+
+    /// A change from a slider or the pad (kept for Esc while one is held).
+    fn drag_change(&mut self, app: &mut AppState, changes: &[(&str, String)]) -> Vec<Ask> {
+        if self.sliding.is_some() {
+            // (A built-in skin gets its copy first: what Esc puts back is the copy's text.)
+            let Some(id) = self.editable(app) else { return Vec::new() };
+            let text = app.skins.find(&id).map(|e| e.text.clone()).unwrap_or_default();
+            if let Some(d) = self.sliding.as_mut() {
+                d.changing(&id, &text);
+            }
+        }
+        self.change(app, changes)
+    }
+
+    /// Reads the pictures next to the skin small, in the background, when the folder or the
+    /// wallpaper changed (or the window came to the front: one may have been added).
+    fn read_pictures(&mut self, app: &AppState) {
+        let want = (self.picture_dir(app), app.theme.wallpaper.clone());
+        if self.thumbs_for.as_ref() == Some(&want) {
+            return;
+        }
+        self.thumbs_for = Some(want.clone());
+        let (hwnd, serial) = (self.hwnd.0 as isize, self.serial);
+        shell::background("skins: pictures", move || {
+            let (dir, current) = want;
+            let (list, current_pic, too_big) = read_nearby(&dir, &current);
+            post(hwnd, serial, Bg::Pictures { dir, current, list, current_pic, too_big });
+        });
+    }
+
+    /// Slider `s` back to the skin's default (double-click, or Delete on it).
+    fn reset_slide(&mut self, s: Slide, app: &mut AppState) -> Vec<Ask> {
+        if app.skins.find(&app.settings.skin).is_none() || app.theme.wallpaper.is_empty() {
+            return Vec::new();
+        }
+        let t = app.theme.clone();
+        self.change_text(app, |text| slide_reset(text, s, &t))
+    }
+
+    /// A slider let go of: the changes while it was held are one undo step.
+    fn end_sliding(&mut self) {
+        if self.sliding.take().is_some() {
+            self.edit_group = None;
+            self.invalidate();
+        }
+    }
+
+    /// Esc while a slider is held: the skin as it was before the drag.
+    fn cancel_sliding(&mut self, app: &mut AppState) -> Vec<Ask> {
+        let Some(d) = self.sliding.take() else { return Vec::new() };
+        self.edit_group = None;
+        // SAFETY: releasing our own capture.
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        self.pressed = None;
+        self.invalidate();
+        let Some((id, text)) = d.put_back(&app.settings.skin).map(|(i, t)| (i.to_string(), t.to_string())) else { return Vec::new() };
+        if app.skins.find(&id).is_none_or(|e| e.built_in() || e.text == text) {
+            return Vec::new();
+        }
+        app.skins.set_text(&id, &text);
+        app.apply_skin();
+        self.save_soon(&id);
+        vec![Ask::RedrawMain]
     }
 
     fn wheel(&mut self, p: Point, notches: f32) {
@@ -2156,8 +2987,15 @@ impl SkinWindow {
             spots.push(Spot::Text);
         } else if app.skins.find(&app.settings.skin).is_some() {
             for row in &self.rows {
+                if row.ctl == Ctl::Thumbs {
+                    spots.extend(self.extra_parts(row).into_iter().map(|p| Spot::Ctl(row.ctl, p)));
+                    continue;
+                }
                 spots.push(Spot::Ctl(row.ctl, Part::Main));
-                if matches!(row.ctl, Ctl::Colour(_)) {
+                if matches!(row.ctl, Ctl::Slide(_)) {
+                    spots.push(Spot::Ctl(row.ctl, Part::Hex));
+                }
+                if matches!(row.ctl, Ctl::Colour(_) | Ctl::Picture) {
                     spots.push(Spot::Ctl(row.ctl, Part::Hex));
                     spots.push(Spot::Ctl(row.ctl, Part::Clear));
                 }
@@ -2226,10 +3064,70 @@ impl SkinWindow {
                 Done::NotMine => {}
             }
         }
+        if self.sliding.is_some() {
+            if is(VK_ESCAPE) {
+                asks.extend(self.cancel_sliding(app));
+            }
+            return true;
+        }
         if alt && !is(VK_DOWN) {
             return false;
         }
         let now = self.now();
+        if self.focus == Spot::Ctl(Ctl::Place, Part::Main) {
+            let (x, y) = (slide_value(Slide::Across, &app.theme), slide_value(Slide::Down, &app.theme));
+            let to = match () {
+                _ if is(VK_LEFT) => Some((x - 1.0, y)),
+                _ if is(VK_RIGHT) => Some((x + 1.0, y)),
+                _ if is(VK_UP) => Some((x, y - 1.0)),
+                _ if is(VK_DOWN) => Some((x, y + 1.0)),
+                _ if is(VK_PRIOR) => Some((x, y - 10.0)),
+                _ if is(VK_NEXT) => Some((x, y + 10.0)),
+                _ if is(VK_HOME) => Some((0.0, y)),
+                _ if is(VK_END) => Some((100.0, y)),
+                _ => None,
+            };
+            if is(VK_DELETE) || is(VK_BACK) {
+                self.cues = true;
+                asks.extend(self.reset_place(app));
+                return true;
+            }
+            if let Some((x, y)) = to {
+                self.cues = true;
+                self.edit_group = Some(self.held_key_group(repeat));
+                asks.extend(self.place_to(x, y, app));
+                self.edit_group = None;
+                self.invalidate();
+                return true;
+            }
+        }
+        if let Spot::Ctl(Ctl::Slide(s), _) = self.focus {
+            let (_, min, max, step, page) = slide_spec(s);
+            let v = slide_value(s, &app.theme);
+            let to = match () {
+                _ if is(VK_LEFT) => Some(v - step),
+                _ if is(VK_RIGHT) => Some(v + step),
+                _ if is(VK_PRIOR) => Some(v + page),
+                _ if is(VK_NEXT) => Some(v - page),
+                _ if is(VK_HOME) => Some(min),
+                _ if is(VK_END) => Some(max),
+                _ => None,
+            };
+            if is(VK_DELETE) || is(VK_BACK) {
+                self.cues = true;
+                asks.extend(self.reset_slide(s, app));
+                return true;
+            }
+            if let Some(to) = to {
+                self.cues = true;
+                // Held down, a key is one undo step (as a box typed in); the next change is another.
+                self.edit_group = Some(self.held_key_group(repeat));
+                asks.extend(self.slide_to(s, to.clamp(min, max), app));
+                self.edit_group = None;
+                self.invalidate();
+                return true;
+            }
+        }
         match () {
             _ if is(VK_ESCAPE) || (ctrl && vk == 'W' as u16) => asks.push(Ask::Job(Job::Close)),
             // Light or dark, as in the main window: switches to the skin's twin (if it has one).
@@ -2263,7 +3161,7 @@ impl SkinWindow {
                 self.cues = true;
                 let dropdown = matches!(
                     self.focus,
-                    Spot::Ctl(Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Era | Ctl::Icons | Ctl::Logo, _)
+                    Spot::Ctl(Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Era | Ctl::Icons | Ctl::Logo | Ctl::Fit, _)
                 );
                 if dropdown && (is(VK_SPACE) || is(VK_RETURN)) {
                     // Opened when the key's character has come (it would close the menu again).
@@ -2335,14 +3233,16 @@ impl SkinWindow {
     /// Changes the skin in use: these settings get these values in its text, the look follows at
     /// once and the file is saved a moment later.
     fn change(&mut self, app: &mut AppState, changes: &[(&str, String)]) -> Vec<Ask> {
+        self.change_text(app, |text| changes.iter().fold(text.to_string(), |t, (key, value)| skin::with_value(&t, key, value)))
+    }
+
+    /// [`SkinWindow::change`] with the skin's new text made by `edit` from its text now.
+    fn change_text(&mut self, app: &mut AppState, edit: impl Fn(&str) -> String) -> Vec<Ask> {
         // The next "Saved…" may show again (unless this change makes a copy, which says so).
         self.status_mine = false;
         let Some(id) = self.editable(app) else { return Vec::new() };
         let Some(text) = app.skins.find(&id).map(|e| e.text.clone()) else { return Vec::new() };
-        let mut new = text.clone();
-        for (key, value) in changes {
-            new = skin::with_value(&new, key, value);
-        }
+        let new = edit(&text);
         if new != text {
             self.remember(&id, text, self.edit_group);
         }
@@ -2464,11 +3364,11 @@ impl SkinWindow {
                 let now = self.colour(app, i);
                 let own = Self::own_value(app, i);
                 let put_back = own.clone().or_else(|| now.follows.clone()).unwrap_or_else(|| now.text.clone());
-                self.start_editing(Editing::Hex(i, Before { shown: now.text.clone(), own, put_back }), &now.text);
+                self.start_editing(Editing::Hex(i, Before { shown: now.text.clone(), own, put_back }), &now.text, app);
                 Vec::new()
             }
             (Ctl::LogoText, _) => {
-                self.start_editing(Editing::LogoText(t.logo_text.clone()), &t.logo_text);
+                self.start_editing(Editing::LogoText(t.logo_text.clone()), &t.logo_text, app);
                 Vec::new()
             }
             (Ctl::Dark, _) => {
@@ -2534,7 +3434,72 @@ impl SkinWindow {
                 self.flips.start("grip", !t.scrollbar_grip, now, kit::SWITCH_TIME);
                 self.change(app, &[("scrollbar-grip", (!t.scrollbar_grip).to_string())])
             }
+            (Ctl::Thumbs, Part::Thumb(i)) => {
+                let Some(path) = self.thumbs.get(i as usize).map(|t| t.0.clone()) else { return Vec::new() };
+                let name = written_picture(&path, Some(&self.picture_dir(app)), &skin::folder());
+                if same_path(&path, &app.theme.wallpaper) {
+                    return Vec::new();
+                }
+                self.set_picture(app, &name)
+            }
+            (Ctl::Thumbs, _) => Vec::new(),
+            (Ctl::Fit | Ctl::Slide(_) | Ctl::Place, _) if app.theme.wallpaper.is_empty() => Vec::new(),
+            (Ctl::Place, Part::Grid(i)) => {
+                let (x, y) = grid_place(i as usize);
+                self.place_to(x, y, app)
+            }
+            (Ctl::Place, _) => Vec::new(),
+            (Ctl::Slide(s), Part::Hex) => {
+                let v = slide_value(s, &app.theme);
+                self.start_editing(Editing::Number(s, v), &slide_label(s, v), app);
+                Vec::new()
+            }
+            (Ctl::Fit, _) => {
+                self.menu_for = Some(ctl);
+                menu(styles(&FITS.map(|(s, _, l)| (l, s == t.wallpaper_fit))))
+            }
+            (Ctl::Picture, Part::Hex) => {
+                let now = app.skins.find(&app.settings.skin).map(|e| picture_of(&e.text)).unwrap_or_default();
+                self.start_editing(Editing::Picture(now.clone()), &now, app);
+                Vec::new()
+            }
+            (Ctl::Picture, Part::Clear) => self.set_picture(app, ""),
+            (Ctl::Picture, Part::Main) => {
+                self.dialog_for = Some(app.settings.skin.clone());
+                vec![Ask::Job(Job::Picture(Some(self.picture_dir(app))))]
+            }
+            (Ctl::Slide(_), _) => Vec::new(),
+            (Ctl::Colour(_) | Ctl::Picture, Part::Grid(_) | Part::Thumb(_)) => Vec::new(),
         }
+    }
+
+    /// The folder a wallpaper is looked for in first: the skin's own (a built-in skin's copy goes in
+    /// the skins folder).
+    fn picture_dir(&self, app: &AppState) -> PathBuf {
+        app.skins.find(&app.settings.skin).and_then(|e| e.file.as_ref()).and_then(|f| f.parent()).map_or_else(skin::folder, std::path::Path::to_path_buf)
+    }
+
+    /// The skin's wallpaper is `name` now ("" for none: its line goes). A picture Glint can't find
+    /// is said under the skin's name.
+    fn set_picture(&mut self, app: &mut AppState, name: &str) -> Vec<Ask> {
+        let asks = if name.is_empty() {
+            self.change_text(app, |t| skin::without_value(t, "wallpaper"))
+        } else {
+            self.change(app, &[("wallpaper", name.to_string())])
+        };
+        // (A network path isn't looked for: a server or mapped drive that's away would hold up the
+        // window.)
+        let wall = &app.theme.wallpaper;
+        let path = std::path::Path::new(wall);
+        if name.is_empty() || wall.is_empty() || skin::on_network(wall) || path.is_file() {
+            return asks;
+        }
+        if path.is_dir() {
+            self.say(format!("\u{201c}{name}\u{201d} is a folder, not a picture"), true);
+        } else {
+            self.say(format!("Can't find \u{201c}{name}\u{201d}: put it next to the skin, or pick it with BROWSE\u{2026}"), true);
+        }
+        asks
     }
 
     /// A drop-down's choice: what it means in the skin's text.
@@ -2580,6 +3545,7 @@ impl SkinWindow {
             Ctl::Sidebar => word_at(&SIDEBAR_STYLES, n, "sidebar-style"),
             Ctl::Era => word_at(&ERAS, n, "era"),
             Ctl::Icons => word_at(&ICON_SETS, n, "icons"),
+            Ctl::Fit => word_at(&FITS, n, "wallpaper-fit"),
             Ctl::Logo => {
                 // The setting, as Settings changes it: every title bar follows.
                 let Some((logo, _)) = LOGOS.get(n) else { return Vec::new() };
@@ -2600,10 +3566,15 @@ impl SkinWindow {
     }
 
     /// Shows the one-line box with `text` in it, for `what`.
-    fn start_editing(&mut self, what: Editing, text: &str) {
+    fn start_editing(&mut self, what: Editing, text: &str, app: &AppState) {
         // Only the logo's word has a hint: empty means the chrome wordmark.
-        self.edit_box.set_hint(if matches!(what, Editing::LogoText(_)) { LOGO_HINT } else { "" });
+        self.edit_box.set_hint(match what {
+            Editing::LogoText(_) => LOGO_HINT,
+            Editing::Picture(_) => PICTURE_HINT,
+            _ => "",
+        });
         self.editing = Some(what);
+        self.editing_for = app.skins.find(&app.settings.skin).map(|e| (e.id.clone(), e.text.clone()));
         self.edit_group = Some(self.next_group);
         self.next_group += 1;
         self.edit_at = None; // placed on the next frame
@@ -2625,12 +3596,39 @@ impl SkinWindow {
         self.edit_box.hide();
         self.edit_at = None;
         self.invalidate();
-        let asks = self.finish_editing(what, typed, keep, app);
+        let for_skin = self.editing_for.take();
+        // Another skin in use now (Windows switched light or dark, its file changed): nothing that
+        // was typed for the first one goes into it. (A rename names its skin itself.)
+        let asks = if matches!(what, Editing::Rename(_)) || self.still_for(app, for_skin.as_ref()) {
+            self.finish_editing(what, typed, keep, for_skin.map(|f| f.1), app)
+        } else {
+            Vec::new()
+        };
         self.edit_group = None;
         asks
     }
 
-    fn finish_editing(&mut self, what: Editing, typed: String, keep: bool, app: &mut AppState) -> Vec<Ask> {
+    /// Whether the skin in use is still the one the box was opened for.
+    fn still_for(&self, app: &AppState, for_skin: Option<&(String, String)>) -> bool {
+        for_skin.is_some_and(|(id, _)| app.skins.find(&app.settings.skin).is_some_and(|e| e.id == *id))
+    }
+
+    /// Esc in a slider's number box: the skin's text as it was when the box opened (`before`),
+    /// exactly as written, and no undo step left for what was typed.
+    fn put_text_back(&mut self, app: &mut AppState, before: Option<String>) -> Vec<Ask> {
+        let Some(before) = before else { return Vec::new() };
+        let Some(id) = self.editable(app) else { return Vec::new() };
+        if app.skins.find(&id).is_none_or(|e| e.text == before) {
+            return Vec::new();
+        }
+        let asks = self.change_text(app, |_| before.clone());
+        if self.undo.last().is_some_and(|s| s.0 == id && s.1 == before) {
+            self.undo.pop();
+        }
+        asks
+    }
+
+    fn finish_editing(&mut self, what: Editing, typed: String, keep: bool, before_text: Option<String>, app: &mut AppState) -> Vec<Ask> {
         match what {
             Editing::Hex(i, before) => {
                 let typed = if keep { typed_value(COLOURS[i].0, &typed) } else { None };
@@ -2644,6 +3642,12 @@ impl SkinWindow {
                 }
                 Vec::new()
             }
+            Editing::Number(_, _) if !keep => self.put_text_back(app, before_text),
+            Editing::Number(s, before) => self.slide_to(s, typed_number(s, &typed).unwrap_or(before), app),
+            Editing::Picture(before) => match typed_picture(&typed).filter(|_| keep) {
+                Some(name) if name != before => self.set_picture(app, &name),
+                _ => Vec::new(),
+            },
             Editing::Rename(id) => {
                 let name = typed.trim().to_string();
                 if !keep || name.is_empty() || app.skins.find(&id).is_none_or(|e| e.name == name) {
@@ -2666,10 +3670,13 @@ impl SkinWindow {
                         step.0 = new_id.clone();
                         step.1 = skin::with_value(&step.1, "name", &name);
                     }
+                    // The skin in use, renamed "X (Light)", turned light: "Light or dark" follows (as
+                    // when it's picked), or the next start would open X's dark side.
                     if app.settings.skin == id {
-                        app.settings.skin = new_id;
+                        app.pick_skin(&new_id);
+                    } else {
+                        app.apply_skin();
                     }
-                    app.apply_skin();
                     self.say(format!("Renamed to {name}"), false);
                 }
                 self.layout_dirty = true;
@@ -2719,7 +3726,7 @@ impl SkinWindow {
                     let rect = item.rect;
                     self.list.reveal(rect.y, rect.bottom(), 4.0, self.now());
                 }
-                self.start_editing(Editing::Rename(e.id.clone()), &e.name);
+                self.start_editing(Editing::Rename(e.id.clone()), &e.name, app);
                 Vec::new()
             }
             Btn::Delete => {
@@ -2818,6 +3825,17 @@ impl SkinWindow {
                     asks.extend(self.after_new(app, &id));
                 }
                 Bg::Imported(Err(why)) => self.say(why, true),
+                Bg::Pictures { dir, current, list, current_pic, too_big } => {
+                    // (Read for a folder or a wallpaper left behind meanwhile: the next is coming.)
+                    if self.thumbs_for.as_ref().is_some_and(|(d, c)| *d == dir && *c == current) {
+                        self.thumbs = list;
+                        self.current_pic = current_pic;
+                        if too_big {
+                            let name = std::path::Path::new(&current).file_name().map_or_else(|| current.clone(), |n| n.to_string_lossy().into_owned());
+                            self.say(format!("\u{201c}{name}\u{201d} is too big for a wallpaper (over 100 megapixels)"), true);
+                        }
+                    }
+                }
                 Bg::Open(dir) => {
                     // The folder exists now: watch it (a skin copied in shows at once).
                     app.skins.watch_folder();
@@ -2837,11 +3855,20 @@ impl SkinWindow {
         }
         match ev.kind {
             TextEventKind::Changed => {
-                // Colours and the logo show as they're typed (a colour once it's whole).
+                // Colours and the logo show as they're typed (a colour once it's whole) - in the
+                // skin the box was opened for only.
                 let typed = self.edit_box.text();
+                if !self.still_for(app, self.editing_for.as_ref()) {
+                    return Vec::new();
+                }
                 match self.editing.clone() {
                     Some(Editing::Hex(i, before)) => match typed_value(COLOURS[i].0, &typed) {
                         Some(value) => self.set_colour(app, i, Some(value), &before),
+                        None => Vec::new(),
+                    },
+                    // A slider's number moves it as it's typed (once it's a number).
+                    Some(Editing::Number(s, _)) => match typed_number(s, &typed) {
+                        Some(v) => self.slide_to(s, v, app),
                         None => Vec::new(),
                     },
                     Some(Editing::LogoText(_)) => {
@@ -2931,6 +3958,14 @@ impl SkinWindow {
                 });
                 Vec::new()
             }
+            JobDone::Picture(path) => {
+                // Another skin was picked while the dialog was open: the picture isn't put in it.
+                if self.dialog_for.take().is_some_and(|id| !id.eq_ignore_ascii_case(&app.settings.skin)) {
+                    return Vec::new();
+                }
+                let name = written_picture(&path, Some(&self.picture_dir(app)), &skin::folder());
+                self.set_picture(app, &name)
+            }
             JobDone::Export(path) => {
                 // The skin the dialog was opened for, even if another was picked meanwhile.
                 let id = self.dialog_for.take().unwrap_or_else(|| app.settings.skin.clone());
@@ -3011,7 +4046,7 @@ impl SkinWindow {
             }
             WM_MOUSEMOVE => {
                 let p = self.client_point(lparam);
-                self.mouse_move(p);
+                asks.extend(self.mouse_move(p, app));
                 Some(LRESULT(0))
             }
             WM_MOUSELEAVE => {
@@ -3035,6 +4070,7 @@ impl SkinWindow {
             WM_CAPTURECHANGED => {
                 self.pressed = None;
                 self.drag = None;
+                self.end_sliding();
                 self.code.mouse_up();
                 self.holding.release(self.hwnd);
                 self.invalidate();
@@ -3081,6 +4117,9 @@ impl SkinWindow {
             WM_SYSCHAR if wparam.0 != ' ' as usize => Some(LRESULT(0)),
             WM_ACTIVATE => {
                 self.active = lo_word(wparam.0) != WA_INACTIVE;
+                if self.active {
+                    self.thumbs_for = None;
+                }
                 self.invalidate();
                 None
             }
@@ -3389,6 +4428,349 @@ mod tests {
                 assert!(code.chars().count() <= 52, "too long for a column: {code}");
             } else {
                 assert!(g.chars().count() <= 80, "too long: {g}");
+            }
+        }
+    }
+
+    /// The skin's text after slider `s` is moved to `v` (as the customiser does it: read the skin,
+    /// write what the slider says into its text).
+    fn slid(text: &str, s: Slide, v: f32) -> String {
+        let theme = skin::parse(text, "x").theme;
+        slide_changes(s, v, &theme).iter().fold(text.to_string(), |t, (k, val)| skin::with_value(&t, k, val))
+    }
+
+    fn shown(text: &str, s: Slide) -> f32 {
+        slide_value(s, &skin::parse(text, "x").theme)
+    }
+
+    #[test]
+    fn every_slider_value_is_written_and_read_back_the_same() {
+        for (s, key, min, max, ..) in SLIDES {
+            assert!(skin::range_of(key).is_some() || key == "wallpaper-position", "{key}");
+            let mut v = min;
+            while v <= max {
+                let text = slid("dark: true\n", s, v);
+                let p = skin::parse(&text, "x");
+                assert!(p.notes.is_empty(), "{s:?} {v}: {:?}\n{text}", p.notes);
+                assert_eq!(shown(&text, s), v, "{s:?} at {v}:\n{text}");
+                v += 1.0;
+            }
+        }
+    }
+
+    #[test]
+    fn sliders_stop_at_their_ends_and_ignore_nonsense() {
+        for (s, _, min, max, ..) in SLIDES {
+            assert_eq!(shown(&slid("", s, min - 9999.0), s), min, "{s:?}");
+            assert_eq!(shown(&slid("", s, max + 9999.0), s), max, "{s:?}");
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                assert!(slide_changes(s, bad, &skin::parse("", "x").theme).is_empty(), "{s:?} {bad}");
+            }
+            // Between whole steps: the nearest one.
+            assert_eq!(shown(&slid("", s, min + 10.4), s), min + 10.0, "{s:?}");
+        }
+        // With nothing written, each shows the skin's standard: half strong, its usual size, in
+        // the middle.
+        assert_eq!((shown("", Slide::Opacity), shown("", Slide::Zoom), shown("", Slide::Blur)), (50.0, 0.0, 0.0));
+        assert_eq!((shown("", Slide::Across), shown("", Slide::Down)), (50.0, 50.0));
+    }
+
+    #[test]
+    fn the_track_maps_the_mouse_to_values_and_pulls_to_the_middle() {
+        let area = Rect::new(100.0, 0.0, 214.0, 30.0);
+        for (s, _, min, max, ..) in SLIDES {
+            let mid = (min + max) / 2.0;
+            assert_eq!(slide_at(s, area, -1e6, mid), min, "{s:?}");
+            assert_eq!(slide_at(s, area, 1e6, mid), max, "{s:?}");
+            assert_eq!(slide_at(s, area, 107.0, mid), min, "{s:?}");
+            assert_eq!(slide_at(s, area, 307.0, mid), max, "{s:?}");
+        }
+        // Very near the default: exactly it (a notch); a little further: just the value.
+        assert_eq!(slide_at(Slide::Zoom, area, 208.5, 0.0), 0.0);
+        assert_eq!(slide_at(Slide::Zoom, area, 212.0, 0.0), 25.0, "5 DIPs away doesn't snap");
+        assert_eq!(slide_at(Slide::Opacity, area, 208.5, 50.0), 50.0);
+        assert_eq!(slide_at(Slide::Opacity, area, 210.0, 50.0), 52.0, "1.5% away doesn't snap");
+        assert_eq!(slide_at(Slide::Opacity, area, 209.0, 40.0), 51.0, "only the default snaps");
+        // A slider squashed to nothing doesn't divide by zero.
+        assert!(slide_at(Slide::Zoom, Rect::new(0.0, 0.0, 0.0, 0.0), 5.0, 0.0).is_finite());
+    }
+
+    #[test]
+    fn position_uses_words_when_it_can_and_keeps_the_other_half() {
+        assert_eq!(slid("", Slide::Across, 0.0).trim(), "wallpaper-position: left");
+        assert_eq!(slid("", Slide::Across, 50.0).trim(), "wallpaper-position: middle");
+        // Down said: the second word.
+        assert_eq!(slid("wallpaper-position: left\n", Slide::Down, 0.0).trim(), "wallpaper-position: left top");
+        assert_eq!(slid("wallpaper-position: right\n", Slide::Down, 50.0).trim(), "wallpaper-position: right middle");
+        assert_eq!(slid("wallpaper-position: middle\n", Slide::Down, 100.0).trim(), "wallpaper-position: middle bottom");
+        // In between: percentages, the other half kept as it shows.
+        assert_eq!(slid("wallpaper-position: left bottom\n", Slide::Across, 30.0).trim(), "wallpaper-position: 30% 100%");
+        assert_eq!(slid("wallpaper-position: 30% 70%\n", Slide::Down, 20.0).trim(), "wallpaper-position: 30% 20%");
+        // Down not said is the middle, whatever the fit.
+        let t = slid("wallpaper-fit: whole\n", Slide::Across, 25.0);
+        assert!(t.contains("wallpaper-position: 25% 50%"), "{t}");
+        assert_eq!(shown("wallpaper-fit: whole\n", Slide::Down), 50.0);
+        assert_eq!(shown("wallpaper-fit: tile\n", Slide::Down), 50.0);
+        // Every place across and down reads back where it was put.
+        for x in (0..=100).step_by(5) {
+            for y in (0..=100).step_by(5) {
+                let t = slid(&slid("", Slide::Across, x as f32), Slide::Down, y as f32);
+                assert_eq!((shown(&t, Slide::Across), shown(&t, Slide::Down)), (x as f32, y as f32), "{t}");
+            }
+        }
+    }
+
+    #[test]
+    fn text_typed_while_a_slider_moves_is_kept() {
+        // Typed in the text: a note on the line, and other lines.
+        let mut text = "name: Mine\r\nwallpaper-opacity: 10 // my note\r\naccent: #ff0000\r\n".to_string();
+        for v in [20.0, 35.0, 90.0] {
+            text = slid(&text, Slide::Opacity, v);
+            assert!(text.contains(&format!("wallpaper-opacity: {} // my note", number(v))), "{text}");
+            // Typing in between: a new line, and the opacity written by hand.
+            text.push_str("tab: none\r\n");
+            text = text.replace(&format!("wallpaper-opacity: {}", number(v)), "wallpaper-opacity: 55");
+            assert_eq!(shown(&text, Slide::Opacity), 55.0, "the slider follows the text");
+        }
+        assert_eq!(text.matches("wallpaper-opacity").count(), 1, "{text}");
+        assert_eq!(text.matches("tab: none").count(), 3);
+        assert!(text.contains("accent: #ff0000"));
+        // Something the text has wrong: the slider shows the standard, and moving it puts it right.
+        let bad = "wallpaper-zoom: lots\r\n";
+        assert_eq!(shown(bad, Slide::Zoom), 0.0);
+        let fixed = slid(bad, Slide::Zoom, 50.0);
+        assert!(skin::parse(&fixed, "x").notes.is_empty(), "{fixed}");
+        assert_eq!(shown(&fixed, Slide::Zoom), 50.0);
+        // The same setting written twice: the last line counts, and is the one moved.
+        let twice = slid("wallpaper-blur: 3\r\nwallpaper-blur: 4\r\n", Slide::Blur, 9.0);
+        assert_eq!(shown(&twice, Slide::Blur), 9.0, "{twice}");
+        // Closed and opened again: the sliders read the saved text.
+        let saved = slid(&slid("", Slide::Fade, 12.0), Slide::Zoom, -250.0);
+        assert_eq!((shown(&saved, Slide::Fade), shown(&saved, Slide::Zoom)), (12.0, -250.0));
+    }
+
+    #[test]
+    fn esc_puts_back_the_text_from_before_the_drag() {
+        let mut d = Sliding::new(Slide::Zoom);
+        assert_eq!(d.put_back("mine"), None, "nothing changed yet");
+        d.changing("mine", "before");
+        d.changing("mine", "during");
+        assert_eq!(d.put_back("MINE"), Some(("mine", "before")));
+        // Another skin in use now (picked from the main window): nothing goes into it.
+        assert_eq!(d.put_back("other"), None);
+    }
+
+    #[test]
+    fn the_wallpaper_is_named_as_glint_finds_it() {
+        use std::path::Path;
+        let skins = Path::new(r"C:\Users\x\AppData\Roaming\Glint\skins");
+        let pack = Path::new(r"C:\Users\x\AppData\Roaming\Glint\skins\beach");
+        assert_eq!(written_picture(Path::new(r"C:\Users\x\AppData\Roaming\Glint\skins\beach\sea.jpg"), Some(pack), skins), "sea.jpg");
+        // In the skins folder, for a skin in a folder of its own: its full path (a bg.png next to
+        // the skin would be found first by its name).
+        assert_eq!(written_picture(Path::new(r"C:\Users\x\AppData\Roaming\Glint\skins\sun.png"), Some(pack), skins), r"C:\Users\x\AppData\Roaming\Glint\skins\sun.png");
+        // A skin in the skins folder itself: a picture there is next to it.
+        assert_eq!(written_picture(Path::new(r"c:\users\X\appdata\roaming\glint\SKINS\sun.png"), Some(skins), skins), "sun.png");
+        assert_eq!(written_picture(Path::new(r"c:\users\X\appdata\roaming\glint\SKINS\sun.png"), None, skins), "sun.png");
+        assert_eq!(written_picture(Path::new(r"D:\Pictures\cat.jpg"), Some(pack), skins), r"D:\Pictures\cat.jpg");
+        assert_eq!(written_picture(Path::new(r"\\server\share\a b.jpg"), None, skins), r"\\server\share\a b.jpg");
+        // Typed: quotes and spaces round it go; a line break or a note can't go in a line.
+        assert_eq!(typed_picture("  \"beach.jpg\" ").as_deref(), Some("beach.jpg"));
+        assert_eq!(typed_picture("").as_deref(), Some(""));
+        assert_eq!(typed_picture("a.jpg\r\naccent: #fff"), None);
+        assert_eq!(typed_picture("a.jpg // x"), None);
+        // What the box shows is the skin's own line.
+        assert_eq!(picture_of("wallpaper: 'sea.jpg'\r\n"), "sea.jpg");
+        assert_eq!(picture_of("accent: #fff\r\n"), "");
+        // A path with spaces and a drive's colon is one value.
+        let t = skin::with_value("", "wallpaper", r"D:\My Pictures\a b.jpg");
+        assert_eq!(picture_of(&t), r"D:\My Pictures\a b.jpg");
+        // Names that start with a quote or a space, or a network path, come back as written.
+        for name in ["'90s.png", " sea.png", "sea.png ", "\"x\".png", "//server/share/a.png", r"\\server\share\a.png", "a;"] {
+            let t = skin::with_value("name: a\r\n", "wallpaper", name);
+            assert_eq!(picture_of(&t), name, "{t}");
+        }
+        assert_eq!(typed_picture("'90s.png").as_deref(), Some("'90s.png"));
+        assert_eq!(typed_picture("//server/share/a.png").as_deref(), Some("//server/share/a.png"));
+        // NONE takes the line out; the rest stays.
+        let t = skin::without_value("name: a\r\nwallpaper: sea.jpg // the sea\r\nwallpaper-opacity: 30\r\n", "wallpaper");
+        assert_eq!(t, "name: a\r\nwallpaper-opacity: 30\r\n");
+        assert_eq!(picture_of(&t), "");
+    }
+
+    #[test]
+    fn the_fit_choices_write_what_the_skin_reads() {
+        for (fit, word, _) in FITS {
+            let p = skin::parse(&format!("wallpaper-fit: {word}"), "x");
+            assert_eq!(p.theme.wallpaper_fit, fit);
+            assert!(p.notes.is_empty());
+        }
+        assert_eq!(word_at(&FITS, 3, "wallpaper-fit"), [("wallpaper-fit", "tile".to_string())]);
+        assert!(word_at(&FITS, 9, "wallpaper-fit").is_empty());
+        assert_eq!(label_of(&FITS, WallpaperFit::default()), "Fill");
+    }
+
+    #[test]
+    fn slider_numbers_and_labels_are_short() {
+        assert_eq!(slide_label(Slide::Zoom, 50.0), "+50");
+        assert_eq!(slide_label(Slide::Zoom, -50.0), "-50");
+        assert_eq!(slide_label(Slide::Zoom, 0.0), "0");
+        assert_eq!(slide_label(Slide::Across, 30.0), "30%");
+        assert_eq!(slide_label(Slide::Opacity, 40.0), "40");
+        for (s, _, min, max, ..) in SLIDES {
+            assert!(slide_label(s, min).chars().count() <= 5 && slide_label(s, max).chars().count() <= 5, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn numbers_typed_in_the_box_are_understood_or_waited_for() {
+        assert_eq!(typed_number(Slide::Zoom, "-50"), Some(-50.0));
+        assert_eq!(typed_number(Slide::Zoom, "+20"), Some(20.0));
+        assert_eq!(typed_number(Slide::Zoom, " 120 "), Some(120.0));
+        assert_eq!(typed_number(Slide::Across, "30%"), Some(30.0));
+        assert_eq!(typed_number(Slide::Across, "30 %"), Some(30.0));
+        assert_eq!(typed_number(Slide::Opacity, "7.6"), Some(8.0));
+        assert_eq!(typed_number(Slide::Opacity, "7,4"), Some(7.0), "a decimal comma");
+        // Past the ends: the end. A minus where there can't be one: the smallest.
+        assert_eq!(typed_number(Slide::Zoom, "-99999"), Some(-500.0));
+        assert_eq!(typed_number(Slide::Zoom, "1e9"), Some(500.0));
+        assert_eq!(typed_number(Slide::Opacity, "-5"), Some(0.0));
+        assert_eq!(typed_number(Slide::Blur, "51"), Some(50.0));
+        // Not a number yet: nothing changes.
+        for half in ["", " ", "-", "+", "%", "abc", "1-", "--5", "NaN", "inf", "-inf", "5 5"] {
+            assert_eq!(typed_number(Slide::Zoom, half), None, "{half:?}");
+        }
+        // What the box shows reads back as the same number.
+        for (s, _, min, max, ..) in SLIDES {
+            let mut v = min;
+            while v <= max {
+                assert_eq!(typed_number(s, &slide_label(s, v)), Some(v), "{s:?} {v}");
+                v += 1.0;
+            }
+        }
+    }
+
+    #[test]
+    fn defaults_are_what_a_skin_without_the_line_shows() {
+        for fit in ["fill", "whole", "stretch", "tile", "actual"] {
+            let text = format!("wallpaper-fit: {fit}\n");
+            let t = skin::parse(&text, "x").theme;
+            for (s, ..) in SLIDES {
+                assert_eq!(slide_default(s, &t), shown(&text, s), "{s:?} with {fit}");
+            }
+        }
+        assert_eq!([Slide::Opacity, Slide::Zoom, Slide::Across, Slide::Down, Slide::Blur, Slide::Fade].map(|s| slide_default(s, &skin::parse("", "x").theme)), [50.0, 0.0, 50.0, 50.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_reset_slider_shows_its_default_and_keeps_the_rest() {
+        let reset = |text: &str, s: Slide| slide_reset(text, s, &skin::parse(text, "x").theme);
+        let text = "name: Mine\r\nwallpaper-opacity: 70 // strong\r\nwallpaper-zoom: -200\r\nwallpaper-blur: 9\r\n";
+        let t = reset(text, Slide::Opacity);
+        assert_eq!(t, "name: Mine\r\nwallpaper-zoom: -200\r\nwallpaper-blur: 9\r\n");
+        assert_eq!(shown(&t, Slide::Opacity), 50.0);
+        assert_eq!(shown(&reset(text, Slide::Zoom), Slide::Zoom), 0.0);
+        assert_eq!(shown(&reset(text, Slide::Zoom), Slide::Blur), 9.0);
+        // Across and down share a line: resetting one keeps the other.
+        let both = "wallpaper-position: 30% 70%\r\n";
+        let t = reset(both, Slide::Across);
+        assert_eq!((shown(&t, Slide::Across), shown(&t, Slide::Down)), (50.0, 70.0), "{t}");
+        let t = reset(both, Slide::Down);
+        assert_eq!((shown(&t, Slide::Across), shown(&t, Slide::Down)), (30.0, 50.0), "{t}");
+        let t = reset("wallpaper-position: left bottom\r\n", Slide::Down);
+        assert_eq!(t.trim(), "wallpaper-position: left");
+        // Both at their defaults: the line goes.
+        let t = reset(&reset(both, Slide::Across), Slide::Down);
+        assert!(!t.contains("wallpaper-position"), "{t}");
+        // Nothing to reset: nothing changes.
+        assert_eq!(reset("name: a\r\n", Slide::Blur), "name: a\r\n");
+    }
+
+    #[test]
+    fn each_square_of_the_3x3_writes_its_words() {
+        let words = ["left top", "middle top", "right top", "left middle", "middle middle", "right middle", "left bottom", "middle bottom", "right bottom"];
+        for (i, w) in words.iter().enumerate() {
+            let (x, y) = grid_place(i);
+            assert_eq!(position_text(x / 100.0, Some(y / 100.0), WallpaperFit::Fill), *w);
+            let text = format!("wallpaper-position: {w}\n");
+            assert!(skin::parse(&text, "x").notes.is_empty(), "{w}");
+            assert_eq!((shown(&text, Slide::Across), shown(&text, Slide::Down)), (x, y), "{w}");
+        }
+    }
+
+    #[test]
+    fn small_pictures_are_cut_to_shape_not_squashed() {
+        // Wide into square: its middle.
+        assert_eq!(cover_src((200.0, 100.0), (50.0, 50.0)), Rect::new(50.0, 0.0, 100.0, 100.0));
+        // Tall into wide: its middle band.
+        assert_eq!(cover_src((100.0, 400.0), (100.0, 50.0)), Rect::new(0.0, 175.0, 100.0, 50.0));
+        // Same shape: all of it.
+        assert_eq!(cover_src((300.0, 200.0), (150.0, 100.0)), Rect::new(0.0, 0.0, 300.0, 200.0));
+        // Nothing to draw into, or nothing to draw: still a sensible part.
+        for (pic, dest) in [((0.0, 0.0), (10.0, 10.0)), ((100.0, 100.0), (0.0, 0.0))] {
+            let r = cover_src(pic, dest);
+            assert!(r.w.is_finite() && r.h.is_finite() && r.w >= 0.0 && r.h >= 0.0, "{r:?}");
+        }
+    }
+
+    #[test]
+    fn nearby_pictures_are_the_skin_folders_pictures_newest_first() {
+        let dir = std::env::temp_dir().join(format!("glint-nearby-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("inner")).unwrap();
+        let now = std::time::SystemTime::now();
+        for (name, age) in [("old.jpg", 300), ("new.PNG", 10), ("mid.webp", 100), ("notes.txt", 0), ("skin.glint", 0)] {
+            let f = std::fs::File::create(dir.join(name)).unwrap();
+            f.set_modified(now - std::time::Duration::from_secs(age)).unwrap();
+        }
+        std::fs::File::create(dir.join("inner").join("deep.jpg")).unwrap();
+        let names = |v: Vec<PathBuf>| v.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert_eq!(names(nearby_pictures(&dir, 8)), ["new.PNG", "mid.webp", "old.jpg"]);
+        assert_eq!(names(nearby_pictures(&dir, 2)), ["new.PNG", "mid.webp"]);
+        assert!(nearby_pictures(&dir.join("not there"), 8).is_empty());
+        // Read small in the background: these aren't real pictures, so none, but the list stays.
+        let (list, current, too_big) = read_nearby(&dir, &dir.join("old.jpg").to_string_lossy());
+        assert_eq!(list.len(), 3);
+        assert!(list.iter().all(|(_, pic)| pic.is_none()) && current.is_none() && !too_big);
+        // A picture on another computer isn't read for the pad.
+        assert!(read_nearby(&dir, r"\\nowhere\share\a.jpg").1.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        // Which one is in use, whatever the capitals or slashes.
+        assert!(same_path(std::path::Path::new(r"C:\Skins\Sea.JPG"), "c:/skins/sea.jpg"));
+        assert!(!same_path(std::path::Path::new(r"C:\Skins\sea.jpg"), ""));
+        assert!(!same_path(std::path::Path::new(r"C:\Skins\sea.jpg"), r"C:\Skins\sea.jpeg"));
+    }
+
+    #[test]
+    fn the_picture_on_the_pad_moves_with_the_mouse() {
+        // Smaller than the pad (room to move): dragged right, it goes right.
+        let d = (50.0, 50.0);
+        assert_eq!(pan_place((0.0, 0.0), (30.0, 0.0), (60.0, 40.0), d), (50.0, 0.0));
+        assert_eq!(pan_place((50.0, 50.0), (-15.0, 10.0), (60.0, 40.0), d), (25.0, 75.0));
+        // Bigger than the pad (it fills it): dragged right, its left side comes into view.
+        assert_eq!(pan_place((100.0, 0.0), (30.0, 0.0), (-60.0, -40.0), d), (50.0, 0.0));
+        // Past the ends: the end.
+        assert_eq!(pan_place((10.0, 90.0), (-1000.0, 1000.0), (60.0, 40.0), d), (0.0, 100.0));
+        // No room (as wide as the pad), or nonsense: it stays.
+        assert_eq!(pan_place((30.0, 70.0), (25.0, 25.0), (0.4, -0.2), d), (30.0, 70.0));
+        assert_eq!(pan_place((30.0, 70.0), (f32::NAN, f32::INFINITY), (60.0, 40.0), d), (30.0, 70.0));
+        // Very near the default: exactly it; a bit further: where it was dragged.
+        assert_eq!(pan_place((0.0, 0.0), (29.6, 0.0), (60.0, 40.0), d), (50.0, 0.0));
+        assert_eq!(pan_place((0.0, 0.0), (28.8, 0.0), (60.0, 40.0), d), (48.0, 0.0));
+    }
+
+    #[test]
+    fn the_pad_shows_the_wallpaper_as_the_list_does_only_smaller() {
+        let list = Rect::new(0.0, 0.0, 900.0, 560.0);
+        let k = 160.0 / 900.0;
+        let pad = Rect::new(0.0, 0.0, 160.0, 560.0 * k);
+        let (orig, thumb) = ((1200.0, 800.0), (480.0, 320.0));
+        for fit in ["fill", "whole", "stretch", "tile", "actual"] {
+            for zoom in ["0", "100", "-50"] {
+                let t = skin::parse(&format!("wallpaper-fit: {fit}\nwallpaper-zoom: {zoom}\nwallpaper-position: 30% 70%\n"), "x").theme;
+                let big = crate::list::wallpaper_drawn_size(list, orig, &t, 1.0);
+                let small = crate::list::wallpaper_drawn_size(pad, thumb, &t, orig.0 / thumb.0 * k);
+                assert!((small.0 - big.0 * k).abs() < 0.01 && (small.1 - big.1 * k).abs() < 0.01, "{fit} {zoom}: {big:?} {small:?}");
             }
         }
     }
