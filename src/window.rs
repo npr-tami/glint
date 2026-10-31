@@ -84,7 +84,7 @@ use crate::life::{self, Request, WM_APP_LIFE};
 use windows::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, SC_CLOSE, SW_HIDE, WM_CLOSE};
 use crate::theme::size;
 use crate::titlebar::TitleBar;
-use crate::toolbar::Toolbar;
+use crate::toolbar::{self, Toolbar};
 use crate::ui::{Command, Component, Ctx, CursorKind, Effect, Hit, Menu, Mods, MouseButton, MouseEvent, Point, Rect};
 // Drag and drop (dragdrop.rs, and the window's side in window/drag.rs).
 use crate::dragdrop::{self, WM_APP_DRAG, WM_APP_DROP_DONE};
@@ -717,7 +717,13 @@ fn run_deferred(hwnd: HWND, ptr: *mut Window) {
                 Deferred::Menu(part, menu) => {
                     // SAFETY: as above, a short borrow to read the scale.
                     let scale = unsafe { (*ptr).scale() };
-                    let picked = show_menu(hwnd, &menu, scale);
+                    let picked = if part == Part::Toolbar && toolbar::drawn_menu(menu.tag) {
+                        // SAFETY: as above, a short borrow to read the skin.
+                        let look = unsafe { crate::droplist::DropLook::of(&(*ptr).app.theme) };
+                        drawn_menu(hwnd, &menu, scale, look)
+                    } else {
+                        show_menu(hwnd, &menu, scale)
+                    };
                     if picked != 0 && still_alive(hwnd, ptr) {
                         BUSY.with(|b| b.set(true));
                         // SAFETY: BUSY again guards the only live reference.
@@ -766,7 +772,7 @@ fn run_deferred(hwnd: HWND, ptr: *mut Window) {
                 Deferred::Settings(job) => {
                     // SAFETY: as above, a short borrow to read where the Settings window is.
                     let Some((swin, scale)) = (unsafe { (*ptr).settings_win.as_ref().map(|s| (s.hwnd(), s.scale())) }) else { continue };
-                    let done = settingswin::run_job(swin, scale, job, show_menu);
+                    let done = settingswin::run_job(swin, scale, job);
                     if done != settingswin::JobDone::Nothing && still_alive(hwnd, ptr) {
                         BUSY.with(|b| b.set(true));
                         // SAFETY: BUSY guards the only live reference.
@@ -878,10 +884,12 @@ fn open_settings(hwnd: HWND, ptr: *mut Window, page: Option<usize>) {
             BUSY.with(|b| b.set(false));
             return;
         }
-        let (theme, remembered) = ((*ptr).app.theme.clone(), (*ptr).app.settings.settings_size);
-        let (opens, bounds) = ((*ptr).app.settings.settings_opens, (*ptr).app.settings.settings_bounds);
-        // Docked or as a tab, Settings takes the sort editor's and the customiser's place.
-        if matches!(opens, settings::SettingsOpens::Docked | settings::SettingsOpens::Tab) {
+        let theme = (*ptr).app.theme.clone();
+        let (opens, place) = ((*ptr).app.settings.settings_opens, (*ptr).app.settings.settings_place);
+        // Opened without a page: the last one it showed, when it should reopen there.
+        let page = page.unwrap_or(if (*ptr).app.settings.settings_last_page { (*ptr).app.settings.settings_page } else { 0 });
+        // Glued to the side, Settings takes the sort editor's and the customiser's place.
+        if opens == settings::SettingsOpens::Side {
             if let Some(s) = (*ptr).sort_win.as_ref() {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(s.hwnd()), WM_CLOSE, WPARAM(0), LPARAM(0));
             }
@@ -889,7 +897,8 @@ fn open_settings(hwnd: HWND, ptr: *mut Window, page: Option<usize>) {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(s.hwnd()), WM_CLOSE, WPARAM(0), LPARAM(0));
             }
         }
-        let Some(win) = settingswin::create(hwnd, &theme, remembered, bounds, opens, page.unwrap_or(0)) else {
+        let list = (*ptr).app.settings.settings_pages == settings::SettingsPages::List;
+        let Some(win) = settingswin::create(hwnd, &theme, place, opens, list, page) else {
             BUSY.with(|b| b.set(true));
             (*ptr).app.say("Windows couldn't open the Settings window right now");
             (*ptr).invalidate();
@@ -1011,6 +1020,18 @@ pub fn settings_message(owner: HWND, hwnd: HWND, msg: u32, wparam: WPARAM, lpara
     BUSY.with(|b| b.set(false));
     run_deferred(owner, ptr);
     handled
+}
+
+/// Shows a button's menu drawn by Glint (droplist.rs), hanging from `menu.at`, and returns the
+/// picked item's id (0 = none).
+fn drawn_menu(hwnd: HWND, menu: &Menu, scale: f32, look: crate::droplist::DropLook) -> u32 {
+    let mut pt = POINT { x: (menu.at.x * scale).round() as i32, y: (menu.at.y * scale).round() as i32 };
+    // SAFETY: converts in place for our own window.
+    unsafe {
+        let _ = ClientToScreen(hwnd, &mut pt);
+    }
+    let under = RECT { left: pt.x, top: pt.y, right: pt.x, bottom: pt.y };
+    crate::droplist::show(hwnd, &crate::droplist::DropList { items: menu.items.clone(), under, look, menu: true, right: menu.right_aligned })
 }
 
 /// Shows a native popup menu (popup.rs: with its items' dots and pictures, and its bold item) and
@@ -1547,12 +1568,6 @@ impl Window {
                     self.deferred.push(Deferred::Settings(settingswin::Job::Close));
                 }
             }
-            // A folder's tab picked while Settings is open as a tab: Settings closes.
-            Command::SwitchTab(i) if self.app.settings_tab => {
-                self.deferred.push(Deferred::Settings(settingswin::Job::Close));
-                self.app.settings_tab = false;
-                self.app.run(Command::SwitchTab(i));
-            }
             Command::OpenSortEditor => self.deferred.push(Deferred::OpenSort),
             Command::CheckForUpdates => {
                 // Only the main Glint looks (Settings > About says so in an extra window).
@@ -1985,7 +2000,6 @@ impl Window {
         }
         marks.mark("receive");
         self.sync_theme();
-        self.app.settings_tab = self.settings_win.is_some() && self.app.settings.settings_opens == settings::SettingsOpens::Tab;
         self.app.icons.begin_frame();
         // A new generation for the thumbnails: what isn't asked for again in this frame or the next
         // isn't on screen any more (thumbs.rs).

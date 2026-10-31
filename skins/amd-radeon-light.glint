@@ -1,11 +1,11 @@
-// AMD Radeon (Light) - the same layers in soft greys, one red accent, slanted buttons.
-// (How skins are written: see the top of AMD Radeon.)
+// A Glint skin. Press GUIDE to see how skins are written.
 
 name: AMD Radeon (Light)
 description: Glint's own look in light: soft greys, one red accent, slanted buttons
 dark: false
+twin: AMD Radeon
 
-// ---- colours
+// Colours
 accent: #e3262d
 accent-text: #ffffff
 background: #e9e9ec
@@ -40,7 +40,7 @@ caption-pressed: button-hover 70%
 close-hover: accent
 menus: light
 
-// ---- shapes and text
+// Shapes and text
 shape: slanted
 slant: 8
 path-slant: 6

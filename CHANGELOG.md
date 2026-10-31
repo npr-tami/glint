@@ -2,6 +2,16 @@
 
 The newest version is at the top.
 
+## 1.0.23-beta.1 · 31/10/2026 01:52
+
+- Added choices for how Settings looks, in Settings > Appearance > Settings window
+- Added a search box, a dot on changed settings and a Reset page button to Settings
+- Changed Settings to a small window, like File Explorer's Folder Options
+- Changed drop-downs and the SORT, VIEW and SETTINGS menus to drop down right under their button
+- Changed the built-in skins' text and the skin guide to be easier to read
+- Renamed Settings > Mouse & keys to Keys, with a list of every shortcut
+- Some other improvements and bugfixes
+
 ## 1.0.22-beta.1 · 25/10/2026 04:09
 
 - Added a Wallpaper section to the skin customiser

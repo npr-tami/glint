@@ -1,14 +1,11 @@
-// Gunmetal - year 2000 chrome in dark gunmetal: dark brushed bars, glossy liquid buttons, glass
-// marbles for minimise, maximise and close, rounded tabs and sidebar panels. Its light other half
-// is Chrome.
-// (How skins are written: see the top of AMD Radeon; gradients: see Chrome.)
+// A Glint skin. Press GUIDE to see how skins are written.
 
 name: Gunmetal
 description: Year 2000 chrome in dark gunmetal, liquid buttons
 dark: true
-twin: chrome
+twin: Chrome
 
-// ---- colours
+// Colours
 accent: #84a6e0
 accent-text: #ffffff
 background: #2a303a, #1c2028
@@ -19,7 +16,7 @@ sidebar: #262d38, #1c222c
 status-bar: #2a303a, #1c2028
 input: #12151b, #181c23
 input-border: #3c4556
-button: #dde6f5, #7088b0 45%, #2d3f63         // the liquid glass: light point, body, rim
+button: #dde6f5, #7088b0 45%, #2d3f63
 button-hover: #eef3fb, #8299c0 45%, #3a4e76
 button-text: #ffffff
 text: #e6e8ee
@@ -68,7 +65,7 @@ caption-pressed: #ffffff14
 close-hover: #7a2233
 menus: dark
 
-// ---- shapes and text
+// Shapes and text
 shape: rounded
 slant: 0
 path-slant: 0
@@ -79,7 +76,7 @@ toolbar-line-width: 1
 font: Verdana, Tahoma, Segoe UI
 font-size: 8pt
 
-// ---- styles
+// Styles
 buttons: liquid
 caption-buttons: marbles
 tabs: pills

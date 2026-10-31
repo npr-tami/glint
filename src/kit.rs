@@ -65,7 +65,6 @@ pub mod size {
     pub const HEADING_FONT: f32 = 12.5;
     pub const PAGE_TITLE_FONT: f32 = 20.0;
     pub const NAV_FONT: f32 = 12.5;
-    pub const NAV_ITEM_H: f32 = 36.0;
     /// The close button of a window's own title bar, and its marble (`caption-buttons: marbles`).
     pub const CLOSE_W: f32 = 46.0;
     pub const MARBLE: f32 = 16.0;
@@ -297,6 +296,31 @@ pub fn checkbox(r: &mut Renderer, theme: &Theme, rect: Rect, on: f32, look: Look
     }
     if look.focused {
         focus_ring(r, theme, rect, lean);
+    }
+}
+
+/// A round button in `rect` (a square): a ring, with the accent's dot in it when it's the one
+/// picked (`on`, 0.0 to 1.0 while it fades in or out, like a checkbox).
+pub fn radio(r: &mut Renderer, theme: &Theme, rect: Rect, on: f32, look: Look) {
+    let t = on.clamp(0.0, 1.0);
+    let c = Point::new(rect.x + rect.w / 2.0, rect.y + rect.h / 2.0);
+    let radius = rect.w.min(rect.h) / 2.0;
+    let lit = look.enabled && (look.hover || look.pressed);
+    let (ring, dot) = if theme.era.old() {
+        // An older Windows' sunken white well with a black dot.
+        r.fill_ellipse(c, radius, radius, faded(theme.input, look));
+        (theme.text, theme.text)
+    } else {
+        let fill = if lit { theme.accent.with_alpha(0.88) } else { theme.accent };
+        (blend(if lit { theme.text } else { theme.muted }, fill, t), fill)
+    };
+    r.stroke_ellipse(c, radius - 0.6, radius - 0.6, 1.2, faded(ring, look));
+    if t > 0.0 {
+        let d = radius * 0.5;
+        r.fill_ellipse(c, d, d, faded(dot.with_alpha(dot.a * t), look));
+    }
+    if look.focused {
+        focus_ring_round(r, theme, rect.inset(-2.0, -2.0), radius + 2.0, 0.0);
     }
 }
 
@@ -646,6 +670,34 @@ pub fn titled_group(r: &mut Renderer, theme: &Theme, card: Rect, heading: Rect, 
     let w = r.measure(text, &style).ceil();
     let x = r.snap(group.x + 8.0);
     r.fill_rect(Rect::new(x - 2.0, top - 7.0, w + 4.0, 14.0), theme.toolbar);
+    r.text(text, Rect::new(x, top - 10.0, w + 2.0, 20.0), &style);
+}
+
+/// A group box like File Explorer's Folder Options: a hairline frame round `rect` with the group's
+/// title sitting on its top line, the line broken behind the words (98 / 2000 draw theirs raised,
+/// as `titled_group` does).
+pub fn group(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str) {
+    let style = TextStyle::new(if panels(theme) { theme.panel_header_text } else { theme.text }).size(size::HEADING_FONT).semibold();
+    let w = r.measure(text, &style).ceil();
+    let x = r.snap(rect.x + 10.0);
+    let top = r.snap(rect.y);
+    // The frame is drawn three times, each clipped round the gap the title takes: left of it, right
+    // of it and below it (so it works for every shape of corner, on any background).
+    let gap = Rect::new(x - 4.0, top - 4.0, w + 8.0, 8.0);
+    let around = Rect::new(rect.x - 4.0, rect.y - 4.0, rect.w + 8.0, rect.h + 8.0);
+    for clip in [
+        Rect::new(around.x, around.y, (gap.x - around.x).max(0.0), around.h),
+        Rect::new(gap.right(), around.y, (around.right() - gap.right()).max(0.0), around.h),
+        Rect::new(gap.x, gap.bottom(), gap.w, (around.bottom() - gap.bottom()).max(0.0)),
+    ] {
+        r.push_clip(clip);
+        if theme.era.old() {
+            crate::retroctl::group_box(r, theme, rect);
+        } else {
+            frame(r, theme, rect, theme.line);
+        }
+        r.pop_clip();
+    }
     r.text(text, Rect::new(x, top - 10.0, w + 2.0, 20.0), &style);
 }
 

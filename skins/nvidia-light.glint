@@ -1,12 +1,11 @@
-// NVIDIA (Light) - the NVIDIA style in light: white and soft grey layers, dark text, NVIDIA
-// green, straight square edges and a green line on top of the active tab.
-// (How skins are written: see the top of AMD Radeon.)
+// A Glint skin. Press GUIDE to see how skins are written.
 
 name: NVIDIA (Light)
 description: White and grey layers, dark text, NVIDIA green, square edges
 dark: false
+twin: NVIDIA
 
-// ---- colours
+// Colours
 accent: #76b900
 accent-text: #0f0f0f
 background: #e6e6e6
@@ -41,7 +40,7 @@ caption-pressed: button-hover 70%
 close-hover: accent
 menus: light
 
-// ---- shapes and text
+// Shapes and text
 shape: straight
 slant: 0
 path-slant: 0

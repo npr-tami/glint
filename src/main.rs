@@ -52,6 +52,7 @@ mod details;
 mod eraicons;
 mod oldmenu;
 mod dragdrop;
+mod droplist;
 mod dupes;
 mod fileops;
 mod folder;

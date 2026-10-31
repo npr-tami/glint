@@ -112,6 +112,8 @@ const BUILT_IN: [(&str, &str); 6] = [
     ("gunmetal", include_str!("../skins/gunmetal.glint")),
 ];
 
+/// The first line of every built-in skin, and of a new skin or a copy.
+pub const HEADER: &str = "// A Glint skin. Press GUIDE to see how skins are written.";
 /// A person's own skins: at most this many files are read, each at most this big.
 const MAX_OWN: usize = 500;
 const MAX_FILE_BYTES: u64 = 256 * 1024;
@@ -1451,12 +1453,11 @@ pub fn without_value(text: &str, key: &str) -> String {
 }
 
 /// The text of a new skin called `name`, made from `from` (another skin's text): its opening notes
-/// are replaced by one saying where it came from.
+/// are replaced by the line every skin starts with, and its description says where it came from.
 pub fn copy_text(from: &str, name: &str, came_from: &str) -> String {
     let body: Vec<&str> = from.trim_start_matches('\u{feff}').lines().skip_while(|l| l.trim().is_empty() || l.trim_start().starts_with("//")).collect();
-    let header = format!(
-        "// {name} - made from {came_from}.\r\n// One setting per line: \"name: value\". Colours are #rrggbb (#rrggbbaa: see-through),\r\n// or a gradient: #fdfdfd, #c3cddb 45%, #8d9db8 (top to bottom; left to right on tall things).\r\n\r\n"
-    );
+    // The same first line as every built-in skin (where it came from is in its description).
+    let header = format!("{HEADER}\r\n\r\n");
     // A copy is a skin of its own: the original's other half isn't the copy's.
     let body: Vec<&str> = body.into_iter().filter(|l| without_note(l).and_then(split_line).is_none_or(|(k, _)| normalize_key(k) != "twin")).collect();
     let text = format!("{header}{}\r\n", body.join("\r\n"));
@@ -3076,7 +3077,20 @@ mod tests {
         assert_eq!(p.name, "My skin");
         assert!(p.notes.is_empty(), "{:?}", p.notes);
         assert_eq!(p.theme, built_in_theme("nvidia"));
-        assert!(copy.starts_with("// My skin - made from NVIDIA"));
+        assert!(copy.starts_with(HEADER));
+    }
+
+    #[test]
+    fn the_built_in_skins_are_written_the_same_way() {
+        // The same first line, the same lines about the skin, the same headings: only values differ.
+        for (id, text) in BUILT_IN {
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(lines[..2], [HEADER, ""], "{id}");
+            let keys: Vec<&str> = lines[2..6].iter().map(|l| l.split(':').next().unwrap_or("")).collect();
+            assert_eq!(keys, ["name", "description", "dark", "twin"], "{id}");
+            let notes: Vec<&str> = lines[1..].iter().copied().filter(|l| l.starts_with("//") || l.contains(" //")).collect();
+            assert!(notes.iter().all(|n| ["// Colours", "// Shapes and text", "// Styles"].contains(n)), "{id}: {notes:?}");
+        }
     }
 
     #[test]

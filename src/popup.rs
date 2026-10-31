@@ -170,6 +170,13 @@ fn picture_art(picture: MenuPicture, scale: f32) -> Option<Art> {
     }
 }
 
+/// The same picture as premultiplied BGRA bytes and its size, for a list drawn by Glint itself
+/// (the Settings window's drop-downs).
+pub fn picture_bytes(picture: MenuPicture, scale: f32) -> Option<(u32, u32, Vec<u8>)> {
+    let art = picture_art(picture, scale)?;
+    Some((art.width as u32, art.height as u32, art.pixels.iter().flat_map(|p| p.to_le_bytes()).collect()))
+}
+
 /// glint.exe's icon `number` (res/glint.rc), `side` pixels square.
 fn icon_art(number: u16, side: usize) -> Option<Art> {
     let wic = crate::thumbs::wic_factory()?;

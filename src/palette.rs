@@ -880,7 +880,7 @@ mod tests {
         assert_eq!(found.action, Action::Run(Command::OpenSetting(2, "Hidden files".into())));
         // Any setting on any page, once each; the shortcut list isn't one.
         let settings: Vec<&Item> = all.iter().filter(|i| matches!(i.action, Action::Run(Command::OpenSetting(..)))).collect();
-        for t in ["Setting: Skin", "Setting: Zip icon", "Setting: Open on startup", "Setting: Check for updates automatically"] {
+        for t in ["Setting: Skin", "Setting: Zip icon", "Setting: Open Glint to", "Setting: Check for updates automatically"] {
             assert_eq!(settings.iter().filter(|i| i.name == t).count(), 1, "{t}");
         }
         assert!(!settings.iter().any(|i| i.name.contains("Ctrl+")), "no shortcuts");

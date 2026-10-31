@@ -1,17 +1,11 @@
-// AMD Radeon - Glint's own look: layers of charcoal, one red accent, slanted buttons.
-//
-// One setting per line: "name: value". Lines starting with // are notes.
-// Colours: #rrggbb, #rrggbbaa (see-through), another colour's name ("tab-line: accent"),
-// or one at a strength ("accent 16%"). Anything left out comes from AMD Radeon
-// (or AMD Radeon (Light) for a light skin).
-// A skin can have a wallpaper too: "wallpaper: picture.png", with wallpaper-opacity, -position,
-// -fit, -zoom, -offset, -size, -blur and -fade.
+// A Glint skin. Press GUIDE to see how skins are written.
 
 name: AMD Radeon
 description: Glint's own look: layered charcoal, one red accent, slanted buttons
 dark: true
+twin: AMD Radeon (Light)
 
-// ---- colours
+// Colours
 accent: #e3262d
 accent-text: #ffffff
 background: #0e0e10
@@ -46,7 +40,7 @@ caption-pressed: button-hover
 close-hover: accent
 menus: dark
 
-// ---- shapes and text
+// Shapes and text
 shape: slanted
 slant: 8
 path-slant: 6

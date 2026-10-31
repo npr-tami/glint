@@ -1,12 +1,11 @@
-// NVIDIA - in the style of the NVIDIA app: near-black layers, white text, NVIDIA green,
-// straight square edges and a green line on top of the active tab.
-// (How skins are written: see the top of AMD Radeon.)
+// A Glint skin. Press GUIDE to see how skins are written.
 
 name: NVIDIA
 description: Near-black layers, white text, NVIDIA green, square edges
 dark: true
+twin: NVIDIA (Light)
 
-// ---- colours
+// Colours
 accent: #76b900
 accent-text: #0f0f0f
 background: #0f0f0f
@@ -41,7 +40,7 @@ caption-pressed: button-hover
 close-hover: accent
 menus: dark
 
-// ---- shapes and text
+// Shapes and text
 shape: straight
 slant: 0
 path-slant: 0

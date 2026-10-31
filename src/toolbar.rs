@@ -44,6 +44,13 @@ const FILTER_BOX: u16 = 101;
 
 /// Our popup menus, told apart in `menu_pick`.
 const MENU_SORT: u32 = 1;
+
+/// Whether the menu `tag` drops from a button (SORT, VIEW, SETTINGS, the hidden steps, Back and
+/// Forward's lists), so Glint draws it itself, like the Settings window's drop-downs. A right-click
+/// on the path gets Windows' own menu, as right-clicks do everywhere.
+pub fn drawn_menu(tag: u32) -> bool {
+    tag != MENU_PATH
+}
 const MENU_SETTINGS: u32 = 2;
 /// The steps hidden behind "…".
 const MENU_HIDDEN: u32 = 3;
@@ -600,7 +607,7 @@ impl Toolbar {
     fn settings_pick(&mut self, item: u32) -> Effect {
         match item {
             SET_WINDOW => Effect::Command(Command::OpenSettings(None)),
-            SET_ABOUT => Effect::Command(Command::OpenSettings(Some(crate::settingswin::ABOUT))),
+            SET_ABOUT => Effect::Command(Command::OpenSetting(crate::settingswin::ABOUT, crate::settingswin::ABOUT_ROW.to_string())),
             SET_QUIT => Effect::Command(Command::Quit),
             _ => Effect::None,
         }

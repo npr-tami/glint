@@ -490,15 +490,58 @@ pub enum HomePage {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SettingsOpens {
-    /// Beside the main window, on the side with room, like the sort editor.
+    /// A small window of its own on top of Glint, where it was left (the middle at first). It
+    /// stays open while you use Glint, so every change shows behind it. (Before 1.0.23 there were
+    /// Docked, Small, Tab and Last position: they all open floating now.)
     #[default]
-    Docked,
-    /// A small window in the middle of the main window.
-    Small,
-    /// Over the main window's files, with a Settings tab of its own.
-    Tab,
-    /// Where it was left, at the size it was left.
-    Free,
+    #[serde(alias = "docked", alias = "small", alias = "tab", alias = "free")]
+    Floating,
+    /// Glued to the main window's side, as tall as it, moving with it.
+    Side,
+    /// Over the main window's right edge, where the details panel goes.
+    Panel,
+}
+
+/// How the Settings window shows its pages.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SettingsPages {
+    /// Tabs along the top.
+    #[default]
+    Tabs,
+    /// A list down the left (tabs again when the window is too narrow for it).
+    List,
+}
+
+/// What the Settings window's choices look like.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SettingsStyle {
+    /// Like File Explorer's Folder Options: group boxes, ticks, round buttons for short choices.
+    #[default]
+    Ticks,
+    /// Every choice spelled out as a sentence with round buttons under it, no boxes.
+    Sentences,
+}
+
+/// How much each Settings page shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SettingsShow {
+    #[default]
+    All,
+    /// The everyday settings, then "More" for the rest.
+    Basic,
+}
+
+/// How the Settings window lists the skins.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SettingsSkins {
+    #[default]
+    List,
+    /// Little tiles in each skin's colours.
+    Tiles,
 }
 
 /// Light or dark.
@@ -798,8 +841,21 @@ pub struct Settings {
     /// "Home opens": page | folder.
     #[serde(rename = "HomeOpens")]
     pub home: HomePage,
-    /// "Settings opens": docked | small | tab | free.
+    /// "Settings opens": floating | side | panel.
     pub settings_opens: SettingsOpens,
+    /// The Settings window's own look ("Settings window" on the Appearance page): its pages as tabs or a
+    /// list, its choices as ticks or sentences, everything or the basics, skins as a list or tiles,
+    /// and the search box, the dots on changed settings, Reset page and reopening on the last page.
+    pub settings_pages: SettingsPages,
+    pub settings_style: SettingsStyle,
+    pub settings_show: SettingsShow,
+    pub settings_skins: SettingsSkins,
+    pub settings_search: bool,
+    pub settings_dots: bool,
+    pub settings_reset: bool,
+    pub settings_last_page: bool,
+    /// The page Settings showed last (for `settings_last_page`).
+    pub settings_page: usize,
     /// Show hidden files and folders (greyed). Ctrl+H.
     pub show_hidden: bool,
     /// Also show protected operating-system files (hidden + system, like desktop.ini), when hidden
@@ -956,10 +1012,9 @@ pub struct Settings {
     pub logo: LogoStyle,
     /// "ZipIcon": what zip and 7z files that open in Glint look like in Windows.
     pub zip_icon: ZipIcon,
-    /// The Settings window's size in DIPs (width, height), when it was last resized.
-    pub settings_size: Option<[f32; 2]>,
-    /// Where Settings was (screen pixels: x, y, width, height) when it opens where it was left.
-    pub settings_bounds: Option<[i32; 4]>,
+    /// Where the floating Settings window was left (screen pixels: x, y, width, height). (Before
+    /// 1.0.23: SettingsSize and SettingsBounds, for the old ways it opened; they're not read now.)
+    pub settings_place: Option<[i32; 4]>,
     /// The details panel's width in DIPs (dragged at its left edge); 0 = the standard width (side.rs).
     pub details_width: f32,
     /// The Space preview's width in DIPs; 0 = half of the room next to the sidebar.
@@ -978,7 +1033,16 @@ impl Default for Settings {
             theme: ThemeMode::Dark,
             new_tab: NewTab::Same,
             home: HomePage::Page,
-            settings_opens: SettingsOpens::Docked,
+            settings_opens: SettingsOpens::Floating,
+            settings_pages: SettingsPages::Tabs,
+            settings_style: SettingsStyle::Ticks,
+            settings_show: SettingsShow::All,
+            settings_skins: SettingsSkins::List,
+            settings_search: true,
+            settings_dots: true,
+            settings_reset: true,
+            settings_last_page: false,
+            settings_page: 0,
             show_hidden: false,
             show_system: false,
             confirm_delete: ConfirmDelete::Permanent,
@@ -1038,8 +1102,7 @@ impl Default for Settings {
             rail_group: RailGroup::Quick,
             logo: LogoStyle::Box,
             zip_icon: ZipIcon::Label,
-            settings_size: None,
-            settings_bounds: None,
+            settings_place: None,
             details_width: 0.0,
             preview_width: 0.0,
             preview_info: true,
@@ -1057,6 +1120,14 @@ const CHOICES: &[&str] = &[
     "StartupFolder",
     "HomeOpens",
     "SettingsOpens",
+    "SettingsPages",
+    "SettingsStyle",
+    "SettingsShow",
+    "SettingsSkins",
+    "SettingsSearch",
+    "SettingsDots",
+    "SettingsReset",
+    "SettingsLastPage",
     "Theme",
     "NewTab",
     "ShowHidden",
@@ -1281,11 +1352,8 @@ impl Settings {
         if self.sidebar_width < 0 {
             self.sidebar_width = 0;
         }
-        if self.settings_size.is_some_and(|[w, h]| !(w.is_finite() && h.is_finite() && w >= 200.0 && h >= 150.0 && w <= 20000.0 && h <= 20000.0)) {
-            self.settings_size = None;
-        }
-        if self.settings_bounds.is_some_and(|[_, _, w, h]| !((200..=20000).contains(&w) && (150..=20000).contains(&h))) {
-            self.settings_bounds = None;
+        if self.settings_place.is_some_and(|[_, _, w, h]| !((200..=20000).contains(&w) && (150..=20000).contains(&h))) {
+            self.settings_place = None;
         }
         if self.sort_bounds.is_some_and(|[_, _, w, h]| !((200..=20000).contains(&w) && (150..=20000).contains(&h))) {
             self.sort_bounds = None;
@@ -2005,11 +2073,29 @@ mod tests {
         assert!(!Settings::default().to_json().contains("ColumnWidths"));
     }
 
+    /// The four old ways Settings opened all open it floating now; the new ones are read back.
+    #[test]
+    fn the_old_ways_settings_opened_open_it_floating() {
+        for old in ["docked", "small", "tab", "free"] {
+            let Parsed::Good(s) = parse(&format!("{{\"SettingsOpens\": \"{old}\"}}")) else { panic!("{old}") };
+            assert_eq!(s.settings_opens, SettingsOpens::Floating, "{old}");
+        }
+        let s = Settings { settings_opens: SettingsOpens::Panel, settings_pages: SettingsPages::List, settings_style: SettingsStyle::Sentences, settings_skins: SettingsSkins::Tiles, ..Default::default() };
+        let text = serde_json::to_string(&s).unwrap();
+        assert!(text.contains("\"SettingsOpens\":\"panel\"") && text.contains("\"SettingsStyle\":\"sentences\""));
+        let Parsed::Good(back) = parse(&text) else { panic!() };
+        assert_eq!((back.settings_opens, back.settings_pages, back.settings_style, back.settings_skins), (SettingsOpens::Panel, SettingsPages::List, SettingsStyle::Sentences, SettingsSkins::Tiles));
+        // By default: floating, tabs, ticks, everything, a drop-down; search, dots and RESET PAGE on.
+        let d = Settings::default();
+        assert_eq!((d.settings_opens, d.settings_pages, d.settings_style, d.settings_show, d.settings_skins), (SettingsOpens::Floating, SettingsPages::Tabs, SettingsStyle::Ticks, SettingsShow::All, SettingsSkins::List));
+        assert!(d.settings_search && d.settings_dots && d.settings_reset && !d.settings_last_page);
+    }
+
     #[test]
     fn the_old_values_are_read() {
         let text = "{\"Size\": \"large\", \"DateFormat\": \"iso\", \"SizeFormat\": \"kb\", \"Backspace\": \"back\", \"RailGroup\": \"pc\", \
                     \"Columns\": [\"Size\", \"created\", \"nonsense\", \"size\"], \"Pinned\": [\"C:\\\\Work\"], \"PinNames\": {\"C:\\\\Work\": \"Work\"}, \
-                    \"StayRunning\": false, \"Skin\": \" amd-radeon-light \", \"SettingsSize\": [900, 700]}";
+                    \"StayRunning\": false, \"Skin\": \" amd-radeon-light \", \"SettingsPlace\": [10, 20, 440, 520]}";
         let Parsed::Good(s) = parse(text) else { panic!() };
         assert_eq!((s.size, s.date_format, s.size_format, s.backspace, s.rail_group), (ListSize::Large, DateFormat::Iso, SizeFormat::Kb, Backspace::Back, RailGroup::Pc));
         assert_eq!(s.columns, vec!["created", "size"], "known columns only, once each, in their order");
@@ -2017,10 +2103,10 @@ mod tests {
         assert_eq!(s.pin_names.get("C:\\Work").map(String::as_str), Some("Work"));
         assert!(!s.stay_running);
         assert_eq!(s.skin, "amd-radeon-light", "spaces around a skin id go");
-        assert_eq!(s.settings_size, Some([900.0, 700.0]));
+        assert_eq!(s.settings_place, Some([10, 20, 440, 520]));
         // A silly size is forgotten; a wrong value only loses itself.
-        let Parsed::Good(s) = parse("{\"SettingsSize\": [5, 5]}") else { panic!() };
-        assert_eq!(s.settings_size, None);
+        let Parsed::Good(s) = parse("{\"SettingsPlace\": [0, 0, 5, 5]}") else { panic!() };
+        assert_eq!(s.settings_place, None);
         assert!(matches!(parse("{\"Size\": \"huge\", \"ShowHidden\": true}"), Parsed::Partly(s, d) if s.show_hidden && s.size == ListSize::Small && d == ["Size"]));
     }
 
