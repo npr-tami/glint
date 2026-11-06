@@ -84,6 +84,7 @@ use crate::fileops;
 use crate::log;
 use crate::settings;
 use crate::shell;
+use crate::sortrecipe;
 use crate::theme::{size, ButtonStyle, CaptionStyle, Color, Era, IconSet, Paint, Shape, SidebarStyle, Stop, TabStyle, Theme, WallpaperFit, MAX_STOPS};
 
 /// The skin Glint starts with, and its light version.
@@ -113,7 +114,7 @@ const BUILT_IN: [(&str, &str); 6] = [
 ];
 
 /// The first line of every built-in skin, and of a new skin or a copy.
-pub const HEADER: &str = "// A Glint skin. Press GUIDE to see how skins are written.";
+pub const HEADER: &str = "// A Glint skin. Open Skins in Glint and press GUIDE to see how skins are written.";
 /// A person's own skins: at most this many files are read, each at most this big.
 const MAX_OWN: usize = 500;
 const MAX_FILE_BYTES: u64 = 256 * 1024;
@@ -124,81 +125,81 @@ pub const DEFAULT_LOGO_TEXT: &str = "GLINT";
 
 /// Every colour a skin can set, with what it colours.
 pub const COLOURS: &[(&str, &str)] = &[
-    ("accent", "Lines, selected rows' edge, switches"),
-    ("accent-text", "Text on the accent colour"),
-    ("background", "The darkest layer, between the panels"),
-    ("title-bar", "The bar with the logo and tabs"),
-    ("toolbar", "The bar with the path, and the current tab"),
-    ("panel", "File list and details panel"),
-    ("sidebar", "Sidebar"),
-    ("status-bar", "Status bar"),
-    ("input", "Path and filter boxes"),
-    ("button", "Buttons, and the current folder in the path"),
-    ("button-hover", "Buttons under the mouse"),
-    ("text", "Text"),
-    ("text-bright", "Text on selected rows and buttons"),
-    ("muted", "Headings, dates, inactive tabs"),
-    ("disabled", "Buttons that can't be used"),
-    ("selection", "Selected rows"),
-    ("selection-edge", "Left edge of selected rows"),
-    ("hover", "Rows under the mouse"),
-    ("tool-hover", "Back, Forward, Up and Refresh under the mouse"),
-    ("tool-pressed", "Those while clicked"),
-    ("path-hover", "A step of the path under the mouse"),
-    ("line", "Thin lines"),
-    ("scrollbar", "Scroll bars"),
-    ("scrollbar-hover", "Scroll bars under the mouse"),
-    ("usage-bar", "Behind a drive's usage bar"),
-    ("logo", "Logo box"),
-    ("logo-letters", "Logo letters"),
-    ("tab-line", "Line on top of the current tab"),
-    ("toolbar-line", "Line under the toolbar"),
+    ("accent", "lines, selected rows' edge, switches"),
+    ("accent-text", "text on the accent colour"),
+    ("background", "the darkest layer, between the panels"),
+    ("title-bar", "the bar with the logo and tabs"),
+    ("toolbar", "the bar with the path, and the current tab"),
+    ("panel", "file list and details panel"),
+    ("sidebar", "sidebar"),
+    ("status-bar", "status bar"),
+    ("input", "path and filter boxes"),
+    ("button", "buttons, and the current folder in the path"),
+    ("button-hover", "buttons under the mouse"),
+    ("text", "text"),
+    ("text-bright", "text on selected rows and buttons"),
+    ("muted", "headings, dates, inactive tabs"),
+    ("disabled", "buttons that can't be used"),
+    ("selection", "selected rows"),
+    ("selection-edge", "left edge of selected rows"),
+    ("hover", "rows under the mouse"),
+    ("tool-hover", "back, forward, up and refresh under the mouse"),
+    ("tool-pressed", "those while clicked"),
+    ("path-hover", "a step of the path under the mouse"),
+    ("line", "thin lines"),
+    ("scrollbar", "scroll bars"),
+    ("scrollbar-hover", "scroll bars under the mouse"),
+    ("usage-bar", "behind a drive's usage bar"),
+    ("logo", "logo box"),
+    ("logo-letters", "logo letters"),
+    ("tab-line", "line on top of the current tab"),
+    ("toolbar-line", "line under the toolbar"),
     ("caption-hover", "+, minimise and maximise under the mouse"),
-    ("caption-pressed", "Those while clicked"),
-    ("close-hover", "Close button under the mouse"),
-    ("tab", "Tabs other than the current one"),
-    ("tab-active", "The current tab"),
-    ("tab-text", "Names of the other tabs"),
-    ("tab-active-text", "Name of the current tab"),
-    ("tab-border", "Edge of each tab (tabs: pills)"),
-    ("highlight", "Thin shine along the top of bars and tabs"),
-    ("sidebar-panel", "Sidebar panels (sidebar-style: panels)"),
-    ("panel-header", "Header bars of the sidebar panels"),
-    ("panel-header-text", "Sidebar headings"),
-    ("sidebar-selection", "The place you're in, in the sidebar"),
-    ("sidebar-selection-text", "Its name"),
-    ("list-header", "Column titles' bar"),
-    ("list-header-text", "Column titles"),
-    ("column-line", "Lines between the column titles"),
-    ("status-text", "Status bar text"),
-    ("status-line", "Line along the top of the status bar"),
-    ("selection-text", "Text on selected rows"),
-    ("input-border", "Edge of the path and filter boxes"),
-    ("button-text", "Words and signs on buttons"),
-    ("marble", "Minimise and maximise (caption-buttons: marbles)"),
-    ("marble-close", "Close (caption-buttons: marbles)"),
-    ("usage-fill", "Used part of a drive's usage bar"),
-    ("scrollbar-track", "Behind the scroll bars"),
-    ("scrollbar-border", "Edge of the scroll bars"),
-    ("scrollbar-grip-lines", "Lines on the scroll bars (scrollbar-grip)"),
-    ("back-button", "Back and forward as round glass buttons"),
-    ("tool-border", "Edge of toolbar buttons under the mouse"),
-    ("selection-border", "Edge of selected rows"),
-    ("title-gloss", "Shine over the top half of the title bar"),
-    ("title-text", "Window titles (Settings, Sort order)"),
-    ("title-text-inactive", "Window titles while the window isn't active"),
-    ("title-text-shadow", "Shadow under window titles"),
-    ("title-bar-inactive", "The title bar while the window isn't active"),
+    ("caption-pressed", "those while clicked"),
+    ("close-hover", "close button under the mouse"),
+    ("tab", "tabs other than the current one"),
+    ("tab-active", "the current tab"),
+    ("tab-text", "names of the other tabs"),
+    ("tab-active-text", "name of the current tab"),
+    ("tab-border", "edge of each tab (tabs: pills)"),
+    ("highlight", "thin shine along the top of bars and tabs"),
+    ("sidebar-panel", "sidebar panels (sidebar-style: panels)"),
+    ("panel-header", "header bars of the sidebar panels"),
+    ("panel-header-text", "sidebar headings"),
+    ("sidebar-selection", "the place you're in, in the sidebar"),
+    ("sidebar-selection-text", "its name"),
+    ("list-header", "column titles' bar"),
+    ("list-header-text", "column titles"),
+    ("column-line", "lines between the column titles"),
+    ("status-text", "status bar text"),
+    ("status-line", "line along the top of the status bar"),
+    ("selection-text", "text on selected rows"),
+    ("input-border", "edge of the path and filter boxes"),
+    ("button-text", "words and signs on buttons"),
+    ("marble", "minimise and maximise (caption-buttons: marbles)"),
+    ("marble-close", "close (caption-buttons: marbles)"),
+    ("usage-fill", "used part of a drive's usage bar"),
+    ("scrollbar-track", "behind the scroll bars"),
+    ("scrollbar-border", "edge of the scroll bars"),
+    ("scrollbar-grip-lines", "lines on the scroll bars (scrollbar-grip)"),
+    ("back-button", "back and forward as round glass buttons"),
+    ("tool-border", "edge of toolbar buttons under the mouse"),
+    ("selection-border", "edge of selected rows"),
+    ("title-gloss", "shine over the top half of the title bar"),
+    ("title-text", "window titles (Settings, Sort order and views)"),
+    ("title-text-inactive", "window titles while the window isn't active"),
+    ("title-text-shadow", "shadow under window titles"),
+    ("title-bar-inactive", "the title bar while the window isn't active"),
     ("bevel-highlight", "3D edges: the lit outer line (bevels)"),
     ("bevel-light", "3D edges: the lit inner line"),
     ("bevel-shadow", "3D edges: the shaded inner line"),
     ("bevel-dark", "3D edges: the shaded outer line"),
-    ("menu", "Menus drawn in the skin (none: Windows' own)"),
-    ("menu-text", "Words in menus"),
-    ("menu-selection", "The menu item under the mouse"),
-    ("menu-selection-text", "Its words"),
-    ("menu-border", "Edge of menus"),
-    ("sidebar-text", "Names of the places in the sidebar"),
+    ("menu", "menus drawn in the skin (none: Windows' own)"),
+    ("menu-text", "words in menus"),
+    ("menu-selection", "the menu item under the mouse"),
+    ("menu-selection-text", "its words"),
+    ("menu-border", "edge of menus"),
+    ("sidebar-text", "names of the places in the sidebar"),
 ];
 
 /// Colours that came later than AMD Radeon and NVIDIA: each follows an older colour when a skin
@@ -251,44 +252,44 @@ pub const DERIVED: &[(&str, &str)] = &[
 
 /// Everything else a skin can set, with what it does.
 pub const OTHERS: &[(&str, &str)] = &[
-    ("name", "Name in Settings; its light version adds \" (Light)\""),
-    ("description", "One line about it"),
-    ("author", "Who made it"),
+    ("name", "name in Settings; its light version adds \" (Light)\""),
+    ("description", "one line about it"),
+    ("author", "who made it"),
     ("dark", "true or false"),
-    ("twin", "Its light or dark other half, by id or name (when the names don't pair up)"),
-    ("menus", "Right-click menus: dark or light"),
+    ("twin", "its light or dark other half, by id or name (when the names don't pair up)"),
+    ("menus", "right-click menus: dark or light"),
     ("shape", "slanted, straight or rounded"),
-    ("slant", "How far buttons lean, 0 to 20"),
-    ("path-slant", "How far the current folder's box leans, 0 to 20"),
-    ("radius", "Corner roundness, 0 to 16"),
-    ("row-height", "File list row height, 20 to 48"),
-    ("sidebar-row-height", "Sidebar row height, 16 to 48"),
-    ("tab-line-width", "Current tab's line, 0 to 6"),
-    ("toolbar-line-width", "Toolbar's line, 0 to 6"),
-    ("font", "Fonts to try, best first"),
+    ("slant", "how far buttons lean, 0 to 20"),
+    ("path-slant", "how far the current folder's box leans, 0 to 20"),
+    ("radius", "corner roundness, 0 to 16"),
+    ("row-height", "file list row height, 20 to 48"),
+    ("sidebar-row-height", "sidebar row height, 16 to 48"),
+    ("tab-line-width", "current tab's line, 0 to 6"),
+    ("toolbar-line-width", "toolbar's line, 0 to 6"),
+    ("font", "fonts to try, best first"),
     ("font-size", "8pt to 14pt (or pixels: 12px)"),
-    ("logo-text", "The word in the logo's box, at most 12 letters"),
-    ("buttons", "flat, or liquid (glossy glass marbles and capsules)"),
+    ("logo-text", "the word in the logo's box, at most 12 letters"),
+    ("buttons", "flat, or liquid (glossy glass)"),
     ("caption-buttons", "symbols, marbles or tiles (minimise, maximise, close)"),
     ("tabs", "attached (the current one joins the toolbar), or pills"),
     ("sidebar-style", "plain, or panels (each group in a rounded panel)"),
-    ("scrollbar-grip", "Lines across the scroll bars: true or false"),
-    ("scrollbar-width", "How thick the scroll bars are, 4 to 18"),
-    ("bevels", "Raised and sunken 3D edges, as in Windows 2000: true or false"),
-    ("title-bar-across", "The title bar's gradient runs left to right: true or false"),
-    ("see-through", "How much shows through the glass title bar (era 7, Windows 11): 0 to 90"),
-    ("wallpaper", "A picture behind the files: its file name (next to the skin, or in the skins folder), or a full path"),
-    ("wallpaper-opacity", "How strongly the wallpaper shows: 0 to 100 (50 if not set)"),
-    ("wallpaper-position", "Which side of the wallpaper stays in view: left, middle or right, then top, middle or bottom if you like; or two percentages, across then down (30% 70%). The middle if not set"),
-    ("wallpaper-zoom", "Zoom the wallpaper: -500 to 500 (0 is its usual size, 100 twice as big)"),
-    ("wallpaper-fit", "fill (fills the list), whole (all of it, at its side), stretch (to the list's shape), tile (repeated) or actual (its own size)"),
-    ("wallpaper-size", "The wallpaper's width as a part of the list's, 1 to 400 (50% is half). Instead of the fit's size; the zoom goes on top"),
-    ("wallpaper-offset", "Moves the wallpaper across, then down: -2000 to 2000 each (20 -10)"),
-    ("wallpaper-blur", "Blurs the wallpaper: 0 to 50 (0 for none)"),
-    ("wallpaper-fade", "Fades the wallpaper out at the list's edges: 0 to 50 (0 for none), as a part of the list's size"),
-    ("era", "Older Windows to look like: none, 98, 2000, xp or 7"),
-    ("icons", "Icons: windows (today's), classic, xp or aero (follows the era)"),
-    ("title-font", "Font of window titles (empty: the skin's font)"),
+    ("scrollbar-grip", "lines across the scroll bars: true or false"),
+    ("scrollbar-width", "how thick the scroll bars are, 4 to 18"),
+    ("bevels", "raised and sunken 3D edges, as in Windows 2000: true or false"),
+    ("title-bar-across", "the title bar's gradient runs left to right: true or false"),
+    ("see-through", "how much shows through the glass title bar (era 7, Windows 11): 0 solid to 90 almost clear"),
+    ("wallpaper", "a picture behind the files: its file name (next to the skin, or in the skins folder), or a full path"),
+    ("wallpaper-opacity", "how strongly the wallpaper shows: 0 to 100 (50 if not set)"),
+    ("wallpaper-position", "which side of the wallpaper stays in view: left, middle or right, then top, middle or bottom if you like; or two percentages, across then down (30% 70%); the middle if not set"),
+    ("wallpaper-zoom", "zoom the wallpaper: -500 to 500 (0 is its usual size, 100 twice as big)"),
+    ("wallpaper-fit", "fill (fills the list), whole, stretch (to the list's shape), tile (repeated) or actual (its own size)"),
+    ("wallpaper-size", "width compared to the file list: 1% to 400%"),
+    ("wallpaper-offset", "moves the wallpaper across, then down: -2000 to 2000 each (20 -10)"),
+    ("wallpaper-blur", "blurs the wallpaper: 0 to 50 (0 for none)"),
+    ("wallpaper-fade", "fades the wallpaper out at the list's edges: 0 to 50 (0 for none), as a part of the list's size"),
+    ("era", "older Windows to look like: none, 98, 2000, xp or 7"),
+    ("icons", "icons: windows (today's), classic, xp or aero (follows the era)"),
+    ("title-font", "font of window titles (empty: the skin's font)"),
 ];
 
 /// The settings that are a number, with the smallest and biggest they can be (font-size in points:
@@ -315,6 +316,12 @@ const NUMBERS: &[(&str, f32, f32, bool)] = &[
 /// setting that isn't a number.
 pub fn range_of(key: &str) -> Option<String> {
     let &(_, min, max, in_pt) = NUMBERS.iter().find(|n| n.0 == key)?;
+    // Two say what their ends mean, or that they're percentages.
+    match key {
+        "see-through" => return Some(format!("{} solid to {} almost clear", show(min, None), show(max, None))),
+        "wallpaper-size" => return Some(format!("{}% to {}%", show(min, None), show(max, None))),
+        _ => {}
+    }
     let pt = in_pt.then_some(PT);
     let k = pt.unwrap_or(1.0);
     Some(format!("{} to {}", show(min * k, pt), show(max * k, pt)))
@@ -450,6 +457,31 @@ pub fn unquoted(v: &str) -> &str {
     if v.len() >= 2 && ((v.starts_with('"') && v.ends_with('"')) || (v.starts_with('\'') && v.ends_with('\''))) { &v[1..v.len() - 1] } else { v }
 }
 
+/// What a note says about a name Glint doesn't know ("“hello” doesn't exist."), with the closest
+/// of `names` when one is near ("Did you mean accent?").
+fn doesnt_exist<'a>(name: &str, names: impl IntoIterator<Item = &'a str>) -> String {
+    let mut said = format!("\u{201c}{name}\u{201d} doesn't exist.");
+    if let Some(near) = sortrecipe::closest(name, names) {
+        said.push_str(&format!(" Did you mean {near}?"));
+    }
+    said
+}
+
+/// A setting's name Glint doesn't know (or a line it can't read).
+fn unknown(name: &str) -> String {
+    doesnt_exist(name, COLOURS.iter().chain(OTHERS).map(|(k, _)| *k))
+}
+
+/// A colour's name Glint doesn't know.
+fn unknown_colour(name: &str) -> String {
+    doesnt_exist(name, COLOURS.iter().map(|(k, _)| *k))
+}
+
+/// `why` ready for more words after it: with a full stop and a space ("… doesn't exist. ").
+fn with_stop(why: &str) -> String {
+    if why.ends_with(['.', '?']) { format!("{why} ") } else { format!("{why}. ") }
+}
+
 /// The settings in `text`, in order, and notes about lines that aren't settings.
 fn read_lines(text: &str, notes: &mut Vec<Note>) -> Vec<Line> {
     let mut lines = Vec::new();
@@ -461,12 +493,12 @@ fn read_lines(text: &str, notes: &mut Vec<Note>) -> Vec<Line> {
             continue;
         }
         let Some((key, value)) = split_line(t) else {
-            notes.push(Note { line: number, text: format!("\u{201c}{t}\u{201d} isn't a setting: write it as name: value. Skipped.") });
+            notes.push(Note { line: number, text: unknown(t) });
             continue;
         };
         let key = normalize_key(key.trim_start_matches('{'));
         if key.is_empty() {
-            notes.push(Note { line: number, text: "No name before the colon. Skipped.".into() });
+            notes.push(Note { line: number, text: "This line has no name.".into() });
             continue;
         }
         lines.push(Line { key, value: clean_value(value), number });
@@ -648,7 +680,7 @@ impl Resolver<'_> {
         let v = v.trim();
         let (term, strength) = match v.rsplit_once(char::is_whitespace) {
             Some((t, pct)) if pct.ends_with('%') => {
-                let p = pct.trim_end_matches('%').trim().parse::<f32>().ok().filter(|p| p.is_finite()).ok_or_else(|| format!("\u{201c}{pct}\u{201d} isn't a strength like 16%"))?;
+                let p = pct.trim_end_matches('%').trim().parse::<f32>().ok().filter(|p| p.is_finite()).ok_or_else(|| format!("\u{201c}{pct}\u{201d} isn't a percentage like 16%"))?;
                 (t.trim(), Some((p / 100.0).clamp(0.0, 1.0)))
             }
             _ => (v, None),
@@ -664,10 +696,10 @@ impl Resolver<'_> {
                 return Err(if term.is_empty() {
                     "A colour is missing (two commas in a row?)".to_string()
                 } else {
-                    format!("\u{201c}{term}\u{201d} isn't a colour: write it like #e3262d, or another colour's name")
+                    unknown_colour(term)
                 });
             }
-            self.colour(&name).ok_or_else(|| format!("\u{201c}{name}\u{201d} refers back to itself"))?
+            self.colour(&name).ok_or_else(|| format!("\u{201c}{name}\u{201d} can't use itself as its colour"))?
         };
         Ok(match strength {
             Some(s) => paint.with_strength(s),
@@ -733,10 +765,10 @@ impl Resolver<'_> {
                 Ok(c) => result = Some(c),
                 Err(Bad { why, instead: Some(instead) }) => {
                     let (paint, said) = *instead;
-                    self.notes.push(Note { line, text: format!("{why}. {said}") });
+                    self.notes.push(Note { line, text: format!("{}{said}", with_stop(&why)) });
                     result = Some(paint);
                 }
-                Err(Bad { why, instead: None }) => self.notes.push(Note { line, text: format!("{why}. Using the standard {key} instead.") }),
+                Err(Bad { why, instead: None }) => self.notes.push(Note { line, text: format!("{}Using the standard {key} instead.", with_stop(&why)) }),
             }
         }
         if result.is_none() {
@@ -777,7 +809,7 @@ fn parse_in(text: &str, fallback_name: &str, dir: Option<&Path>) -> Parsed {
     let mut own: HashMap<String, (String, usize)> = HashMap::new();
     for l in &lines {
         if !known_key(&l.key) {
-            notes.push(Note { line: l.number, text: format!("\u{201c}{}\u{201d} isn't a skin setting. Skipped.", l.key) });
+            notes.push(Note { line: l.number, text: unknown(&l.key) });
             continue;
         }
         // The same setting twice (or under another of its names): the later line wins, and says so.
@@ -1596,6 +1628,16 @@ impl Library {
         }
     }
 
+    /// The name the lists show for `e`: its name - with its file's name after it when another skin
+    /// has the same name ("My skin 2 (copy.glint)"), so the two can be told apart.
+    pub fn shown_name(&self, e: &Entry) -> String {
+        let twin = self.entries.iter().any(|o| o.id != e.id && o.name.trim().to_lowercase() == e.name.trim().to_lowercase());
+        match e.file.as_ref().and_then(|f| f.file_name()) {
+            Some(file) if twin => format!("{} ({})", e.name, file.to_string_lossy()),
+            _ => e.name.clone(),
+        }
+    }
+
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
@@ -1940,7 +1982,8 @@ impl Library {
             .map(|(id, s)| self.notes(id).iter().filter(|n| s.problems.is_empty() || !n.text.starts_with(WALLPAPER_MISSING)).count())
             .sum();
         if skipped > 0 {
-            said.push_str(&format!(". Skipped {skipped} line(s): see Show as text"));
+            let lines = if skipped == 1 { "1 line has a mistake".to_string() } else { format!("{skipped} lines have mistakes") };
+            said.push_str(&format!(". {lines}: see Show as text"));
         }
         (id, said, !problems.is_empty() || skipped > 0)
     }
@@ -1988,6 +2031,14 @@ impl Library {
             return;
         }
         self.watch = Watch::start(folder(), self.hwnd);
+    }
+
+    /// Glint's files moved (Settings > About > Portable): the skins folder at the new place is
+    /// watched and listed instead.
+    pub fn folder_moved(&mut self) {
+        self.watch = None;
+        self.watch_folder();
+        self.refresh();
     }
 
     /// Lists the folder in the background; the result comes back as WM_APP_SKINS.
@@ -2312,9 +2363,9 @@ impl Neighbour {
     fn read(file: &Path) -> Result<Neighbour, String> {
         let too_big = std::fs::metadata(file).is_ok_and(|m| m.len() > MAX_FILE_BYTES);
         if too_big {
-            return Err(format!("{} is too big to be a skin", file.display()));
+            return Err(format!("{} is too big for a skin (256 KB at most)", file.file_name().map_or_else(|| file.display().to_string(), |n| n.to_string_lossy().into_owned())));
         }
-        let bytes = std::fs::read(file).map_err(|e| format!("Couldn't read {}: {e}", file.display()))?;
+        let bytes = std::fs::read(file).map_err(|e| format!("Failed to read {}: {e}", file.display()))?;
         let text = decode(&bytes);
         let stem = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Imported skin".into());
         let p = parse(&text, &stem);
@@ -2672,27 +2723,27 @@ fn run_job(job: FileJob) -> Result<String, String> {
         FileJob::Write { file, text, name, new } => {
             if (new && file.exists()) || (!new && not_ours(&file)) {
                 refuse(&file, None);
-                return Err(format!("Couldn't save the skin \u{201c}{name}\u{201d}: {} is another file (it was left as it is)", file.display()));
+                return Err(format!("Failed to save the skin \u{201c}{name}\u{201d}: {} is another file (it was left as it is)", file.display()));
             }
-            write_atomic(&file, &text).map_err(|e| unwritten(&file, format!("Couldn't save the skin \u{201c}{name}\u{201d}: {e}")))?;
+            write_atomic(&file, &text).map_err(|e| unwritten(&file, format!("Failed to save the skin \u{201c}{name}\u{201d}: {e}")))?;
             ours_now(&file);
             Ok(format!("Saved {name}"))
         }
         FileJob::Export { file, text, name } => {
-            write_atomic(&file, &text).map(|()| format!("Exported {name}")).map_err(|e| format!("Couldn't export \u{201c}{name}\u{201d}: {e}"))
+            write_atomic(&file, &text).map(|()| format!("Exported {name}")).map_err(|e| format!("Failed to export \u{201c}{name}\u{201d}: {e}"))
         }
         FileJob::Rename { from, to, text, name } => {
             // (Any letters: Windows takes "élan" and "Élan" as one file, so that's a change of capitals.)
             let same_file = from.to_string_lossy().to_lowercase() == to.to_string_lossy().to_lowercase();
             if to.exists() && !same_file {
                 refuse(&to, Some(&from));
-                return Err(format!("Couldn't rename the skin to \u{201c}{name}\u{201d}: {} is another file (it was left as it is)", to.display()));
+                return Err(format!("Failed to rename the skin to \u{201c}{name}\u{201d}: {} is another file (it was left as it is)", to.display()));
             }
             // (A skin never saved yet has no file to rename: writing makes it.)
             if from.exists() && from != to {
-                std::fs::rename(&from, &to).map_err(|e| format!("Couldn't rename the skin's file: {e}"))?;
+                std::fs::rename(&from, &to).map_err(|e| format!("Failed to rename the skin's file: {e}"))?;
             }
-            write_atomic(&to, &text).map_err(|e| unwritten(&to, format!("Couldn't save the skin \u{201c}{name}\u{201d}: {e}")))?;
+            write_atomic(&to, &text).map_err(|e| unwritten(&to, format!("Failed to save the skin \u{201c}{name}\u{201d}: {e}")))?;
             ours_now(&to);
             Ok(format!("Saved {name}"))
         }
@@ -2707,9 +2758,9 @@ fn run_job(job: FileJob) -> Result<String, String> {
                 // Where the Recycle Bin is switched off for the drive, Windows asked and deleted it
                 // for good: the Recycle Bin holds no more than before.
                 Ok(true) if bin && before.is_some_and(|n| bin_items(&file).is_some_and(|now| now <= n)) => return Ok(format!("Deleted {name}")),
-                Ok(true) => return Ok(if bin { format!("{name} is in the Recycle Bin") } else { format!("Deleted {name}") }),
+                Ok(true) => return Ok(if bin { format!("Moved {name} to the Recycle Bin") } else { format!("Deleted {name}") }),
                 Ok(false) => format!("{name} wasn't deleted"),
-                Err(e) => format!("Couldn't delete the skin \u{201c}{name}\u{201d}: {e}"),
+                Err(e) => format!("Failed to delete the skin \u{201c}{name}\u{201d}: {e}"),
             };
             // (Still there: listed again, the skin is back in the list.)
             KEPT.store(true, Ordering::SeqCst);
@@ -3741,7 +3792,19 @@ mod tests {
         // settings aren't the same one.
         let p = parse("sparkle: 1\nsparkle: 2\naccent: #ff0000\ntext: #ff0000\n", "x");
         assert_eq!(noted(&p), [1, 2], "{:?}", p.notes);
-        assert!(p.notes.iter().all(|n| n.text.contains("isn't a skin setting")));
+        assert!(p.notes.iter().all(|n| n.text.contains("doesn't exist")));
+    }
+
+    #[test]
+    fn a_name_glint_doesnt_know_says_which_is_near() {
+        let p = parse("acent: #fff\nhello: 1\ntext: hello\ntext-bright: accnt\nwobble\n: #fff\n", "x");
+        let said = |line: usize| p.notes.iter().find(|n| n.line == line).map(|n| n.text.as_str());
+        assert_eq!(said(1), Some("\u{201c}acent\u{201d} doesn't exist. Did you mean accent?"));
+        assert_eq!(said(2), Some("\u{201c}hello\u{201d} doesn't exist."));
+        assert_eq!(said(3), Some("\u{201c}hello\u{201d} doesn't exist. Using the standard text instead."));
+        assert_eq!(said(4), Some("\u{201c}accnt\u{201d} doesn't exist. Did you mean accent? Using the standard text-bright instead."));
+        assert_eq!(said(5), Some("\u{201c}wobble\u{201d} doesn't exist."));
+        assert_eq!(said(6), Some("This line has no name."));
     }
 
     // ------------------------------------------------------------ importing
@@ -3926,7 +3989,7 @@ mod tests {
         let file = from.join("Dusk.glint");
         std::fs::write(&file, format!("name: Dusk\ndark: true\ntwin: Dusk morning\nwallpaper: {gone}\nsparkle: 1\n")).unwrap();
         let (_, said, problem) = import(&mut lib, &file, &skins);
-        assert_eq!(said, format!("Imported Dusk, but its picture {gone} wasn't found, and its light version \u{201c}Dusk morning\u{201d} wasn't found. Skipped 1 line(s): see Show as text"));
+        assert_eq!(said, format!("Imported Dusk, but its picture {gone} wasn't found, and its light version \u{201c}Dusk morning\u{201d} wasn't found. 1 line has a mistake: see Show as text"));
         assert!(problem);
         // An other half that is one of the skins already (a built-in one) is fine.
         let file = from.join("Steel.glint");

@@ -121,7 +121,7 @@ impl Listing {
     /// The status bar's line about the bin: "1.2 GB in the Recycle Bin".
     pub fn size_text(&self) -> String {
         if self.items.is_empty() {
-            "The Recycle Bin is empty".to_string()
+            "The Recycle Bin is empty.".to_string()
         } else {
             format!("{} in the Recycle Bin", format_size(self.total))
         }
@@ -521,6 +521,33 @@ fn newest_from<E>(pairs: &[(E, BinItem)]) -> std::collections::HashMap<String, &
     newest
 }
 
+/// Now, as a FILETIME (the bin's "when deleted" times are these).
+pub fn now_filetime() -> u64 {
+    let since_1970 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    116_444_736_000_000_000 + (since_1970.as_nanos() / 100) as u64
+}
+
+/// Which of these full paths (as [`fileops::path_key`]s) have an item in the bin deleted at
+/// `since` (a FILETIME) or later. Windows sometimes doesn't say an item went to the bin (after
+/// "File In Use" > Try Again); this asks the bin itself.
+pub fn sent_since(paths: &[String], since: u64) -> std::collections::HashSet<String> {
+    let listed = match test_dir() {
+        Some(dir) => read_pairs(dir),
+        None => read_shell(),
+    };
+    let Ok(pairs) = listed else { return Default::default() };
+    // (The bin's times are rounded: a few seconds of slack.)
+    let since = since.saturating_sub(5 * 10_000_000);
+    let wanted: std::collections::HashSet<String> = paths.iter().map(|p| fileops::path_key(p)).collect();
+    pairs
+        .iter()
+        .map(|(_, item)| item)
+        .filter(|item| item.deleted == 0 || item.deleted >= since)
+        .map(|item| fileops::path_key(&item.original))
+        .filter(|key| wanted.contains(key))
+        .collect()
+}
+
 /// Puts back the items last deleted from these full paths (Ctrl+Z after a delete, Ctrl+Y after
 /// undoing a copy or a new folder): for each path, the newest item in the bin that came from there.
 /// Restored items are reported as made, so the list selects them. An item whose name is taken now
@@ -636,7 +663,7 @@ fn restore(items: &[BinItem], test: Option<&str>) -> Outcome {
     let note = match (restored.as_slice(), problems.first()) {
         (_, Some(first)) => {
             let more = problems.len() - 1;
-            Some(if more > 0 { format!("Couldn't restore {first} (and {} more)", format_count(more)) } else { format!("Couldn't restore {first}") })
+            Some(if more > 0 { format!("Failed to restore {first} (and {} more)", format_count(more)) } else { format!("Failed to restore {first}") })
         }
         ([one], None) if renamed > 0 => Some(format!("Restored as \u{201c}{}\u{201d} (the name was taken)", file_name(one))),
         ([one], None) => Some(format!("Restored \u{201c}{}\u{201d} to {}", file_name(one), parent(one).unwrap_or_default())),
@@ -718,7 +745,7 @@ fn delete(items: &[BinItem], test: Option<&str>) -> Outcome {
     let note = match (gone.as_slice(), problems.first()) {
         (_, Some(first)) => {
             let more = problems.len() - 1;
-            Some(if more > 0 { format!("Couldn't delete {first} (and {} more)", format_count(more)) } else { format!("Couldn't delete {first}") })
+            Some(if more > 0 { format!("Failed to delete {first} (and {} more)", format_count(more)) } else { format!("Failed to delete {first}") })
         }
         ([], None) => None,
         ([one], None) => Some(format!("\u{201c}{one}\u{201d} deleted permanently")),
@@ -797,7 +824,7 @@ fn empty(owner: HWND, test: Option<&str>) -> Outcome {
             let items: Vec<BinItem> = read_pairs(dir).map(|p| p.into_iter().map(|(_, i)| i).collect()).unwrap_or_default();
             let mut out = delete(&items, test);
             if out.ok {
-                out.note = Some("The Recycle Bin is empty".to_string());
+                out.note = Some("The Recycle Bin is empty.".to_string());
             }
             out
         }
@@ -808,7 +835,7 @@ fn empty(owner: HWND, test: Option<&str>) -> Outcome {
             let left = count();
             log::line(&format!("empty the Recycle Bin: {:?}, {:?} items left", result.as_ref().map_err(|e| e.code()), left));
             match left {
-                Some(0) => Outcome { ok: true, ..note("The Recycle Bin is empty") },
+                Some(0) => Outcome { ok: true, ..note("The Recycle Bin is empty.") },
                 // Windows' own question was answered with No, or it stopped.
                 _ => Outcome::default(),
             }

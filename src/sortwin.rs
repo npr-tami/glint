@@ -695,21 +695,21 @@ fn places(app: &AppState) -> Vec<Place> {
     let mut out: Vec<Place> = shell::known_folders().into_iter().map(|k| Place { name: k.name.to_string(), path: k.path, hint: "Quick access".into() }).collect();
     let name = |p: &str| folder::file_name(p).to_string();
     for p in &app.settings.pinned {
-        out.push(Place { name: name(p), path: p.clone(), hint: "Pinned".into() });
+        out.push(Place { name: name(p), path: p.clone(), hint: "pinned".into() });
     }
     for t in &app.tabs {
         if !t.path.is_empty() && !crate::folder::is_place(&t.path) {
-            out.push(Place { name: name(&t.path), path: t.path.clone(), hint: "Open tab".into() });
+            out.push(Place { name: name(&t.path), path: t.path.clone(), hint: "open tab".into() });
         }
     }
     let tab = app.tab();
     if !tab.folder.path.is_empty() && !crate::recycle::is_bin(&tab.folder.path) && tab.search.is_none() {
         for e in tab.folder.entries.iter().filter(|e| e.kind == EntryKind::Folder && !e.is_hidden()).take(300) {
-            out.push(Place { name: e.name.clone(), path: folder::join(&tab.folder.path, &e.name), hint: "Subfolder".into() });
+            out.push(Place { name: e.name.clone(), path: folder::join(&tab.folder.path, &e.name), hint: "subfolder".into() });
         }
     }
     for d in &app.drives {
-        out.push(Place { name: d.name.clone(), path: d.root.clone(), hint: "Drive".into() });
+        out.push(Place { name: d.name.clone(), path: d.root.clone(), hint: "drive".into() });
     }
     out
 }
@@ -774,7 +774,7 @@ fn fix_text(m: &sortrecipe::Message, fix: &str) -> String {
 /// typed, so the lines it names are the ones on screen).
 fn here(app: &AppState, recipe: &Recipe) -> Here {
     if !app.settings.custom_sort {
-        return Here { text: "Custom sort is off, so these rules don't sort anything yet.".into(), link: Some(HereLink::TurnOn), ..Here::default() };
+        return Here { text: "Custom sort is off.".into(), link: Some(HereLink::TurnOn), ..Here::default() };
     }
     let tab = app.tab();
     let path = &tab.folder.path;
@@ -2690,7 +2690,7 @@ mod tests {
             here(&app, &Recipe::parse(recipe))
         };
         let h = say(false, "-a_to_z", false);
-        assert_eq!((h.text.as_str(), h.link), ("Custom sort is off, so these rules don't sort anything yet.", Some(HereLink::TurnOn)));
+        assert_eq!((h.text.as_str(), h.link), ("Custom sort is off.", Some(HereLink::TurnOn)));
         assert_eq!(say(true, "-a_to_z", true).link, Some(HereLink::UseRules));
         assert_eq!(say(true, "-a_to_z", false).text, "On screen: sub, sorted by the rules for every folder.");
         assert!(say(true, "in C:\\elsewhere (\n-a_to_z\n)", false).text.ends_with("so its column does."));

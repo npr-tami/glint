@@ -24,7 +24,7 @@ use crate::ui::MenuAbout;
 /// The status-bar note for file commands in This PC.
 pub const THIS_PC_NOTE: &str = "This PC only holds drives. Open a drive or folder first.";
 /// The status-bar note for changes inside a .zip or .7z (archive.rs only reads them).
-pub const ARCHIVE_NOTE: &str = "Glint only looks inside zip and 7z files. Copy things out (Ctrl+C) to change them.";
+pub const ARCHIVE_NOTE: &str = "Zip and 7z files can't be changed here. Copy things out (Ctrl+C) to change them.";
 
 /// How long a name box waits for its item to turn up in the list (a new folder being read).
 const RENAME_WAIT: Duration = Duration::from_secs(3);
@@ -152,7 +152,7 @@ impl AppState {
         let chosen = t.selected_entries();
         let paths: Vec<String> = chosen.iter().filter(|&&i| copying || i >= parts.recent).map(|&i| t.folder.entries[i].path_in(&t.folder.path)).collect();
         if paths.is_empty() && !chosen.is_empty() {
-            self.say("Folders in Quick access can only be copied from Home.");
+            self.say("Folders in Quick access can only be copied here, not moved or deleted.");
         }
         Some(paths)
     }
@@ -194,7 +194,7 @@ impl AppState {
         }
         let paths = match result {
             Ok(p) if !p.is_empty() => p,
-            Ok(_) => return self.say("There was nothing to take out."),
+            Ok(_) => return self.say("There was nothing to extract."),
             Err(why) => return self.say(why),
         };
         if then == super::Then::OpenWith {
@@ -208,11 +208,11 @@ impl AppState {
         // Something was copied in another program meanwhile (Glint left the clipboard empty): that
         // stays on the clipboard, it isn't replaced.
         if !fileops::clipboard_is_empty() {
-            return self.say(format!("Didn't copy {}: something else was copied meanwhile.", items_text(&paths)));
+            return self.say(format!("Cancelled copying {} because you copied something else.", items_text(&paths)));
         }
         let hwnd = HWND(self.hwnd.load(Ordering::SeqCst) as *mut _);
         match fileops::put_files(hwnd, &paths, false) {
-            Some(_) => self.say(format!("Copied {}. Paste it in a folder (Ctrl+V)", items_text(&paths))),
+            Some(_) => self.say(format!("Copied {}.", items_text(&paths))),
             None => self.say("The clipboard is busy. Try again."),
         }
     }
@@ -296,14 +296,14 @@ impl AppState {
             folder: t.folder.path.clone(),
             names: t.selected_entries().iter().map(|&i| t.folder.entries[i].lower.clone()).collect(),
         });
-        self.say(format!("{} {}", if cut { "Cut" } else { "Copied" }, items_text(&paths)));
+        self.say(format!("{} {}.", if cut { "Cut" } else { "Copied" }, items_text(&paths)));
     }
 
     /// Ctrl+V: the files on the clipboard (from Glint or File Explorer) are copied here - or moved,
     /// when they were cut. `into`: a folder in the list instead (right-click > Paste into folder).
     pub(super) fn paste(&mut self, into: Option<String>) {
         if self.taking_out {
-            return self.say("Still taking it out of the archive. Try again in a moment.");
+            return self.say("Still extracting. Try again in a moment.");
         }
         if !self.files_here() {
             return;
@@ -342,15 +342,23 @@ impl AppState {
     /// drive) a delete is for good either way, so it's asked as one.
     pub(super) fn delete_asking(&mut self, paths: Vec<String>, permanent: bool, after: AfterJob) {
         let what = items_text(&paths);
-        let no_bin = !permanent && paths.iter().any(|p| !fileops::has_recycle_bin(p));
+        let no_bin = !permanent && paths.iter().any(|p| !fileops::can_recycle(p));
+        // (On a drive with a Recycle Bin, but a path too long for it.)
+        let too_long = no_bin && paths.iter().all(|p| fileops::has_recycle_bin(p));
         // (Some on this PC's drive, some not: the ones that can still go to the Recycle Bin.)
-        let recycle = !permanent && !paths.iter().all(|p| !fileops::has_recycle_bin(p));
+        let recycle = !permanent && !paths.iter().all(|p| !fileops::can_recycle(p));
         let after = AfterJob { deleted: if recycle { Vec::new() } else { paths.clone() }, ..after };
         let job = Job::Delete { paths, recycle };
         if !self.settings.ask_before_deleting(permanent || no_bin) {
             self.start_job(job, after);
         } else if permanent || no_bin {
-            let why = if no_bin { "This drive has no Recycle Bin, so it can't be undone." } else { "This can't be undone." };
+            let why = if too_long {
+                "The path is too long for the Recycle Bin, so it can't be undone."
+            } else if no_bin {
+                "This drive has no Recycle Bin, so it can't be undone."
+            } else {
+                "This can't be undone."
+            };
             self.ask(format!("Delete {what} permanently?"), why.into(), "DELETE", job, after);
         } else {
             self.ask(format!("Move {what} to the Recycle Bin?"), String::new(), "DELETE", job, after);
@@ -442,7 +450,7 @@ impl AppState {
     /// undone. Works from any folder: the step knows where its items are.
     pub(super) fn undo(&mut self, redo: bool) {
         if self.history.busy {
-            return self.say("Wait for the last one to finish.");
+            return self.say("Wait for the last undo to finish.");
         }
         let step = if redo { self.history.take_redo() } else { self.history.take_undo() };
         let Some(step) = step else {
@@ -536,7 +544,12 @@ impl AppState {
                 }
             }
             Some((redo, step)) if outcome.ok => {
-                outcome.note = Some(format!("{} {}", if redo { "Redid" } else { "Undid" }, step.describe()));
+                outcome.note = Some(match (&step, redo) {
+                    (_, true) => format!("Redid {}.", step.describe()),
+                    // Undoing a delete brings the items back from the Recycle Bin.
+                    (crate::undo::Step::Recycled { paths }, false) => format!("Restored {} \u{b7} Ctrl+Y to redo.", items_text(paths)),
+                    (_, false) => format!("Undid {} \u{b7} Ctrl+Y to redo.", step.describe()),
+                });
                 if redo {
                     self.history.redone(step);
                 } else {
@@ -675,15 +688,15 @@ impl AppState {
         match tag {
             Some(tag) if paths.iter().all(|p| self.tags.of(p) == Some(tag)) => {
                 self.tags.set(&paths, None);
-                self.say(format!("Removed the {} tag from {what}", tag.word()));
+                self.say(format!("Removed the {} tag from {what}.", tag.word()));
             }
             Some(tag) => {
                 self.tags.set(&paths, Some(tag));
-                self.say(format!("Tagged {what} {}", tag.word()));
+                self.say(format!("Tagged {what} {}.", tag.word()));
             }
             None => {
                 if self.tags.set(&paths, None) {
-                    self.say(format!("Removed the tag from {what}"));
+                    self.say(format!("Removed the tag from {what}."));
                 }
             }
         }
@@ -692,6 +705,10 @@ impl AppState {
 
     /// The window came to the front: tags another Glint window changed meanwhile show here too.
     pub fn tags_refresh(&mut self) {
+        // Another Glint window moved Glint's files meanwhile (Portable): this one follows.
+        if crate::settings::follow_move() {
+            self.files_moved();
+        }
         if self.tags.refresh() {
             self.tags_changed();
         }
@@ -1084,18 +1101,18 @@ mod tests {
         assert!(a.history.busy);
         // Pressed again (or Ctrl+Y) before it's done: nothing more is taken off the lists.
         a.run(Command::Undo);
-        assert_eq!(a.note(), Some("Wait for the last one to finish."));
+        assert_eq!(a.note(), Some("Wait for the last undo to finish."));
         a.run(Command::Redo);
-        assert_eq!(a.note(), Some("Wait for the last one to finish."));
+        assert_eq!(a.note(), Some("Wait for the last undo to finish."));
         finish_job(&mut a);
         assert!(!a.history.busy);
-        assert_eq!(a.note(), Some("Undid the rename of \u{201c}x.txt\u{201d}"));
+        assert_eq!(a.note(), Some("Undid renaming \u{201c}x.txt\u{201d} \u{b7} Ctrl+Y to redo."));
         assert!(fileops::exists(&s.at("x.txt")) && !fileops::exists(&s.at("y.txt")));
         assert_eq!(a.history.next_undo(), Some(&first), "only one was undone");
         // Redo, undo after redo, then the one before: each lands as it was.
         a.run(Command::Redo);
         finish_job(&mut a);
-        assert_eq!(a.note(), Some("Redid the rename of \u{201c}x.txt\u{201d}"));
+        assert_eq!(a.note(), Some("Redid renaming \u{201c}x.txt\u{201d}."));
         assert!(fileops::exists(&s.at("y.txt")));
         for _ in 0..2 {
             a.run(Command::Undo);
@@ -1107,7 +1124,7 @@ mod tests {
         assert!(!a.history.busy);
         a.run(Command::Redo);
         finish_job(&mut a);
-        assert_eq!(a.note(), Some("Redid the rename of \u{201c}1.txt\u{201d}"));
+        assert_eq!(a.note(), Some("Redid renaming \u{201c}1.txt\u{201d}."));
         assert!(fileops::exists(&s.at("2.txt")));
         assert_eq!(a.history.next_undo(), Some(&first));
     }

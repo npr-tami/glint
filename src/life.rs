@@ -625,11 +625,11 @@ pub fn open_new_window(owner: Owner, folder: &str) {
     let arg = if folder.is_empty() { "This PC".to_string() } else { folder.to_string() };
     let started = shell::background("new window", move || {
         if let Err(e) = std::process::Command::new(&exe).arg(NEW_WINDOW_SWITCH).arg(&arg).spawn() {
-            shell::tell(owner.hwnd(), format!("Couldn't open a new window: {e}"));
+            shell::tell(owner.hwnd(), format!("Failed to open a new window: {e}"));
         }
     });
     if !started {
-        shell::tell(owner.hwnd(), "Couldn't open a new window right now".into());
+        shell::tell(owner.hwnd(), "Failed to open a new window right now.".into());
     }
 }
 
@@ -658,7 +658,7 @@ pub fn apply_tray_icon(settings: &mut Settings, on: bool) {
 /// The setting changes only if the registry did.
 pub fn apply_start_with_windows(settings: &mut Settings, on: bool) -> Result<(), String> {
     if !testing_without_registry() {
-        let exe = registry::this_exe().ok_or("Glint couldn't find its own glint.exe")?;
+        let exe = registry::this_exe().ok_or("Glint couldn't find its own Glint.exe")?;
         registry::set_start_with_windows(&Places::current(), on, &exe)?;
     }
     settings.start_with_windows = on;
@@ -672,7 +672,7 @@ pub fn apply_zip_icon(icon: ZipIcon) -> Result<bool, String> {
     if testing_without_registry() {
         return Ok(true);
     }
-    let exe = registry::this_exe().ok_or("Glint couldn't find its own glint.exe")?;
+    let exe = registry::this_exe().ok_or("Glint couldn't find its own Glint.exe")?;
     let shows = registry::sync_archive_icon(&Places::current(), &exe, icon)?;
     crate::icons::set_archive_icon(&shows.types, shows.icon);
     Ok(!shows.types.is_empty())
@@ -695,7 +695,7 @@ pub fn win_e_on() -> bool {
 /// "Win+E opens Glint": Windows starts glint.exe for Win+E, and while Glint runs it catches Win+E
 /// itself (faster). Only ever changed here, when the person switches it.
 pub fn apply_win_e(on: bool) -> Result<(), String> {
-    let exe = registry::this_exe().ok_or("Glint couldn't find its own glint.exe")?;
+    let exe = registry::this_exe().ok_or("Glint couldn't find its own Glint.exe")?;
     if let Some(why) = registry::risky_place(&exe).filter(|_| on) {
         return Err(why.to_string());
     }
@@ -728,7 +728,7 @@ pub fn default_explorer_on() -> bool {
 /// "Open folders and drives in Glint": per-user registration (registry.rs), and undoing it. Only
 /// ever changed here, when the person switches it.
 pub fn apply_default_explorer(on: bool) -> Result<(), String> {
-    let exe = registry::this_exe().ok_or("Glint couldn't find its own glint.exe")?;
+    let exe = registry::this_exe().ok_or("Glint couldn't find its own Glint.exe")?;
     if let Some(why) = registry::risky_place(&exe).filter(|_| on) {
         return Err(why.to_string());
     }

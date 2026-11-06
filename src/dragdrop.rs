@@ -642,7 +642,8 @@ fn drop_menu(hwnd: HWND, at: POINT, plan: &Plan) -> Option<Action> {
                 items.push((Action::Transfer(how), label));
             }
         }
-        Dest::RecycleBin => items.push((plan.action, "Move to the Recycle Bin")),
+        // (Delete permanently is Shift+Del's: Glint asks first.)
+        Dest::RecycleBin => items.extend([(Action::Recycle { permanent: false }, "Move to the Recycle Bin"), (Action::Recycle { permanent: true }, "Delete permanently")]),
         Dest::Pin => items.push((Action::Pin, "Pin to the sidebar")),
     }
     if items.is_empty() {

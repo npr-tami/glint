@@ -99,7 +99,7 @@ pub fn start(door: HWND) {
                 if h.number == number {
                     h.wanted = false;
                 }
-                log::line("Win+E: couldn't be caught here; Windows starts glint.exe for it instead");
+                log::line("Win+E: couldn't be caught here; Windows starts Glint.exe for it instead");
                 return;
             };
             // The thread's message queue exists before `stop` can post WM_QUIT to it.
@@ -125,7 +125,7 @@ pub fn start(door: HWND) {
     });
     if !started {
         hook_state().wanted = false;
-        log::line("Win+E: couldn't be caught (no thread to be had); Windows starts glint.exe for it instead");
+        log::line("Win+E: couldn't be caught (no thread to be had); Windows starts Glint.exe for it instead");
     }
 }
 

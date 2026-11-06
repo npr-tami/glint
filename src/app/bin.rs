@@ -79,7 +79,7 @@ impl AppState {
                 // The bin's own Properties (how big it may get on each drive); deleted items have none
                 // worth showing.
                 if self.tab().selected_entries().is_empty() && !crate::shellmenu::properties(self.owner().hwnd(), vec![recycle::LOCATION.to_string()]) {
-                    self.say("Windows couldn't show the properties right now");
+                    self.say("Windows couldn't show the properties right now. Try again.");
                 }
             }
             Command::OpenTerminal(dir) if recycle::is_bin(dir) => self.open_terminal(String::new()),
@@ -195,7 +195,7 @@ impl AppState {
         let hwnd = self.owner().hwnd();
         let ok = shell::copy_text(hwnd, &lines.join("\r\n"));
         self.say(match (ok, lines.len()) {
-            (false, _) => "Couldn't copy (the clipboard is busy)".to_string(),
+            (false, _) => "Failed to copy. Try again in a moment.".to_string(),
             (true, 1) => "Original location copied".to_string(),
             (true, n) => format!("{} original locations copied", format_count(n)),
         });

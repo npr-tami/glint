@@ -6,7 +6,7 @@ different rules for different folders. You write the rules as short lines of tex
 ## Where to find it
 
 - **SORT > Edit custom order…** opens the editor.
-- **SORT > Custom order** switches your order on or off (it's off until you switch it on).
+- **SORT > Custom order** turns your order on or off (it's off until you switch it on).
   The same switch is in **Settings > Files > Custom sort order**.
 - For views: **VIEW > Edit custom views…**, and **VIEW > Custom views** to switch them on or off
   (they're on unless you switch them off).

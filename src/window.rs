@@ -900,7 +900,7 @@ fn open_settings(hwnd: HWND, ptr: *mut Window, page: Option<usize>) {
         let list = (*ptr).app.settings.settings_pages == settings::SettingsPages::List;
         let Some(win) = settingswin::create(hwnd, &theme, place, opens, list, page) else {
             BUSY.with(|b| b.set(true));
-            (*ptr).app.say("Windows couldn't open the Settings window right now");
+            (*ptr).app.say("Windows couldn't open Settings right now. Try again.");
             (*ptr).invalidate();
             BUSY.with(|b| b.set(false));
             return;
@@ -952,7 +952,7 @@ fn open_skins(hwnd: HWND, ptr: *mut Window) {
         let theme = (*ptr).app.theme.clone();
         let Some(win) = skinwin::create(hwnd, &theme) else {
             BUSY.with(|b| b.set(true));
-            (*ptr).app.say("Windows couldn't open the skin customiser right now");
+            (*ptr).app.say("Windows couldn't open Skins right now. Try again.");
             (*ptr).invalidate();
             BUSY.with(|b| b.set(false));
             return;
@@ -1405,13 +1405,13 @@ impl Window {
             Action::SelectAll => self.app.tab_mut().select_all(),
             Action::SelectPattern(pattern) => {
                 if crate::palette::select_matching(self.app.tab_mut(), &pattern) == 0 {
-                    self.app.say(format!("Nothing here matches {pattern}"));
+                    self.app.say(format!("Nothing here matches {pattern}."));
                 }
             }
             // (The box keeps these itself.)
             Action::Fill(_) => {}
             Action::FolderSizes(on) => self.app.set_folder_sizes(on),
-            Action::RenameMany if self.app.tab().selected_entries().len() < 2 => self.app.say("Select two or more items to rename them all at once"),
+            Action::RenameMany if self.app.tab().selected_entries().len() < 2 => self.app.say("Select two or more items to rename them all at once."),
             Action::RenameMany => self.apply(Part::List, Effect::Command(Command::RenameMany)),
             Action::Search(text) => {
                 // As Ctrl+F and typing: the text in the filter box, and the cursor there.
@@ -1453,10 +1453,10 @@ impl Window {
         self.side_changed(now);
         if self.side.preview_open() {
             // The preview is in its place; the panel comes back when the preview closes.
-            self.app.say(if show { "The details panel shows when the preview closes" } else { "Details panel hidden" });
+            self.app.say(if show { "The details panel comes back when the preview closes." } else { "Details panel hidden" });
         } else if show && self.side.rect().is_empty() {
             // No room for it next to the list (side.rs): it shows once the window is wider.
-            self.app.say("Make the window wider to show the details panel");
+            self.app.say("Make the window wider to show the details panel.");
         } else {
             self.app.say(if show { "Details panel shown (Alt+P hides it)" } else { "Details panel hidden (Alt+P shows it)" });
         }
@@ -1467,14 +1467,14 @@ impl Window {
         if self.side.preview_open() {
             self.side.set_preview(false);
         } else if self.app.tab().selected_entries().is_empty() {
-            self.app.say("Select a file to preview");
+            self.app.say("Select a file to preview.");
             return;
         } else {
             self.side.set_preview(true);
         }
         self.side_changed(now);
         if self.side.preview_open() && self.side.rect().is_empty() {
-            self.app.say("Make the window wider to show the preview");
+            self.app.say("Make the window wider to show the preview.");
         }
     }
 
@@ -1519,7 +1519,7 @@ impl Window {
                 if !self.set_dark(dark) {
                     // Nothing changed on screen, so "Light or dark" stays as it was too.
                     self.app.settings.theme = before;
-                    self.app.say(if dark { "This skin has no dark version" } else { "This skin has no light version: make one called \u{201c}\u{2026} (Light)\u{201d}" });
+                    self.app.say(if dark { "This skin has no dark version" } else { "This skin has no light version. Make one called \u{201c}\u{2026} (Light)\u{201d}." });
                 }
             }
             Command::SetTheme(mode) => {
@@ -1799,7 +1799,7 @@ impl Window {
                         if updatewin::is_open() {
                             updatewin::problem(&why);
                         } else {
-                            self.app.say(format!("Glint couldn't update itself: {why}"));
+                            self.app.say(format!("Failed to update Glint: {why}."));
                             self.invalidate();
                         }
                     }
@@ -2472,6 +2472,9 @@ impl Window {
         }
         let cmd = if ctrl && m.shift && letter('L') {
             Some(Command::ToggleTheme)
+        } else if ctrl && m.shift && letter('U') {
+            // Disk space for the drive on screen (diskpage.rs).
+            Some(Command::DiskSpace(None))
         } else if ctrl && m.shift && letter('T') {
             Some(Command::ReopenClosedTab)
         } else if ctrl && !m.shift && letter('H') {

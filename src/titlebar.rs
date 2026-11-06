@@ -39,6 +39,8 @@ const TAB_MIN: f32 = 96.0;
 const TAB_MAX: f32 = 220.0;
 /// Narrowest a tab gets when many share the bar.
 const TAB_SQUEEZED: f32 = 36.0;
+/// Narrowest a pinned tab gets: wide enough for its pin.
+const PINNED_SQUEEZED: f32 = 52.0;
 const PLUS: f32 = 28.0;
 /// Empty title bar always left to grab the window by.
 const DRAG_ROOM: f32 = 46.0;
@@ -114,6 +116,13 @@ pub struct TitleBar {
     held_tab: Option<(u64, f32)>,
     /// The skin's older Windows (its window buttons are that Windows' size, where it had them).
     era: Era,
+    /// With more tabs than fit: how far the tab row is scrolled to the left (the mouse wheel over
+    /// it scrolls it; switching tabs brings the current one into sight).
+    scroll: f32,
+    /// The tab last brought into sight (its id; u64::MAX: the Settings tab).
+    shown_tab: Option<u64>,
+    /// Where tabs are seen (and can be clicked): between the logo and the "+".
+    strip: Rect,
 }
 
 impl TitleBar {
@@ -149,6 +158,10 @@ impl TitleBar {
         // Only where it's drawn: with many tabs it has no room left of the caption buttons.
         if self.plus.right() <= self.button(2).x && self.plus.contains(p) {
             return Some(Part::NewTab);
+        }
+        // (Tabs scrolled out of sight can't be clicked.)
+        if !self.strip.contains(p) {
+            return None;
         }
         for (i, t) in self.tabs.iter().enumerate() {
             if t.close.contains(p) {
@@ -215,10 +228,32 @@ impl TitleBar {
         let total: f32 = widths.iter().sum::<f32>() + gap * (n - 1.0);
         if total > room {
             let each = ((room - gap * (n - 1.0)) / n).max(TAB_SQUEEZED);
-            widths.iter_mut().for_each(|w| *w = w.min(each));
+            for (i, w) in widths.iter_mut().enumerate() {
+                let pinned = app.tabs.get(i).is_some_and(|t| t.pinned);
+                *w = w.min(if pinned { each.max(PINNED_SQUEEZED) } else { each });
+            }
         }
+        // Still too many to fit: the row scrolls, and the current tab is brought into sight when
+        // it changes.
+        let total: f32 = widths.iter().sum::<f32>() + gap * (n - 1.0);
+        let overflow = (total - room).max(0.0);
+        let current = if app.settings_tab { Some(u64::MAX) } else { app.tabs.get(app.active).map(|t| t.id) };
+        if overflow > 0.0 && current != self.shown_tab {
+            let i = if app.settings_tab { widths.len() - 1 } else { app.active.min(widths.len() - 1) };
+            let start: f32 = widths[..i].iter().map(|w| w + gap).sum();
+            let end = start + widths[i];
+            if start < self.scroll {
+                self.scroll = start;
+            } else if end > self.scroll + room {
+                self.scroll = end - room;
+            }
+        }
+        self.shown_tab = current;
+        self.scroll = self.scroll.clamp(0.0, overflow);
+        let strip_right = if overflow > 0.0 { left + room } else { self.button(2).x };
+        self.strip = Rect::new(left, self.rect.y, (strip_right - left).max(0.0), self.rect.h);
         self.tabs.clear();
-        let mut x = left;
+        let mut x = left - self.scroll;
         for w in widths {
             let rect = Rect::new(x, y, w, h);
             let close = if classic {
@@ -230,6 +265,8 @@ impl TitleBar {
             self.tabs.push(TabSlot { rect, close });
             x += w + gap;
         }
+        // (With the row scrolled, the "+" stays just right of where tabs are seen.)
+        let x = x.min(strip_right + gap);
         self.plus = if classic {
             Rect::new((x + 6.0).round(), (y + 2.0 + (h - 2.0 - 20.0) / 2.0).round(), 20.0, 20.0)
         } else {
@@ -243,8 +280,8 @@ impl TitleBar {
             return self.paint_classic_tabs(r, theme, app);
         }
         let pills = theme.tabs == TabStyle::Pills;
-        // Tabs never run under the caption buttons.
-        r.push_clip(Rect::new(self.rect.x, self.rect.y, self.button(2).x - self.rect.x, self.rect.h));
+        // Tabs never run under the caption buttons (or past the "+", or over the logo when they scroll).
+        r.push_clip(self.strip);
         for i in 0..app.tabs.len() + app.settings_tab as usize {
             let Some(slot) = self.tabs.get_mut(i) else { break };
             let tab = app.tabs.get(i);
@@ -553,7 +590,7 @@ impl TitleBar {
     /// corners cut; the current one 2 taller and 2 wider each side, joined to the toolbar under it
     /// (`join_toolbar`). Then "+" on the caption in its white, a raised button under the mouse.
     fn paint_classic_tabs(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState) {
-        r.push_clip(Rect::new(self.rect.x, self.rect.y, self.button(2).x - self.rect.x, self.rect.h));
+        r.push_clip(self.strip);
         // The current tab last: it overlaps its neighbours.
         let current = if app.settings_tab { app.tabs.len() } else { app.active };
         let count = app.tabs.len() + app.settings_tab as usize;
@@ -794,6 +831,22 @@ impl Component for TitleBar {
             return Effect::Redraw;
         }
         Effect::None
+    }
+
+    /// The mouse wheel over the tabs scrolls them when there are more than fit.
+    fn wheel(&mut self, _ctx: &Ctx, e: &MouseEvent, _app: &mut AppState) -> Effect {
+        if !self.strip.contains(e.pos) || e.wheel == 0.0 {
+            return Effect::None;
+        }
+        let before = self.scroll;
+        // As far as the row's end (where the last tab ends, unscrolled).
+        let most = self.tabs.last().map_or(0.0, |t| (t.rect.right() + before - self.strip.right()).max(0.0));
+        self.scroll = (before - e.wheel * 80.0).clamp(0.0, most);
+        if self.scroll == before {
+            return Effect::None;
+        }
+        self.hover = None;
+        Effect::Redraw
     }
 
     fn mouse_leave(&mut self, _ctx: &Ctx, _app: &mut AppState) -> Effect {

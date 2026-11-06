@@ -597,7 +597,7 @@ impl Toolbar {
             right_aligned: true,
             items: vec![
                 MenuItem::new(SET_WINDOW, "Settings\u{2026}\tCtrl+,"),
-                MenuItem::new(SET_ABOUT, "About Glint"),
+                MenuItem::new(SET_ABOUT, "About Glint\u{2026}"),
                 MenuItem::separator(),
                 MenuItem::new(SET_QUIT, "Quit Glint\tCtrl+Q"),
             ],
@@ -650,7 +650,7 @@ impl Toolbar {
 
     fn copy_path(&self, ctx: &Ctx, path: &str, app: &mut AppState) {
         let text = if path.is_empty() { "This PC" } else { path };
-        app.say(if shell::copy_text(ctx.hwnd, text) { "Path copied" } else { "Couldn't copy (the clipboard is busy)" });
+        app.say(if shell::copy_text(ctx.hwnd, text) { "Path copied." } else { "Failed to copy. Try again in a moment." });
     }
 }
 

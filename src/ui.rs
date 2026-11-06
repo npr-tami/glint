@@ -220,6 +220,10 @@ pub enum Command {
     /// Go to a folder in the current tab. "" means This PC. Accepts what a person types too
     /// ("c:", "C:/Users", "%USERPROFILE%", "This PC").
     Navigate(String),
+    /// Disk space (Ctrl+Shift+U) for this drive ("C:\\"), or the drive on screen.
+    DiskSpace(Option<String>),
+    /// Disk space's SCAN AGAIN: a new look at the drive.
+    DiskLookAgain(String),
     Back,
     Forward,
     /// Back or Forward that many places at once (XP's lists beside its Back and Forward).
@@ -311,7 +315,7 @@ pub enum Command {
     /// Pin this folder to the sidebar, or unpin it if it's pinned (Ctrl+D, "Pin to sidebar").
     TogglePin(String),
     /// Add the selected items to Home's Favorites, or take them out when they all are in
-    /// ("Add to Favorites" / "Remove from Favorites").
+    /// ("Add to Favourites" / "Remove from Favourites").
     ToggleFavorites,
     /// Sort by this column; asking for the column that is already sorted reverses it.
     SortBy(SortKey),

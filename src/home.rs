@@ -1,6 +1,6 @@
 //! Home's page, laid out like File Explorer's Home: "Quick access" with a tile for each standard
 //! folder (Desktop, Downloads, Documents, Pictures, Music, Videos) and each pinned folder, then
-//! "Recent" and "Favorites" as two pill buttons over a list of files with the folder each is in
+//! "Recent" and "Favourites" as two pill buttons over a list of files with the folder each is in
 //! under its name.
 //!
 //! The items are the tab's own entries (recent.rs reads them; `Parts` says where each part
@@ -42,7 +42,7 @@ pub enum Spot {
     Quick,
     /// The chevron that folds the lists below.
     Lists,
-    /// The "Recent" and "Favorites" pills.
+    /// The "Recent" and "Favourites" pills.
     Recent,
     Favorites,
 }
@@ -231,7 +231,7 @@ pub fn paint(r: &mut Renderer, theme: &Theme, app: &AppState, tab: &Tab, home: &
                     "Recent"
                 } else {
                     star(r, c, ink);
-                    "Favorites"
+                    "Favourites"
                 };
                 r.text(label, Rect::new(b.x + 32.0, b.y, b.w - 36.0, b.h), &TextStyle::new(ink).size(font).semibold());
             }
@@ -323,7 +323,7 @@ pub fn paint(r: &mut Renderer, theme: &Theme, app: &AppState, tab: &Tab, home: &
         // Nothing in the list: say how things get there.
         let empty = !l.spots.iter().any(|&(s, rc)| matches!(s, Spot::Item(_)) && rc.y > c.y);
         if empty && tab.folder.error.is_none() {
-            let text = if home.favorites { "Right-click a file or folder and pick Add to Favorites to see it here." } else { "Files you open show up here." };
+            let text = if home.favorites { "Right-click a file or folder and pick Add to Favourites to see it here." } else { "Files you open show up here." };
             r.text(text, Rect::new(b.x + 12.0, b.bottom() + 8.0, b.w - 24.0, 24.0), &TextStyle::new(theme.muted).size(font).align(Align::Left));
         }
     }
@@ -358,7 +358,7 @@ fn paint_era_spot(r: &mut Renderer, theme: &Theme, home: &Home, spot: Spot, b: R
             if spot == Spot::Recent {
                 crate::retrolist::list_switch(r, theme, rect, "Recent", on, hovered, &clock);
             } else {
-                crate::retrolist::list_switch(r, theme, rect, "Favorites", on, hovered, &star);
+                crate::retrolist::list_switch(r, theme, rect, "Favourites", on, hovered, &star);
             }
         }
         Spot::Item(_) => return false,

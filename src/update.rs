@@ -22,9 +22,9 @@
 //! About > CHECK FOR UPDATES checks at once and shows the result there. Only the main Glint checks
 //! (an extra window says so in About).
 //!
-//! **Asking**: "Remind me again later" asks again at the first check after 12 hours
-//! ("RemindUpdateAfter"); "Don't remind me about this update" remembers the version
-//! ("SkippedUpdate"): a newer one asks again; "Turn off automatic updates" turns "CheckForUpdates"
+//! **Asking**: LATER asks again at the first check after 12 hours ("RemindUpdateAfter"); SKIP THIS
+//! VERSION remembers the version ("SkippedUpdate"): a newer one asks again; "Stop checking for
+//! updates" turns "CheckForUpdates"
 //! off. A check from About always shows what it found, automatic checks on or off.
 //!
 //! **Installing** (`start_install`, on a thread of its own; one check or install at a time),
@@ -101,14 +101,14 @@ pub const ANSWERED: usize = 3;
 pub const ANSWER_UPDATE: isize = 1;
 pub const ANSWER_LATER: isize = 2;
 pub const ANSWER_SKIP: isize = 3;
-/// "Turn off automatic updates".
+/// "Stop checking for updates".
 pub const ANSWER_OFF: isize = 4;
 /// The main window's timer for the next check.
 pub const UPDATE_TIMER: usize = 70;
 
 /// The first check after start (or after coming back from the background, when one is due).
 const FIRST_CHECK: Duration = Duration::from_secs(30);
-/// Then every so long, and "Remind me again later" waits as long.
+/// Then every so long, and LATER waits as long.
 pub const EVERY: Duration = Duration::from_secs(12 * 60 * 60);
 /// How long one question to GitHub may take, all in all (the newest release; the changelog).
 const CHECK_LIMIT: Duration = Duration::from_secs(60);
@@ -304,11 +304,14 @@ pub struct Status {
     pub installing: bool,
     /// What the last check found, and when ("14:02").
     pub last: Option<(Found, String)>,
+    /// How many checks in a row have failed (Found::Failed), the last one too; 0 after any other
+    /// result. About words GitHub being out of reach differently the longer it goes on.
+    pub failed_in_row: u32,
     /// What the last install brought (taken by the window).
     installed: Option<Result<PathBuf, String>>,
 }
 
-static STATUS: Mutex<Status> = Mutex::new(Status { checking: false, installing: false, last: None, installed: None });
+static STATUS: Mutex<Status> = Mutex::new(Status { checking: false, installing: false, last: None, failed_in_row: 0, installed: None });
 
 fn status_lock() -> std::sync::MutexGuard<'static, Status> {
     STATUS.lock().unwrap_or_else(PoisonError::into_inner)
@@ -337,10 +340,11 @@ pub fn now_seconds() -> u64 {
 }
 
 /// What Settings > About says about updates (the row's explanation), and whether CHECK FOR UPDATES
-/// can be pressed now. `main`: this is the main Glint (only it checks); `auto`: "CheckForUpdates".
-pub fn about(main: bool, auto: bool) -> (String, bool) {
+/// can be pressed now. `main`: this is the main Glint (only it checks); `_auto`: "CheckForUpdates"
+/// (the words are the same either way now: they name no button).
+pub fn about(main: bool, _auto: bool) -> (String, bool) {
     if !main {
-        return ("Only the main Glint window checks for updates.".into(), false);
+        return ("Your other Glint window checks for updates.".into(), false);
     }
     let st = status_lock();
     let ours = ours();
@@ -350,17 +354,22 @@ pub fn about(main: bool, auto: bool) -> (String, bool) {
         "Looking for a new version…".to_string()
     } else {
         match &st.last {
-            None if auto => format!("You have Glint {ours}."),
-            None => format!("You have Glint {ours}. Press CHECK FOR UPDATES to look now."),
-            Some((Found::Unavailable(_), at)) => format!("Couldn't check for updates right now. Tried at {at}."),
-            Some((Found::Failed(why), at)) => format!("Couldn't check for updates at {at}: {why}."),
-            Some((Found::UpToDate(theirs), at)) => match Version::parse(theirs) {
-                Some(v) if v < ours => format!("You have Glint {ours}, newer than the newest release ({theirs}). Checked at {at}."),
-                _ => format!("You have the newest Glint ({ours}). Checked at {at}."),
+            None => format!("Current version: {ours}."),
+            Some((Found::Unavailable(_), at)) => format!("Failed to check for updates right now. Tried at {at}."),
+            // GitHub out of reach: worded by how long it has gone on.
+            Some((Found::Failed(why), at)) if why == UNREACHABLE => match st.failed_in_row {
+                0 | 1 => format!("Failed to check for updates at {at}. Check your internet connection."),
+                2 => format!("Failed to reach GitHub at {at}. Is the PC online?"),
+                _ => format!("Failed to reach GitHub at {at}. Try again later."),
             },
-            Some((Found::Newer(r), at)) if r.required => format!("Glint {} is a required fix for your version ({ours}). Found at {at}.", r.version),
-            Some((Found::Newer(r), at)) => format!("Glint {} is ready (you have {ours}). Found at {at}.", r.version),
-            Some((Found::NotReady(v), at)) => format!("Glint {v} is coming but isn't ready yet. Checked at {at}."),
+            Some((Found::Failed(why), at)) => format!("Failed to check for updates at {at}: {why}."),
+            Some((Found::UpToDate(theirs), at)) => match Version::parse(theirs) {
+                Some(v) if v < ours => format!("Current version: {ours}, newer than the newest release ({theirs}). Checked at {at}."),
+                _ => format!("Current version: {ours}. It's the newest. Checked at {at}."),
+            },
+            Some((Found::Newer(r), at)) if r.required => format!("Current version: {ours}. Glint {} is a required fix for it. Found at {at}.", r.version),
+            Some((Found::Newer(r), at)) => format!("Current version: {ours}. New version available: {}. Found at {at}.", r.version),
+            Some((Found::NotReady(v), at)) => format!("Glint {v} is coming soon. Checked at {at}."),
         }
     };
     (said, !st.checking && !st.installing)
@@ -455,7 +464,7 @@ impl Schedule {
 /// said not to be reminded about it, or to be reminded later (automatic checks only).
 pub fn should_prompt(found: &Found, s: &Settings, asked: bool, now: u64) -> bool {
     let Found::Newer(r) = found else { return false };
-    // (A required hotfix asks every time: "later" and "don't remind me" don't apply to it.)
+    // (A required hotfix asks every time: LATER and SKIP THIS VERSION don't apply to it.)
     if asked || r.required {
         return true;
     }
@@ -550,13 +559,17 @@ impl Drop for Internet {
     }
 }
 
+/// Why a check failed when GitHub couldn't be reached at all (no network, most likely): About
+/// words that one by how many checks in a row failed.
+const UNREACHABLE: &str = "GitHub couldn't be reached (is the computer online?)";
+
 /// What a WinHTTP error code means, in a few words.
 fn net_problem(code: u32) -> String {
     match code {
-        ERROR_WINHTTP_NAME_NOT_RESOLVED | ERROR_WINHTTP_CANNOT_CONNECT | ERROR_WINHTTP_CONNECTION_ERROR => "GitHub couldn't be reached (is the computer online?)".into(),
+        ERROR_WINHTTP_NAME_NOT_RESOLVED | ERROR_WINHTTP_CANNOT_CONNECT | ERROR_WINHTTP_CONNECTION_ERROR => UNREACHABLE.into(),
         ERROR_WINHTTP_TIMEOUT => "GitHub took too long to answer".into(),
         ERROR_WINHTTP_SECURE_FAILURE | ERROR_WINHTTP_SECURE_INVALID_CA | ERROR_WINHTTP_SECURE_CERT_CN_INVALID | ERROR_WINHTTP_SECURE_CERT_DATE_INVALID | ERROR_WINHTTP_SECURE_CERT_REVOKED => {
-            "the connection to GitHub wasn't safe (its certificate was refused)".into()
+            "the connection to GitHub wasn't safe".into()
         }
         _ => format!("the connection to GitHub failed (error {code})"),
     }
@@ -671,7 +684,7 @@ fn shorten(text: &str, max: usize) -> String {
 /// read single releases with it).
 #[cfg(test)]
 fn read_latest(json: &[u8], ours: &Version) -> Found {
-    let Ok(release) = serde_json::from_slice::<ReleaseJson>(json) else { return Found::Failed("GitHub's answer about the newest release couldn't be read".into()) };
+    let Ok(release) = serde_json::from_slice::<ReleaseJson>(json) else { return Found::Failed("GitHub sent an answer Glint couldn't use".into()) };
     read_release(release, ours)
 }
 
@@ -679,7 +692,7 @@ fn read_latest(json: &[u8], ours: &Version) -> Found {
 /// with the highest version number, judged as `read_latest` does. Drafts are left out, and so are
 /// pre-releases unless `ours` is a beta itself.
 fn read_releases(json: &[u8], ours: &Version) -> Found {
-    let Ok(list) = serde_json::from_slice::<Vec<ReleaseJson>>(json) else { return Found::Failed("GitHub's list of releases couldn't be read".into()) };
+    let Ok(list) = serde_json::from_slice::<Vec<ReleaseJson>>(json) else { return Found::Failed("GitHub sent an answer Glint couldn't use".into()) };
     let best = list
         .into_iter()
         .filter(|r| !r.draft && (!r.prerelease || ours.is_beta()) && valid_tag(r.tag_name.trim()))
@@ -750,6 +763,7 @@ pub fn start_check(owner: shell::Owner, s: &Settings, asked: bool) -> bool {
         {
             let mut st = status_lock();
             st.checking = false;
+            st.failed_in_row = if matches!(found, Found::Failed(_)) { st.failed_in_row.saturating_add(1) } else { 0 };
             st.last = Some((found, clock_text()));
         }
         // SAFETY: posting to a window handle is safe even if the window is gone.
@@ -946,7 +960,12 @@ fn install_into(new_exe: &Path, ours: &Path, verify: impl Fn(&Path) -> Result<()
     let pid = std::process::id();
     let tmp = dir.join(format!("{stem}.update-{pid}.exe"));
     // 1. The copy, next to ours.
-    let size = std::fs::metadata(new_exe).map_err(|e| format!("the new Glint.exe isn't there any more ({e}). Press CHECK FOR UPDATES and try again."))?.len();
+    let size = std::fs::metadata(new_exe)
+        .map_err(|e| {
+            log::line(&format!("update: {} isn't there any more ({e})", new_exe.display()));
+            "the new Glint.exe isn't there any more. Try again.".to_string()
+        })?
+        .len();
     if let Err(e) = std::fs::copy(new_exe, &tmp) {
         let _ = std::fs::remove_file(&tmp);
         return Err(if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -1492,12 +1511,12 @@ mod tests {
         assert!(should_prompt(&release("9.0.0"), &s, false, 100));
         assert!(!should_prompt(&Found::UpToDate("9.0.0".into()), &s, true, 100));
         assert!(!should_prompt(&Found::Unavailable("no release yet".into()), &s, true, 100));
-        // "Don't remind me again" for 9.0.0: not that one, but a newer one; asking always shows it.
+        // SKIP THIS VERSION for 9.0.0: not that one, but a newer one; asking always shows it.
         s.skipped_update = Some("9.0.0".into());
         assert!(!should_prompt(&release("9.0.0"), &s, false, 100));
         assert!(should_prompt(&release("9.0.1"), &s, false, 100));
         assert!(should_prompt(&release("9.0.0"), &s, true, 100));
-        // "Remind me later": not before the time.
+        // LATER: not before the time.
         s.remind_update_after = 1000;
         assert!(!should_prompt(&release("9.0.1"), &s, false, 999));
         assert!(should_prompt(&release("9.0.1"), &s, false, 1000));
@@ -1712,17 +1731,37 @@ mod tests {
     fn about_says_it_briefly() {
         let at = "18:48".to_string();
         let ours = ours();
-        let said = |found: Found| {
-            status_lock().last = Some((found, at.clone()));
+        let said_after = |found: Found, failed_in_row: u32| {
+            {
+                let mut st = status_lock();
+                st.last = Some((found, at.clone()));
+                st.failed_in_row = failed_in_row;
+            }
             let (text, ready) = about(true, true);
-            status_lock().last = None;
+            {
+                let mut st = status_lock();
+                st.last = None;
+                st.failed_in_row = 0;
+            }
             assert!(ready);
             text
         };
-        assert_eq!(said(Found::UpToDate(ours.to_string())), format!("You have the newest Glint ({ours}). Checked at 18:48."));
-        assert_eq!(said(Found::Unavailable("no release yet".into())), "Couldn't check for updates right now. Tried at 18:48.");
-        assert_eq!(said(Found::Failed("GitHub couldn't be reached (is the computer online?)".into())), "Couldn't check for updates at 18:48: GitHub couldn't be reached (is the computer online?).");
-        assert_eq!(said(Found::NotReady("99.0.0".into())), "Glint 99.0.0 is coming but isn't ready yet. Checked at 18:48.");
-        assert_eq!(about(false, true).0, "Only the main Glint window checks for updates.");
+        let said = |found: Found| said_after(found, 0);
+        assert_eq!(about(true, false).0, format!("Current version: {ours}."));
+        assert_eq!(said(Found::UpToDate(ours.to_string())), format!("Current version: {ours}. It's the newest. Checked at 18:48."));
+        assert_eq!(said(Found::Unavailable("no release yet".into())), "Failed to check for updates right now. Tried at 18:48.");
+        assert_eq!(said(Found::Failed("the connection to GitHub wasn't safe".into())), "Failed to check for updates at 18:48: the connection to GitHub wasn't safe.");
+        assert_eq!(said(Found::NotReady("99.0.0".into())), "Glint 99.0.0 is coming soon. Checked at 18:48.");
+        let newer = Release { version: "99.0.0".into(), ..Default::default() };
+        assert_eq!(said(Found::Newer(newer.clone())), format!("Current version: {ours}. New version available: 99.0.0. Found at 18:48."));
+        assert_eq!(said(Found::Newer(Release { required: true, ..newer })), format!("Current version: {ours}. Glint 99.0.0 is a required fix for it. Found at 18:48."));
+        assert_eq!(about(false, true).0, "Your other Glint window checks for updates.");
+        // GitHub out of reach: worded by how many checks in a row failed (in one test, as they
+        // share the status).
+        let offline = |n: u32| said_after(Found::Failed(UNREACHABLE.into()), n);
+        assert_eq!(offline(1), "Failed to check for updates at 18:48. Check your internet connection.");
+        assert_eq!(offline(2), "Failed to reach GitHub at 18:48. Is the PC online?");
+        assert_eq!(offline(3), "Failed to reach GitHub at 18:48. Try again later.");
+        assert_eq!(offline(7), "Failed to reach GitHub at 18:48. Try again later.");
     }
 }

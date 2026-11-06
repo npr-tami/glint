@@ -299,12 +299,12 @@ fn paste(dest: &str) -> Outcome {
         let left: Vec<String> = files.iter().filter(|s| exists(s)).cloned().collect();
         if !left.is_empty() {
             out.ok = false;
-            out.note = Some(format!("Couldn't move {}: still where it was.", items_text(&left)));
+            out.note = Some(format!("Failed to move {}.", items_text(&left)));
             return out;
         }
     }
     if out.ok {
-        out.note = Some(format!("{} {verb}", items_text(&files)));
+        out.note = Some(format!("{} {}.", if clip.cut { "Moved" } else { "Copied" }, items_text(&files)));
         if clip.cut {
             // Like Explorer: what was cut and has now moved is gone from the clipboard.
             clear_clipboard_if(clip.seq);
@@ -325,7 +325,7 @@ fn transfer(sources: &[String], dest: &str, moving: bool, same_folder: bool) -> 
     let verb = if moving { "move" } else { "copy" };
     // The folder may be gone since the tab showed it (the older engine would quietly make it again).
     if !is_folder(dest) {
-        return Outcome::note(format!("Couldn't {verb} here: \u{201c}{}\u{201d} isn't there any more.", file_name(dest)));
+        return Outcome::note(format!("Failed to {verb} here: \u{201c}{}\u{201d} isn't there any more.", file_name(dest)));
     }
     let mut flags = FOF_ALLOWUNDO | FOFX_ADDUNDORECORD | FOF_NOCONFIRMMKDIR;
     // The copy queue (copyqueue.rs): a copy, or a move to another drive, waits its turn and shows
@@ -351,7 +351,7 @@ fn transfer(sources: &[String], dest: &str, moving: bool, same_folder: bool) -> 
     // An item deleted meanwhile (it may have waited its turn a while) is left out and named in the
     // note; the rest is still done. (The older engine would refuse the lot, the newer say nothing.)
     let (sources, gone): (Vec<String>, Vec<String>) = sources.iter().cloned().partition(|s| exists(s));
-    let gone_note = (!gone.is_empty()).then(|| format!("Couldn't {verb}: {} {} there any more.", items_text(&gone), if gone.len() == 1 { "isn't" } else { "aren't" }));
+    let gone_note = (!gone.is_empty()).then(|| format!("Failed to {verb}: {} {} there any more.", items_text(&gone), if gone.len() == 1 { "isn't" } else { "aren't" }));
     if sources.is_empty() {
         return Outcome { note: gone_note, ..Default::default() };
     }
@@ -367,7 +367,7 @@ fn transfer(sources: &[String], dest: &str, moving: bool, same_folder: bool) -> 
     let (done, made) = match Engine::new(flags) {
         Some(engine) => {
             let Some(target) = shell_item(dest) else {
-                return Outcome::note(format!("Couldn't {verb} here: Windows can't open \u{201c}{}\u{201d}.", file_name(dest)));
+                return Outcome::note(format!("Failed to {verb} here: Windows can't open \u{201c}{}\u{201d}.", file_name(dest)));
             };
             let mut queued = 0;
             for s in &sources {
@@ -384,8 +384,8 @@ fn transfer(sources: &[String], dest: &str, moving: bool, same_folder: bool) -> 
             }
             if queued == 0 {
                 return Outcome::note(match engine.unopened() {
-                    Some(name) => format!("Couldn't {verb}: Windows can't open \u{201c}{name}\u{201d}."),
-                    None => format!("Couldn't {verb}: {} isn't there any more.", items_text(&sources)),
+                    Some(name) => format!("Failed to {verb}: Windows can't open \u{201c}{name}\u{201d}."),
+                    None => format!("Failed to {verb}: {} isn't there any more.", items_text(&sources)),
                 });
             }
             let done = engine.run();
@@ -461,7 +461,7 @@ fn transfer(sources: &[String], dest: &str, moving: bool, same_folder: bool) -> 
         (!made.is_empty()).then_some(crate::undo::Step::Made { paths: made, what: "copy" })
     };
     let mut out = Outcome { ok: done.ok() && gone.is_empty(), changed, created: Some((dest.to_string(), names)), moved_folders, undo, ..Default::default() };
-    out.note = done.problem(&format!("Couldn't {verb} everything")).or(gone_note);
+    out.note = done.problem(&format!("Failed to {verb} everything")).or(gone_note);
     out
 }
 
@@ -488,7 +488,7 @@ fn extract(archive: &str, own_folder: bool) -> Outcome {
                 made.push(folder.clone());
                 crate::archive::extract_all(archive, &folder, &mut Vec::new())
             }
-            Err(e) => Err(format!("\u{201c}{}\u{201d} couldn't be made ({e}).", file_name(&folder))),
+            Err(e) => Err(format!("Failed to make the folder \u{201c}{}\u{201d}: {e}", file_name(&folder))),
         }
     } else {
         crate::archive::extract_all(archive, &dir, &mut made)
@@ -504,7 +504,7 @@ fn extract(archive: &str, own_folder: bool) -> Outcome {
     let names: Vec<String> = made.iter().map(|p| file_name(p).to_string()).collect();
     let undo = (!made.is_empty()).then(|| crate::undo::Step::Made { paths: made.clone(), what: "extract" });
     let note = match &result {
-        Ok(()) if made.is_empty() => format!("\u{201c}{name}\u{201d} is empty: there was nothing to take out."),
+        Ok(()) if made.is_empty() => format!("\u{201c}{name}\u{201d} is empty."),
         Ok(()) => format!("Extracted \u{201c}{name}\u{201d}"),
         Err(why) => why.clone(),
     };
@@ -550,7 +550,7 @@ fn compress(paths: &[String], format: crate::archive::Format) -> Outcome {
             note: Some(format!("Compressed {what} to \u{201c}{name}\u{201d}")),
             ..Default::default()
         },
-        Err(why) => Outcome { changed, note: Some(format!("Couldn't compress {what}: {why}")), ..Default::default() },
+        Err(why) => Outcome { changed, note: Some(format!("Failed to compress {what}: {why}")), ..Default::default() },
     }
 }
 
@@ -593,6 +593,8 @@ fn rename_many_by(pairs: &[(String, String)], mut rename: impl FnMut(&str, &str)
     let changed = distinct_parents(pairs.iter().map(|(a, _)| a));
     // (where it is, where it goes, whether it turned out it can't be moved there for now)
     let mut todo: Vec<(String, String, bool)> = pairs.iter().filter(|(a, _)| exists(a)).map(|(a, b)| (a.clone(), b.clone(), false)).collect();
+    // Items gone (renamed, moved or deleted outside Glint meanwhile) are said, not skipped quietly.
+    let missing: Vec<String> = pairs.iter().filter(|(a, _)| !exists(a)).map(|(a, _)| a.clone()).collect();
     let mut done: Vec<(String, String)> = Vec::new();
     // Items that couldn't have their own name back after stepping aside: (was, is called now).
     let mut aside: Vec<(String, String)> = Vec::new();
@@ -682,11 +684,19 @@ fn rename_many_by(pairs: &[(String, String)], mut rename: impl FnMut(&str, &str)
         format!("Renamed {}", items_text(&done.iter().map(|(a, _)| a.clone()).collect::<Vec<_>>()))
     } else {
         let left: Vec<String> = todo.iter().map(|(a, _, _)| a.clone()).chain(aside.iter().map(|(a, _)| a.clone())).collect();
-        let mut note = format!("Couldn't rename {}: the name is taken, or it's in use", items_text(&left));
+        let mut note = format!("Failed to rename {}: the name is taken, or it's in use", items_text(&left));
         for (was, now) in &aside {
             note.push_str(&format!(". \u{201c}{}\u{201d} is called \u{201c}{}\u{201d} now: its own name was taken", file_name(was), file_name(now)));
         }
+        note.push('.');
         note
+    };
+    // Items gone (renamed, moved or deleted outside Glint meanwhile) are said, not skipped quietly.
+    let note = if missing.is_empty() {
+        note
+    } else {
+        let gone = format!("{} {}", items_text(&missing), if missing.len() == 1 { "isn't there any more" } else { "aren't there any more" });
+        if done.is_empty() && todo.is_empty() && aside.is_empty() { format!("{gone}.") } else if note.ends_with('.') { format!("{note} {gone}") } else { format!("{note}. {gone}") }
     };
     let ok = todo.is_empty() && aside.is_empty() && done.len() == pairs.len();
     let undo = (!done.is_empty()).then(|| crate::undo::Step::Moved { pairs: done.clone() });
@@ -754,7 +764,7 @@ fn move_each(pairs: &[(String, String)]) -> Outcome {
     let (todo, taken): (Vec<&(String, String)>, Vec<&(String, String)>) = pairs.iter().filter(|(from, _)| exists(from)).partition(|(_, to)| !exists(to));
     if todo.is_empty() {
         let note = match taken.first() {
-            Some((_, to)) => format!("Couldn't move it back: something called \u{201c}{}\u{201d} is there now.", file_name(to)),
+            Some((_, to)) => format!("Failed to move it back: something called \u{201c}{}\u{201d} is there now.", file_name(to)),
             None => "It isn't where it was moved to any more.".to_string(),
         };
         return Outcome { changed, ..Outcome::note(note) };
@@ -797,7 +807,7 @@ fn move_each(pairs: &[(String, String)]) -> Outcome {
     let ok = done.ok() && moved.len() == pairs.len();
     let moved_from: HashSet<&str> = moved.iter().map(|(m, _)| m.as_str()).collect();
     let left: Vec<String> = pairs.iter().filter(|(a, _)| !moved_from.contains(a.as_str())).map(|(a, _)| a.clone()).collect();
-    let note = done.problem("Couldn't move everything").or_else(|| {
+    let note = done.problem("Failed to move everything").or_else(|| {
         (!left.is_empty()).then(|| format!("{} stayed where it was: its place is taken, or it's gone", items_text(&left)))
     });
     let undo = (!moved.is_empty()).then_some(crate::undo::Step::Moved { pairs: moved });
@@ -837,7 +847,7 @@ fn dropped(sources: &[String], dest: &str, how: DropHow) -> Outcome {
         let left: Vec<String> = files.iter().filter(|s| exists(s)).cloned().collect();
         if !left.is_empty() {
             out.ok = false;
-            out.note = Some(format!("Couldn't move {}: still where it was.", items_text(&left)));
+            out.note = Some(format!("Failed to move {}.", items_text(&left)));
             return out;
         }
     }
@@ -851,7 +861,7 @@ fn dropped(sources: &[String], dest: &str, how: DropHow) -> Outcome {
 /// name is taken), as Explorer's "Create shortcuts here" does. Never replaces anything.
 fn shortcuts(sources: &[String], dest: &str) -> Outcome {
     if !is_folder(dest) {
-        return Outcome::note(format!("Couldn't make shortcuts here: \u{201c}{}\u{201d} isn't there any more.", file_name(dest)));
+        return Outcome::note("Failed to create shortcuts here.");
     }
     let mut made: Vec<String> = Vec::new();
     let mut error = None;
@@ -871,9 +881,9 @@ fn shortcuts(sources: &[String], dest: &str) -> Outcome {
     }
     let n = made.len();
     let note = match error {
-        Some(hr) => format!("Couldn't make every shortcut: {}", explain(hr)),
-        None if n == 1 => format!("Made a shortcut in \u{201c}{}\u{201d}", file_name(dest)),
-        None => format!("Made {} shortcuts in \u{201c}{}\u{201d}", format_count(n), file_name(dest)),
+        Some(hr) => format!("Failed to create shortcuts here: {}", explain(hr)),
+        None if n == 1 => format!("Created a shortcut in \u{201c}{}\u{201d}.", file_name(dest)),
+        None => format!("Created {} shortcuts in \u{201c}{}\u{201d}.", format_count(n), file_name(dest)),
     };
     let paths: Vec<String> = made.iter().map(|n| join(dest, n)).collect();
     let undo = (!paths.is_empty()).then_some(crate::undo::Step::Made { paths, what: "shortcut" });
@@ -909,7 +919,8 @@ fn delete(paths: &[String], recycle: bool) -> Outcome {
     // Glint has already asked (or was told not to). Windows still warns when something can't go to
     // the Recycle Bin (a network drive, a USB stick without one) and would be gone for good.
     let flags = if recycle { FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOFX_ADDUNDORECORD | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING } else { FOF_NOCONFIRMATION };
-    let done = match Engine::new(flags) {
+    let started = crate::recycle::now_filetime();
+    let mut done = match Engine::new(flags) {
         Some(engine) => {
             let mut queued = 0;
             for p in paths {
@@ -919,7 +930,7 @@ fn delete(paths: &[String], recycle: bool) -> Outcome {
             }
             if queued == 0 {
                 let note = match engine.unopened() {
-                    Some(name) => format!("Couldn't delete: Windows can't open \u{201c}{name}\u{201d}."),
+                    Some(name) => format!("Failed to delete: Windows can't open \u{201c}{name}\u{201d}."),
                     None => format!("{} isn't there any more.", items_text(paths)),
                 };
                 return Outcome { changed, ..Outcome::note(note) };
@@ -930,6 +941,12 @@ fn delete(paths: &[String], recycle: bool) -> Outcome {
     };
     if recycle && paths.iter().any(|p| !exists(p)) {
         crate::recycle::saw_full(true); // (the sidebar's bin icon)
+    }
+    // After "File In Use" > Try Again, Windows says the item was deleted for good although it went
+    // to the bin: ask the bin what it got.
+    if recycle && !done.gone_for_good.is_empty() {
+        let in_bin = crate::recycle::sent_since(&done.gone_for_good, started);
+        done.gone_for_good.retain(|g| !in_bin.contains(&path_key(g)));
     }
     // Sent to the Recycle Bin: Ctrl+Z brings back what really went. (Deleted for good - Windows
     // asks first when something can't go there - there's no way back.)
@@ -945,7 +962,7 @@ fn delete(paths: &[String], recycle: bool) -> Outcome {
     };
     let undo = (recycle && !gone.is_empty()).then_some(crate::undo::Step::Recycled { paths: gone });
     let mut out = Outcome { ok: done.ok(), changed, undo, ..Default::default() };
-    out.note = done.problem("Couldn't delete everything").or(Some(note));
+    out.note = done.problem("Failed to delete everything").or(Some(note));
     out
 }
 
@@ -997,7 +1014,7 @@ fn rename(path: &str, new_name: &str) -> Outcome {
             Outcome {
                 changed: vec![dir],
                 retry: taken.then(|| (path.to_string(), new_name.to_string())),
-                ..Outcome::note(format!("Couldn't rename \u{201c}{old}\u{201d}: {}", explain(hr)))
+                ..Outcome::note(format!("Failed to rename \u{201c}{old}\u{201d}: {}", explain(hr)))
             }
         }
     }
@@ -1011,7 +1028,7 @@ fn new_item(dir: &str, folder: bool) -> Outcome {
     let (error, made) = match Engine::new(flags) {
         Some(engine) => {
             let Some(target) = shell_item(dir) else {
-                return Outcome::note(format!("Couldn't make a new {what}: Windows can't open this folder."));
+                return Outcome::note(format!("Failed to make a new {what}: Windows can't open this folder."));
             };
             let name_w = wide(&name);
             // FILE_ATTRIBUTE_DIRECTORY makes a folder; FILE_ATTRIBUTE_NORMAL with no template an empty file.
@@ -1041,7 +1058,7 @@ fn new_item(dir: &str, folder: bool) -> Outcome {
             let undo = Some(crate::undo::Step::Made { paths: vec![join(dir, &name)], what: if folder { "new folder" } else { "new text file" } });
             Outcome { ok: true, changed: vec![dir.to_string()], created: Some((dir.to_string(), vec![name])), rename_new: true, undo, ..Default::default() }
         }
-        Some(hr) => Outcome::note(format!("Couldn't make a new {what} here: {}", explain(hr))),
+        Some(hr) => Outcome::note(format!("Failed to make a new {what} here: {}", explain(hr))),
     }
 }
 
@@ -1073,7 +1090,7 @@ impl Done {
     fn problem(&self, lead: &str) -> Option<String> {
         match self.error {
             Some(hr) => Some(format!("{lead}: {}", explain(hr))),
-            None if self.aborted => Some("Stopped before it was finished.".to_string()),
+            None if self.aborted => Some("Cancelled before it was finished.".to_string()),
             None => self.unopened.as_ref().map(|name| format!("{lead}: Windows can't open \u{201c}{name}\u{201d}.")),
         }
     }
@@ -1475,6 +1492,12 @@ pub fn has_recycle_bin(path: &str) -> bool {
     !matches!(kind, 2 | 4 | 5) // DRIVE_REMOVABLE, DRIVE_REMOTE, DRIVE_CDROM
 }
 
+/// Whether `path` can go to the Recycle Bin: its drive has one, and the path isn't too long for it.
+/// Windows deletes an item with a path of 260 characters or more for good, without asking.
+pub fn can_recycle(path: &str) -> bool {
+    has_recycle_bin(path) && path.encode_utf16().count() < 260
+}
+
 /// Whether `path` is a full path ("C:\..." or "\\server\share\...") of something inside a folder -
 /// not a drive or a share itself, and not a bare name.
 pub fn is_full_item_path(path: &str) -> bool {
@@ -1836,6 +1859,8 @@ mod tests {
     fn network_shares_have_no_recycle_bin() {
         assert!(!has_recycle_bin("\\\\server\\share\\notes.txt"));
         assert!(has_recycle_bin("C:\\Users\\notes.txt"));
+        assert!(can_recycle("C:\\Users\\notes.txt"));
+        assert!(!can_recycle(&format!("C:\\{}\\notes.txt", "x".repeat(260))));
     }
 
     #[test]
@@ -2114,7 +2139,20 @@ mod tests {
         assert_eq!(read(&s.at("e.txt")), "d.txt");
         assert_eq!(names_in(&s.0).unwrap().len(), 5, "nothing lost, no temporary name left");
         assert_eq!(out.undo, Some(Step::Moved { pairs: vec![(s.at("b.txt"), s.at("same.txt")), (s.at("d.txt"), s.at("e.txt"))] }), "Ctrl+Z undoes only what was done");
-        assert_eq!(out.note.as_deref(), Some("Couldn't rename 2 items: the name is taken, or it's in use"));
+        assert_eq!(out.note.as_deref(), Some("Failed to rename 2 items: the name is taken, or it's in use."));
+    }
+
+    /// Undoing a Rename many after one item was renamed outside Glint says so (break test 31/10).
+    #[test]
+    fn renaming_many_says_which_items_are_gone() {
+        let s = Scratch::new("many-gone");
+        put(&s.0, "a.txt", "a");
+        put(&s.0, "b.txt", "b");
+        let out = run(Job::RenameMany { pairs: vec![(s.at("a.txt"), s.at("x.txt")), (s.at("gone.txt"), s.at("y.txt"))] });
+        assert!(!out.ok);
+        assert_eq!(out.note.as_deref(), Some("Renamed \u{201c}a.txt\u{201d}. \u{201c}gone.txt\u{201d} isn't there any more"));
+        let out = run(Job::RenameMany { pairs: vec![(s.at("gone.txt"), s.at("y.txt")), (s.at("gone2.txt"), s.at("z.txt"))] });
+        assert_eq!(out.note.as_deref(), Some("2 items aren't there any more."));
     }
 
     #[test]
@@ -2200,7 +2238,7 @@ mod tests {
         }
         assert_eq!(names_in(&s.0).unwrap().len(), 3);
         assert!(out.undo.is_none());
-        assert_eq!(out.note.as_deref(), Some("Couldn't rename 3 items: the name is taken, or it's in use"));
+        assert_eq!(out.note.as_deref(), Some("Failed to rename 3 items: the name is taken, or it's in use."));
     }
 
     /// 1 and 2 swap (2 is in use), a and b swap: a and b still do. Ctrl+Z and Ctrl+Y too.
@@ -2220,7 +2258,7 @@ mod tests {
             assert_eq!((read(&s.at("a [1] & b's.jpg")), read(&s.at("b #2 ~ (x).jpg"))), ("b #2 ~ (x).jpg".into(), "a [1] & b's.jpg".into()), "{:?}", out.note);
             assert_eq!((read(&s.at("1.jpg")), read(&s.at("2.jpg"))), ("1.jpg".into(), "2.jpg".into()), "each back under its own name");
             assert!(no_temporary_name(&s.0), "{:?}", names_in(&s.0));
-            assert_eq!(out.note.as_deref(), Some("Couldn't rename 2 items: the name is taken, or it's in use"));
+            assert_eq!(out.note.as_deref(), Some("Failed to rename 2 items: the name is taken, or it's in use."));
             let step = out.undo.clone().unwrap();
             assert!(matches!(&step, crate::undo::Step::Moved { pairs } if pairs.len() == 2), "{step:?}");
             for (job, swapped) in [(step.undo_job(), false), (step.redo_job(), true), (step.undo_job(), false)] {

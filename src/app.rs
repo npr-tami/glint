@@ -37,6 +37,7 @@ use crate::ui::Command;
 use crate::watch::{self, Armed, Watcher};
 
 mod bin;
+pub(crate) mod disk;
 mod dropping;
 mod files;
 // The form box's forms: saving tabs as a set, renaming many items (form.rs draws them).
@@ -422,6 +423,20 @@ impl Tab {
     }
 }
 
+/// A sort column's title, as the list shows it ("Sorted by Date modified.").
+fn column_title(key: SortKey) -> &'static str {
+    match key {
+        SortKey::Name => "Name",
+        SortKey::Date => "Date modified",
+        SortKey::Type => "Type",
+        SortKey::Size => "Size",
+        SortKey::Created => "Date created",
+        SortKey::Folder => "Folder",
+        SortKey::Dimensions => "Picture size",
+        SortKey::Length => "Length",
+    }
+}
+
 /// A closed tab, kept for Ctrl+Shift+T.
 struct ClosedTab {
     /// Where it was in the tab row.
@@ -459,6 +474,10 @@ enum Loaded {
     FolderSize { tab_id: u64, dir: String, bytes: u64 },
     /// The files of a tab's duplicates list that are gone after a file job (app/files.rs).
     DupesGone { tab_id: u64, gone: std::collections::HashSet<String> },
+    /// A look at a drive for Disk space finished (app/disk.rs); None when it couldn't be done.
+    Disk { drive: String, result: Option<(crate::diskspace::Look, Option<crate::diskspace::Remembered>)> },
+    /// A look at a drive got further: paint its page again.
+    DiskProgress,
 }
 
 /// What happens to items once they're taken out of an archive (app/files.rs `extract_then`).
@@ -542,6 +561,8 @@ pub struct AppState {
     /// Drive-list reads asked for, and the newest one shown (see `Loaded::Drives`).
     drives_asked: u64,
     drives_shown: u64,
+    /// Disk space's looks, by drive (app/disk.rs).
+    pub disks: disk::Disks,
     /// Windows telling about changes to the Recycle Bin while the active tab (this id) shows it
     /// (None inside when that couldn't be started). See app/bin.rs.
     bin_watch: Option<(u64, Option<recycle::Watch>)>,
@@ -628,6 +649,7 @@ impl AppState {
             next_tab_id: 1,
             drives_asked: 0,
             drives_shown: 0,
+            disks: disk::Disks::default(),
             bin_watch: None,
             tags: crate::tags::Tags::open(),
         };
@@ -640,6 +662,10 @@ impl AppState {
                 tab.set_own_view(v);
             }
             tab.pinned = saved.pinned;
+            if saved.pinned {
+                tab.back = saved.back.clone();
+                tab.forward = saved.forward.clone();
+            }
             app.tabs.push(tab);
         }
         // Pinned tabs first (a hand-edited file could have them anywhere); the active one stays so.
@@ -699,6 +725,7 @@ impl AppState {
             next_tab_id: 2,
             drives_asked: 0,
             drives_shown: 0,
+            disks: disk::Disks::default(),
             bin_watch: None,
             subfolders: false,
             hidden: false,
@@ -738,7 +765,11 @@ impl AppState {
         s.tabs = self
             .tabs
             .iter()
-            .map(|t| SavedTab { path: t.path.clone(), sort_column: settings::sort_number(t.sort), sort_descending: t.descending, view: Some(t.own_view), pinned: t.pinned })
+            .map(|t| {
+                // A pinned tab keeps its Back and Forward places (the nearest ones, when there are many).
+                let last = |v: &[String]| if t.pinned { v[v.len().saturating_sub(settings::HISTORY_SAVED)..].to_vec() } else { Vec::new() };
+                SavedTab { path: t.path.clone(), sort_column: settings::sort_number(t.sort), sort_descending: t.descending, view: Some(t.own_view), pinned: t.pinned, back: last(&t.back), forward: last(&t.forward) }
+            })
             .collect();
         s.active_tab = self.active;
         s.split_folder = self.split_index().map(|i| self.tabs[i].path.clone());
@@ -883,14 +914,35 @@ impl AppState {
     /// order stays on for every other folder and tab. (In a folder it has no rules for, the column
     /// just sorts that folder anyway.) Home and Duplicates, in an order of their own, are sorted by
     /// the column from then on too.
-    fn column_for_now(&mut self) {
+    fn column_for_now(&mut self, key: SortKey) {
         let dupes = self.tab().search.as_ref().is_some_and(|s| s.is_dupes());
         if recent::is_recent(&self.tab().folder.path) || dupes {
             self.tab_mut().column_now = true;
         } else if self.tab().custom_here().is_some() {
             self.tab_mut().column_now = true;
-            self.say("Sorted by this column for now. Your custom sort comes back when you open this folder again");
+            // (A click on these words in the status bar goes back to the custom order.)
+            self.say(format!("Sorted by {}.", column_title(key)));
         }
+    }
+
+    /// Whether a column sorts the folder on screen for now, where the custom sort order would.
+    pub fn custom_order_waits(&self) -> bool {
+        let t = self.tab();
+        let dupes = t.search.as_ref().is_some_and(|s| s.is_dupes());
+        t.column_now && !dupes && !t.folder.path.is_empty() && !recent::is_recent(&t.folder.path) && t.custom.as_ref().is_some_and(|r| r.applies(&t.folder.path))
+    }
+
+    /// A click on "Sorted by Name." (or "Column for now") in the status bar: the custom sort order
+    /// sorts this folder again, in place of the column picked for now.
+    pub fn back_to_custom_order(&mut self) {
+        if !self.custom_order_waits() {
+            return;
+        }
+        let t = self.tab_mut();
+        t.column_now = false;
+        t.rebuild_view();
+        t.reveal_focus = true;
+        self.note = None;
     }
 
     /// Shows or hides one of the columns next to Name ("modified", "created", "type", "size",
@@ -916,6 +968,13 @@ impl AppState {
     pub fn set_error_log(&mut self, on: bool) {
         self.settings.error_log = on;
         log::set_error_log(on);
+    }
+
+    /// Glint's files moved (Settings > About > Portable, in this window or another): the colour
+    /// tags and the skins are read from their new place (`tags_refresh` reads the tags again).
+    pub fn files_moved(&mut self) {
+        self.tags.kept_in(crate::settings::config_now().join(crate::tags::FILE_NAME));
+        self.skins.folder_moved();
     }
 
     /// Whether Ctrl+Shift+T has a tab to bring back.
@@ -974,6 +1033,8 @@ impl AppState {
         }
         match cmd {
             Command::Navigate(p) => self.navigate(&p),
+            Command::DiskSpace(drive) => self.open_disk_space(drive),
+            Command::DiskLookAgain(drive) => self.look_at_disk(&drive, true),
             Command::Back => self.back(),
             Command::Forward => self.forward(),
             Command::BackBy(steps) => self.back_by(steps),
@@ -991,7 +1052,7 @@ impl AppState {
             Command::NewTabAt(p) => self.open_tab(folder::normalize(&p)),
             Command::CloseTab(i) => {
                 if self.tabs.get(i).is_some_and(|t| t.pinned) {
-                    self.say("This tab is pinned. Right-click it to close it, or unpin it first");
+                    self.say("This tab is pinned. Right-click it to close it, or unpin it first.");
                 } else {
                     self.close_tab(i);
                 }
@@ -1033,14 +1094,14 @@ impl AppState {
                 // While the custom sort order decides, no column is the sorted one (its title has no
                 // arrow), so a click on one is a first click, not a second that turns it around.
                 let custom = self.tab().custom_here().is_some();
-                self.column_for_now();
+                self.column_for_now(key);
                 let t = self.tab_mut();
                 // Newest, biggest and longest first feel natural.
                 let desc = if t.sort == key && !custom { !t.descending } else { matches!(key, SortKey::Date | SortKey::Created | SortKey::Size | SortKey::Dimensions | SortKey::Length) };
                 t.set_sort(key, desc);
             }
             Command::SetSort(key, desc) => {
-                self.column_for_now();
+                self.column_for_now(key);
                 self.tab_mut().set_sort(key, desc);
             }
             Command::SetCustomSort(on) => self.set_custom_sort(on, None),
@@ -1194,7 +1255,7 @@ impl AppState {
                 Some(path) => self.go(&path),
                 None => {
                     shell::show_in_explorer(typed, false);
-                    self.say("Glint can't show that place, so it opened in File Explorer");
+                    self.say("Glint can't show that place, so it opened in File Explorer.");
                 }
             }
             return;
@@ -1203,7 +1264,8 @@ impl AppState {
     }
 
     fn go(&mut self, input: &str) {
-        let path = folder::resolve(input, &self.tab().path);
+        // (Typed in other capitals: the folder's real names show.)
+        let path = folder::real_case(&folder::resolve(input, &self.tab().path));
         let t = self.tab_mut();
         if path == t.path {
             self.refresh();
@@ -1360,7 +1422,7 @@ impl AppState {
     /// Ctrl+Shift+T: the tab closed last comes back where it was, with its history.
     fn reopen_closed_tab(&mut self) {
         let Some(c) = self.closed.pop() else {
-            self.say("No closed tabs to bring back");
+            self.say("No closed tabs to bring back.");
             return;
         };
         let at = c.index.min(self.tabs.len());
@@ -1403,6 +1465,10 @@ impl AppState {
         t.reloading = None;
         t.loading = Some(Pending { generation, started: Instant::now() });
         let (tab_id, path, tx, hwnd) = (t.id, t.path.clone(), self.tx.clone(), self.hwnd.clone());
+        if let Some(drive) = crate::diskspace::drive_of_location(&path) {
+            // Disk space: its page shows the drive's look, started here if there isn't one yet.
+            self.look_at_disk(&drive, false);
+        }
         if recent::is_recent(&path) {
             // Home lists the pinned folders and the favorites too.
             recent::set_extras(&self.settings.pinned, &self.settings.favorites);
@@ -1445,6 +1511,11 @@ impl AppState {
         let mut changed = false;
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
+                Loaded::Disk { drive, result } => {
+                    self.disk_looked(drive, result);
+                    changed = true;
+                }
+                Loaded::DiskProgress => changed = true,
                 Loaded::Drives(asked, d) => {
                     if asked < self.drives_shown {
                         continue; // an older read that took longer than a newer one
@@ -1563,7 +1634,7 @@ impl AppState {
                         // (The folder it was on its way to hadn't come in yet: that one's read now.)
                         let behind = !fileops::same_path(&t.folder.path, &t.path);
                         let name = folder::file_name(&folder.path).to_string();
-                        self.say(format!("Opened \u{201c}{name}\u{201d}"));
+                        self.say(format!("Opened \u{201c}{name}\u{201d}."));
                         if let Some(i) = self.tabs.iter().position(|t| t.id == tab_id).filter(|_| behind) {
                             self.start_load(i);
                         }
@@ -1735,7 +1806,7 @@ impl AppState {
                     self.start_load(i);
                 }
                 if i == self.active {
-                    self.say(format!("This folder was renamed to \u{201c}{}\u{201d}", folder::file_name(&to)));
+                    self.say(format!("This folder was renamed to \u{201c}{}\u{201d}.", folder::file_name(&to)));
                 }
                 // sync_watch (end of `receive`) now watches it under its new name and reads it again.
                 true
@@ -1867,15 +1938,15 @@ impl AppState {
         // (This PC has no path of its own: nothing is copied over what's on the clipboard.)
         let paths: Vec<String> = self.selected_paths().into_iter().filter(|p| !p.is_empty()).collect();
         if paths.is_empty() {
-            self.say("This PC has no path to copy");
+            self.say("This PC has no path to copy.");
             return;
         }
         let hwnd = HWND(self.hwnd.load(Ordering::SeqCst) as *mut _);
         let text = paths.iter().map(|p| if p.contains(' ') { format!("\"{p}\"") } else { p.clone() }).collect::<Vec<_>>().join("\r\n");
         let note = if shell::copy_text(hwnd, &text) {
-            if paths.len() == 1 { "Path copied".to_string() } else { format!("{} paths copied", paths.len()) }
+            if paths.len() == 1 { "Path copied.".to_string() } else { format!("{} paths copied.", paths.len()) }
         } else {
-            "Couldn't copy (the clipboard is busy)".to_string()
+            "Failed to copy. Try again in a moment.".to_string()
         };
         self.say(note);
     }
@@ -1922,7 +1993,7 @@ impl AppState {
                 for p in many.iter().take(32).rev() {
                     self.open_tab_behind(p.clone());
                 }
-                self.say(format!("Opened {} tabs", many.len().min(32)));
+                self.say(format!("Opened {} tabs.", many.len().min(32)));
             }
         }
     }
@@ -1968,10 +2039,10 @@ impl AppState {
         // the others would be looked for in the first one's folder).
         let paths = one_folder(all.clone());
         if paths.len() < all.len() {
-            self.say("Properties shows the items of one folder at a time");
+            self.say("Properties shows the items of one folder at a time.");
         }
         if !shellmenu::properties(self.owner().hwnd(), paths) {
-            self.say("Windows couldn't show the properties right now");
+            self.say("Windows couldn't show the properties right now. Try again.");
         }
     }
 
@@ -2029,11 +2100,11 @@ impl AppState {
     /// The Subfolders switch (Ctrl+Shift+F, or its button next to the filter).
     fn toggle_subfolders(&mut self) {
         if recycle::is_bin(&self.tab().path) {
-            self.say("Can't search subfolders in the Recycle Bin");
+            self.say("Can't search subfolders in the Recycle Bin.");
             return;
         }
         if recent::is_recent(&self.tab().path) {
-            self.say("Can't search subfolders in Home");
+            self.say("Can't search subfolders in Home.");
             return;
         }
         self.subfolders = !self.subfolders;
@@ -2069,18 +2140,18 @@ impl AppState {
     fn find_duplicates(&mut self) {
         let t = self.tab();
         if t.path.is_empty() {
-            self.say("Open a drive or folder first, then look for duplicates there");
+            self.say("Open a drive or folder first, then look for duplicates there.");
             return;
         }
         if folder::is_place(&t.path) || crate::archive::split(&t.path).is_some() {
-            self.say("Glint can only look for duplicates in a drive or folder");
+            self.say("Glint can only look for duplicates in a drive or folder.");
             return;
         }
         let i = self.active;
         self.tabs[i].filter.clear();
         self.tabs[i].column_now = false; // the sets as they're found, whatever column sorted the folder
         self.start_search_for(i, false, true);
-        self.say("Looking for files with the same content\u{2026}");
+        self.say("Looking for files with the same content\u{2026}.");
     }
 
     /// "Select extra copies": in each set of duplicates, every file but the first one in the list is
@@ -2234,6 +2305,9 @@ impl AppState {
         if recent::is_recent(path) {
             return recent::NAME.into();
         }
+        if let Some(drive) = crate::diskspace::drive_of_location(path) {
+            return format!("{} \u{b7} {}", crate::diskspace::NAME, self.display_name(&drive));
+        }
         if let Some(d) = self.drive_for_root(path) {
             return d.name.clone();
         }
@@ -2260,6 +2334,9 @@ impl AppState {
         }
         if recent::is_recent(path) {
             return vec![(recent::NAME.to_string(), path.to_string())];
+        }
+        if crate::diskspace::is_disk(path) {
+            return vec![("This PC".to_string(), String::new()), (self.display_name(path), path.to_string())];
         }
         let mut chain = vec![path.to_string()];
         let mut cur = path.to_string();
@@ -2859,7 +2936,7 @@ mod tests {
     fn a_folder_that_vanishes_and_comes_back() {
         let mut t = tab_with(&["a.txt"]);
         t.select_only_row(0);
-        let gone = Folder { path: "C:\\x".into(), error: Some("This folder doesn't exist (any more).".into()), ..Default::default() };
+        let gone = Folder { path: "C:\\x".into(), error: Some("This folder doesn't exist.".into()), ..Default::default() };
         assert!(merge_listing(&mut t, gone, &[], size::ROW_H));
         assert!(t.view.is_empty() && t.folder.error.is_some());
         assert!(merge_listing(&mut t, listing(&["a.txt", "new.txt"]), &[], size::ROW_H));
@@ -2966,7 +3043,7 @@ mod tests {
         let mut a = AppState::for_tests(Settings::default());
         a.tabs[0].path = String::new();
         a.copy_paths();
-        assert_eq!(a.note(), Some("This PC has no path to copy"));
+        assert_eq!(a.note(), Some("This PC has no path to copy."));
     }
 
     #[test]
@@ -2996,7 +3073,12 @@ mod tests {
         assert_eq!(shown(a.tab()), ["c.txt", "b.txt", "a.txt"], "Z to A, as the rules say");
         a.run(Command::SortBy(SortKey::Name));
         assert_eq!(shown(a.tab()), ["a.txt", "b.txt", "c.txt"]);
-        assert!(a.note().is_some_and(|n| n.contains("for now")));
+        assert_eq!(a.note(), Some("Sorted by Name."));
+        // A click on the note: the custom order again.
+        a.back_to_custom_order();
+        assert_eq!(shown(a.tab()), ["c.txt", "b.txt", "a.txt"]);
+        assert!(a.note().is_none() && a.tab().custom_here().is_some());
+        a.run(Command::SortBy(SortKey::Name));
         // Read again (F5): still the column.
         apply_listing(a.tab_mut(), listing(&["b.txt", "a.txt", "c.txt"]));
         assert_eq!(shown(a.tab()), ["a.txt", "b.txt", "c.txt"]);
@@ -3183,6 +3265,35 @@ mod tests {
         a.tabs.iter().map(|t| t.path.clone()).collect()
     }
 
+    /// A pinned tab's Back and Forward places are saved (the nearest 50 each way) and read back;
+    /// another tab's aren't, and neither are a tab set's.
+    #[test]
+    fn a_pinned_tabs_back_and_forward_come_back_after_a_restart() {
+        let mut app = with_tabs(&["C:\\b"]);
+        app.tabs[0].pinned = true;
+        app.tabs[0].back = (0..60).map(|n| format!("C:\\back {n}")).collect();
+        app.tabs[0].forward = vec!["C:\\later".into(), "C:\\next".into()];
+        app.tabs[1].back = vec!["C:\\old".into()];
+        app.tabs[1].forward = vec!["C:\\new".into()];
+        let saved = serde_json::from_str::<Settings>(&app.snapshot().to_json()).unwrap().tabs;
+        assert_eq!(saved[0].back.len(), settings::HISTORY_SAVED);
+        assert_eq!((saved[0].back.first().map(String::as_str), saved[0].back.last().map(String::as_str)), (Some("C:\\back 10"), Some("C:\\back 59")));
+        assert_eq!(saved[0].forward, ["C:\\later", "C:\\next"]);
+        assert!(saved[1].back.is_empty() && saved[1].forward.is_empty());
+        // Back after the restart goes to the place before, Forward to the one after.
+        let mut again = with_tabs(&[]);
+        again.tabs[0].path = saved[0].path.clone();
+        (again.tabs[0].back, again.tabs[0].forward) = (saved[0].back.clone(), saved[0].forward.clone());
+        again.back();
+        assert_eq!(again.tab().path, "C:\\back 59");
+        again.forward();
+        again.forward();
+        assert_eq!(again.tab().path, "C:\\next");
+        // A tab set keeps none.
+        save_set(&mut app, "Work");
+        assert!(app.settings.tab_sets.iter().flat_map(|s| &s.tabs).all(|t| t.back.is_empty() && t.forward.is_empty()));
+    }
+
     #[test]
     fn pinned_tabs_survive_every_way_of_closing_but_their_own_menu() {
         let mut app = with_tabs(&["C:\\b", "C:\\c", "C:\\d"]);
@@ -3332,7 +3443,7 @@ mod tests {
     #[test]
     fn a_huge_tab_set_of_folders_that_are_gone_opens_without_reading_them_all() {
         let mut app = with_tabs(&[]);
-        let tabs: Vec<_> = (0..300).map(|n| SavedTab { path: format!("Z:\\no such folder {n}\\\u{1F600} \u{e9}#."), sort_column: 0, sort_descending: false, view: None, pinned: false }).collect();
+        let tabs: Vec<_> = (0..300).map(|n| SavedTab { path: format!("Z:\\no such folder {n}\\\u{1F600} \u{e9}#."), sort_column: 0, sort_descending: false, view: None, pinned: false, back: Vec::new(), forward: Vec::new() }).collect();
         app.settings.tab_sets.push(settings::TabSet { name: "Big".into(), tabs });
         app.run(Command::OpenTabSet(0));
         assert_eq!(app.tabs.len(), 301);

@@ -119,7 +119,7 @@ enum Item {
     Known(usize),
     /// The Recycle Bin, in Quick access.
     Bin,
-    /// "Right-click to show items again", when every Quick access place was removed.
+    /// "Right-click to bring items back", when every Quick access place was removed.
     QuickHint,
     /// "Pinned" (a title; folders dropped on it are pinned).
     PinnedHeading,
@@ -745,7 +745,7 @@ impl Sidebar {
         let folder_tail = |items: &mut Vec<MenuItem>| {
             items.push(MenuItem::separator());
             items.push(MenuItem::new(PICK_COPY_PATH, "Copy path"));
-            items.push(MenuItem::new(PICK_EXPLORER, "Show in File Explorer"));
+            items.push(MenuItem::new(PICK_EXPLORER, "Open in File Explorer"));
             items.push(MenuItem::new(PICK_TERMINAL, "Open in terminal"));
             items.push(MenuItem::new(PICK_PROPERTIES, "Properties"));
         };
@@ -781,7 +781,7 @@ impl Sidebar {
             Item::QuickHeading | Item::QuickHint => items.extend(self.show_again_menu(app)),
             Item::Pin(i) => {
                 open(&mut items);
-                items.push(MenuItem::new(PICK_RENAME_PIN, "Rename\u{2026}"));
+                items.push(MenuItem::new(PICK_RENAME_PIN, "Rename"));
                 items.push(MenuItem::new(PICK_MOVE_UP, "Move up").disabled(i == 0));
                 items.push(MenuItem::new(PICK_MOVE_DOWN, "Move down").disabled(i + 1 >= app.settings.pinned.len()));
                 items.push(MenuItem::new(PICK_UNPIN, "Unpin from sidebar"));
@@ -794,7 +794,7 @@ impl Sidebar {
             }
             Item::PcHeading => {
                 open(&mut items);
-                items.push(MenuItem::new(PICK_EXPLORER, "Show in File Explorer"));
+                items.push(MenuItem::new(PICK_EXPLORER, "Open in File Explorer"));
             }
             Item::Drive(_) => {
                 let p = path.unwrap_or("");
@@ -999,7 +999,7 @@ impl Component for Sidebar {
                         r.stroke_rect(row, 1.0, theme.accent);
                     }
                     // Where the icons start (a hint has none), so it fits the narrow sidebar.
-                    let hint = if placed.item == Item::PinHint { "Ctrl+D or drop folders here" } else { "Right-click to show items again" };
+                    let hint = if placed.item == Item::PinHint { "Ctrl+D or drop folders here" } else { "Right-click to bring items back" };
                     let (x, w) = self.name_span(row);
                     let left = row.x + self.pad_left();
                     r.text(hint, Rect::new(left, y, w + x - left, row.h), &TextStyle::new(theme.muted));
@@ -1102,8 +1102,17 @@ impl Component for Sidebar {
             let page = (self.rect.h - self.row_h).max(self.row_h);
             return self.scroll_to(from + if e.pos.y < thumb.y { -page } else { page }, ctx.now);
         }
-        let Some(item) = self.item_at(e.pos).map(|i| self.items[i].item) else { return Effect::None };
+        let Some(at) = self.item_at(e.pos) else { return Effect::None };
+        let item = self.items[at].item;
         let path = self.path_of(item, app).map(str::to_string);
+        // A drive's usage bar (under its name): Disk space for that drive.
+        if let (MouseButton::Left, Item::Drive(i), Some(root)) = (e.button, item, path.as_ref()) {
+            let name_h = if self.panels { self.items[at].h - PANEL_BAR_H - 8.0 } else { self.drive_text_h() };
+            let below_name = e.pos.y - self.rect.y + self.scroll >= self.items[at].top + name_h;
+            if below_name && app.drives.get(i).and_then(usage).is_some() {
+                return Effect::Command(Command::DiskSpace(Some(root.clone())));
+            }
+        }
         match (e.button, path) {
             (MouseButton::Left, Some(path)) => Effect::Command(Command::Navigate(path)),
             (MouseButton::Middle, Some(path)) => Effect::Command(Command::NewTabAt(path)),
@@ -1188,11 +1197,11 @@ impl Component for Sidebar {
             }
             PICK_UNPIN => {
                 app.unpin(&path);
-                app.say(format!("Unpinned {}", app.display_name(&path)));
+                app.say(format!("Unpinned {}.", app.display_name(&path)));
                 Effect::Redraw
             }
             PICK_COPY_PATH => {
-                app.say(if shell::copy_text(ctx.hwnd, &path) { "Path copied" } else { "Couldn't copy (the clipboard is busy)" });
+                app.say(if shell::copy_text(ctx.hwnd, &path) { "Path copied." } else { "Failed to copy. Try again in a moment." });
                 Effect::Redraw
             }
             PICK_EXPLORER => {
@@ -1204,7 +1213,7 @@ impl Component for Sidebar {
             PICK_PROPERTIES => {
                 // Windows' Properties window for the folder, drive or Recycle Bin (shellmenu.rs).
                 if !crate::shellmenu::properties(ctx.hwnd, vec![path]) {
-                    app.say("Windows couldn't show the properties right now");
+                    app.say("Windows couldn't show the properties right now. Try again.");
                 }
                 Effect::Redraw
             }

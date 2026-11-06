@@ -13,7 +13,7 @@ use crate::folder::{format_count, format_size};
 use crate::pathbar::{fill_box_paint, outline_box};
 use crate::render::{Align, Renderer, TextStyle};
 use crate::theme::{size, Theme};
-use crate::ui::{Component, Ctx, Rect};
+use crate::ui::{Component, CursorKind, Ctx, Effect, MouseButton, MouseEvent, Point, Rect};
 
 const PAD: f32 = 12.0;
 /// 98 / 2000: the last pane, saying where the folder is (My Computer, or Local intranet).
@@ -22,6 +22,9 @@ const ZONE_W: f32 = 130.0;
 #[derive(Default)]
 pub struct StatusBar {
     rect: Rect,
+    /// Where the left text was drawn at the last frame (a click there, while a column sorts the
+    /// folder for now, goes back to the custom order).
+    left: Rect,
 }
 
 /// Glint's memory use, three ways, in bytes.
@@ -248,7 +251,7 @@ impl Component for StatusBar {
         if let Some(version) = &app.update_needed {
             r.fill_rect(self.rect, crate::theme::Color::hex(0xc42b1c));
             let style = TextStyle::new(crate::theme::Color::hex(0xffffff)).semibold();
-            let text = format!("Update needed: Glint {version} fixes a problem in your version. Glint tries again at the next start.");
+            let text = format!("Update needed: Glint {version} fixes a problem in this version. It will try again next time Glint starts.");
             r.text(&text, self.rect.inset(PAD, 0.0), &style);
             return;
         }
@@ -274,7 +277,8 @@ impl Component for StatusBar {
                 r.text(words, Rect::new(icon.right() + 5.0, pane.y, (pane.right() - icon.right() - 8.0).max(0.0), pane.h), &style);
             }
             r.text(&right, Rect::new(inner.right() - right_w - 1.0, inner.y, right_w + 1.0, inner.h), &style.align(Align::Right));
-            r.text(&Self::left_text(app), Rect::new(inner.x, inner.y, (split - inner.x - 8.0).max(0.0), inner.h), &style);
+            self.left = Rect::new(inner.x, inner.y, (split - inner.x - 8.0).max(0.0), inner.h);
+            r.text(&Self::left_text(app), self.left, &style);
             return;
         }
         r.fill_paint(self.rect, 0.0, &theme.statusbar_paint);
@@ -290,7 +294,32 @@ impl Component for StatusBar {
         let right_w = r.measure(&right, &style).min(self.rect.w * 0.6);
         let inner = self.rect.inset(PAD, 0.0);
         r.text(&right, Rect::new(inner.right() - right_w - 1.0, inner.y, right_w + 1.0, inner.h), &style.align(Align::Right));
-        r.text(&Self::left_text(app), Rect::new(inner.x, inner.y, inner.w - right_w - 16.0, inner.h), &style);
+        self.left = Rect::new(inner.x, inner.y, inner.w - right_w - 16.0, inner.h);
+        r.text(&Self::left_text(app), self.left, &style);
+    }
+
+    fn cursor(&self, p: Point, app: &AppState) -> CursorKind {
+        if self.back_to_custom(p, app) {
+            CursorKind::Hand
+        } else {
+            CursorKind::Arrow
+        }
+    }
+
+    fn mouse_down(&mut self, _ctx: &Ctx, e: &MouseEvent, app: &mut AppState) -> Effect {
+        if e.button == MouseButton::Left && self.back_to_custom(e.pos, app) {
+            app.back_to_custom_order();
+            return Effect::Redraw;
+        }
+        Effect::None
+    }
+}
+
+impl StatusBar {
+    /// Whether `p` is on "Sorted by Name." or "Column for now": a column sorts the folder for now,
+    /// in place of the custom sort order.
+    fn back_to_custom(&self, p: Point, app: &AppState) -> bool {
+        app.update_needed.is_none() && app.custom_order_waits() && self.left.contains(p)
     }
 }
 

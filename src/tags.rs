@@ -326,6 +326,15 @@ impl Tags {
         binned.extend(paths.iter().map(|p| key(p.trim_end_matches('\\'))));
     }
 
+    /// Glint's files moved (Settings > About > Portable): the tags are kept in `file` from now on,
+    /// and read from there at the next `refresh`. (Kept in memory only, they stay so.)
+    pub fn kept_in(&mut self, file: PathBuf) {
+        if self.file.as_ref().is_some_and(|f| *f != file) {
+            self.file = Some(file);
+            self.stamp = None;
+        }
+    }
+
     /// Reads the file again when another window wrote it since (this one came to the front).
     /// Whether the tags changed.
     pub fn refresh(&mut self) -> bool {
@@ -386,7 +395,7 @@ impl Tags {
             // now is never written over: the changes wait for the next try.)
             let mut read = match read_file(&file) {
                 Ok(read) => read,
-                Err(e) => return self.trouble(format!("Couldn't save the colour tags: {} couldn't be read ({e}).", file.display())),
+                Err(e) => return self.trouble(format!("Failed to save the colour tags: {} couldn't be read ({e}).", file.display())),
             };
             for c in &self.pending {
                 c.apply(&mut read);
@@ -401,7 +410,7 @@ impl Tags {
                     log::error(&format!("The colour tags could be saved again ({}).", file.display()));
                 }
             }
-            Err(e) => self.trouble(format!("Couldn't save the colour tags to {}: {e}", file.display())),
+            Err(e) => self.trouble(format!("Failed to save the colour tags to {}: {e}", file.display())),
         }
     }
 

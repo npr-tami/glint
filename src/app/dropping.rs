@@ -77,8 +77,8 @@ impl AppState {
         let note = match (pinned.as_slice(), folders.len()) {
             (_, 0) => "Only folders can be pinned.".to_string(),
             ([], _) => "Already pinned.".to_string(),
-            ([one], _) => format!("Pinned \u{201c}{one}\u{201d}"),
-            (many, _) => format!("Pinned {} folders", many.len()),
+            ([one], _) => format!("Pinned \u{201c}{one}\u{201d}."),
+            (many, _) => format!("Pinned {} folders.", many.len()),
         };
         self.say(note);
     }

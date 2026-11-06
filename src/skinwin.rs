@@ -142,6 +142,9 @@ const PLACE_H: f32 = 124.0;
 const PICTURE_HINT: &str = "None";
 /// What the Logo box says while it's empty: no word means the chrome wordmark.
 const LOGO_HINT: &str = "GLINT";
+/// The box above the colours that finds them by name: its width, and what it says while empty.
+const SEARCH_W: f32 = 220.0;
+const SEARCH_HINT: &str = "Find a colour";
 /// What Glint couldn't understand in the skin's text, under the text.
 const NOTES_H: f32 = 86.0;
 /// At most this many problems are listed under the skin's text (then "and N more").
@@ -172,19 +175,20 @@ const GUIDE: &[&str] = &[
     "A colour is #rrggbb, #rrggbbaa (see-through), another colour's name, or none.",
     "Anything left out comes from AMD Radeon, or AMD Radeon (Light) for a light skin.",
     "Moss and Moss (Light) pair up by name. Other names need a twin line.",
-    "A line starting with // is a note. Ctrl+/ makes one, and back.",
+    "// starts a note. Ctrl+/ adds or removes it.",
     "Ctrl+Space shows what fits. Alt+Up and Alt+Down move a line.",
 ];
 
 /// The guide's second column: gradients, numbers and wallpapers.
 const GUIDE_PICTURES: &[&str] = &[
-    "A gradient: colours with commas between, top to bottom.",
+    "Fade one colour into another: put commas between them. Example:",
     "|title-bar: #ff0000, #0000ff",
-    "Numbers have a smallest and a biggest. The faint words after a line say them.",
+    "Every number has a lowest and highest value.",
+    "The faint text after a line shows them.",
     "A wallpaper is a picture behind the files:",
     "|wallpaper: beach.jpg         // next to the skin",
     "|wallpaper-opacity: 50        // 0 to 100",
-    "|wallpaper-fit: fill          // whole, stretch, tile",
+    "|wallpaper-fit: fill  // whole, stretch, tile, actual",
     "|wallpaper-position: 50% 50%  // across, down",
     "|wallpaper-zoom: 0            // -500 to 500",
     "|wallpaper-size: 50%          // of the list's width",
@@ -273,7 +277,7 @@ const COLOURS: [(&str, &str); 75] = [
     ("sidebar-text", "Sidebar names"),
     ("sidebar-panel", "Sidebar panels"),
     ("panel-header", "Panel headers"),
-    ("panel-header-text", "Panel header text"),
+    ("panel-header-text", "Sidebar heading text"),
     ("sidebar-selection", "Sidebar selection"),
     ("sidebar-selection-text", "Sidebar selection text"),
     // File list
@@ -282,9 +286,9 @@ const COLOURS: [(&str, &str); 75] = [
     ("list-header-text", "Column title text"),
     ("column-line", "Lines between columns"),
     ("selection", "Selected rows"),
-    ("selection-edge", "Selected row edge"),
+    ("selection-edge", "Selected row left edge"),
     ("selection-text", "Selected row text"),
-    ("selection-border", "Selected row edges"),
+    ("selection-border", "Selected row outline"),
     // Scroll bars
     ("scrollbar", "Scroll bars"),
     ("scrollbar-hover", "Scroll bars hover"),
@@ -300,9 +304,9 @@ const COLOURS: [(&str, &str); 75] = [
     ("usage-fill", "Usage bar fill"),
     // Menus
     ("menu", "Menus"),
-    ("menu-text", "Menu words"),
+    ("menu-text", "Menu text"),
     ("menu-selection", "Menu item hover"),
-    ("menu-selection-text", "Menu item hover words"),
+    ("menu-selection-text", "Menu item hover text"),
     ("menu-border", "Menu edge"),
     // 3D edges
     ("bevel-highlight", "3D edge, lit outside"),
@@ -395,6 +399,8 @@ enum Ctl {
     /// Where it sits: the pad (across and down at once), the 3x3 squares and the two numbers.
     Place,
     Slide(Slide),
+    /// The box above the colours: only colours whose name has what's typed in it show.
+    Search,
 }
 
 /// A wallpaper slider.
@@ -500,6 +506,8 @@ enum Editing {
     Picture(String),
     /// A slider's number typed in its box, with the value before (Esc puts it back).
     Number(Slide, f32),
+    /// The search above the colours, with what it was before (Esc puts it back).
+    Search(String),
 }
 
 /// A slider being dragged: which, and the skin's text before the drag (taken at its first
@@ -695,6 +703,8 @@ pub struct SkinWindow {
     edit_at: Option<Rect>,
     /// The one-line box was just given its text and isn't in its place yet.
     edit_fresh: bool,
+    /// What the search above the colours has in it (empty: every colour shows).
+    colour_search: String,
     /// "Show as text": the skin's text, typed like code (codebox.rs), instead of the controls.
     advanced: bool,
     code: CodeBox,
@@ -854,6 +864,7 @@ pub fn create(owner: HWND, theme: &Theme) -> Option<SkinWindow> {
             editing: None,
             editing_for: None,
             edit_at: None,
+            colour_search: String::new(),
             edit_fresh: false,
             advanced: false,
             code: CodeBox::default(),
@@ -1221,7 +1232,7 @@ enum Said {
 fn note_lines(notes: &[skin::Note], built_in: bool, room: usize) -> Vec<(String, Said, usize)> {
     let mut lines = Vec::new();
     if built_in {
-        lines.push(("Built-in skins can't be edited here. DUPLICATE makes a copy you can edit.".to_string(), Said::Plain, 0));
+        lines.push(("Default skins are read-only. Press DUPLICATE to make your own copy.".to_string(), Said::Plain, 0));
     }
     if notes.is_empty() {
         lines.push(("Every line is understood.".to_string(), Said::Quiet, 0));
@@ -1236,7 +1247,11 @@ fn note_lines(notes: &[skin::Note], built_in: bool, room: usize) -> Vec<(String,
     }
     let more = notes.len() - shown;
     if more > 0 {
-        let line = if shown == 0 { format!("{more} line(s) Glint couldn't understand: see the red marks.") } else { format!("\u{2026}and {more} more.") };
+        let line = match (shown, more) {
+            (0, 1) => "Mistake in 1 line (marked in red).".to_string(),
+            (0, _) => format!("Mistakes in {more} lines (marked in red)."),
+            _ => format!("\u{2026}and {more} more."),
+        };
         lines.push((line, if shown == 0 { Said::Problem } else { Said::Quiet }, 0));
     }
     // (A window too short for even one problem: the problems before the built-in line.)
@@ -1788,6 +1803,7 @@ impl SkinWindow {
                 Some(Rect::new(right - DROPDOWN_W, mid(ksize::FIELD_H), DROPDOWN_W, ksize::FIELD_H))
             }
             (Ctl::LogoText, Part::Main) => Some(Rect::new(right - LOGO_FIELD_W, mid(ksize::FIELD_H), LOGO_FIELD_W, ksize::FIELD_H)),
+            (Ctl::Search, Part::Main) => Some(Rect::new(right - SEARCH_W, mid(ksize::FIELD_H), SEARCH_W, ksize::FIELD_H)),
             // The wallpaper: NONE, BROWSE… and its name.
             (Ctl::Picture, Part::Hex) => Some(Rect::new(right - HEX_W, mid(ksize::FIELD_H), HEX_W, ksize::FIELD_H)),
             (Ctl::Picture, Part::Main) => Some(Rect::new(right - HEX_W - 8.0 - BROWSE_W, mid(ksize::FIELD_H), BROWSE_W, ksize::FIELD_H)),
@@ -1881,13 +1897,13 @@ impl SkinWindow {
         let mut y = 6.0 + GROUP_H;
         let entries = app.skins.entries();
         for e in entries.iter().filter(|e| e.built_in()) {
-            items.push(Item { id: e.id.clone(), name: e.name.clone(), rect: Rect::new(0.0, y, LIST_W, ITEM_H) });
+            items.push(Item { id: e.id.clone(), name: app.skins.shown_name(e), rect: Rect::new(0.0, y, LIST_W, ITEM_H) });
             y += ITEM_H;
         }
         y += 10.0 + GROUP_H;
         let own_top = y;
         for e in entries.iter().filter(|e| !e.built_in()) {
-            items.push(Item { id: e.id.clone(), name: e.name.clone(), rect: Rect::new(0.0, y, LIST_W, ITEM_H) });
+            items.push(Item { id: e.id.clone(), name: app.skins.shown_name(e), rect: Rect::new(0.0, y, LIST_W, ITEM_H) });
             y += ITEM_H;
         }
         if y == own_top {
@@ -1945,14 +1961,14 @@ impl SkinWindow {
             (Ctl::Caption, "Window buttons", ""),
             (Ctl::Tabs, "Tabs", ""),
             (Ctl::Sidebar, "Sidebar", ""),
-            (Ctl::Grip, "Scrollbar grip", ""),
+            (Ctl::Grip, "Scroll bar grip", ""),
             (Ctl::Era, "Older Windows", ""),
             (Ctl::Icons, "Icons", ""),
         ];
         card("Style", &style, &mut y, &mut blocks, &mut rows);
         let wallpaper = [
             (Ctl::Picture, "Picture", ""),
-            (Ctl::Thumbs, "Nearby", "Click one to use it"),
+            (Ctl::Thumbs, "Nearby", ""),
             (Ctl::Fit, "Fit", ""),
             (Ctl::Place, "Position", "Drag the picture"),
             (Ctl::Slide(Slide::Across), "Across (X)", ""),
@@ -1963,9 +1979,14 @@ impl SkinWindow {
             (Ctl::Slide(Slide::Fade), "Soft edges", ""),
         ];
         card("Wallpaper", &wallpaper, &mut y, &mut blocks, &mut rows);
+        // The search, then the colours whose name has what it says (a group with none is left out).
+        card("Colours", &[(Ctl::Search, "Search", "")], &mut y, &mut blocks, &mut rows);
         let mut from = 0;
         for (title, n) in COLOUR_GROUPS {
-            card(title, &colours[from..from + n], &mut y, &mut blocks, &mut rows);
+            let found: Vec<_> = colours[from..from + n].iter().copied().filter(|(_, t, _)| found_by(t, &self.colour_search)).collect();
+            if !found.is_empty() {
+                card(title, &found, &mut y, &mut blocks, &mut rows);
+            }
             from += n;
         }
         self.rows = rows;
@@ -2147,7 +2168,16 @@ impl SkinWindow {
         }
         if let Some((said, problem)) = &self.status {
             let color = if *problem { theme.accent } else { theme.text };
-            r.text(said, Rect::new(x, line_y, w + 110.0, NOTE_LINE), &TextStyle::new(color).size(ksize::NOTE_FONT).semibold());
+            let style = TextStyle::new(color).size(ksize::NOTE_FONT).semibold();
+            // A long message goes on as many lines as the header has room for.
+            let room = (((h.bottom() - 2.0 - line_y) / NOTE_LINE).floor() as usize).max(1);
+            let lines = kit::wrap(r, said, &style, w + 110.0);
+            let shown = lines.len().min(room);
+            for (n, line) in lines.iter().take(shown).enumerate() {
+                // (The last line that fits takes the rest, cut short with "…".)
+                let text = if n + 1 == shown { lines[n..].join(" ") } else { line.clone() };
+                r.text(&text, Rect::new(x, line_y + n as f32 * NOTE_LINE, w + 110.0, NOTE_LINE), &style);
+            }
         }
         // "Show as text", and its switch.
         let label = Rect::new(t.x - 110.0, t.y - 2.0, 102.0, t.h + 4.0);
@@ -2319,7 +2349,7 @@ impl SkinWindow {
             // The Logo setting isn't the skin's: it can always be changed.
             // How the wallpaper looks means nothing until it has a picture.
             let enabled = enabled && (has_picture || !matches!(row.ctl, Ctl::Fit | Ctl::Slide(_) | Ctl::Place));
-            let main_look = self.look_of(row.ctl, Part::Main, enabled || row.ctl == Ctl::Logo);
+            let main_look = self.look_of(row.ctl, Part::Main, enabled || matches!(row.ctl, Ctl::Logo | Ctl::Search));
             let hex_look = self.look_of(row.ctl, Part::Hex, enabled);
             let clear = self.part_rect(&row, Part::Clear).map(shift);
             let picture = if row.ctl == Ctl::Picture { app.skins.find(&app.settings.skin).map(|e| picture_of(&e.text)).unwrap_or_default() } else { String::new() };
@@ -2364,6 +2394,16 @@ impl SkinWindow {
                             // it while typing).
                             let grey = if main_look.enabled { theme.muted } else { theme.muted.with_alpha(theme.muted.a * 0.38) };
                             r.text(LOGO_HINT, Rect::new(m.x + 8.0, m.y, (m.w - 16.0).max(0.0), m.h), &TextStyle::new(grey));
+                        }
+                    }
+                }
+                Ctl::Search => {
+                    if let Some(m) = main {
+                        let editing = matches!(self.editing, Some(Editing::Search(_)));
+                        let typed = self.colour_search.as_str();
+                        kit::field(r, theme, m, (!editing && !typed.is_empty()).then_some(typed), editing, main_look);
+                        if !editing && typed.is_empty() {
+                            r.text(SEARCH_HINT, Rect::new(m.x + 8.0, m.y, (m.w - 16.0).max(0.0), m.h), &TextStyle::new(theme.muted));
                         }
                     }
                 }
@@ -2503,6 +2543,7 @@ impl SkinWindow {
         let want = match &self.editing {
             Some(Editing::Hex(i, _)) => self.rows.iter().find(|r| r.ctl == Ctl::Colour(*i)).and_then(|r| self.part_rect(r, Part::Hex)).map(|r| self.on_page(r)),
             Some(Editing::LogoText(_)) => self.rows.iter().find(|r| r.ctl == Ctl::LogoText).and_then(|r| self.part_rect(r, Part::Main)).map(|r| self.on_page(r)),
+            Some(Editing::Search(_)) => self.rows.iter().find(|r| r.ctl == Ctl::Search).and_then(|r| self.part_rect(r, Part::Main)).map(|r| self.on_page(r)),
             Some(Editing::Picture(_)) => self.rows.iter().find(|r| r.ctl == Ctl::Picture).and_then(|r| self.part_rect(r, Part::Hex)).map(|r| self.on_page(r)),
             Some(Editing::Number(s, _)) => self.rows.iter().find(|r| r.ctl == Ctl::Slide(*s)).and_then(|r| self.part_rect(r, Part::Hex)).map(|r| self.on_page(r)),
             Some(Editing::Rename(id)) => self.items.iter().find(|i| i.id == *id).map(|i| self.item_on_screen(i.rect).inset(6.0, 3.0)),
@@ -3227,7 +3268,11 @@ impl SkinWindow {
         let new = app.skins.add(&name, &text);
         self.forget_steps(&new);
         app.pick_skin(&new);
-        self.say(format!("Made {name}, your copy of {from_name}"), false);
+        // A box open for the built-in skin types on into the copy (its next letters too).
+        if self.editing_for.as_ref().is_some_and(|(for_id, _)| *for_id == id) {
+            self.editing_for = Some((new.clone(), text));
+        }
+        self.say(format!("Made {name}, your copy of {from_name}."), false);
         self.layout_dirty = true;
         Some(new)
     }
@@ -3337,8 +3382,8 @@ impl SkinWindow {
 
     /// A control was clicked, or Space / Enter was pressed on it.
     fn activate(&mut self, ctl: Ctl, part: Part, app: &mut AppState) -> Vec<Ask> {
-        // (The Logo setting isn't the skin's: it works whatever the skin.)
-        if app.skins.find(&app.settings.skin).is_none() && ctl != Ctl::Logo {
+        // (The Logo setting isn't the skin's: it works whatever the skin. So does the search.)
+        if app.skins.find(&app.settings.skin).is_none() && !matches!(ctl, Ctl::Logo | Ctl::Search) {
             return Vec::new();
         }
         let anchor = self.rows.iter().find(|r| r.ctl == ctl).and_then(|r| self.part_rect(r, part)).map(|r| self.on_page(r));
@@ -3371,6 +3416,11 @@ impl SkinWindow {
             }
             (Ctl::LogoText, _) => {
                 self.start_editing(Editing::LogoText(t.logo_text.clone()), &t.logo_text, app);
+                Vec::new()
+            }
+            (Ctl::Search, _) => {
+                let typed = self.colour_search.clone();
+                self.start_editing(Editing::Search(typed.clone()), &typed, app);
                 Vec::new()
             }
             (Ctl::Dark, _) => {
@@ -3497,9 +3547,11 @@ impl SkinWindow {
             return asks;
         }
         if path.is_dir() {
-            self.say(format!("\u{201c}{name}\u{201d} is a folder, not a picture"), true);
+            self.say(format!("\u{201c}{name}\u{201d} is a folder, not a picture."), true);
         } else {
-            self.say(format!("Can't find \u{201c}{name}\u{201d}: put it next to the skin, or pick it with BROWSE\u{2026}"), true);
+            // (Only the file's own name: a whole typed path doesn't fit under the skin's name.)
+            let file = name.rsplit(['\\', '/']).next().filter(|f| !f.is_empty()).unwrap_or(name);
+            self.say(format!("Can't find \u{201c}{file}\u{201d}: put it next to the skin, or use BROWSE\u{2026} to pick it."), true);
         }
         asks
     }
@@ -3567,12 +3619,22 @@ impl SkinWindow {
         self.change(app, &changes)
     }
 
+    /// Shows only the colours whose name has `typed` in it (all of them for nothing).
+    fn search_colours(&mut self, typed: String) {
+        if typed != self.colour_search {
+            self.colour_search = typed;
+            self.layout_dirty = true;
+            self.invalidate();
+        }
+    }
+
     /// Shows the one-line box with `text` in it, for `what`.
     fn start_editing(&mut self, what: Editing, text: &str, app: &AppState) {
         // Only the logo's word has a hint: empty means the chrome wordmark.
         self.edit_box.set_hint(match what {
             Editing::LogoText(_) => LOGO_HINT,
             Editing::Picture(_) => PICTURE_HINT,
+            Editing::Search(_) => SEARCH_HINT,
             _ => "",
         });
         self.editing = Some(what);
@@ -3601,7 +3663,7 @@ impl SkinWindow {
         let for_skin = self.editing_for.take();
         // Another skin in use now (Windows switched light or dark, its file changed): nothing that
         // was typed for the first one goes into it. (A rename names its skin itself.)
-        let asks = if matches!(what, Editing::Rename(_)) || self.still_for(app, for_skin.as_ref()) {
+        let asks = if matches!(what, Editing::Rename(_) | Editing::Search(_)) || self.still_for(app, for_skin.as_ref()) {
             self.finish_editing(what, typed, keep, for_skin.map(|f| f.1), app)
         } else {
             Vec::new()
@@ -3644,6 +3706,12 @@ impl SkinWindow {
                 }
                 Vec::new()
             }
+            Editing::Search(before) => {
+                if !keep {
+                    self.search_colours(before);
+                }
+                Vec::new()
+            }
             Editing::Number(_, _) if !keep => self.put_text_back(app, before_text),
             Editing::Number(s, before) => self.slide_to(s, typed_number(s, &typed).unwrap_or(before), app),
             Editing::Picture(before) => match typed_picture(&typed).filter(|_| keep) {
@@ -3657,7 +3725,7 @@ impl SkinWindow {
                 }
                 // (Its own name in other capitals - in any letters, "élan" to "Élan" - is fine.)
                 if !app.skins.may_rename(&id, &name) {
-                    self.say(format!("There's a skin called \u{201c}{name}\u{201d} already"), true);
+                    self.say(format!("There's a skin called \u{201c}{name}\u{201d} already."), true);
                     return Vec::new();
                 }
                 if let Some(new_id) = app.skins.rename(&id, &name) {
@@ -3679,7 +3747,7 @@ impl SkinWindow {
                     } else {
                         app.apply_skin();
                     }
-                    self.say(format!("Renamed to {name}"), false);
+                    self.say(format!("Renamed to {name}."), false);
                 }
                 self.layout_dirty = true;
                 vec![Ask::RedrawMain]
@@ -3712,14 +3780,14 @@ impl SkinWindow {
                 let Some(from) = app.skins.find(base).cloned() else { return Vec::new() };
                 let name = app.skins.free_name("My skin");
                 let id = app.skins.add(&name, &skin::copy_text(&from.text, &name, &from.name));
-                self.say(format!("Made {name} from {}", from.name), false);
+                self.say(format!("Made {name} from {}.", from.name), false);
                 self.after_new(app, &id)
             }
             Btn::Duplicate => {
                 let Some(from) = current else { return Vec::new() };
                 let name = app.skins.free_name(&format!("{} copy", from.name));
                 let id = app.skins.add(&name, &skin::copy_text(&from.text, &name, &from.name));
-                self.say(format!("Made {name}, a copy of {}", from.name), false);
+                self.say(format!("Made {name}, a copy of {}.", from.name), false);
                 self.after_new(app, &id)
             }
             Btn::Rename => {
@@ -3834,7 +3902,7 @@ impl SkinWindow {
                         self.current_pic = current_pic;
                         if too_big {
                             let name = std::path::Path::new(&current).file_name().map_or_else(|| current.clone(), |n| n.to_string_lossy().into_owned());
-                            self.say(format!("\u{201c}{name}\u{201d} is too big for a wallpaper (over 100 megapixels)"), true);
+                            self.say(format!("\u{201c}{name}\u{201d} is too big for a wallpaper (over 100 megapixels)."), true);
                         }
                     }
                 }
@@ -3860,6 +3928,11 @@ impl SkinWindow {
                 // Colours and the logo show as they're typed (a colour once it's whole) - in the
                 // skin the box was opened for only.
                 let typed = self.edit_box.text();
+                // The search finds colours as it's typed, whatever the skin.
+                if matches!(self.editing, Some(Editing::Search(_))) {
+                    self.search_colours(typed);
+                    return Vec::new();
+                }
                 if !self.still_for(app, self.editing_for.as_ref()) {
                     return Vec::new();
                 }
@@ -3971,7 +4044,7 @@ impl SkinWindow {
             JobDone::Export(path) => {
                 // The skin the dialog was opened for, even if another was picked meanwhile.
                 let id = self.dialog_for.take().unwrap_or_else(|| app.settings.skin.clone());
-                self.say(format!("Exporting to {}\u{2026}", path.display()), false);
+                self.say(format!("Exporting to {}\u{2026}.", path.display()), false);
                 app.skins.export(&id, path);
                 self.invalidate();
                 Vec::new()
@@ -4223,9 +4296,15 @@ fn swatch(r: &mut Renderer, theme: &Theme, rect: Rect, p: &Paint, look: Look) {
     }
 }
 
+/// Whether a colour called `title` is found by the search `typed` (in any capitals; spaces round
+/// it don't count, and nothing finds every colour).
+fn found_by(title: &str, typed: &str) -> bool {
+    title.to_lowercase().contains(&typed.trim().to_lowercase())
+}
+
 fn slant_label(v: f32) -> String {
     match v {
-        x if x < 0.5 => "0 (straight)".into(),
+        x if x < 0.5 => "0 (upright)".into(),
         x if (x - 8.0).abs() < 0.01 => "8 (AMD Radeon)".into(),
         x => number(x),
     }
@@ -4276,10 +4355,18 @@ mod tests {
     }
 
     #[test]
+    fn the_search_finds_colours_by_name() {
+        let found: Vec<&str> = COLOURS.iter().map(|(_, t)| *t).filter(|t| found_by(t, "scroll")).collect();
+        assert_eq!(found, ["Scroll bars", "Scroll bars hover", "Scroll bar track", "Scroll bar edges"]);
+        assert!(found_by("Accent", " ACC "));
+        assert!(COLOURS.iter().all(|(_, t)| found_by(t, "")));
+    }
+
+    #[test]
     fn labels_and_numbers() {
         assert_eq!(number(8.0), "8");
         assert_eq!(number(10.5), "10.5");
-        assert_eq!(slant_label(0.0), "0 (straight)");
+        assert_eq!(slant_label(0.0), "0 (upright)");
         assert_eq!(slant_label(8.0), "8 (AMD Radeon)");
         assert_eq!(row_label(28.0), "28 (standard)");
         assert_eq!(size_label(9.0), "9 pt (standard)");
@@ -4407,7 +4494,8 @@ mod tests {
         let lines = note_lines(&some_notes(3), true, 1);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].1, Said::Problem);
-        assert!(lines[0].0.starts_with('3'), "{}", lines[0].0);
+        assert_eq!(lines[0].0, "Mistakes in 3 lines (marked in red).");
+        assert_eq!(note_lines(&some_notes(1), true, 1)[0].0, "Mistake in 1 line (marked in red).");
         // A problem with no line (the skin as a whole) says no "Line 0".
         let lines = note_lines(&[skin::Note { line: 0, text: "whole".into() }], false, 5);
         assert_eq!(lines[0], ("whole".to_string(), Said::Problem, 0));

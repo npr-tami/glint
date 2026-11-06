@@ -2,12 +2,28 @@
 
 The newest version is at the top.
 
+## 1.0.24-beta.1 · 06/11/2026 15:03
+
+- Added Disk space (Ctrl+Shift+U): the biggest folders, what changed since your last scan, and space by type
+- Added opening Disk space by clicking a drive's usage bar in the sidebar
+- Added LATER and SKIP THIS VERSION buttons to the update window
+- Changed Portable mode to move Glint's files right away
+- Changed messages across Glint to be clearer
+- Fixed deleting in a very long folder path skipping the Recycle Bin without asking
+- Fixed a delete after Try Again not being undoable
+- Fixed the skin customiser's Logo text keeping only the first letter
+- Fixed a path typed in other capitals showing those capitals instead of the real names
+- Fixed two skins with the same name looking the same in the skin list
+- Improved many tabs: the tab row scrolls with the wheel, and the current tab and + stay in sight
+- Improved pinned tabs: they keep their Back and Forward places after a restart
+- Some other improvements and bugfixes
+
 ## 1.0.23-beta.1 · 31/10/2026 01:52
 
 - Added choices for how Settings looks, in Settings > Appearance > Settings window
 - Added a search box, a dot on changed settings and a Reset page button to Settings
 - Changed Settings to a small window, like File Explorer's Folder Options
-- Changed drop-downs and the SORT, VIEW and SETTINGS menus to drop down right under their button
+- Changed drop-downs and the SORT, VIEW and SETTINGS menus to open right under their buttons
 - Changed the built-in skins' text and the skin guide to be easier to read
 - Renamed Settings > Mouse & keys to Keys, with a list of every shortcut
 - Some other improvements and bugfixes
@@ -15,7 +31,7 @@ The newest version is at the top.
 ## 1.0.22-beta.1 · 25/10/2026 04:09
 
 - Added a Wallpaper section to the skin customiser
-- Changed new wallpapers to sit in the middle, at 50% strength
+- Changed new wallpapers to sit in the middle, at 50% opacity
 - Fixed a skin renamed to "X (Light)" not becoming X's light version
 - Some other improvements and bugfixes
 

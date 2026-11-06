@@ -18,64 +18,66 @@ pub struct SkinLang;
 
 /// The words a setting can be, with a few words about each.
 fn values_for(key: &str) -> &'static [(&'static str, &'static str)] {
-    const YES_NO: &[(&str, &str)] = &[("true", "On"), ("false", "Off")];
+    const YES_NO: &[(&str, &str)] = &[("true", "on"), ("false", "off")];
     match key {
-        "dark" => &[("true", "A dark skin"), ("false", "A light skin")],
+        "dark" => &[("true", "a dark skin"), ("false", "a light skin")],
         "scrollbar-grip" | "bevels" | "title-bar-across" => YES_NO,
-        "menus" => &[("dark", "Dark right-click menus"), ("light", "Light right-click menus")],
-        "shape" => &[("slanted", "Buttons lean"), ("straight", "Square buttons"), ("rounded", "Round corners")],
-        "buttons" => &[("flat", "Plain buttons"), ("liquid", "Glossy glass marbles and capsules")],
-        "caption-buttons" => &[("symbols", "Plain signs"), ("marbles", "Round glass buttons"), ("tiles", "Square tiles")],
-        "tabs" => &[("attached", "The current tab joins the toolbar"), ("pills", "Rounded tabs")],
-        "sidebar-style" => &[("plain", "One list"), ("panels", "Each group in a rounded panel")],
-        "era" => &[("none", "Today's Glint"), ("98", "Windows 98"), ("2000", "Windows 2000"), ("xp", "Windows XP"), ("7", "Windows 7")],
-        "icons" => &[("windows", "Today's icons"), ("classic", "Windows 98 / 2000"), ("xp", "Windows XP"), ("aero", "Windows 7")],
+        "menus" => &[("dark", "dark right-click menus"), ("light", "light right-click menus")],
+        "shape" => &[("slanted", "buttons lean"), ("straight", "square buttons"), ("rounded", "round corners")],
+        "buttons" => &[("flat", "plain buttons"), ("liquid", "glossy glass")],
+        "caption-buttons" => &[("symbols", "plain symbols"), ("marbles", "round glass buttons"), ("tiles", "square tiles")],
+        "tabs" => &[("attached", "the current tab joins the toolbar"), ("pills", "rounded tabs")],
+        "sidebar-style" => &[("plain", "one list"), ("panels", "each group in a rounded panel")],
+        "era" => &[("none", "today's Glint"), ("98", "Windows 98"), ("2000", "Windows 2000"), ("xp", "Windows XP"), ("7", "Windows 7")],
+        "icons" => &[("windows", "today's icons"), ("classic", "Windows 98 / 2000"), ("xp", "Windows XP"), ("aero", "Windows 7")],
         // Every corner and edge, then a side alone.
         "wallpaper-position" => &[
-            ("left top", "The top left corner"),
-            ("middle top", "The middle of the top"),
-            ("right top", "The top right corner"),
-            ("left middle", "The middle of the left side"),
-            ("middle", "The very middle"),
-            ("right middle", "The middle of the right side"),
-            ("left bottom", "The bottom left corner"),
-            ("middle bottom", "The middle of the bottom"),
-            ("right bottom", "The bottom right corner"),
-            ("left", "Keep the left side in view"),
-            ("right", "Keep the right side in view"),
-            ("50% 50%", "Across, then down, as percentages"),
+            ("left top", "the top left corner"),
+            ("middle top", "the middle of the top"),
+            ("right top", "the top right corner"),
+            ("left middle", "the middle of the left side"),
+            ("middle", "the very middle"),
+            ("right middle", "the middle of the right side"),
+            ("left bottom", "the bottom left corner"),
+            ("middle bottom", "the middle of the bottom"),
+            ("right bottom", "the bottom right corner"),
+            ("left", "keep the left side in view"),
+            ("right", "keep the right side in view"),
+            ("50% 50%", "across, then down, as percentages"),
         ],
-        "wallpaper-zoom" => &[("0", "Its usual size"), ("50", "Zoomed in a little"), ("100", "Twice as big"), ("-50", "Zoomed out a little"), ("-100", "Half as big")],
+        "wallpaper-zoom" => &[("0", "its usual size"), ("50", "zoomed in a little"), ("100", "twice as big"), ("-50", "zoomed out a little"), ("-100", "half as big")],
         "wallpaper-fit" => &[
-            ("fill", "Fills the list (cropped)"),
-            ("whole", "All of it, at its side"),
-            ("stretch", "Pulled to the list's shape"),
-            ("tile", "Repeated, at its own size"),
-            ("actual", "Once, at its own size"),
+            ("fill", "fills the list (cropped)"),
+            ("whole", ""),
+            ("stretch", "pulled to the list's shape"),
+            ("tile", "repeated, at its own size"),
+            ("actual", "once, at its own size"),
         ],
-        "wallpaper-size" => &[("25%", "A quarter of the list's width"), ("50%", "Half the list's width"), ("100%", "As wide as the list")],
-        "wallpaper-offset" => &[("0 0", "Where it's placed"), ("20 0", "20 to the right"), ("-20 0", "20 to the left"), ("0 20", "20 down"), ("0 -20", "20 up")],
-        "wallpaper-blur" => &[("0", "Sharp"), ("4", "A little"), ("12", "Soft"), ("30", "Very soft")],
-        "wallpaper-fade" => &[("0", "No fade"), ("10", "Soft edges"), ("25", "A wide fade"), ("50", "Fades from the middle")],
+        "wallpaper-size" => &[("25%", "a quarter of the list's width"), ("50%", "half the list's width"), ("100%", "as wide as the list")],
+        "wallpaper-offset" => &[("0 0", "where it's placed"), ("20 0", "20 to the right"), ("-20 0", "20 to the left"), ("0 20", "20 down"), ("0 -20", "20 up")],
+        "wallpaper-blur" => &[("0", "sharp"), ("4", "a little"), ("12", "soft"), ("30", "very soft")],
+        "wallpaper-fade" => &[("0", "no fade"), ("10", "soft edges"), ("25", "a wide fade"), ("50", "fades from the middle")],
         "font" | "title-font" => &[
             ("Segoe UI", "Windows' own"),
             ("Segoe UI Variable", "Windows 11's"),
             ("Tahoma", "Windows 2000 / XP"),
-            ("Verdana", "Wide and clear"),
-            ("Arial", "Plain"),
+            ("Verdana", "wide and clear"),
+            ("Arial", "plain"),
             ("Trebuchet MS", "XP's titles"),
-            ("Calibri", "Soft"),
-            ("Consolas", "Monospaced"),
+            ("Calibri", "soft"),
+            ("Consolas", "monospaced"),
         ],
-        "font-size" => &[("8pt", "Small"), ("9pt", "Standard"), ("10pt", "Bigger"), ("11pt", "Big"), ("12pt", "Bigger still"), ("14pt", "Biggest")],
-        "slant" | "path-slant" => &[("0", "Upright"), ("4", "A little"), ("8", "AMD Radeon's"), ("12", "More"), ("20", "The most")],
-        "radius" => &[("0", "Square"), ("4", "Slightly round"), ("8", "Round"), ("16", "Roundest")],
-        "row-height" => &[("24", "Tight"), ("28", "Standard"), ("32", "Roomy"), ("40", "Big")],
-        "sidebar-row-height" => &[("22", "Tight"), ("28", "Standard"), ("32", "Roomy")],
-        "tab-line-width" | "toolbar-line-width" => &[("0", "No line"), ("1", "Thin"), ("2", "Standard"), ("3", "Thick")],
-        "scrollbar-width" => &[("6", "Thin"), ("8", "Standard"), ("12", "Wide"), ("17", "Older Windows'")],
-        "see-through" => &[("0", "None"), ("30", "A little"), ("60", "Half"), ("90", "Most")],
-        "wallpaper-opacity" => &[("20", "Faint"), ("50", "Standard"), ("70", "Strong"), ("100", "Full")],
+        "font-size" => &[("8pt", "small"), ("9pt", "standard"), ("10pt", "a bit bigger"), ("11pt", "big"), ("12pt", "bigger"), ("14pt", "biggest")],
+        "slant" => &[("0", "upright"), ("4", "a little"), ("8", "AMD Radeon's"), ("12", "more"), ("20", "the most")],
+        "path-slant" => &[("0", "upright"), ("4", "a little"), ("6", "AMD Radeon's"), ("12", "more"), ("20", "the most")],
+        "radius" => &[("0", "square"), ("4", "slightly round"), ("8", "round"), ("16", "roundest")],
+        "row-height" => &[("24", "tight"), ("28", "standard"), ("32", "roomy"), ("40", "big")],
+        "sidebar-row-height" => &[("22", "tight"), ("28", "standard"), ("32", "roomy")],
+        "tab-line-width" => &[("0", "no line"), ("1", "thin"), ("3", "standard"), ("6", "thick")],
+        "toolbar-line-width" => &[("0", "no line"), ("1", "thin"), ("2", "standard"), ("3", "thick")],
+        "scrollbar-width" => &[("4", "thin"), ("6", "standard"), ("12", "wide"), ("17", "older Windows'")],
+        "see-through" => &[("0", "none"), ("30", "a little"), ("60", "half"), ("90", "most")],
+        "wallpaper-opacity" => &[("20", "faint"), ("50", "standard"), ("70", "strong"), ("100", "full")],
         _ => &[],
     }
 }
@@ -205,8 +207,8 @@ impl Lang for SkinLang {
                 .iter()
                 .filter(|(k, _)| *k != key)
                 .map(|(k, d)| (*k, *d))
-                .chain(std::iter::once(("none", "No colour")))
-                .map(|(k, d)| (k.to_string(), Suggestion { insert: k.to_string(), label: k.to_string(), hint: if k == "none" { d.to_string() } else { format!("Same as {k}: {}", d.to_lowercase()) } }))
+                .chain(std::iter::once(("none", "no colour")))
+                .map(|(k, d)| (k.to_string(), Suggestion { insert: k.to_string(), label: k.to_string(), hint: if k == "none" { d.to_string() } else { format!("same as {k}: {d}") } }))
                 .collect()
         } else {
             values_for(&key).iter().map(|(v, d)| (v.to_string(), Suggestion { insert: v.to_string(), label: v.to_string(), hint: d.to_string() })).collect()
@@ -289,7 +291,7 @@ mod tests {
     #[test]
     fn lines_are_explained_and_coloured() {
         let l = SkinLang;
-        assert_eq!(l.explain("accent: #ff0000").as_deref(), Some("Lines, selected rows' edge, switches"));
+        assert_eq!(l.explain("accent: #ff0000").as_deref(), Some("lines, selected rows' edge, switches"));
         assert!(l.explain("tab-line: accent").is_some_and(|s| s.ends_with("same as accent")));
         assert_eq!(l.explain("nonsense: 3"), None);
         assert_eq!(l.swatch("accent: #ff0000"), skin::parse_hex("#ff0000"));

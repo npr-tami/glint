@@ -31,8 +31,6 @@ use crate::watch::{self, Armed, Event, Watcher};
 
 /// At most this many open folders of the tab on screen are watched: the most recently opened.
 const MAX_WATCHED: usize = 16;
-/// At most this many folders can be open at once in one tab.
-const MAX_OPEN: usize = 256;
 
 /// A folder open in the tree.
 #[derive(Debug)]
@@ -144,6 +142,8 @@ pub(super) fn nest(folder: &Folder, tree: &Tree, view: &mut Vec<u32>) {
         };
         under.entry(parent).or_default().push(i);
     }
+    // (Looked up once: any number of folders can be open.)
+    let open: HashSet<&str> = tree.open.iter().map(|b| b.key.as_str()).collect();
     let mut out = Vec::with_capacity(view.len());
     let mut stack = vec![under.remove("").unwrap_or_default().into_iter()];
     while let Some(level) = stack.last_mut() {
@@ -155,7 +155,7 @@ pub(super) fn nest(folder: &Folder, tree: &Tree, view: &mut Vec<u32>) {
         let e = &folder.entries[i as usize];
         if e.is_container() {
             let k = key(&e.path_in(&folder.path));
-            if tree.open.iter().any(|b| b.key == k) {
+            if open.contains(k.as_str()) {
                 if let Some(items) = under.remove(&k) {
                     stack.push(items.into_iter());
                 }
@@ -323,9 +323,9 @@ impl AppState {
         }
         let n = ViewMode::ALL.iter().position(|(v, _)| *v == mode).unwrap_or(0) + 1;
         if ruled {
-            self.say(format!("{} (Ctrl+Shift+{n}) for now: the view rules give this folder its own view", mode.name()));
+            self.say(format!("This folder has a custom view. Showing {} for now.", mode.name()));
         } else {
-            self.say(format!("{} (Ctrl+Shift+{n}) for this folder", mode.name()));
+            self.say(format!("{} (Ctrl+Shift+{n}) for this folder.", mode.name()));
         }
     }
 
@@ -362,10 +362,6 @@ impl AppState {
         let Some(e) = t.folder.entries.get(index).filter(|e| e.is_container()) else { return false };
         let path = e.path_in(&t.folder.path);
         if t.tree.has(&path) {
-            return false;
-        }
-        if t.tree.open.len() >= MAX_OPEN {
-            self.say("Too many open folders. Close some first (Left key).");
             return false;
         }
         let k = key(&path);
@@ -454,7 +450,7 @@ impl AppState {
             t.tree.open.retain(|b| b.key != k && !b.key.starts_with(&below));
             regraft(t, Some(&path));
             if just_opened && i == self.active {
-                self.say(format!("\u{201c}{name}\u{201d} can't be opened here: {err}"));
+                self.say(format!("\u{201c}{name}\u{201d} can't be opened here: {err}."));
             }
             self.sync_branch_watch();
             return true;

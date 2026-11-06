@@ -24,7 +24,7 @@ impl AppState {
     pub(super) fn toggle_split(&mut self) {
         if self.split.take().is_some() {
             self.split_watch.stop();
-            self.say("Split view off");
+            self.say("Split view off.");
             return;
         }
         let i = self.active;
@@ -43,7 +43,7 @@ impl AppState {
         self.split_last = self.tab().id;
         self.ensure_loaded(other);
         self.sync_split_watch();
-        self.say("Split view: click a side to work in it (F6 switches)");
+        self.say("Split view: click a side to work in it (F6 switches).");
     }
 
     /// F6, or a click in the other half: Glint works in that half now.
@@ -122,7 +122,7 @@ impl AppState {
         }
         let dest = self.tabs[other].path.clone();
         if dest.is_empty() || folder::is_place(&dest) || archive::split(&dest).is_some() || recycle::is_bin(&dest) {
-            self.say("The other side isn't a folder files can go into");
+            self.say("The other side isn't a folder files can go into.");
             return;
         }
         let sources = self.chosen();

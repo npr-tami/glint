@@ -150,7 +150,7 @@ pub fn for_items(app: &AppState, at: Point, how: How) -> Effect {
     }
     let split = app.split_index().is_some();
     if split && single && first.is_container() {
-        items.push(MenuItem::new(PICK_OTHER_SIDE, "Open in other side"));
+        items.push(MenuItem::new(PICK_OTHER_SIDE, "Open on the other side"));
     }
     if single && !first.is_container() {
         items.push(MenuItem::new(PICK_OPEN_WITH, "Open with\u{2026}"));
@@ -162,7 +162,7 @@ pub fn for_items(app: &AppState, at: Point, how: How) -> Effect {
     if files && !inside {
         // Home's Favorites (app/places.rs): "Remove" when they're all in already.
         let all_in = chosen.iter().all(|&i| app.is_favorite(&t.folder.entries[i].path_in(&t.folder.path)));
-        items.push(MenuItem::new(PICK_FAVORITE, if all_in { "Remove from Favorites" } else { "Add to Favorites" }));
+        items.push(MenuItem::new(PICK_FAVORITE, if all_in { "Remove from Favourites" } else { "Add to Favourites" }));
         // (Not on Home: its rows come from all over, and change as files are opened.)
         if !crate::recent::is_recent(&t.folder.path) {
             items.push(tag_menu(app, &chosen));
@@ -178,8 +178,8 @@ pub fn for_items(app: &AppState, at: Point, how: How) -> Effect {
             items.push(MenuItem::new(PICK_PASTE_INTO, "Paste into folder"));
         }
         if split && !inside {
-            items.push(MenuItem::new(PICK_COPY_OTHER, "Copy to other side"));
-            items.push(MenuItem::new(PICK_MOVE_OTHER, "Move to other side"));
+            items.push(MenuItem::new(PICK_COPY_OTHER, "Copy to the other side"));
+            items.push(MenuItem::new(PICK_MOVE_OTHER, "Move to the other side"));
         }
     }
     items.push(MenuItem::new(PICK_COPY_PATH, if single { "Copy path\tCtrl+Shift+C" } else { "Copy paths\tCtrl+Shift+C" }));
@@ -818,11 +818,11 @@ mod tests {
         assert!(!merge_item(&item("&View", ""), &glint));
         assert!(!merge_item(&item("Line up Icons", ""), &glint));
         // Spelt the British way (Windows in English (United Kingdom)): the same item.
-        let fav: Vec<String> = ["Open\tEnter", "Add to Favorites"].iter().map(|l| label_key(l)).collect();
+        let fav: Vec<String> = ["Open\tEnter", "Add to Favourites"].iter().map(|l| label_key(l)).collect();
         assert!(!merge_item(&item("Add to &Favourites", ""), &fav));
         assert!(!merge_item(&item("Add to Favorites", "pintohome"), &fav));
         // Glint says Remove (the items are in its Favorites): Windows' Add or Remove still goes.
-        let remove: Vec<String> = ["Open\tEnter", "Remove from Favorites"].iter().map(|l| label_key(l)).collect();
+        let remove: Vec<String> = ["Open\tEnter", "Remove from Favourites"].iter().map(|l| label_key(l)).collect();
         assert!(!merge_item(&item("Add to Favourites", ""), &remove));
         assert!(!merge_item(&item("Remove from Favourites", ""), &remove));
         // Without Glint's own (in a zip file, say), Windows' stays.

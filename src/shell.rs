@@ -155,7 +155,7 @@ pub const WM_APP_NOTE: u32 = WM_APP + 21;
 
 static NOTES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// From any thread: a short note for the status bar ("Couldn't open a terminal here"). The window
+/// From any thread: a short note for the status bar ("Failed to open a terminal here"). The window
 /// shows it when it gets WM_APP_NOTE (see [`take_notes`]).
 pub fn tell(owner: HWND, text: String) {
     NOTES.lock().unwrap_or_else(|e| e.into_inner()).push(text);
@@ -267,7 +267,7 @@ pub fn open_terminal(owner: Owner, dir: &str, choice: Terminal) {
     let started = background("open terminal", move || {
         // A folder that's gone (or a drive that isn't there) would give a terminal somewhere else.
         if !exists(&dir) {
-            tell(owner.hwnd(), format!("Couldn't open a terminal: \u{201c}{}\u{201d} can't be reached.", file_name(&dir)));
+            tell(owner.hwnd(), format!("Failed to open a terminal: \u{201c}{}\u{201d} can't be reached.", file_name(&dir)));
             return;
         }
         let found = match terminal_command(&dir, choice) {
@@ -282,12 +282,12 @@ pub fn open_terminal(owner: Owner, dir: &str, choice: Terminal) {
             None => None,
         };
         let Some((exe, args, name)) = found else {
-            tell(owner.hwnd(), "Couldn't find Windows Terminal or PowerShell.".to_string());
+            tell(owner.hwnd(), "Failed to find Windows Terminal or PowerShell.".to_string());
             return;
         };
         if let Err(e) = start_process(&exe, &args, &dir) {
             log::line(&format!("open terminal: {exe} {args} in {dir:?}: {e}"));
-            tell(owner.hwnd(), format!("Couldn't open {name}: {}", e.message()));
+            tell(owner.hwnd(), format!("Failed to open {name}: {}", e.message()));
         }
     });
     if !started {

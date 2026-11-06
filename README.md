@@ -24,7 +24,7 @@ Nothing to install, and it opens instantly.
 - **Split view**: two folders side by side (Ctrl+\\).
 - **Sidebar** with Quick access, pinned folders and your drives.
 - **Path bar** you can click or type into.
-- **Home** with your folders, recent files and Favorites.
+- **Home** with your folders, recent files and Favourites.
 - **Command box** (Ctrl+U): type a command, a setting, a folder or a search word.
 
 ### Seeing your files
@@ -46,7 +46,7 @@ Nothing to install, and it opens instantly.
 
 ### Making it yours
 
-- **Skins**: AMD Radeon, NVIDIA, Chrome and Gunmetal, with light versions.
+- **Skins**: AMD Radeon and NVIDIA, each with a light version, plus Chrome and Gunmetal.
 - **Skin customiser** to make your own, even with a wallpaper.
 - **Your own sort order and views** per folder: [how it works](docs/sort-order.md).
 - **Default file explorer**, if you want: folders, drives and Win+E open in Glint.
@@ -162,8 +162,8 @@ The ones you'll use most:
 
 This is optional.
 
-**To switch it on:** go to **Settings > General** and turn on **Open folders and drives in Glint**.
-Turn on **Open with Win+E** too, if you like.
+**To turn it on:** go to **Settings > General** and turn on **Open folders and drives in Glint**.
+Turn on **Win+E opens Glint** too, if you like.
 
 **What changes:** folders and drives you double-click open in Glint.
 Control Panel, phones and similar still open in File Explorer.
@@ -172,7 +172,7 @@ Only your own Windows account is changed, and no admin rights are needed.
 **Keep Glint.exe where it is.** If you move it, start it once from the new place.
 It can't be switched on from a USB stick, a network drive or straight from inside a zip.
 
-**To switch it off:** turn the same settings off. Whatever was there before comes back.
+**To turn it off:** turn the same settings off. Whatever was there before comes back.
 
 <details>
 <summary>If Glint won't start or is gone</summary>

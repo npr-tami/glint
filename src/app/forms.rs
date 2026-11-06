@@ -36,6 +36,8 @@ pub struct Field {
     pub hint: &'static str,
     /// What's in it at first.
     pub start: String,
+    /// A faint line under the box saying how to fill it in ("" for none).
+    pub note: &'static str,
 }
 
 /// What a form's typing would do, for its preview.
@@ -67,7 +69,7 @@ impl AppState {
     /// "Save tabs as a set…": asks for a name.
     pub(super) fn ask_tab_set_name(&mut self) {
         let start = self.tab_set_suggestion();
-        self.open_form("Save these tabs as a set".into(), vec![Field { label: "Name", hint: "Work", start }], "SAVE", Kind::SaveTabs);
+        self.open_form("Save these tabs as a set".into(), vec![Field { label: "Name", hint: "Work", start, note: "" }], "SAVE", Kind::SaveTabs);
     }
 
     /// The name offered for a new set: "Set 1", "Set 2"…
@@ -89,9 +91,9 @@ impl AppState {
         let folders = chosen.iter().map(|&i| t.folder.entries[i].is_container()).collect();
         let title = format!("Rename {} items", paths.len());
         let fields = vec![
-            Field { label: "New name", hint: "Holiday #", start: String::new() },
-            Field { label: "Find", hint: "", start: String::new() },
-            Field { label: "Replace with", hint: "", start: String::new() },
+            Field { label: "New name", hint: "Holiday #", start: String::new(), note: "# becomes 1, 2, 3" },
+            Field { label: "Find", hint: "", start: String::new(), note: "" },
+            Field { label: "Replace with", hint: "", start: String::new(), note: "" },
         ];
         self.open_form(title, fields, "RENAME", Kind::RenameMany { paths, folders });
     }
@@ -173,13 +175,14 @@ impl AppState {
     }
 
     fn save_tab_set(&mut self, name: &str) {
-        let tabs: Vec<SavedTab> = self.snapshot().tabs;
+        // (A set keeps no Back and Forward places, a pinned tab's either: it opens fresh tabs.)
+        let tabs: Vec<SavedTab> = self.snapshot().tabs.into_iter().map(|t| SavedTab { back: Vec::new(), forward: Vec::new(), ..t }).collect();
         let sets = &mut self.settings.tab_sets;
         sets.retain(|s| !s.name.eq_ignore_ascii_case(name));
         sets.push(TabSet { name: name.to_string(), tabs });
         let extra = sets.len().saturating_sub(MAX_TAB_SETS);
         sets.drain(..extra);
-        self.say(format!("Saved the tabs as \u{201c}{name}\u{201d}"));
+        self.say(format!("Saved the tabs as \u{201c}{name}\u{201d}."));
     }
 
     /// Opens the tabs of set `i` after the ones open now, and shows the first of them.
@@ -201,13 +204,13 @@ impl AppState {
             self.active = at;
             self.start_load(at);
         }
-        self.say(format!("Opened \u{201c}{}\u{201d}", set.name));
+        self.say(format!("Opened \u{201c}{}\u{201d}.", set.name));
     }
 
     pub(super) fn delete_tab_set(&mut self, i: usize) {
         if i < self.settings.tab_sets.len() {
             let set = self.settings.tab_sets.remove(i);
-            self.say(format!("Removed the set \u{201c}{}\u{201d}", set.name));
+            self.say(format!("Removed the set \u{201c}{}\u{201d}.", set.name));
         }
     }
 }
@@ -477,10 +480,10 @@ mod tests {
         assert_eq!(names(), ["Trip 1", "Trip 2", "Trip 3.jpg", "Trip 4.JPG", "notes.txt"]);
         assert_eq!(std::fs::read_to_string(join(&dir, "Trip 1\\in.txt")).unwrap(), "2023");
         assert_eq!((a.tabs[1].path.clone(), a.tabs[1].back.clone()), (join(&dir, "Trip 1"), vec![join(&dir, "Trip 2")]), "the tab inside went along");
-        assert_eq!(a.history.next_undo().map(|s| s.describe()).as_deref(), Some("the rename of 4 items"));
+        assert_eq!(a.history.next_undo().map(|s| s.describe()).as_deref(), Some("renaming 4 items"));
         a.run(Command::Undo);
         finish_job(&mut a);
-        assert_eq!(a.note(), Some("Undid the rename of 4 items"));
+        assert_eq!(a.note(), Some("Undid renaming 4 items \u{b7} Ctrl+Y to redo."));
         assert_eq!(names(), ["2023", "2024", "a.jpg", "b.JPG", "notes.txt"]);
         assert_eq!((a.tabs[1].path.clone(), a.tabs[1].back.clone()), (join(&dir, "2023"), vec![join(&dir, "2024")]));
         a.run(Command::Redo);

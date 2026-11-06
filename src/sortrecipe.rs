@@ -336,8 +336,8 @@ pub const GROUP_RULES: &[(&str, &str)] = &[
     ("-updated", "changed in the last 24 hours"),
     ("-image", "pictures"),
     ("-video", "videos"),
-    ("-audio", "music and sounds"),
-    ("-document", "pdf, Word, Excel, txt…"),
+    ("-music", "music and sounds"),
+    ("-document", "pdf, word, excel, txt…"),
     ("-archive", "zip, rar, 7z, iso…"),
     ("-program", "programs and installers"),
     ("-code", "code files"),
@@ -351,7 +351,7 @@ pub const GROUP_RULES: &[(&str, &str)] = &[
 pub const ORDER_RULES: &[(&str, &str)] = &[
     ("-newest", "newest changed first"),
     ("-oldest", "oldest changed first"),
-    ("-biggest", "largest first"),
+    ("-biggest", "biggest first"),
     ("-smallest", "smallest first"),
     ("-newest_added", "newest added first"),
     ("-oldest_added", "oldest added first"),
@@ -365,8 +365,8 @@ pub const ORDER_RULES: &[(&str, &str)] = &[
 pub const EXACT_RULES: &[(&str, &str)] = &[
     ("-today", "changed today"),
     ("-yesterday", "changed yesterday"),
-    ("-added", "added in the last day"),
-    ("-updated_3_days", "changed in 3 days"),
+    ("-added", "added in the last 24 hours"),
+    ("-updated_3_days", "changed in the last 3 days"),
     ("-older_than_1_year", "not changed for a year"),
     ("-bigger_than_100mb", "files over 100 MB"),
     ("-smaller_than_1mb", "files under 1 MB"),
@@ -390,14 +390,14 @@ pub const VIEW_RULES: &[(&str, &str)] = &[
 /// a rule, and rules that need something after them (those end in "_", so the list stays open for
 /// it). "Did you mean" names a rule as they do (see `as_offered`).
 pub const MORE_RULES: &[(&str, &str)] = &[
-    ("-added_3_days", "added in 3 days"),
+    ("-added_3_days", "added in the last 3 days"),
     ("-larger_than_", "files over a size"),
     ("-name_contains_", "names with a word"),
-    ("-music", "same as -audio"),
+    ("-audio", "same as -music"),
     ("-photos", "same as -image"),
     ("-pictures", "same as -image"),
     ("-movies", "same as -video"),
-    ("-songs", "same as -audio"),
+    ("-songs", "same as -music"),
     ("-docs", "same as -document"),
     ("-apps", "same as -program"),
     ("-installers", "same as -program"),
@@ -661,7 +661,7 @@ fn as_offered(w: &str, typed: &str) -> String {
 fn unfit_reason(above: &[Group], word: &str) -> Option<String> {
     let Meaning::Group(g) = meaning(word, word) else { return None };
     if let Some(x) = above.iter().find(|x| x.name == g.name) {
-        return Some(format!("{} already have a line above", x.label));
+        return Some(format!("there's already a line for {}", x.label));
     }
     if let Some(x) = above.iter().find(|x| covers(&x.takes, &g.takes)) {
         return Some(format!("{} above already takes {}", x.written, what_it_takes(&g)));
@@ -951,7 +951,7 @@ fn make_group(w: &str, written: &str) -> Result<Option<Group>, String> {
         "hidden" => return Ok(Some(group("hidden", "hidden", Takes::Hidden))),
         "empty" => return Ok(Some(group("empty", "empty files", Takes::Empty))),
         // Dates take files only: a folder's date changes whenever anything inside it does.
-        "updated" => return Ok(Some(since("updated".into(), 24.0, "updated in the last 24 hours".into(), false))),
+        "updated" => return Ok(Some(since("updated".into(), 24.0, "changed in the last 24 hours".into(), false))),
         "added" => return Ok(Some(since("added".into(), 24.0, "added in the last 24 hours".into(), true))),
         "today" => return Ok(Some(group("today", "changed today", Takes::Today))),
         "yesterday" => return Ok(Some(group("yesterday", "changed yesterday", Takes::Yesterday))),
@@ -1000,7 +1000,9 @@ fn make_group(w: &str, written: &str) -> Result<Option<Group>, String> {
             return Ok(Some(group(format!("older:{hours}"), format!("older than {n} {unit_name}"), Takes::Older { hours })));
         }
         let shown = if n == 1 { unit_name } else { format!("{n} {unit_name}") };
-        return Ok(Some(since(format!("{kind}:{hours}"), hours, format!("{kind} in the last {shown}"), kind == "added")));
+        // (Updated things are said to be "changed", as in the guide.)
+        let said = if kind == "updated" { "changed" } else { kind };
+        return Ok(Some(since(format!("{kind}:{hours}"), hours, format!("{said} in the last {shown}"), kind == "added")));
     }
     // -bigger_than_100mb, -smaller_than_1mb
     for kind in ["bigger", "larger", "smaller"] {
@@ -2467,7 +2469,7 @@ fn read_line(tokens: &[Token], line: usize, into: &mut Rules, messages: &mut Vec
         parts.push(s);
     }
     for label in left_out {
-        parts.push(format!("left out: {label} already have a line above"));
+        parts.push(format!("left out: there's already a line for {label}"));
     }
     if !every.is_empty() {
         let list = every.join(", then ");
@@ -2495,7 +2497,7 @@ fn read_line(tokens: &[Token], line: usize, into: &mut Rules, messages: &mut Vec
 /// line above).
 fn add_group(into: &mut Rules, mut g: Group, written: &str, line: usize, span: Option<(usize, usize)>, messages: &mut Vec<Message>) -> Option<usize> {
     if let Some(i) = into.groups.iter().position(|x| x.name == g.name) {
-        messages.push(Message { line, text: format!("{written}: {} already have a line above, so this one is left out.", into.groups[i].label), error: false, span, fix: None, fix_label: None });
+        messages.push(Message { line, text: format!("{written}: there's already a line for {}, so this one is left out.", into.groups[i].label), error: false, span, fix: None, fix_label: None });
         return None;
     }
     // A _first / _last line takes the lines stacked under it along to the top / bottom (one that's
@@ -3036,10 +3038,10 @@ mod tests {
 
     #[test]
     fn being_exact() {
-        assert_eq!(name_of("-updated_3_days", &f("c.pdf", NOW - 3 * D, 1)), "updated in the last 3 days");
+        assert_eq!(name_of("-updated_3_days", &f("c.pdf", NOW - 3 * D, 1)), "changed in the last 3 days");
         assert_eq!(name_of("-updated_3_days", &f("old.pdf", NOW - 4 * D, 1)), "everything else");
-        assert_eq!(name_of("-updated_2_hours\n-updated", &f("x.txt", NOW - H, 1)), "updated in the last 2 hours");
-        assert_eq!(name_of("-updated\n-updated_2_hours", &f("x.txt", NOW - H, 1)), "updated in the last 24 hours");
+        assert_eq!(name_of("-updated_2_hours\n-updated", &f("x.txt", NOW - H, 1)), "changed in the last 2 hours");
+        assert_eq!(name_of("-updated\n-updated_2_hours", &f("x.txt", NOW - H, 1)), "changed in the last 24 hours");
         assert!(Recipe::parse("-updated\n-updated_2_hours").messages.iter().any(|m| m.line == 2 && !m.error && m.text.contains("never gets anything")));
         assert_eq!(name_of("-older_than_1_year", &f("old.txt", NOW - 400 * D, 1)), "older than 1 year");
         assert_eq!(name_of("-image\n-bigger_than_200b", &f("q.jpg", NOW, 900)), "pictures");
@@ -3068,7 +3070,7 @@ mod tests {
         // The starter has -updated above -program_last, so b.exe (changed an hour ago) is with the
         // updated files and z.exe with the programs at the bottom.
         let b = f("b.exe", NOW - H, 500);
-        assert_eq!(name_of(STARTER, &b), "updated in the last 24 hours");
+        assert_eq!(name_of(STARTER, &b), "changed in the last 24 hours");
         assert_eq!(name_of(STARTER, &f("z.exe", NOW - 2 * D, 100)), "programs");
         assert_eq!(sorted_in(STARTER, "C:\\t").join(","), "Zeta,Alpha,b.exe,a.txt,m.txt,s.png,c.pdf,q.jpg,p.png,z.exe");
         // _first and _last still go to the very top and bottom, written anywhere; and a _last
@@ -3296,7 +3298,7 @@ mod tests {
         assert_eq!(order("-image biggest"), order("-image -biggest"));
         assert_eq!(order("pictures last, a to z"), order("-image_last -a_to_z"));
         assert_eq!(name_of("bigger than 200 b", &f("q.jpg", NOW, 900)), "bigger than 200 bytes");
-        assert_eq!(name_of("updated 3 days", &f("c.pdf", NOW - 3 * D, 1)), "updated in the last 3 days");
+        assert_eq!(name_of("updated 3 days", &f("c.pdf", NOW - 3 * D, 1)), "changed in the last 3 days");
         // A name rule takes one word; the next is a rule of its own.
         let r = Recipe::parse("name has screenshot newest");
         assert!(r.messages.is_empty(), "{:?}", r.messages);
@@ -3320,7 +3322,7 @@ mod tests {
         for text in ["-image\n-pic", "-photos -newest\n\n-pic_last", "in C:\\t (\n-image\n-pic\n)"] {
             let (said, fixed) = fix(text).unwrap_or_else(|| panic!("{text:?}"));
             assert_eq!(fixed, None, "{text:?}");
-            assert!(said.starts_with("\"pic") && said.contains("If you meant -pictures") && said.ends_with("pictures already have a line above."), "{said}");
+            assert!(said.starts_with("\"pic") && said.contains("If you meant -pictures") && said.ends_with("there's already a line for pictures."), "{said}");
         }
         // In another folder's rules, or with only another kind above, the fix is offered.
         assert_eq!(fix("in C:\\a (\n-image\n)\nin C:\\b (\n-pic\n)").unwrap().1.as_deref(), Some("-pictures"));
@@ -3681,7 +3683,7 @@ mod tests {
         assert_eq!(said(2), Some("Folders at the very top"));
         assert_eq!(said(3), Some("Pictures next, near the top, biggest first"), "stacked under folder_first");
         assert_eq!(said(4), Some("Then A to Z, where the order above ties"));
-        assert_eq!(said(5), Some("Left out: folders already have a line above"));
+        assert_eq!(said(5), Some("Left out: there's already a line for folders"));
         assert_eq!(said(6), Some("Just a view for Downloads: its order stays as it was"));
         assert_eq!(said(7), Some("Shown as large icons"));
         assert!(said(8).is_some_and(|s| s.starts_with("The end of these rules")));

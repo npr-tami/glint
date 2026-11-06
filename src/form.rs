@@ -34,6 +34,8 @@ const LABEL_W: f32 = 120.0;
 const FIELD_H: f32 = 28.0;
 const FIELD_GAP: f32 = 8.0;
 const LINE: f32 = 19.0;
+/// A field's note line under its box.
+const NOTE_LINE: f32 = 18.0;
 const BUTTON_H: f32 = 30.0;
 const LEAN: f32 = 8.0;
 const BUTTON_GAP: f32 = 6.0;
@@ -113,7 +115,8 @@ impl FormBox {
         let w = WIDTH.min(area.w - 32.0).max(260.0);
         let inner = w - 2.0 * PAD;
         let lines = preview.lines.len() + preview.problem.is_some() as usize;
-        let fields_h = self.used as f32 * (FIELD_H + FIELD_GAP);
+        let notes = form.fields.iter().take(self.used).filter(|f| !f.note.is_empty()).count();
+        let fields_h = self.used as f32 * (FIELD_H + FIELD_GAP) + notes as f32 * NOTE_LINE;
         let h = 20.0 + TITLE_LINE + 12.0 + fields_h + 6.0 + lines as f32 * LINE + 22.0 + BUTTON_H + 20.0;
         let x = area.x + ((area.w - w) / 2.0).max(0.0);
         let y = area.y + ((area.h - h) / 2.0 - 24.0).max(12.0);
@@ -144,6 +147,11 @@ impl FormBox {
             b.place(field.inset(6.0, 4.0), 0.0, scale);
             b.show();
             line_y += FIELD_H + FIELD_GAP;
+            // How to fill it in, faint, under the box.
+            if !f.note.is_empty() {
+                r.text(f.note, Rect::new(field.x, line_y - FIELD_GAP + 2.0, field.w, NOTE_LINE), &TextStyle::new(theme.muted));
+                line_y += NOTE_LINE;
+            }
         }
         if fresh {
             if let Some(first) = self.boxes.first() {

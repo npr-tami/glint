@@ -34,6 +34,10 @@ use crate::ui::{Command, Mods, Point, Rect};
 const BOX_ID: u16 = 700;
 /// The most rows shown (but for the guide, which scrolls).
 const MAX_ROWS: usize = 8;
+
+/// Rows that go first when others match what was typed just as well ("new" puts New folder above
+/// New tab and New window).
+const FIRST_AMONG_EQUALS: [&str; 1] = ["New folder"];
 const WIDTH: f32 = 560.0;
 /// The guide (help or ?) is this wide, room allowing.
 const GUIDE_WIDTH: f32 = 780.0;
@@ -149,7 +153,7 @@ pub fn actions(app: &AppState) -> Vec<Item> {
         Item::new("Go up", "Alt+Up", Run(Command::Up)).guide(G::Places, "Goes to the folder this one is in"),
         Item::new("Back", "Alt+Left", Run(Command::Back)).guide(G::Places, "Goes to the folder you were in before"),
         Item::new("Forward", "Alt+Right", Run(Command::Forward)).guide(G::Places, "Goes forward again after Back"),
-        Item::new("Undo", "Ctrl+Z", Run(Command::Undo)).guide(G::Files, "Takes back your last move, copy, rename or delete"),
+        Item::new("Undo", "Ctrl+Z", Run(Command::Undo)).guide(G::Files, "Undoes your last change"),
         Item::new("Redo", "Ctrl+Y", Run(Command::Redo)).guide(G::Files, "Does it again after Undo"),
         Item::new("Select all", "Ctrl+A", Action::SelectAll).guide(G::Select, "Selects everything here"),
         // (The guide shows *.pdf under its things to type instead.)
@@ -157,7 +161,7 @@ pub fn actions(app: &AppState) -> Vec<Item> {
         Item::new("Copy path", "Ctrl+Shift+C", Run(Command::CopyPath)).guide(G::Files, "Copies where the selected items are, as text"),
         Item::new("Type a path", "Ctrl+L", Run(Command::EditPath)).guide(G::Places, "Puts the cursor in the address bar"),
         Item::new("Filter", "Ctrl+F", Run(Command::FocusFilter)).guide(G::Select, "Shows only the items with what you type in their name"),
-        Item::new(&show_hide(s.show_hidden, "hidden files"), "Ctrl+H", Run(Command::ToggleHidden)).guide(G::View, "The files Windows keeps out of sight"),
+        Item::new(if s.show_hidden { "Stop showing hidden files" } else { "Show hidden files" }, "Ctrl+H", Run(Command::ToggleHidden)).guide(G::View, "The files Windows keeps out of sight"),
         Item::new(&show_hide(s.show_sidebar, "sidebar"), "Ctrl+B", Run(Command::ToggleSidebar)).guide(G::View, "The list of places on the left"),
         Item::new(&show_hide(s.show_status_bar, "status bar"), "", Run(Command::ShowStatusBar(!s.show_status_bar))).guide(G::View, "The line at the bottom that counts the items"),
         Item::new(&show_hide(s.show_details, "details panel"), "Alt+P", Run(Command::ToggleDetails)).guide(G::View, "The panel on the right with a file's details"),
@@ -208,7 +212,7 @@ pub fn actions(app: &AppState) -> Vec<Item> {
     let custom_on = s.custom_sort && !tab.column_now;
     let about = if custom_on { "Sorts by the columns again" } else { "Sorts with your own rules" };
     v.push(Item::new(&on_off(custom_on, "custom order"), "", Run(Command::SetCustomSort(!custom_on))).guide(G::Sort, about));
-    v.push(Item::new("Edit custom order", "", Run(Command::OpenSortEditor)).guide(G::Sort, "Opens the editor for your own sort rules"));
+    v.push(Item::new("Edit custom order\u{2026}", "", Run(Command::OpenSortEditor)).guide(G::Sort, "Opens the editor for your own sort rules"));
     let about = if s.custom_views { "Every folder uses the same view" } else { "Folders keep the view you gave them" };
     v.push(Item::new(&on_off(s.custom_views, "custom views"), "", Run(Command::SetCustomViews(!s.custom_views))).guide(G::View, about));
     let about = if s.folder_sizes { "Stops adding up how big folders are" } else { "Shows how big each folder is" };
@@ -218,16 +222,17 @@ pub fn actions(app: &AppState) -> Vec<Item> {
         true => Item::new("Stop searching subfolders", "Ctrl+Shift+F", Run(Command::ToggleSubfolders)).guide(G::Select, "The filter looks only in this folder"),
         false => Item::new("Search subfolders", "Ctrl+Shift+F", Run(Command::ToggleSubfolders)).guide(G::Select, "The filter also looks inside the folders here"),
     });
-    v.push(Item::new("Rename many", "F2", Action::RenameMany).guide(G::Files, "Renames all the selected files at once"));
+    v.push(Item::new("Rename all\u{2026}", "F2", Action::RenameMany).guide(G::Files, "Renames all the selected items at once"));
     v.push(Item::new("Properties", "Alt+Enter", Run(Command::Properties)).guide(G::Files, "Opens Windows' Properties window"));
     if !here.is_empty() {
-        v.push(Item::new("Open terminal here", "Ctrl+`", Run(Command::OpenTerminal(here.clone()))).guide(G::Places, "Opens a command window in this folder"));
+        v.push(Item::new("Open in terminal", "Ctrl+`", Run(Command::OpenTerminal(here.clone()))).guide(G::Places, "Opens a terminal in this folder"));
+        v.push(Item::new("Disk space", "Ctrl+Shift+U", Run(Command::DiskSpace(None))).guide(G::Places, "Shows what fills this drive"));
     }
-    v.push(Item::new("Show in File Explorer", "", Run(Command::ShowInExplorer)).guide(G::Places, "Opens this folder in File Explorer"));
+    v.push(Item::new("Open in File Explorer", "", Run(Command::ShowInExplorer)).guide(G::Places, "Opens this folder in File Explorer"));
     if crate::app::can_pin(&here) {
         v.push(match app.is_pinned(&here) {
-            true => Item::new("Unpin folder from sidebar", "Ctrl+D", Run(Command::TogglePin(here))).guide(G::Places, "Takes this folder off the sidebar"),
-            false => Item::new("Pin folder to sidebar", "Ctrl+D", Run(Command::TogglePin(here))).guide(G::Places, "Adds this folder to the sidebar"),
+            true => Item::new("Unpin from sidebar", "Ctrl+D", Run(Command::TogglePin(here))).guide(G::Places, "Takes this folder off the sidebar"),
+            false => Item::new("Pin to sidebar", "Ctrl+D", Run(Command::TogglePin(here))).guide(G::Places, "Adds this folder to the sidebar"),
         });
     }
     v.push(Item::new("Light or dark", "Ctrl+Shift+L", Run(Command::ToggleTheme)).guide(G::View, "Switches between the light and dark look"));
@@ -344,8 +349,9 @@ pub fn rows_for(all: &[Item], text: &str) -> Vec<Item> {
     if t.is_empty() {
         return all.iter().take(MAX_ROWS).cloned().collect();
     }
-    let mut found: Vec<(u32, usize)> = all.iter().enumerate().filter_map(|(i, it)| score(&it.name, t).map(|s| (s, i))).collect();
+    let mut found: Vec<(u32, bool, usize)> = all.iter().enumerate().filter_map(|(i, it)| score(&it.name, t).map(|s| (s, !FIRST_AMONG_EQUALS.contains(&it.name.as_str()), i))).collect();
     found.sort();
+    let found: Vec<(u32, usize)> = found.into_iter().map(|(s, _, i)| (s, i)).collect();
     if looks_like_path(t) {
         let go = Item::new(&format!("Go to {t}"), "", Action::Run(Command::Navigate(t.to_string())));
         let best = found.into_iter().take(MAX_ROWS - 1).map(|(_, i)| all[i].clone());
@@ -784,6 +790,14 @@ mod tests {
     }
 
     #[test]
+    fn new_puts_new_folder_first() {
+        let all = items(&["New tab", "New window", "New folder", "New text file"]);
+        assert_eq!(names(&rows_for(&all, "new"))[..4], ["New folder", "New tab", "New window", "New text file"]);
+        // It only wins a tie: "new t" still finds New tab first.
+        assert_eq!(rows_for(&all, "new t")[0].name, "New tab");
+    }
+
+    #[test]
     fn text_ends_with_a_search_row_and_a_path_starts_with_go_to() {
         let all = items(&LIST);
         let rows = rows_for(&all, "split");
@@ -883,7 +897,10 @@ mod tests {
         for t in ["Setting: Skin", "Setting: Zip icon", "Setting: Open Glint to", "Setting: Check for updates automatically"] {
             assert_eq!(settings.iter().filter(|i| i.name == t).count(), 1, "{t}");
         }
-        assert!(!settings.iter().any(|i| i.name.contains("Ctrl+")), "no shortcuts");
+        // (A setting may name a key, like "Ctrl+scroll wheel changes view"; a shortcut row is just its keys.)
+        for t in ["Setting: Ctrl+Q", "Setting: Ctrl+Shift+U", "Setting: F2"] {
+            assert!(!settings.iter().any(|i| i.name == t), "no shortcuts: {t}");
+        }
         assert!(rows_for(&all, "setting zip").iter().any(|r| r.name == "Setting: Zip icon"));
     }
 

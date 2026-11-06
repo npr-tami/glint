@@ -15,7 +15,7 @@
 //! - The search box, a dot by each setting that isn't at its default, RESET PAGE, and reopening on
 //!   the page used last can each be switched off.
 //!
-//! Settings that aren't in this version yet are shown greyed, with "Coming later".
+//! Settings that aren't in this version yet are hidden until they work.
 //!
 //! How it fits in:
 //! - **One state, one guard.** The window's state (`SettingsWindow`) lives in the main window's
@@ -78,7 +78,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::app::AppState;
-use crate::registry;
 use crate::droplist;
 use crate::frame;
 use crate::winutil::{hi_word, lo_word, place_visible, visible_rect};
@@ -95,7 +94,7 @@ use crate::ui::{Command, MenuItem, MenuPicture, Point, Rect};
 
 mod flat;
 mod pages;
-pub use pages::{findable, ABOUT, ABOUT_ROW, PAGES};
+pub use pages::{findable, title_of, ABOUT, ABOUT_ROW, PAGES};
 use pages::{Act, Ctl, Facts, Item, Row};
 
 /// The window's title (what Alt+Tab and the taskbar's thumbnails would call it).
@@ -304,8 +303,6 @@ pub enum Ask {
 #[derive(Debug)]
 enum Bg {
     Terminals([bool; 6]),
-    /// What the Zip icon row says (registry::zip_icon_said).
-    ZipSaid(String),
     CacheSize(u64),
     /// CLEAR is done: the bytes left (files in use).
     Cleared(u64),
@@ -549,8 +546,6 @@ pub struct SettingsWindow {
     /// The drop-down whose list is open: its setting and the values of its choices.
     menu_for: Option<(&'static str, Vec<pages::Val>)>,
     terminals: Option<[bool; 6]>,
-    /// What the Zip icon row says, once looked up.
-    zip_said: Option<String>,
     /// The row to put the keyboard on once the page is laid out (found with the command box).
     point_at: Option<String>,
     cache_size: Option<u64>,
@@ -725,7 +720,7 @@ pub fn create(owner: HWND, theme: &Theme, place: Option<[i32; 4]>, opens: Settin
         // WM_NCCALCSIZE again now that it's handled: the caption goes, as in the main window.
         let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         let folder_box = TextBox::new(hwnd, FOLDER_BOX);
-        folder_box.set_hint("Type a folder, or use BROWSE");
+        folder_box.set_hint("Type a folder or press BROWSE…");
         let search_box = TextBox::new(hwnd, SEARCH_BOX);
         search_box.set_hint("Search settings");
         // Tab in a text box moves on to the next control (an EDIT outside a dialog ignores it).
@@ -769,7 +764,6 @@ pub fn create(owner: HWND, theme: &Theme, place: Option<[i32; 4]>, opens: Settin
             swatches_generation: u64::MAX,
             menu_for: None,
             terminals: None,
-            zip_said: None,
             point_at: None,
             cache_size: None,
             cache_said: None,
@@ -1281,17 +1275,7 @@ impl SettingsWindow {
             }
             post(to, Bg::Terminals(found));
         });
-        self.look_up_zip();
         self.measure_cache();
-    }
-
-    /// Whether zip and 7z files open in Glint (the Zip icon row says so).
-    fn look_up_zip(&self) {
-        let to = self.poster();
-        shell::background("settings: zip files", move || {
-            let said = registry::this_exe().map(|exe| registry::zip_icon_said(&registry::Places::current(), &exe)).unwrap_or_default();
-            post(to, Bg::ZipSaid(said));
-        });
     }
 
     fn measure_cache(&self) {
@@ -1332,12 +1316,12 @@ impl SettingsWindow {
         let facts = Facts {
             values: &self.values,
             terminals: self.terminals,
-            zip_said: self.zip_said.as_deref(),
             config: settings::config_now().display().to_string(),
             logs: settings::folders().logs.display().to_string(),
             cache: settings::folders().cache.display().to_string(),
             cache_size: self.cache_size,
             cache_said: self.cache_said.clone(),
+            clear_asked: self.clear_asked_at.is_some(),
             portable_said: self.portable_said.clone(),
             portable_locked: settings::test_folders(),
             skins: &self.skins,
@@ -1368,8 +1352,15 @@ impl SettingsWindow {
                     })),
                 }
             }
+            // Shortcuts found (F2 finds Rename) are listed as the Keys page lists them, in a group of
+            // their own after the settings found.
+            let (keys, found): (Vec<Row>, Vec<Row>) = found.into_iter().partition(|r| matches!(r.ctl, Ctl::Text(_)));
             if !found.is_empty() {
                 groups.push((PAGES[page].to_string(), found));
+            }
+            if !keys.is_empty() {
+                let title = if groups.last().is_some_and(|(t, _)| t == PAGES[page]) { "Shortcuts" } else { PAGES[page] };
+                groups.push((title.to_string(), keys));
             }
         }
         groups
@@ -1432,20 +1423,39 @@ impl SettingsWindow {
         // While only the basics show, the rest wait behind "More settings".
         let basic = style.basic && query.is_empty();
         let mut more = 0;
+        // The basics first, then "More settings" - and once it's pressed, the rest under it, in
+        // their groups, so the button stays where it was.
+        let mut sections: Vec<(String, Vec<Row>)> = Vec::new();
+        let mut later: Vec<(String, Vec<Row>)> = Vec::new();
+        for (title, group) in groups {
+            let (hidden, shown): (Vec<Row>, Vec<Row>) = group
+                .into_iter()
+                .filter(|row| row.only_if.is_none_or(|(k, v)| self.values.get(k) == Some(&v.json())))
+                .partition(|row| basic && row.more);
+            more += hidden.len();
+            later.push((title.clone(), hidden));
+            sections.push((title, shown));
+        }
+        let button_at = sections.len();
+        if self.show_more {
+            sections.extend(later);
+        }
+        let mut more_button = (basic && more > 0).then(|| {
+            let text = if self.show_more { "Fewer settings".to_string() } else { format!("More settings ({more})") };
+            let w = self.renderer.measure(&text, &TextStyle::new(Color::hex(0)).size(TITLE_FONT).semibold()).ceil() + 8.0;
+            (text, w)
+        });
         let mut blocks = Vec::new();
         let mut rows = Vec::new();
         // (A group's title sits on its box's top line, half above it.)
         let mut y = PAD_TOP + if boxes { HEADING_H / 2.0 } else { 0.0 };
-        for (title, group) in groups {
-            let shown: Vec<Row> = group
-                .into_iter()
-                .filter(|row| row.only_if.is_none_or(|(k, v)| self.values.get(k) == Some(&v.json())))
-                .filter(|row| {
-                    let hidden = basic && row.more;
-                    more += hidden as usize;
-                    !hidden || self.show_more
-                })
-                .collect();
+        for (n, (title, shown)) in sections.into_iter().enumerate() {
+            if n == button_at {
+                if let Some((text, w)) = more_button.take() {
+                    blocks.push(Block::More(Rect::new(x0 - 4.0, y - 4.0, w, ROW_H), text));
+                    y += ROW_H - 4.0 + GROUP_GAP + if boxes { HEADING_H / 2.0 } else { 0.0 };
+                }
+            }
             if shown.is_empty() {
                 continue;
             }
@@ -1502,9 +1512,7 @@ impl SettingsWindow {
             blocks.push(Block::Note(Rect::new(x0, y, card_w, TITLE_LINE), format!("Nothing found for \u{201c}{}\u{201d}", self.query.trim())));
             y += TITLE_LINE + GROUP_GAP;
         }
-        if basic && more > 0 {
-            let text = if self.show_more { "Fewer settings".to_string() } else { format!("More settings ({more})") };
-            let w = self.renderer.measure(&text, &TextStyle::new(Color::hex(0)).size(TITLE_FONT).semibold()).ceil() + 8.0;
+        if let Some((text, w)) = more_button {
             blocks.push(Block::More(Rect::new(x0 - 4.0, y - 4.0, w, ROW_H), text));
             y += ROW_H;
         }
@@ -1551,9 +1559,8 @@ impl SettingsWindow {
             Rect::new(self.size.0 - PAD_X - w, foot.y + (FOOT_H - CTL_H) / 2.0, w, CTL_H)
         });
         let plain = TextStyle::new(Color::hex(0)).size(ksize::NOTE_FONT);
-        let said = self.renderer.measure(LIVE_NOTE, &plain).ceil();
         let bug = self.renderer.measure(REPORT_BUG, &plain.semibold()).ceil() + 4.0;
-        let x = PAD_X + said + 12.0;
+        let x = PAD_X + 2.0;
         let end = self.reset_at.map_or(self.size.0 - PAD_X, |r| r.x - 10.0);
         self.bug_at = (x + bug <= end).then(|| Rect::new(x - 2.0, foot.y + (FOOT_H - 20.0) / 2.0, bug, 20.0));
     }
@@ -1568,7 +1575,7 @@ impl SettingsWindow {
         }
         if app.skins.generation != self.skins_generation {
             self.skins_generation = app.skins.generation;
-            self.skins = app.skins.entries().iter().map(|e| (e.id.clone(), e.name.clone(), e.description.clone())).collect();
+            self.skins = app.skins.entries().iter().map(|e| (e.id.clone(), app.skins.shown_name(e), e.description.clone())).collect();
             self.layout_dirty = true;
         }
         // The skin tiles' colours: each skin read once (again when the skins change).
@@ -1596,11 +1603,16 @@ impl SettingsWindow {
             self.reset_asked_at = None;
             self.layout_dirty = true;
         }
+        // So does CLEAR.
+        if self.clear_asked_at.is_some_and(|t| self.now() - t >= CLEAR_CONFIRM_SECONDS) {
+            self.clear_asked_at = None;
+            self.layout_dirty = true;
+        }
         if self.layout_dirty {
             self.layout();
         }
         let now = self.now();
-        let mut more = self.scroller.tick(now) | self.flips.tick(now) || now < self.repaint_until || self.reset_asked_at.is_some();
+        let mut more = self.scroller.tick(now) | self.flips.tick(now) || now < self.repaint_until || self.reset_asked_at.is_some() || self.clear_asked_at.is_some();
         let theme = &app.theme;
         if !self.renderer.begin() {
             // No surface to draw on right now (a graphics driver being reset): try again soon.
@@ -1737,12 +1749,6 @@ impl SettingsWindow {
             r.fill_rect(Rect::new(0.0, foot.y, self.size.0, 1.0), theme.line);
         } else {
             kit::separator(r, theme, 0.0, foot.y, self.size.0);
-        }
-        let plain = TextStyle::new(theme.muted).size(ksize::NOTE_FONT);
-        let reset_x = self.reset_at.map_or(self.size.0 - PAD_X, |r| r.x - 10.0);
-        // "Changes apply right away" goes first when there's no room for both.
-        if self.bug_at.is_some() || r.measure(LIVE_NOTE, &plain).ceil() <= reset_x - PAD_X {
-            r.text(LIVE_NOTE, Rect::new(PAD_X, foot.y, (reset_x - PAD_X).max(0.0), foot.h), &plain);
         }
         if let Some(bug) = self.bug_at {
             let hot = self.hover == Some(Hot::ReportBug);
@@ -2129,12 +2135,21 @@ impl SettingsWindow {
             spots.push(Spot::Search);
         }
         spots.push(Spot::Nav);
+        // "More settings" comes where it is: after the basics, before the rest it shows.
+        let mut more_at = self.blocks.iter().find_map(|b| match b {
+            Block::More(r, _) => Some(r.y),
+            _ => None,
+        });
         for (i, p) in self.rows.iter().enumerate() {
+            if more_at.is_some_and(|y| p.rect.y > y) {
+                spots.push(Spot::More);
+                more_at = None;
+            }
             if p.enabled {
                 spots.extend(p.parts().into_iter().map(|part| Spot::Ctl(i, part)));
             }
         }
-        if self.blocks.iter().any(|b| matches!(b, Block::More(..))) {
+        if more_at.is_some() {
             spots.push(Spot::More);
         }
         if self.reset_at.is_some() {
@@ -2459,7 +2474,7 @@ impl SettingsWindow {
             }
         }
         self.apply_theme(&app.theme);
-        app.say(&format!("{} is back to its defaults", PAGES[self.page]));
+        app.say(&format!("The {} page is back to its defaults.", PAGES[self.page]));
         self.layout_dirty = true;
         self.invalidate();
         asks
@@ -2499,8 +2514,9 @@ impl SettingsWindow {
                         self.cache_said = Some("Windows couldn't do that right now. Try again.".into());
                     }
                 } else {
+                    // The button itself asks: it says PRESS AGAIN for a moment.
                     self.clear_asked_at = Some(now);
-                    self.cache_said = Some("Press CLEAR again to confirm.".into());
+                    self.cache_said = None;
                 }
                 self.layout_dirty = true;
             }
@@ -2514,22 +2530,22 @@ impl SettingsWindow {
             }
             // Not in this version (its row is greyed).
             Act::SortEditor => return vec![Ask::Command(Command::OpenSortEditor)],
-            // (Greyed until there's a Discord: the row isn't in LIVE.)
+            // (Hidden until there's a Discord: the row isn't in LIVE.)
             Act::Discord => {}
         }
         self.invalidate();
         Vec::new()
     }
 
-    /// Settings > About > Portable: moves the settings next to glint.exe or back, on a background
-    /// thread (copying files may take a moment); the row says what happened.
+    /// Settings > About > Portable: moves Glint's files next to Glint.exe or back, right away, on a
+    /// background thread (copying files may take a moment); the row says what happened.
     fn switch_portable(&mut self) -> Vec<Ask> {
         if self.portable_busy {
             return Vec::new();
         }
         let on = !settings::portable_now();
         self.portable_busy = true;
-        self.portable_said = Some("Moving the settings…".into());
+        self.portable_said = Some("Moving Glint's files…".into());
         self.layout_dirty = true;
         self.invalidate();
         let to = self.poster();
@@ -2542,7 +2558,7 @@ impl SettingsWindow {
     }
 
     /// Takes in what background work found.
-    fn take_results(&mut self) -> Vec<Ask> {
+    fn take_results(&mut self, app: &mut AppState) -> Vec<Ask> {
         // Only one Settings window is ever open: results for another number are for one that was
         // closed, and go.
         let mine = self.serial;
@@ -2555,7 +2571,6 @@ impl SettingsWindow {
         for bg in results {
             match bg {
                 Bg::Terminals(found) => self.terminals = Some(found),
-                Bg::ZipSaid(said) => self.zip_said = Some(said),
                 // (A size measured before CLEAR was pressed is out of date while clearing.)
                 Bg::CacheSize(bytes) => {
                     if !self.clearing {
@@ -2568,14 +2583,19 @@ impl SettingsWindow {
                     self.cache_said = Some(if bytes == 0 {
                         "Cleared.".to_string()
                     } else {
-                        format!("Cleared. {} is in use and was left.", crate::folder::format_size(bytes))
+                        format!("Cleared. {} is in use and was kept.", crate::folder::format_size(bytes))
                     });
                 }
                 Bg::Portable(result) => {
                     self.portable_busy = false;
                     self.portable_said = Some(match result {
-                        Ok(said) => said,
-                        Err(why) => format!("Couldn't switch: {why}"),
+                        Ok(said) => {
+                            // The tags and the skins are read from the new place from now on.
+                            app.files_moved();
+                            app.tags_refresh();
+                            said
+                        }
+                        Err(why) => format!("Failed to move Glint's files: {why}"),
                     });
                 }
                 Bg::Open(dir) => {
@@ -2786,10 +2806,6 @@ impl SettingsWindow {
             WM_ACTIVATE => {
                 self.active = lo_word(wparam.0) != WA_INACTIVE;
                 self.invalidate();
-                // Back from Windows' "Open with": the Zip icon row says what's true now.
-                if self.active {
-                    self.look_up_zip();
-                }
                 if !self.active {
                     self.box_had_focus = if self.folder_box.has_focus() {
                         Some(FOLDER_BOX)
@@ -2870,7 +2886,7 @@ impl SettingsWindow {
                 Some(LRESULT(0))
             }
             WM_APP_BG => {
-                asks.extend(self.take_results());
+                asks.extend(self.take_results(app));
                 Some(LRESULT(0))
             }
             _ => None,
@@ -2898,7 +2914,6 @@ impl Drop for SettingsWindow {
 /// The words of the link at the bottom that opens GitHub's issues page.
 const REPORT_BUG: &str = "Report a bug";
 /// At the bottom: there's no OK or Apply.
-const LIVE_NOTE: &str = "Changes apply right away";
 
 /// Whether a row is something searched for (`query`, in small letters): its title, its note, its
 /// choices, what a shortcut does, or its group's heading.
@@ -3175,7 +3190,7 @@ mod tests {
         assert_eq!(s.confirm_delete, settings::ConfirmDelete::Never);
         // Everything else stays as it was, the remembered state too.
         let mut before = Settings { bounds: Some([1, 2, 3, 4]), column_width_map: [("size".to_string(), 99.5)].into(), sort_column: 2, ..Default::default() };
-        before.tabs = vec![settings::SavedTab { path: "C:\\x".into(), sort_column: 1, sort_descending: true, view: None, pinned: false }];
+        before.tabs = vec![settings::SavedTab { path: "C:\\x".into(), sort_column: 1, sort_descending: true, view: None, pinned: false, back: Vec::new(), forward: Vec::new() }];
         let mut after = before.clone();
         assert!(set_in(&mut after, "Terminal", Value::String("cmd".into())));
         after.terminal = before.terminal;
@@ -3225,12 +3240,12 @@ mod tests {
         let facts = Facts {
             values: &values,
             terminals: None,
-            zip_said: None,
             config: String::new(),
             logs: String::new(),
             cache: String::new(),
             cache_size: None,
             cache_said: None,
+            clear_asked: false,
             portable_said: None,
             portable_locked: false,
             skins: &[],
@@ -3279,9 +3294,22 @@ mod tests {
         let new_tab = row_of(0, "NewTab");
         assert!(row_matches(&new_tab, "Startup", "this pc"), "a choice");
         let system = row_of(2, "ShowSystem");
-        assert!(row_matches(&system, "Show", "best left"), "its note");
+        assert!(row_matches(&system, "Show", "protected"), "its title");
         let keys = Row { title: "Ctrl+H".into(), note: None, ctl: Ctl::Text("Show or hide hidden files"), key: "@Keys", indent: false, needs: None, only_if: None, more: false, radios: false, long: false };
         assert!(row_matches(&keys, "Shortcuts", "hidden") && row_matches(&keys, "Shortcuts", "ctrl+h"));
+        // The Keys page's own: F2 finds Rename.
+        let values = values_of(&Settings::default());
+        let facts = pages::plain_facts(&values);
+        let f2: Vec<Row> = pages::page(3, &facts)
+            .into_iter()
+            .flat_map(|i| match i {
+                Item::Card(rows) => rows,
+                Item::Heading(_) => Vec::new(),
+            })
+            .filter(|r| row_matches(r, "Shortcuts", "f2"))
+            .collect();
+        assert_eq!(f2.len(), 1);
+        assert_eq!(f2[0].ctl, Ctl::Text("Rename"));
     }
 
     #[test]
@@ -3290,12 +3318,12 @@ mod tests {
         let facts = Facts {
             values: &values,
             terminals: None,
-            zip_said: None,
             config: String::new(),
             logs: String::new(),
             cache: String::new(),
             cache_size: None,
             cache_said: None,
+            clear_asked: false,
             portable_said: None,
             portable_locked: false,
             skins: &[],

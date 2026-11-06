@@ -411,13 +411,21 @@ pub struct ListView {
     /// Home's page (home.rs) and whether it's on screen (at the last frame).
     home: home::Home,
     home_on: bool,
+    /// Disk space's page, drawn instead of rows while the tab shows it (diskpage.rs).
+    disk: crate::diskpage::DiskPage,
     /// Split view: where the wallpaper lies (both halves); None: this list.
     wall_area: Option<Rect>,
+    /// SHOW THEM after "Only protected system files are here." (at the last frame), when it shows.
+    show_system_at: Option<Rect>,
     /// How media.rs tells this list's asks from the other half's (split view), and what this list
     /// last asked it for (Picture size and Length).
     media_id: u32,
     media: MediaRead,
 }
+
+/// What the list says when everything left to show is a protected system file, and its button.
+const SYSTEM_ONLY: &str = "Only protected system files are here.";
+const SHOW_SYSTEM: &str = "SHOW THEM";
 
 /// Numbers for the lists, for media.rs.
 static NEXT_LIST: AtomicU32 = AtomicU32::new(1);
@@ -513,7 +521,9 @@ impl ListView {
             list_hit: Vec::new(),
             home: home::Home::default(),
             home_on: false,
+            disk: crate::diskpage::DiskPage::default(),
             wall_area: None,
+            show_system_at: None,
             media_id: NEXT_LIST.fetch_add(1, Ordering::Relaxed),
             media: MediaRead::default(),
         }
@@ -1147,7 +1157,7 @@ impl ListView {
         if self.rename_row(tab).is_none() {
             let name = self.rename.as_ref().map(|r| r.name.clone()).unwrap_or_default();
             self.end_rename(now, false, true);
-            app.say(format!("\u{201c}{name}\u{201d} isn't there any more."));
+            app.say(format!("\u{201c}{name}\u{201d} doesn't exist."));
             return;
         }
         self.place_name_box(tab);
@@ -1282,8 +1292,8 @@ impl ListView {
                 // Turned on where it can't show: say where it does.
                 let here = app.tab().media_here;
                 match item {
-                    HEAD_DIMENSIONS if on && !here.dims => app.say("Picture size shows in folders with pictures or videos"),
-                    HEAD_LENGTH if on && !here.length => app.say("Length shows in folders with videos or songs"),
+                    HEAD_DIMENSIONS if on && !here.dims => app.say("Picture size shows in folders with pictures or videos."),
+                    HEAD_LENGTH if on && !here.length => app.say("Length shows in folders with videos or songs."),
                     _ => {}
                 }
             }
@@ -1579,13 +1589,23 @@ impl ListView {
             Some(format!("No items match \u{201c}{}\u{201d}.", tab.filter))
         } else if tab.view.is_empty() && tab.folder.path == tab.path {
             // Everything here is hidden (see Tab::rebuild_view).
-            Some(if tab.show_hidden { "Only protected system files are here." } else { "Only hidden items are here. Ctrl+H shows them." }.to_string())
+            Some(if tab.show_hidden { SYSTEM_ONLY } else { "Only hidden items are here. Ctrl+H shows them." }.to_string())
         } else {
             None
         };
+        self.show_system_at = None;
         if let Some(m) = message {
             let line = Rect::new(area.x + ROW_PAD + size::ICON + 8.0, area.y + 6.0, area.w - 60.0, size::ROW_H);
-            r.text(&m, line, &TextStyle::new(theme.muted));
+            let style = TextStyle::new(theme.muted);
+            r.text(&m, line, &style);
+            // Only protected system files: a button right after the words shows them.
+            if m == SYSTEM_ONLY {
+                let w = crate::kit::button_width(r, SHOW_SYSTEM);
+                let h = crate::kit::size::BUTTON_H;
+                let at = Rect::new(line.x + r.measure(&m, &style).ceil() + 12.0, line.y + (line.h - h) / 2.0, w, h);
+                crate::kit::button(r, theme, at, SHOW_SYSTEM, crate::kit::Look::enabled());
+                self.show_system_at = Some(at);
+            }
         }
 
         if let Some(thumb) = self.thumb(tab) {
@@ -2367,6 +2387,11 @@ impl Component for ListView {
         r.push_clip(self.rect);
         r.fill_paint(self.wall_area.unwrap_or(self.rect), 0.0, &theme.panel_paint);
         self.paint_wallpaper(r, theme);
+        if crate::diskspace::is_disk(&tab.path) {
+            self.disk.paint(r, theme, app, self.rect);
+            r.pop_clip();
+            return;
+        }
         if self.home_on {
             let max = (self.home.layout.height - self.rect.h).max(0.0);
             let area = Rect::new(self.rect.x, self.rect.y, self.rect.w - SCROLL_GUTTER.min(12.0), self.rect.h);
@@ -2398,6 +2423,9 @@ impl Component for ListView {
     }
 
     fn cursor(&self, p: Point, app: &AppState) -> CursorKind {
+        if crate::diskspace::is_disk(&app.tab().path) {
+            return self.disk.cursor(p);
+        }
         if matches!(self.drag, Drag::Column { .. }) || self.edge_at(p).is_some() {
             CursorKind::SizeWE
         } else if app.settings.single_click && self.row_at(app.tab(), p).is_some() && self.on_arrow(app.tab(), p).is_none() {
@@ -2409,6 +2437,9 @@ impl Component for ListView {
     }
 
     fn mouse_move(&mut self, ctx: &Ctx, e: &MouseEvent, app: &mut AppState) -> Effect {
+        if crate::diskspace::is_disk(&app.tab().path) {
+            return self.disk.mouse_move(e);
+        }
         self.mouse = Some(e.pos);
         self.was_active = ctx.active;
         // Moved far enough from where a button went down on an item: the selection is dragged out.
@@ -2473,12 +2504,18 @@ impl Component for ListView {
         Effect::Redraw
     }
 
-    fn mouse_leave(&mut self, _ctx: &Ctx, _app: &mut AppState) -> Effect {
+    fn mouse_leave(&mut self, _ctx: &Ctx, app: &mut AppState) -> Effect {
+        if crate::diskspace::is_disk(&app.tab().path) {
+            return self.disk.mouse_leave();
+        }
         self.mouse = None;
         Effect::Redraw
     }
 
     fn mouse_down(&mut self, ctx: &Ctx, e: &MouseEvent, app: &mut AppState) -> Effect {
+        if crate::diskspace::is_disk(&app.tab().path) {
+            return self.disk.mouse_down(e, app);
+        }
         self.mouse = Some(e.pos);
         self.cancel_slow_click();
         self.click_open = None;
@@ -2493,6 +2530,11 @@ impl Component for ListView {
                 app.tree_toggle(index);
                 return Effect::Redraw;
             }
+        }
+        // SHOW THEM, when only protected system files are here: they show from then on.
+        if e.button == MouseButton::Left && self.show_system_at.is_some_and(|b| crate::kit::button_contains(b, e.pos)) {
+            app.set_show_system(true);
+            return Effect::Redraw;
         }
         // Home: its chevrons fold a section; its pills pick Recent or Favorites.
         if self.home_on && e.button == MouseButton::Left && !self.near_track(e.pos) {
@@ -2734,6 +2776,9 @@ impl Component for ListView {
     }
 
     fn wheel(&mut self, ctx: &Ctx, e: &MouseEvent, app: &mut AppState) -> Effect {
+        if crate::diskspace::is_disk(&app.tab().path) {
+            return self.disk.wheel(e);
+        }
         self.cancel_slow_click();
         // Scrolling while renaming keeps what was typed, like clicking elsewhere.
         if self.rename.is_some() {
@@ -2757,6 +2802,9 @@ impl Component for ListView {
     }
 
     fn key_down(&mut self, ctx: &Ctx, vk: u16, mods: crate::ui::Mods, app: &mut AppState) -> Effect {
+        if crate::diskspace::is_disk(&app.tab().path) {
+            return if self.disk.key(vk) { Effect::Redraw } else { Effect::None };
+        }
         self.cancel_slow_click();
         if app.tab().waiting_long() {
             return Effect::None; // the items on screen aren't this folder's (see paint_rows)

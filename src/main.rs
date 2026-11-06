@@ -53,6 +53,8 @@ mod eraicons;
 mod oldmenu;
 mod dragdrop;
 mod droplist;
+mod diskpage;
+mod diskspace;
 mod dupes;
 mod fileops;
 mod folder;
@@ -227,7 +229,7 @@ fn main() {
     let same_tabs = after_update.then(|| settings::Settings { startup: settings::Startup::Restore, ..loaded.clone() });
     let (tabs, active) = match &target {
         // An extra window (Ctrl+N) opens just its folder.
-        Some(t) if !main => (vec![settings::SavedTab { path: t.folder.clone(), sort_column: loaded.sort_column, sort_descending: loaded.sort_descending, view: None, pinned: false }], 0),
+        Some(t) if !main => (vec![settings::SavedTab { path: t.folder.clone(), sort_column: loaded.sort_column, sort_descending: loaded.sort_descending, view: None, pinned: false, back: Vec::new(), forward: Vec::new() }], 0),
         _ => settings::initial_tabs(same_tabs.as_ref().unwrap_or(&loaded), target.as_ref().map(|t| t.folder.as_str()), &loaded.home_place()),
     };
     log::line(&format!(
@@ -249,7 +251,7 @@ fn main() {
         app.select_when_loaded(name);
     }
     if after_update {
-        app.say(format!("Glint is updated to {}", update::ours()));
+        app.say(format!("Glint is updated to {}.", update::ours()));
         log::line(&format!("started after updating to {}", update::ours()));
     }
     let hwnd = match window::create(app, window::Options { bench, started, main, hidden }) {

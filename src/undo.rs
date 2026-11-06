@@ -62,18 +62,18 @@ impl Step {
         }
     }
 
-    /// What it was, for the status bar: "the rename of “a.txt”", "the move of 3 items".
+    /// What it was, for the status bar: "renaming “a.txt”", "moving 3 items".
     pub fn describe(&self) -> String {
         match self {
-            Step::Renamed { from, .. } => format!("the rename of \u{201c}{from}\u{201d}"),
-            Step::Made { paths, what } => format!("the {what} ({})", items_text(paths)),
+            Step::Renamed { from, .. } => format!("renaming \u{201c}{from}\u{201d}"),
+            Step::Made { paths, .. } => format!("making {}", items_text(paths)),
             Step::Moved { pairs } => {
                 let from: Vec<String> = pairs.iter().map(|(a, _)| a.clone()).collect();
                 // Renamed many at once (app/forms.rs): each stayed in its folder.
                 let renamed = pairs.iter().all(|(a, b)| crate::folder::parent(a) == crate::folder::parent(b));
-                format!("the {} of {}", if renamed { "rename" } else { "move" }, items_text(&from))
+                format!("{} {}", if renamed { "renaming" } else { "moving" }, items_text(&from))
             }
-            Step::Recycled { paths } => format!("the delete of {}", items_text(paths)),
+            Step::Recycled { paths } => format!("deleting {}", items_text(paths)),
         }
     }
 }
@@ -348,13 +348,13 @@ mod tests {
     #[test]
     fn the_status_bar_says_what_was_undone() {
         let r = Step::Renamed { dir: "C:\\x".into(), from: "a.txt".into(), to: "b.txt".into() };
-        assert_eq!(r.describe(), "the rename of \u{201c}a.txt\u{201d}");
+        assert_eq!(r.describe(), "renaming \u{201c}a.txt\u{201d}");
         // Renamed many at once: each stayed in its folder.
         let many = Step::Moved { pairs: vec![("C:\\x\\a.jpg".into(), "C:\\x\\Holiday 1.jpg".into()), ("C:\\x\\b.jpg".into(), "C:\\x\\Holiday 2.jpg".into())] };
-        assert_eq!(many.describe(), "the rename of 2 items");
+        assert_eq!(many.describe(), "renaming 2 items");
         // Up to the drive's root is a move.
-        assert_eq!(Step::Moved { pairs: vec![("C:\\x\\a.jpg".into(), "C:\\a.jpg".into())] }.describe(), "the move of \u{201c}a.jpg\u{201d}");
-        assert_eq!(Step::Made { paths: vec!["C:\\x\\New folder".into()], what: "new folder" }.describe(), "the new folder (\u{201c}New folder\u{201d})");
-        assert_eq!(Step::Recycled { paths: vec!["C:\\a".into(), "C:\\b".into(), "C:\\c".into()] }.describe(), "the delete of 3 items");
+        assert_eq!(Step::Moved { pairs: vec![("C:\\x\\a.jpg".into(), "C:\\a.jpg".into())] }.describe(), "moving \u{201c}a.jpg\u{201d}");
+        assert_eq!(Step::Made { paths: vec!["C:\\x\\New folder".into()], what: "new folder" }.describe(), "making \u{201c}New folder\u{201d}");
+        assert_eq!(Step::Recycled { paths: vec!["C:\\a".into(), "C:\\b".into(), "C:\\c".into()] }.describe(), "deleting 3 items");
     }
 }

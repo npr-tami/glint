@@ -36,7 +36,7 @@ pub(super) fn open_sort(hwnd: HWND, ptr: *mut Window) {
         BUSY.with(|b| b.set(false));
         let Some(win) = made else {
             BUSY.with(|b| b.set(true));
-            (*ptr).app.say("Windows couldn't open the sort editor right now");
+            (*ptr).app.say("Windows couldn't open Sort order and views right now. Try again.");
             (*ptr).invalidate();
             BUSY.with(|b| b.set(false));
             return;

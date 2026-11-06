@@ -172,7 +172,7 @@ pub const NOT_A_FOLDER: &str = "This is a file, not a folder.";
 /// Whether `path` is one of Glint's places that aren't folders: the Recycle Bin or Recent. Nothing
 /// can be made, pasted or dropped there.
 pub fn is_place(path: &str) -> bool {
-    recycle::is_bin(path) || crate::recent::is_recent(path)
+    recycle::is_bin(path) || crate::recent::is_recent(path) || crate::diskspace::is_disk(path)
 }
 
 /// Reads one folder. Never panics; problems end up in `Folder::error`.
@@ -182,6 +182,9 @@ pub fn read(path: &str) -> Folder {
         recycle::read()
     } else if crate::recent::is_recent(path) {
         crate::recent::read()
+    } else if crate::diskspace::is_disk(path) {
+        // Disk space draws its own page (diskpage.rs) from its look (app/disk.rs).
+        Folder { path: path.to_string(), ..Default::default() }
     } else if path.is_empty() {
         this_pc()
     } else if !is_absolute(path) {
@@ -420,7 +423,7 @@ pub(crate) fn is_file(path: &str) -> bool {
 fn explain(code: u32, system: &str) -> String {
     match code & 0xFFFF {
         5 => "You don't have permission to open this folder.".into(),
-        2 | 3 => "This folder doesn't exist (any more).".into(),
+        2 | 3 => "This folder doesn't exist.".into(),
         21 => "The drive isn't ready. Is there a disc or card in it?".into(),
         53 | 67 => "The network location can't be reached.".into(),
         206 => "The path is too long.".into(),
@@ -1059,6 +1062,53 @@ fn is_absolute(path: &str) -> bool {
     path.starts_with("\\\\") || (b.get(1) == Some(&b':') && b.get(2) == Some(&b'\\'))
 }
 
+/// `path` as the disk spells it ("x:\GLINTBREAK\FILES" typed: "X:\GlintBreak\files"), so the path
+/// bar and the tab show the real names. Only on this PC's own drives and USB sticks (a network
+/// drive that's away would hold things up); the path as it is when a part of it isn't found.
+pub fn real_case(path: &str) -> String {
+    let b = path.as_bytes();
+    if !(b.len() >= 3 && b[1] == b':' && b[2] == b'\\' && b[0].is_ascii_alphabetic()) {
+        return path.to_string();
+    }
+    let root = format!("{}:\\", (b[0] as char).to_ascii_uppercase());
+    let w = wide(&root);
+    // SAFETY: a NUL-terminated root path that outlives the call.
+    let kind = unsafe { GetDriveTypeW(PCWSTR(w.as_ptr())) };
+    if !matches!(kind, 2 | 3) {
+        // (DRIVE_REMOVABLE, DRIVE_FIXED only.)
+        return path.to_string();
+    }
+    let mut out = root.trim_end_matches('\\').to_string();
+    for part in path[3..].split('\\').filter(|p| !p.is_empty()) {
+        let asked = format!("{out}\\{part}");
+        // "." and "..", and wildcards, are left as they are.
+        let name = if part == "." || part == ".." || part.contains(['*', '?']) { None } else { found_name(&asked) };
+        match name {
+            Some(n) if n.eq_ignore_ascii_case(part) || n.to_lowercase() == part.to_lowercase() => out = format!("{out}\\{n}"),
+            _ => return path.to_string(),
+        }
+    }
+    if out.len() == 2 {
+        out.push('\\');
+    }
+    out
+}
+
+/// The name of the one item at `path`, as the disk spells it.
+fn found_name(path: &str) -> Option<String> {
+    let w = wide_path(path);
+    let mut data = WIN32_FIND_DATAW::default();
+    // SAFETY: `w` is NUL-terminated and outlives the call; `data` is a valid WIN32_FIND_DATAW.
+    let handle = unsafe {
+        FindFirstFileExW(PCWSTR(w.as_ptr()), FindExInfoBasic, &mut data as *mut _ as *mut _, FindExSearchNameMatch, None, Default::default())
+    }
+    .ok()?;
+    // SAFETY: the handle FindFirstFileExW just gave.
+    let _ = unsafe { FindClose(handle) };
+    let len = data.cFileName.iter().position(|&c| c == 0).unwrap_or(data.cFileName.len());
+    Some(String::from_utf16_lossy(&data.cFileName[..len]))
+}
+
 /// What a person typed, as a full path, with `base` (the folder they're in) as the starting point
 /// for a name or relative path: "src" and "..\Music" go where Explorer's address bar would take
 /// them, not somewhere under the process's current folder (which has nothing to do with what is
@@ -1088,6 +1138,9 @@ pub fn normalize(input: &str) -> String {
     }
     if recycle::means_bin(&s) {
         return recycle::LOCATION.to_string();
+    }
+    if let Some(drive) = crate::diskspace::drive_of_location(&s) {
+        return crate::diskspace::location(&drive);
     }
     if crate::recent::means_home(&s) {
         return crate::recent::LOCATION.to_string();

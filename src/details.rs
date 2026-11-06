@@ -845,7 +845,7 @@ impl Verdict {
             Verdict::Matches => ("\u{2713} Matches the copied code", if theme.dark { Color::hex(0x3dd68c) } else { Color::hex(0x1a7f37) }),
             Verdict::Differs => ("\u{2717} Doesn't match the copied code", crate::codebox::PROBLEM_RED),
             Verdict::NoCode => ("Copy the code from the website first", theme.muted),
-            Verdict::Unreadable => ("Couldn't read this file", theme.muted),
+            Verdict::Unreadable => ("Failed to read this file", theme.muted),
         }
     }
 }
@@ -1156,7 +1156,7 @@ impl DetailsPanel {
             button(r, theme, f.open_with, "Open with\u{2026}", hover, pressed, false, None);
         }
         if can_copy {
-            let copied = one.is_some_and(|o| self.copied.as_deref() == Some(o.key.as_str())) && app.note() == Some("Path copied");
+            let copied = one.is_some_and(|o| self.copied.as_deref() == Some(o.key.as_str())) && app.note() == Some("Path copied.");
             let (hover, pressed) = self.look(Hit::Copy);
             button(r, theme, f.copy, if copied { "Copied" } else { "Copy path" }, hover, pressed, false, copied.then_some(theme.accent));
         }
@@ -1213,7 +1213,7 @@ impl DetailsPanel {
                     buttons.push((Hit::Show, at(0.0, 0.0)));
                 }
                 Some(Step::Working(job)) => r.text(&job.0.progress("Working it out"), value, &muted),
-                Some(Step::Failed) => r.text("Couldn't read this file", value, &muted),
+                Some(Step::Failed) => r.text("Failed to read this file", value, &muted),
                 Some(Step::Done(code)) => {
                     let style = TextStyle::new(theme.text).align(Align::Right);
                     let shown = fit_code(code, value.w, &mut |t| r.measure(t, &style));
@@ -1332,10 +1332,10 @@ impl DetailsPanel {
                 if let Sel::One(one) = selection(app) {
                     // The item's own path as it is (the list's Ctrl+Shift+C quotes paths with spaces).
                     if shell::copy_text(ctx.hwnd, &one.copy) {
-                        app.say("Path copied");
+                        app.say("Path copied.");
                         self.copied = Some(one.key);
                     } else {
-                        app.say("Couldn't copy (the clipboard is busy)");
+                        app.say("Failed to copy. Try again in a moment.");
                     }
                 }
                 Effect::Redraw
@@ -1356,7 +1356,7 @@ impl DetailsPanel {
                             app.say(PRINT_COPIED);
                             p.copied = true;
                         } else {
-                            app.say("Couldn't copy (the clipboard is busy)");
+                            app.say("Failed to copy. Try again in a moment.");
                         }
                     }
                 }

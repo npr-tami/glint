@@ -29,9 +29,9 @@ impl AppState {
         let name = self.display_name(path);
         if self.is_pinned(path) {
             self.unpin(path);
-            self.say(format!("Unpinned {name}"));
+            self.say(format!("Unpinned \u{201c}{name}\u{201d}."));
         } else if self.pin_folder(path) {
-            self.say(format!("Pinned {name}"));
+            self.say(format!("Pinned \u{201c}{name}\u{201d}."));
         }
     }
 
@@ -112,7 +112,7 @@ impl AppState {
         !all_in
     }
 
-    /// "Add to Favorites" / "Remove from Favorites" in the right-click menu: for the selected items.
+    /// "Add to Favourites" / "Remove from Favourites" in the right-click menu: for the selected items.
     /// Home on screen is read again so its Favorites list shows the change.
     pub fn toggle_favorites(&mut self) {
         let t = self.tab();
@@ -120,11 +120,11 @@ impl AppState {
         if paths.is_empty() {
             return;
         }
-        let what = if paths.len() == 1 { self.display_name(&paths[0]) } else { format!("{} items", paths.len()) };
+        let what = if paths.len() == 1 { format!("\u{201c}{}\u{201d}", self.display_name(&paths[0])) } else { format!("{} items", paths.len()) };
         if self.favorite(&paths) {
-            self.say(format!("Added {what} to Favorites"));
+            self.say(format!("Added {what} to Favourites."));
         } else {
-            self.say(format!("Removed {what} from Favorites"));
+            self.say(format!("Removed {what} from Favourites."));
         }
         if crate::recent::is_recent(&self.tab().path) {
             self.refresh();

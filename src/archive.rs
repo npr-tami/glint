@@ -38,7 +38,7 @@ const ATTR_DIRECTORY: u32 = 0x10;
 /// The id 7z gives its AES coder: a block packed with it needs a password.
 const SEVENZ_AES: [u8; 4] = [0x06, 0xF1, 0x07, 0x01];
 
-const PASSWORD: &str = "This archive is locked with a password, and Glint can't open password-protected archives yet.";
+const PASSWORD: &str = "Glint can't open password-protected archives.";
 const DAMAGED_ZIP: &str = "This zip file is damaged or uses a kind of packing Glint can't read.";
 const DAMAGED_7Z: &str = "This 7z file is damaged or uses a kind of packing Glint can't read.";
 /// What unpacking or packing says when CANCEL was clicked in the copy queue's list.
@@ -758,8 +758,8 @@ pub fn extract_all(archive: &str, dest_dir: &str, made: &mut Vec<String>) -> Res
 /// Writes the planned items (index in `items`, where it goes): folders first, then the files. A
 /// file already there is never replaced: that's an error instead.
 fn unpack(archive: &str, opened: &mut Opened, items: &[Item], plan: &[(usize, PathBuf)], meter: &Meter) -> Result<(), String> {
-    if let Some(&(i, _)) = plan.iter().find(|(i, _)| items[*i].locked && !items[*i].is_dir) {
-        return Err(format!("\u{201c}{}\u{201d} is locked with a password, and Glint can't open password-protected archives yet.", folder::file_name(&items[i].path)));
+    if plan.iter().any(|(i, _)| items[*i].locked && !items[*i].is_dir) {
+        return Err(PASSWORD.to_string());
     }
     // Folders first (empty ones too), and every file's folder.
     for (i, out) in plan {

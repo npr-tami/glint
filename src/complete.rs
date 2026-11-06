@@ -307,7 +307,15 @@ fn suggestions(text: &str, caret: usize, places: &[Place], listed: &dyn Fn(&str)
         let order = sortrecipe::is_order_word(base);
         let group = !order && !base.is_empty() && !sortrecipe::is_view_word(base) && sortrecipe::Recipe::parse(&format!("-{base}")).messages.is_empty();
         if order || group {
-            let mut ends: Vec<(&str, &str)> = if order { vec![("_first", "this end first"), ("_last", "turned around")] } else { vec![("_first", "at the very top"), ("_last", "at the very bottom")] };
+            // (By name, the two ends say which way round the letters go.)
+            let by_name = matches!(base, "name" | "by_name" | "alphabetical" | "a_to_z");
+            let mut ends: Vec<(&str, &str)> = if by_name {
+                vec![("_first", "normal order (A to Z)"), ("_last", "reversed (Z to A)")]
+            } else if order {
+                vec![("_first", "this end first"), ("_last", "turned around")]
+            } else {
+                vec![("_first", "at the very top"), ("_last", "at the very bottom")]
+            };
             let date = order && ["newest", "oldest", "date", "modified", "latest", "created"].iter().any(|d| base.starts_with(d));
             if date && !base.contains("_by_") {
                 ends.extend([("_by_day", "a day counts as one"), ("_by_week", "a week counts as one"), ("_by_month", "a month counts as one"), ("_by_year", "a year counts as one")]);
@@ -476,9 +484,9 @@ mod tests {
             p("Home", "C:\\Users\\me", "Quick access"),
             p("Documents", "C:\\Users\\me\\Documents", "Quick access"),
             p("Downloads", "C:\\Users\\me\\Downloads", "Quick access"),
-            p("Work", "D:\\Work", "Pinned"),
-            p("docs", "C:\\src\\docs", "Subfolder"),
-            p("Local Disk (C:)", "C:\\", "Drive"),
+            p("Work", "D:\\Work", "pinned"),
+            p("docs", "C:\\src\\docs", "subfolder"),
+            p("Local Disk (C:)", "C:\\", "drive"),
         ]
     }
 
@@ -610,6 +618,9 @@ mod tests {
         let c = at_end("-name_");
         assert!(c.items[0].insert.starts_with("-name_has_") && c.items[1].insert.starts_with("-name_starts_with_"), "{:?}", labels(&c));
         assert!(labels(&c).contains(&"name_first"), "still there, after them");
+        let hint = |label: &str| c.items.iter().find(|s| s.label == label).map(|s| s.hint.clone());
+        assert_eq!(hint("name_first").as_deref(), Some("normal order (A to Z)"));
+        assert_eq!(hint("name_last").as_deref(), Some("reversed (Z to A)"));
         // -larger_than_, and its sizes.
         assert!(inserts(&at_end("-larg")).contains(&"-larger_than_"));
         assert_eq!(at_end("-larger_than_1").items[0].insert, "-larger_than_1mb");
@@ -620,7 +631,8 @@ mod tests {
         assert_eq!(at_end("-mov").items[0].insert, "-movies");
         assert_eq!(at_end("alpha").items[0].insert, "alphabetical");
         // The main words still come first.
-        assert_eq!(at_end("-a").items[0].insert, "-audio");
+        assert_eq!(at_end("-mu").items[0].insert, "-music");
+        assert_eq!(at_end("-au").items[0].insert, "-audio");
         assert_eq!(at_end("-new").items[0].insert, "-newest");
     }
 
@@ -639,7 +651,7 @@ mod tests {
         assert!(!inserts(&complete(text, 3, &places(), &|_: &str| None)).contains(&"-pictures"));
         let text = "-video\n\n-image";
         let c = asked(text, 7);
-        assert!(!labels(&c).contains(&"-image") && !labels(&c).contains(&"-video") && labels(&c).contains(&"-audio"), "{:?}", labels(&c));
+        assert!(!labels(&c).contains(&"-image") && !labels(&c).contains(&"-video") && labels(&c).contains(&"-music"), "{:?}", labels(&c));
         // In a folder's own rules, only its own lines count.
         assert_eq!(at_end("-image\nin C:\\x (\n-pic").items[0].insert, "-pictures");
         assert!(!inserts(&at_end("in C:\\x (\n-image\n-pic")).contains(&"-pictures"));
