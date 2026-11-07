@@ -2,6 +2,12 @@
 
 The newest version is at the top.
 
+## 1.0.24-beta.2 · 07/11/2026 21:27
+
+- Added Disk space to a drive's right-click menu in the sidebar
+- Added a setting for opening Disk space by clicking a drive's usage bar, in Settings > General
+- Some other improvements and bugfixes
+
 ## 1.0.24-beta.1 · 06/11/2026 15:03
 
 - Added Disk space (Ctrl+Shift+U): the biggest folders, what changed since your last scan, and space by type

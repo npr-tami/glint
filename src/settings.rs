@@ -1078,6 +1078,9 @@ pub struct Settings {
     pub remember_split: bool,
     /// Ctrl + the scroll wheel over the files changes the view, as in File Explorer.
     pub ctrl_wheel_view: bool,
+    /// Clicking a drive's usage bar in the sidebar opens Disk space for it (off: the bar is part of
+    /// the drive's row, so a click opens the drive).
+    pub disk_bar_click: bool,
     /// The custom sort order's rules; None: the starter rules.
     pub sort_recipe: Option<String>,
     /// The folders pinned to the sidebar (Ctrl+D, right-click > Pin to sidebar), in their order.
@@ -1245,6 +1248,7 @@ impl Default for Settings {
             custom_views: true,
             remember_split: false,
             ctrl_wheel_view: false,
+            disk_bar_click: false,
             split_folder: None,
             split_ratio: 0.5,
             sort_recipe: None,
@@ -1333,6 +1337,8 @@ const CHOICES: &[&str] = &[
     "RememberSplit",
     "CtrlWheelView",
     "SortRecipe",
+    // The sidebar's drive usage bars (sidebar.rs).
+    "DiskBarClick",
     // The file list's (list.rs).
     "Size",
     "ShowSidebar",

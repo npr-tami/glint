@@ -107,6 +107,7 @@ const PICK_UNPIN: u32 = 11;
 const PICK_REMOVE_PLACE: u32 = 12;
 const PICK_EMPTY_BIN: u32 = 13;
 const PICK_PIN_HERE: u32 = 14;
+const PICK_DISK_SPACE: u32 = 15;
 /// "Show in Quick access ›": this plus the place's number in `quick_places`.
 const PICK_SHOW_PLACE: u32 = 100;
 
@@ -800,6 +801,7 @@ impl Sidebar {
                 let p = path.unwrap_or("");
                 open(&mut items);
                 items.push(MenuItem::new(PICK_PIN, pin_label(p)));
+                items.push(MenuItem::new(PICK_DISK_SPACE, "Disk space"));
                 folder_tail(&mut items);
             }
         }
@@ -1105,8 +1107,9 @@ impl Component for Sidebar {
         let Some(at) = self.item_at(e.pos) else { return Effect::None };
         let item = self.items[at].item;
         let path = self.path_of(item, app).map(str::to_string);
-        // A drive's usage bar (under its name): Disk space for that drive.
-        if let (MouseButton::Left, Item::Drive(i), Some(root)) = (e.button, item, path.as_ref()) {
+        // A drive's usage bar (under its name): Disk space for that drive, when that's turned on (it's
+        // easily hit by mistake; the right-click menu has Disk space too).
+        if let (MouseButton::Left, Item::Drive(i), Some(root), true) = (e.button, item, path.as_ref(), app.settings.disk_bar_click) {
             let name_h = if self.panels { self.items[at].h - PANEL_BAR_H - 8.0 } else { self.drive_text_h() };
             let below_name = e.pos.y - self.rect.y + self.scroll >= self.items[at].top + name_h;
             if below_name && app.drives.get(i).and_then(usage).is_some() {
@@ -1210,6 +1213,7 @@ impl Component for Sidebar {
                 Effect::None
             }
             PICK_TERMINAL => Effect::Command(Command::OpenTerminal(path)),
+            PICK_DISK_SPACE => Effect::Command(Command::DiskSpace(Some(path))),
             PICK_PROPERTIES => {
                 // Windows' Properties window for the folder, drive or Recycle Bin (shellmenu.rs).
                 if !crate::shellmenu::properties(ctx.hwnd, vec![path]) {

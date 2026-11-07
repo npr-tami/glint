@@ -80,6 +80,7 @@ pub const LIVE: &[&str] = &[
     "SingleClick",
     "DoubleClickUp",
     "CtrlWheelView",
+    "DiskBarClick",
     "Backspace",
     "@Search",
     "@Pins",
@@ -562,6 +563,7 @@ fn general(f: &Facts) -> Vec<Item> {
             choice("SingleClick", "", None, &[(B(true), "Single-click to open"), (B(false), "Double-click to open")]).radios(),
             toggle("DoubleClickUp", "Double-click empty space to go up", None),
             toggle("CtrlWheelView", "Ctrl+scroll wheel changes view", None).more(),
+            toggle("DiskBarClick", "Click a drive's usage bar to open Disk space", None).more(),
         ]),
         Item::Heading("Background"),
         Item::Card(vec![
