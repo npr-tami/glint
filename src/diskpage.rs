@@ -83,7 +83,8 @@ struct Row {
     sub: String,
     /// The bar's length, 0 to 1.
     part: f32,
-    bar: Color,
+    /// The bar's colour; None: the skin's accent.
+    bar: Option<Color>,
     size: String,
     size_color: Option<Color>,
     click: Click,
@@ -362,7 +363,7 @@ impl DiskPage {
         let track = Rect::new(bar_x, b.y + (b.h - BAR_H) / 2.0, bar_w, BAR_H);
         r.fill_round_rect(track, BAR_H / 2.0, theme.chip);
         if row.part > 0.0 {
-            r.fill_round_rect(Rect::new(track.x, track.y, (track.w * row.part).max(BAR_H), BAR_H), BAR_H / 2.0, row.bar);
+            r.fill_round_rect(Rect::new(track.x, track.y, (track.w * row.part).max(BAR_H), BAR_H), BAR_H / 2.0, row.bar.unwrap_or(theme.accent));
         }
         let color = row.size_color.unwrap_or(theme.text);
         r.text(&row.size, Rect::new(size_x, b.y, SIZE_W, b.h), &TextStyle::new(color).size(font).align(Align::Right));
@@ -418,7 +419,7 @@ fn biggest(look: &Look, at: &str) -> Vec<Row> {
                 name: k.name.clone(),
                 sub,
                 part: k.size as f32 / top,
-                bar: Color::hex(0x76b900),
+                bar: None,
                 size: folder::format_size(k.size),
                 size_color: None,
                 click: if k.kids.is_empty() { Click::Open(rel) } else { Click::Into(rel) },
@@ -428,7 +429,7 @@ fn biggest(look: &Look, at: &str) -> Vec<Row> {
     let rest = node.rest();
     if rest > 0 {
         let name = if at.is_empty() { "Files on the drive itself and small folders".to_string() } else { "Files here and small folders".to_string() };
-        rows.push(Row { name, sub: "Open the folder to see them".into(), part: rest as f32 / top, bar: Color::hex(0x5a5a5a), size: folder::format_size(rest), size_color: None, click: Click::Open(at.to_string()) });
+        rows.push(Row { name, sub: "Open the folder to see them".into(), part: rest as f32 / top, bar: Some(Color::hex(0x5a5a5a)), size: folder::format_size(rest), size_color: None, click: Click::Open(at.to_string()) });
     }
     rows
 }
@@ -449,7 +450,7 @@ fn grew_rows(changes: &[diskspace::Change]) -> Vec<Row> {
                 name,
                 sub: if parent.is_empty() { "On the drive itself".into() } else { parent },
                 part: c.change.unsigned_abs() as f32 / top,
-                bar: color,
+                bar: Some(color),
                 size: format!("{sign}{}", folder::format_size(c.change.unsigned_abs())),
                 size_color: Some(color),
                 click: Click::Open(c.rel.clone()),
@@ -463,7 +464,7 @@ fn types(look: &Look) -> Vec<Row> {
     let top = kinds.first().map(|k| k.1).unwrap_or(1).max(1) as f32;
     kinds
         .into_iter()
-        .map(|(k, bytes)| Row { name: k.name().into(), sub: k.examples().into(), part: bytes as f32 / top, bar: kind_color(k), size: folder::format_size(bytes), size_color: None, click: Click::Nothing })
+        .map(|(k, bytes)| Row { name: k.name().into(), sub: k.examples().into(), part: bytes as f32 / top, bar: Some(kind_color(k)), size: folder::format_size(bytes), size_color: None, click: Click::Nothing })
         .collect()
 }
 

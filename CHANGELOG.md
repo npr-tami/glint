@@ -2,6 +2,10 @@
 
 The newest version is at the top.
 
+## 1.0.24-beta.3 · 08/11/2026 18:56
+
+- Changed the bars on Disk space's Biggest tab to your skin's colour
+
 ## 1.0.24-beta.2 · 07/11/2026 21:27
 
 - Added Disk space to a drive's right-click menu in the sidebar
