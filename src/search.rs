@@ -7,7 +7,11 @@
 //! - in This PC (a root of ""), every ready local and removable drive is searched;
 //! - at most [`LIMIT`] results, so a search of a whole drive can't eat the memory (and the list
 //!   of folders still to go through is kept small too);
-//! - folders that can't be read (no permission) are skipped without a word.
+//! - folders that can't be read (no permission) are skipped without a word;
+//! - words in quotes are looked for inside files (`"hello world"`, or `"hello world" *.md` for
+//!   only those kinds; folder.rs `NameFilter`): text files by their name unless kinds are given,
+//!   never files that are only in the cloud (reading would download them), capitals don't matter.
+//!   With quotes this works without Subfolders too, in the folder on screen only.
 //!
 //! The search runs on threads of its own: a few list folders at the same time (a disk answers
 //! several at once faster than one by one, so a whole drive goes quicker), and one gathers what
@@ -74,6 +78,8 @@ pub struct Search {
     pub listing: Folder,
     /// A search for duplicate files (dupes.rs), not for names: what it found, once it's done.
     pub dupes: Option<crate::dupes::Summary>,
+    /// Subfolders too (off: words in quotes looked for in the folder on screen only).
+    pub deep: bool,
 }
 
 impl Search {
@@ -110,6 +116,7 @@ pub fn test_search(root: &str) -> Search {
         started: Instant::now(),
         listing: Folder::default(),
         dupes: None,
+        deep: true,
     }
 }
 
@@ -155,6 +162,8 @@ pub struct Ask {
     pub pause: bool,
     /// Look for duplicate files instead of names (dupes.rs; `query` isn't used).
     pub dupes: bool,
+    /// Subfolders too (otherwise only the folder itself: a look inside its files).
+    pub deep: bool,
 }
 
 /// Starts a search on a new thread. `send` gets the batches on that thread; when it returns false
@@ -163,7 +172,7 @@ pub struct Ask {
 /// Returns the search to keep - or, if no thread could be had, the listing back.
 #[allow(clippy::result_large_err)] // (the listing back, rarely: no thread could be had)
 pub fn start(ask: Ask, listing: Folder, mut send: impl FnMut(Batch) -> bool + Send + 'static) -> Result<Search, Folder> {
-    let Ask { root, query, generation, show_hidden, show_system, pause, dupes } = ask;
+    let Ask { root, query, generation, show_hidden, show_system, pause, dupes, deep } = ask;
     let cancel = Arc::new(AtomicBool::new(false));
     let (flag, dir, text) = (cancel.clone(), root.clone(), query.clone());
     if dupes {
@@ -222,7 +231,7 @@ pub fn start(ask: Ask, listing: Folder, mut send: impl FnMut(Batch) -> bool + Se
             return Err(listing);
         }
         let found = Some(crate::dupes::Summary::default());
-        return Ok(Search { root, query, generation, cancel, fresh: false, done: false, capped: false, started: Instant::now(), listing, dupes: found });
+        return Ok(Search { root, query, generation, cancel, fresh: false, done: false, capped: false, started: Instant::now(), listing, dupes: found, deep });
     }
     let started = shell::background("search subfolders", move || {
         if pause && !wait(&flag, TYPING_PAUSE) {
@@ -232,7 +241,7 @@ pub fn start(ask: Ask, listing: Folder, mut send: impl FnMut(Batch) -> bool + Se
         let filter = NameFilter::new(&text);
         let mut found = Vec::new();
         let mut last_sent = Instant::now();
-        let outcome = walk(roots, &filter, show_hidden, show_system, &flag, &mut |e| {
+        let outcome = walk(roots, &filter, show_hidden, show_system, deep, &flag, &mut |e| {
             if let Some(e) = e {
                 found.push(e);
             }
@@ -249,7 +258,7 @@ pub fn start(ask: Ask, listing: Folder, mut send: impl FnMut(Batch) -> bool + Se
     if !started {
         return Err(listing);
     }
-    Ok(Search { root, query, generation, cancel, fresh: false, done: false, capped: false, started: Instant::now(), listing, dupes: None })
+    Ok(Search { root, query, generation, cancel, fresh: false, done: false, capped: false, started: Instant::now(), listing, dupes: None, deep })
 }
 
 /// The drives a search of This PC goes through: the local and removable ones that are ready (not
@@ -350,6 +359,7 @@ fn walk(
     filter: &NameFilter,
     show_hidden: bool,
     show_system: bool,
+    deep: bool,
     cancel: &Arc<AtomicBool>,
     found: &mut dyn FnMut(Option<Entry>) -> bool,
 ) -> Option<bool> {
@@ -364,13 +374,13 @@ fn walk(
     let mut running = 0;
     for _ in 0..threads {
         let (work, cancel, tx, filter) = (work.clone(), cancel.clone(), tx.clone(), filter.clone());
-        if shell::background("search subfolders", move || search_folders(&work, &filter, show_hidden, show_system, &cancel, &tx)) {
+        if shell::background("search subfolders", move || search_folders(&work, &filter, show_hidden, show_system, deep, &cancel, &tx)) {
             running += 1;
         }
     }
     if running == 0 {
         // No thread could be had: this one goes through the folders itself.
-        search_folders(&work, filter, show_hidden, show_system, cancel, &tx);
+        search_folders(&work, filter, show_hidden, show_system, deep, cancel, &tx);
     }
     drop(tx);
     let stop = |work: &Work| {
@@ -396,7 +406,7 @@ fn walk(
 
 /// One of a search's threads: takes folders from `work` until there are none left, sending each
 /// match to `tx`.
-fn search_folders(work: &Work, filter: &NameFilter, show_hidden: bool, show_system: bool, cancel: &AtomicBool, tx: &Sender<Entry>) {
+fn search_folders(work: &Work, filter: &NameFilter, show_hidden: bool, show_system: bool, deep: bool, cancel: &AtomicBool, tx: &Sender<Entry>) {
     // Type names ("Text Document") come from the shell, which needs COM.
     let _com = ComGuard::init();
     let mut types: HashMap<String, Arc<str>> = HashMap::new();
@@ -415,10 +425,20 @@ fn search_folders(work: &Work, filter: &NameFilter, show_hidden: bool, show_syst
                 if name == "." || name == ".." || !folder::visible(attrs, show_hidden, show_system) {
                     return true;
                 }
-                if attrs & ATTR_DIRECTORY != 0 && !is_link(data) {
+                if deep && attrs & ATTR_DIRECTORY != 0 && !is_link(data) {
                     subs.push(folder::join(&dir, &name));
                 }
-                if !filter.keeps(&name.to_lowercase(), || folder::join(&dir, &name)) {
+                let lower = name.to_lowercase();
+                if !filter.keeps(&lower, || folder::join(&dir, &name)) {
+                    return true;
+                }
+                // Words in quotes: only files that have them inside.
+                if !filter.inside().is_empty()
+                    && (attrs & ATTR_DIRECTORY != 0
+                        || attrs & crate::peek::NOT_HERE != 0
+                        || !filter.reads(&lower)
+                        || !has_inside(&folder::join(&dir, &name), filter.inside(), filter.reads_any(), cancel))
+                {
                     return true;
                 }
                 let Some(mut e) = folder::entry_from(data, &mut types) else { return true };
@@ -446,6 +466,91 @@ fn search_folders(work: &Work, filter: &NameFilter, show_hidden: bool, show_syst
             next = own.pop();
         }
         work.idle();
+    }
+}
+
+/// How much of a file is read at a time when looking inside it.
+const CHUNK: usize = 256 * 1024;
+
+/// Whether the file has every one of `words` (lower case) in it, capitals not mattering. Read a
+/// piece at a time (so a big log file takes no more memory than a small one), as UTF-8, or as
+/// UTF-16 when it starts with that mark (Notepad's "Unicode"). A file with NUL bytes near its
+/// start is taken for a program or picture and skipped - unless `any_kind` (the kinds were
+/// named, as in `*.pdf`: then it's read whatever is in it). Stops when cancelled.
+pub fn has_inside(path: &str, words: &[String], any_kind: bool, cancel: &AtomicBool) -> bool {
+    use std::io::Read;
+    if words.is_empty() {
+        return true;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    let longest = words.iter().map(|w| w.chars().count()).max().unwrap_or(0);
+    let mut left: Vec<bool> = vec![true; words.len()];
+    let mut buf = vec![0u8; CHUNK];
+    let mut pending: Vec<u8> = Vec::new();
+    let mut carry = String::new();
+    let mut first = true;
+    let mut utf16: Option<bool> = None; // Some(little-endian?)
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let n = match file.read(&mut buf) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        let end = n == 0;
+        pending.extend_from_slice(&buf[..n]);
+        if first {
+            first = false;
+            if pending.starts_with(&[0xFF, 0xFE]) {
+                utf16 = Some(true);
+                pending.drain(..2);
+            } else if pending.starts_with(&[0xFE, 0xFF]) {
+                utf16 = Some(false);
+                pending.drain(..2);
+            } else {
+                if pending.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                    pending.drain(..3);
+                }
+                if !any_kind && pending.iter().take(8192).any(|&b| b == 0) {
+                    return false;
+                }
+            }
+        }
+        let text = match utf16 {
+            Some(le) => {
+                let whole = if end { pending.len() } else { pending.len() & !1 };
+                let units: Vec<u16> = pending[..whole & !1].chunks_exact(2).map(|c| if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) }).collect();
+                pending.drain(..whole);
+                String::from_utf16_lossy(&units)
+            }
+            None => {
+                let cut = match std::str::from_utf8(&pending) {
+                    Ok(_) => pending.len(),
+                    // A character cut in two at the end of the piece waits for the rest.
+                    Err(e) if e.error_len().is_none() && !end => e.valid_up_to(),
+                    Err(_) => pending.len(),
+                };
+                let t = String::from_utf8_lossy(&pending[..cut]).into_owned();
+                pending.drain(..cut);
+                t
+            }
+        };
+        let hay = carry + &text.to_lowercase();
+        for (i, w) in words.iter().enumerate() {
+            if left[i] && hay.contains(w.as_str()) {
+                left[i] = false;
+            }
+        }
+        if !left.contains(&true) {
+            return true;
+        }
+        if end {
+            return false;
+        }
+        // The end of this piece goes in front of the next, so words cut in two are still found.
+        let keep = hay.char_indices().rev().nth(longest.saturating_sub(1)).map_or(0, |(i, _)| i);
+        carry = hay[keep..].to_string();
     }
 }
 
@@ -523,7 +628,7 @@ mod tests {
     }
 
     fn ask(root: &str, query: &str, pause: bool) -> Ask {
-        Ask { root: root.to_string(), query: query.to_string(), generation: 1, show_hidden: false, show_system: false, pause, dupes: false }
+        Ask { root: root.to_string(), query: query.to_string(), generation: 1, show_hidden: false, show_system: false, pause, dupes: false, deep: true }
     }
 
     fn search(root: &str, query: &str) -> (Vec<String>, bool) {
@@ -539,6 +644,97 @@ mod tests {
                 return (names, b.capped);
             }
         }
+    }
+
+    /// Writes `text` into a file of the tree (made by Tree::new).
+    fn write(t: &Tree, name: &str, bytes: &[u8]) {
+        std::fs::write(t.0.join(name), bytes).unwrap();
+    }
+
+    fn search_in(root: &str, query: &str, deep: bool) -> Vec<String> {
+        let (tx, rx) = channel();
+        let s = start(Ask { deep, ..ask(root, query, false) }, Folder::default(), move |b| tx.send(b).is_ok());
+        assert!(s.is_ok());
+        let mut names = Vec::new();
+        loop {
+            let b = rx.recv_timeout(Duration::from_secs(20)).expect("the search ends");
+            names.extend(b.entries.iter().map(|e| folder::file_name(e.target.as_deref().unwrap_or_default()).to_string()));
+            if b.done {
+                names.sort();
+                return names;
+            }
+        }
+    }
+
+    #[test]
+    fn words_in_quotes_are_found_inside_text_files_of_the_kinds_asked_for() {
+        let t = Tree::new("inside", &["sub/deep.md", "a.md", "b.txt", "c.md", "pic.png", "hello world.txt", "folder hello/"]);
+        write(&t, "a.md", b"# Notes\nSay Hello World to everyone");
+        write(&t, "b.txt", b"hello world, in a text file");
+        write(&t, "c.md", b"hello, but not the other word");
+        write(&t, "pic.png", b"\x89PNG\0\0hello world");
+        write(&t, "sub/deep.md", b"hello world down here");
+        let root = t.path();
+        // In text files only (not the picture, not a file whose NAME has the words, not folders).
+        assert_eq!(search_in(&root, "\"hello world\"", true), ["a.md", "b.txt", "deep.md"]);
+        // Only .md files; capitals don't matter.
+        assert_eq!(search_in(&root, "\"HELLO WORLD\" *.md", true), ["a.md", "deep.md"]);
+        // Several kinds: any of them.
+        assert_eq!(search_in(&root, "\"hello world\" *.md *.txt", true), ["a.md", "b.txt", "deep.md"]);
+        // Without Subfolders: the folder itself only.
+        assert_eq!(search_in(&root, "\"hello world\" *.md", false), ["a.md"]);
+        // Two phrases: both must be in it.
+        assert_eq!(search_in(&root, "\"hello\" \"everyone\"", true), ["a.md"]);
+        // A word outside the quotes is for the name.
+        assert_eq!(search_in(&root, "\"hello\" deep", true), ["deep.md"]);
+        // Named kinds are read whatever is in them (the picture has NUL bytes).
+        assert_eq!(search_in(&root, "\"hello world\" *.png", true), ["pic.png"]);
+        // A quote still being typed already looks.
+        assert_eq!(search_in(&root, "\"hello wor", true), ["a.md", "b.txt", "deep.md"]);
+        // Nothing there.
+        assert!(search_in(&root, "\"goodbye\"", true).is_empty());
+    }
+
+    #[test]
+    fn inside_a_file_words_cut_between_pieces_odd_text_and_utf16_are_found() {
+        let never = AtomicBool::new(false);
+        let d = std::env::temp_dir().join(format!("glint-search-test-pieces-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let p = |n: &str| d.join(n).to_string_lossy().into_owned();
+        let w = |s: &str| vec![s.to_string()];
+        // The word right across the end of the first piece.
+        let mut big = vec![b'a'; CHUNK - 3];
+        big.extend_from_slice(b"needle");
+        big.extend(vec![b'b'; 1000]);
+        std::fs::write(p("big.txt"), &big).unwrap();
+        assert!(has_inside(&p("big.txt"), &w("needle"), false, &never));
+        assert!(!has_inside(&p("big.txt"), &w("needles"), false, &never));
+        // A non-English letter cut in two between pieces.
+        let mut uni = vec![b'a'; CHUNK - 1];
+        uni.extend_from_slice("Ærlig talt".as_bytes());
+        std::fs::write(p("uni.txt"), &uni).unwrap();
+        assert!(has_inside(&p("uni.txt"), &w("ærlig talt"), false, &never));
+        // Notepad's "Unicode" (UTF-16 with its mark), both byte orders.
+        let mut le = vec![0xFF, 0xFE];
+        le.extend("Hei Verden".encode_utf16().flat_map(|u| u.to_le_bytes()));
+        std::fs::write(p("le.txt"), &le).unwrap();
+        assert!(has_inside(&p("le.txt"), &w("hei verden"), false, &never));
+        let mut be = vec![0xFE, 0xFF];
+        be.extend("Hei Verden".encode_utf16().flat_map(|u| u.to_be_bytes()));
+        std::fs::write(p("be.txt"), &be).unwrap();
+        assert!(has_inside(&p("be.txt"), &w("verden"), false, &never));
+        // UTF-8 with its mark; an empty file; a file that is gone; broken bytes.
+        std::fs::write(p("bom.txt"), b"\xEF\xBB\xBFhello").unwrap();
+        assert!(has_inside(&p("bom.txt"), &w("hello"), false, &never));
+        std::fs::write(p("empty.txt"), b"").unwrap();
+        assert!(!has_inside(&p("empty.txt"), &w("x"), false, &never));
+        assert!(!has_inside(&p("gone.txt"), &w("x"), false, &never));
+        std::fs::write(p("broken.txt"), b"ok \xFF\xFE\xFD then hello").unwrap();
+        assert!(has_inside(&p("broken.txt"), &w("hello"), false, &never));
+        // Cancelled: no answer.
+        assert!(!has_inside(&p("big.txt"), &w("needle"), false, &AtomicBool::new(true)));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

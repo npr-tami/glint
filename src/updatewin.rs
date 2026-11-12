@@ -815,7 +815,7 @@ impl Prompt {
         let top = size::TITLE_H + 18.0;
         let heading = match (self.installing, self.required) {
             (true, _) => format!("Installing Glint {}…", self.version),
-            (false, true) => format!("Glint {} fixes a problem", self.version),
+            (false, true) => format!("Hotfix: Glint {}", self.version),
             (false, false) => format!("Glint {} is ready", self.version),
         };
         let sub = format!("You have Glint {}. What's new:", self.ours);

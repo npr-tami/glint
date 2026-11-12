@@ -467,7 +467,7 @@ fn in_use(archive: &Path, e: &io::Error) -> String {
     const ERROR_LOCK_VIOLATION: i32 = 33;
     let name = archive.file_name().unwrap_or_default().to_string_lossy();
     match e.raw_os_error() {
-        Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION) => format!("\u{201c}{name}\u{201d} is open in another program. Close it there and try again."),
+        Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION) => crate::inuse::open_in(&archive.to_string_lossy()).unwrap_or_else(|| format!("\u{201c}{name}\u{201d} is open in another program. Close it there and try again.")),
         _ if e.kind() == io::ErrorKind::NotFound => format!("\u{201c}{name}\u{201d} isn't there any more."),
         _ if e.kind() == io::ErrorKind::PermissionDenied => format!("Glint isn't allowed to change \u{201c}{name}\u{201d}. It may be open in another program."),
         _ => format!("\u{201c}{name}\u{201d} couldn't be changed ({e})."),
@@ -713,7 +713,8 @@ mod tests {
             // (It can be read, but not moved: as most programs hold a file they have open.)
             let _held = File::options().read(true).share_mode(1).open(&a).expect("hold");
             let why = err(Change::Remove(vec!["readme.txt".into()]));
-            assert!(why.contains("open in another program"), "{why}");
+            // (Named when Windows knows who has it: here the test itself.)
+            assert!(why.contains("open in another program") || why.contains(" is open in "), "{why}");
         }
         assert_eq!(std::fs::read(&a).expect("read"), before);
         assert_eq!(names_in(&t.0), ["box.zip"]);

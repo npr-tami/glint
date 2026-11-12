@@ -43,6 +43,8 @@
 #![windows_subsystem = "windows"]
 
 mod anim;
+mod bugreport;
+mod catcher;
 mod archive;
 mod app;
 mod codebox;
@@ -62,6 +64,7 @@ mod foldersize;
 mod form;
 mod frame;
 mod icons;
+mod inuse;
 mod life;
 mod kit;
 mod home;
@@ -186,6 +189,11 @@ fn main() {
         life::quit_running();
         return;
     }
+    // "Temp Win+E Fix": only the Win+E catcher, no window (catcher.rs).
+    if switches.win_e_catcher {
+        catcher::run();
+        return;
+    }
     // Control Panel, "shell:" places and the like: File Explorer shows them.
     if let Some(place) = start.as_deref().filter(|s| life::is_shell_location(s)) {
         life::open_in_explorer_now(place);
@@ -226,6 +234,7 @@ fn main() {
     }
     let tray_icon = loaded.tray_icon;
     let zip_icon = loaded.zip_icon;
+    let win_e_after_quit = loaded.win_e_after_quit;
     let dark = dark.unwrap_or_else(|| settings::dark_for(loaded.theme));
     // Just updated (update.rs): the same tabs as before, whatever "When Glint starts, open" says.
     let same_tabs = after_update.then(|| settings::Settings { startup: settings::Startup::Restore, ..loaded.clone() });
@@ -267,7 +276,7 @@ fn main() {
     if main {
         // From now on other glint.exe's, the tray icon and Win+E reach this window (life.rs).
         life::open_door(hwnd);
-        life::main_started(zip_icon);
+        life::main_started(zip_icon, win_e_after_quit);
         if hidden {
             life::entered_background(tray_icon);
         }

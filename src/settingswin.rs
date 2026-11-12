@@ -85,7 +85,7 @@ use crate::kit::{self, size as ksize, Look, Scroller};
 use crate::log;
 // Settings > About > Updates (update.rs).
 use crate::{life, update};
-use crate::render::{FrameResult, Renderer, TextStyle};
+use crate::render::{Align, FrameResult, Renderer, TextStyle};
 use crate::settings::{self, Settings, SettingsOpens, Terminal};
 use crate::shell;
 use crate::textbox::{self, TextBox, TextEvent, TextEventKind, WM_APP_TEXT};
@@ -367,6 +367,8 @@ enum Hot {
     More,
     Reset,
     ReportBug,
+    /// A row's (i).
+    Info(usize),
 }
 
 /// How a row's control is shown (it depends on the window's own choices, `Style`).
@@ -455,6 +457,8 @@ struct Placed {
     enabled: bool,
     /// Where the dot goes when the setting isn't at its default.
     dot: Point,
+    /// The (i) after the title (`Row::info`), page coordinates.
+    info: Option<Rect>,
 }
 
 impl Placed {
@@ -552,6 +556,10 @@ pub struct SettingsWindow {
     /// What clearing the cache said last; CLEAR was pressed once at this time and waits for a
     /// second press; the cache is being emptied.
     cache_said: Option<String>,
+    /// What COPY next to Setup info said last.
+    bug_said: Option<String>,
+    /// The row whose (i) is open (its key).
+    info_open: Option<&'static str>,
     clear_asked_at: Option<f64>,
     clearing: bool,
     portable_said: Option<String>,
@@ -767,6 +775,8 @@ pub fn create(owner: HWND, theme: &Theme, place: Option<[i32; 4]>, opens: Settin
             point_at: None,
             cache_size: None,
             cache_said: None,
+            bug_said: None,
+            info_open: None,
             clear_asked_at: None,
             clearing: false,
             portable_said: None,
@@ -1323,6 +1333,8 @@ impl SettingsWindow {
             cache_said: self.cache_said.clone(),
             clear_asked: self.clear_asked_at.is_some(),
             portable_said: self.portable_said.clone(),
+            bug_said: self.bug_said.clone(),
+            info_open: self.info_open,
             portable_locked: settings::test_folders(),
             skins: &self.skins,
             update_said: update::about(life::is_main(), self.values.get("CheckForUpdates").and_then(Value::as_bool).unwrap_or(true)).0,
@@ -1823,6 +1835,12 @@ impl SettingsWindow {
         if !live {
             r.text(LATER, Rect::new(p.text_x, y, p.text_w, NOTE_LINE), &TextStyle::new(theme.muted).size(ksize::NOTE_FONT).semibold());
         }
+        if let Some(info) = p.info.map(shift) {
+            let hot = self.hover == Some(Hot::Info(i)) || self.info_open == Some(p.row.key);
+            let color = if hot { theme.accent } else { theme.muted };
+            r.stroke_ellipse(Point::new(info.x + info.w / 2.0, info.y + info.h / 2.0), info.w / 2.0 - 0.5, info.h / 2.0 - 0.5, 1.2, color);
+            r.text("i", info, &TextStyle::new(color).size(ksize::NOTE_FONT).semibold().align(Align::Center));
+        }
         let main = p.main.map(shift);
         let second = p.second.map(shift);
         let now = self.started.elapsed().as_secs_f64();
@@ -2000,6 +2018,9 @@ impl SettingsWindow {
         if self.blocks.iter().any(|b| matches!(b, Block::More(r, _) if self.on_screen(*r).contains(p))) {
             return Some(Hot::More);
         }
+        if let Some(i) = self.rows.iter().position(|placed| placed.info.is_some_and(|r| self.on_screen(r).inset(-3.0, -3.0).contains(p))) {
+            return Some(Hot::Info(i));
+        }
         for (i, placed) in self.rows.iter().enumerate() {
             for part in placed.parts() {
                 let Some(r) = placed.hit_of(part).map(|r| self.on_screen(r)) else { continue };
@@ -2116,6 +2137,13 @@ impl SettingsWindow {
             Some(Hot::More) => self.flip_more(),
             Some(Hot::Reset) => self.reset_page(app),
             Some(Hot::ReportBug) => self.act(Act::ReportBug),
+            Some(Hot::Info(i)) => {
+                let key = self.rows[i].row.key;
+                self.info_open = if self.info_open == Some(key) { None } else { Some(key) };
+                self.layout_dirty = true;
+                self.invalidate();
+                Vec::new()
+            }
             _ => Vec::new(),
         }
     }
@@ -2376,6 +2404,8 @@ impl SettingsWindow {
                 if let Err(e) = pages::set_outside(k, !bool_of(&self.values, k)) {
                     app.say(e);
                 }
+                // Laid out again: a row that needs this switch ("Temp Win+E Fix") is usable now, or not.
+                self.layout_dirty = true;
                 self.invalidate();
                 Vec::new()
             }
@@ -2494,6 +2524,12 @@ impl SettingsWindow {
                 });
             }
             Act::ReportBug => shell::open_link(&format!("https://github.com/{}/issues", settings::UPDATE_REPO)),
+            Act::CopyBugInfo => {
+                let text = crate::bugreport::text(&self.values, &self.skins, &crate::bugreport::machine());
+                self.bug_said = Some(if shell::copy_text(self.hwnd, &text) { "Copied.".into() } else { "Failed to copy. Try again in a moment.".into() });
+                self.layout_dirty = true;
+                self.invalidate();
+            }
             Act::ClearCache => {
                 // Deleting files asks twice: the cache folder is next to glint.exe when portable,
                 // where a folder called "cache" might not be only Glint's.
@@ -2972,6 +3008,7 @@ fn place_row(r: &mut Renderer, row: Row, shape: Shape, left: f32, y: f32, w: f32
         option_hits: Vec::new(),
         enabled,
         dot: Point::new(lx - 7.0, y + text_y + TITLE_LINE / 2.0),
+        info: None,
         row,
     };
     let wrap_text = |r: &mut Renderer, placed: &mut Placed, text_w: f32| {
@@ -3071,8 +3108,19 @@ fn place_row(r: &mut Renderer, row: Row, shape: Shape, left: f32, y: f32, w: f32
             }
         }
     }
+    // The (i) right after the title's last line (past what a click on the title takes).
+    if placed.row.info {
+        if let Some(last) = placed.title.last() {
+            let w = r.measure(last, &title_style).ceil();
+            let line_y = y + text_y + (placed.title.len() - 1) as f32 * TITLE_LINE;
+            placed.info = Some(Rect::new(placed.text_x + w + 10.0, line_y + ((TITLE_LINE - INFO) / 2.0).round(), INFO, INFO));
+        }
+    }
     placed
 }
+
+/// The (i)'s size.
+const INFO: f32 = 14.0;
 
 /// Lays out the shortcuts as a cheat sheet: the keys, then what they do, a line each - in two
 /// columns when there's room. Returns where they end.
@@ -3102,6 +3150,7 @@ fn place_keys(r: &mut Renderer, rows: Vec<Row>, left: f32, y: f32, w: f32, out: 
             option_hits: Vec::new(),
             enabled,
             dot: Point::new(x, rect.y),
+            info: None,
             row,
         });
     }
@@ -3247,6 +3296,8 @@ mod tests {
             cache_said: None,
             clear_asked: false,
             portable_said: None,
+            bug_said: None,
+            info_open: None,
             portable_locked: false,
             skins: &[],
             update_said: String::new(),
@@ -3295,7 +3346,7 @@ mod tests {
         assert!(row_matches(&new_tab, "Startup", "this pc"), "a choice");
         let system = row_of(2, "ShowSystem");
         assert!(row_matches(&system, "Show", "protected"), "its title");
-        let keys = Row { title: "Ctrl+H".into(), note: None, ctl: Ctl::Text("Show or hide hidden files"), key: "@Keys", indent: false, needs: None, only_if: None, more: false, radios: false, long: false };
+        let keys = Row { title: "Ctrl+H".into(), note: None, ctl: Ctl::Text("Show or hide hidden files"), key: "@Keys", indent: false, needs: None, only_if: None, more: false, radios: false, long: false, info: false };
         assert!(row_matches(&keys, "Shortcuts", "hidden") && row_matches(&keys, "Shortcuts", "ctrl+h"));
         // The Keys page's own: F2 finds Rename.
         let values = values_of(&Settings::default());
@@ -3325,6 +3376,8 @@ mod tests {
             cache_said: None,
             clear_asked: false,
             portable_said: None,
+            bug_said: None,
+            info_open: None,
             portable_locked: false,
             skins: &[],
             update_said: String::new(),

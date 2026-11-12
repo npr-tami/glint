@@ -2,6 +2,17 @@
 
 The newest version is at the top.
 
+## 1.0.24-beta.5 · 12/11/2026 20:05
+
+- Added searching inside files: type words in quotes in the search bar, like "hello world"
+- Added showing which program has a file open, when renaming it fails
+- Added Setup info in Settings > About: copies your Glint and Windows versions and settings for bug reports
+- Added Temp Win+E Fix in Settings > General
+- Changed the update window to say "Hotfix" for quick fixes
+- Fixed sorting by Length or Picture size while that column is hidden
+- Fixed Win+E after moving Glint's folder
+- Some other improvements and bugfixes
+
 ## 1.0.24-beta.4 · 12/11/2026 10:44
 
 - Added changing what's inside zip and 7z files: delete, rename, new folders and text files, paste or drag files in, and cut them out, all undoable with Ctrl+Z

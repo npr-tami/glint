@@ -1332,7 +1332,11 @@ impl ListView {
     /// left, more of the rest of the listing (on the PC's own drives, or anywhere while the tab is
     /// sorted by one of the columns). Nothing is asked while neither column shows.
     fn media_rows(&mut self, tab: &Tab, geo: &Geometry, scroll: f32) -> Vec<(usize, media::Facts)> {
-        let cols = media::Columns { dims: self.cols.iter().any(|p| p.col == Col::Dimensions), length: self.cols.iter().any(|p| p.col == Col::Length) };
+        // (A tab sorted by Picture size or Length needs those values even with the column hidden.)
+        let cols = media::Columns {
+            dims: tab.sort == SortKey::Dimensions || self.cols.iter().any(|p| p.col == Col::Dimensions),
+            length: tab.sort == SortKey::Length || self.cols.iter().any(|p| p.col == Col::Length),
+        };
         if !cols.any() {
             return Vec::new();
         }
@@ -1341,10 +1345,10 @@ impl ListView {
 
     /// A view without columns (List, the icons) of a tab sorted by Picture size or Length: the
     /// listing is still read (the rest, as no value shows), so the sort gets them all.
-    fn media_for_sort(&mut self, tab: &Tab, app: &AppState) {
+    fn media_for_sort(&mut self, tab: &Tab) {
         let cols = media::Columns {
-            dims: tab.sort == SortKey::Dimensions && app.settings.shows_column("dimensions"),
-            length: tab.sort == SortKey::Length && app.settings.shows_column("length"),
+            dims: tab.sort == SortKey::Dimensions,
+            length: tab.sort == SortKey::Length,
         };
         if cols.any() {
             self.media_ask(tab, cols, std::iter::empty());
@@ -1401,7 +1405,9 @@ impl ListView {
     /// come in (at most every RESORT_EVERY; as folder sizes do in app.rs). True while a sort is due.
     fn tick_media(&mut self, now: f64, app: &mut AppState) -> bool {
         // Both columns off: nothing is read, and what was is forgotten.
-        if !app.settings.shows_column("dimensions") && !app.settings.shows_column("length") {
+        // (Not while a tab is sorted by one of them: the sort needs the values.)
+        let sorting = app.tabs.iter().any(|t| matches!(t.sort, SortKey::Dimensions | SortKey::Length));
+        if !sorting && !app.settings.shows_column("dimensions") && !app.settings.shows_column("length") {
             media::clear();
         }
         let m = &mut self.media;
@@ -1546,7 +1552,7 @@ impl ListView {
             }
             // (Rows ask media.rs for their Picture size and Length as they're drawn.)
             if self.flow != Flow::Rows {
-                self.media_for_sort(tab, app);
+                self.media_for_sort(tab);
             }
         }
         // The name box is a Windows text box on top; this is the frame around it.
@@ -1572,6 +1578,9 @@ impl ListView {
                 "Searching\u{2026}".to_string()
             } else if let Some(err) = s.listing.error.as_ref().filter(|_| s.listing.path == tab.path) {
                 err.clone() // the folder itself can't be read (gone, no permission)
+            } else if s.query.contains('"') {
+                // Words in quotes (looked for inside files): shown as typed, quotes and all.
+                format!("Nothing found for {} here{}.", s.query.trim(), if s.deep { " or in the folders inside" } else { "" })
             } else {
                 format!("Nothing called \u{201c}{}\u{201d} here or in the folders inside.", s.query)
             })

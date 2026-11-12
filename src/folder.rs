@@ -928,10 +928,15 @@ fn windows_time(t: &SYSTEMTIME) -> String {
 /// in the name, in any order ("tax 2024" finds "2024 Tax return.pdf"). Capitals don't matter.
 /// `tag:red` keeps only the items with that colour tag, `tag:` alone every tagged item (tags.rs),
 /// and the rest goes for the name as before: "tag:red invoice".
+/// Words in quotes are looked for inside files (search.rs): `"hello world"` in text files,
+/// `"hello world" *.md *.txt` only in those kinds of files. With quotes, each `*` or `?` word is a
+/// pattern of its own (any of them will do) and the other words are for the name.
 #[derive(Clone, Debug)]
 pub struct NameFilter {
     name: NameRule,
     tag: Option<crate::tags::TagFilter>,
+    /// The words in quotes, in lower case: each must be inside the file.
+    inside: Vec<String>,
 }
 
 /// The filter's part about the name.
@@ -942,6 +947,32 @@ enum NameRule {
     Words(Vec<String>),
     /// A wildcard pattern, in lower case.
     Pattern(Vec<char>),
+    /// With words in quotes: names matching any of the patterns (all names when there are none),
+    /// with every word in them.
+    Kinds { patterns: Vec<Vec<char>>, words: Vec<String> },
+}
+
+/// The words in quotes (lower case, not empty) and the rest of the text. A quote left open runs to
+/// the end, so `"hello wor` already looks for "hello wor" while it's being typed.
+pub fn split_quotes(text: &str) -> (Vec<String>, String) {
+    let mut inside = Vec::new();
+    let mut rest = String::new();
+    let mut parts = text.split('"');
+    if let Some(first) = parts.next() {
+        rest.push_str(first);
+    }
+    for (n, part) in parts.enumerate() {
+        if n % 2 == 0 {
+            let p = part.trim();
+            if !p.is_empty() {
+                inside.push(p.to_string());
+            }
+        } else {
+            rest.push(' ');
+            rest.push_str(part);
+        }
+    }
+    (inside, rest)
 }
 
 impl NameFilter {
@@ -952,18 +983,49 @@ impl NameFilter {
     /// As `new`, with the tags `tags` gives (asked only for a `tag:` word).
     fn with_tags(text: &str, tags: impl FnOnce() -> Arc<crate::tags::Map>) -> NameFilter {
         let text = text.trim().to_lowercase();
+        let (inside, text) = if text.contains('"') { split_quotes(&text) } else { (Vec::new(), text) };
         let (tag, text) = match crate::tags::TagFilter::take(&text, tags) {
             Some((tag, rest)) => (Some(tag), rest),
             None => (None, text),
         };
-        let name = if text.is_empty() {
+        let text = text.trim().to_string();
+        let name = if !inside.is_empty() {
+            let (patterns, words): (Vec<&str>, Vec<&str>) = text.split_whitespace().partition(|w| w.contains(['*', '?']));
+            NameRule::Kinds { patterns: patterns.iter().map(|p| p.chars().collect()).collect(), words: words.iter().map(|w| w.to_string()).collect() }
+        } else if text.is_empty() {
             NameRule::All
         } else if text.contains(['*', '?']) {
             NameRule::Pattern(text.chars().collect())
         } else {
             NameRule::Words(text.split_whitespace().map(str::to_string).collect())
         };
-        NameFilter { name, tag }
+        NameFilter { name, tag, inside }
+    }
+
+    /// The words in quotes, to look for inside files (none: only names count).
+    pub fn inside(&self) -> &[String] {
+        &self.inside
+    }
+
+    /// Whether the kinds of files to look inside were named (`*.pdf`): then they're read whatever
+    /// is in them.
+    pub fn reads_any(&self) -> bool {
+        matches!(&self.name, NameRule::Kinds { patterns, .. } if !patterns.is_empty())
+    }
+
+    /// Whether a file (by its name in lower case) is one to look inside: one of the kinds asked for
+    /// (`*.md`), or else a text file by its name.
+    pub fn reads(&self, lower: &str) -> bool {
+        if self.inside.is_empty() {
+            return false;
+        }
+        match &self.name {
+            NameRule::Kinds { patterns, .. } if !patterns.is_empty() => true, // (the name already matched one)
+            _ => {
+                let ext = lower.rsplit_once('.').map_or("", |(_, e)| e);
+                crate::peek::is_text_file(ext) || ext == "glint"
+            }
+        }
     }
 
     /// Whether an item is kept: by its name in lower case and, for a `tag:` filter, by its tag
@@ -980,6 +1042,10 @@ impl NameFilter {
             NameRule::Pattern(p) => {
                 let name: Vec<char> = lower.chars().collect();
                 wildcard(p, &name)
+            }
+            NameRule::Kinds { patterns, words } => {
+                let name: Vec<char> = lower.chars().collect();
+                (patterns.is_empty() || patterns.iter().any(|p| wildcard(p, &name))) && words.iter().all(|w| lower.contains(w.as_str()))
             }
         }
     }
@@ -1520,6 +1586,30 @@ mod tests {
         let kb = format_size_as(3_247_000, SizeFormat::Kb);
         assert!(kb.ends_with(" KB") && digits(&kb) == "3171", "{kb}");
         assert_eq!(format_size_as(512, SizeFormat::Auto), "512 B");
+    }
+
+    #[test]
+    fn words_in_quotes_are_for_inside_files_and_the_rest_for_the_name() {
+        let split = |t: &str| {
+            let (inside, rest) = split_quotes(t);
+            (inside, rest.split_whitespace().collect::<Vec<_>>().join(" "))
+        };
+        assert_eq!(split("\"hello world\" *.md"), (vec!["hello world".to_string()], "*.md".to_string()));
+        assert_eq!(split("a \"b\" c \"d e"), (vec!["b".to_string(), "d e".to_string()], "a c".to_string()));
+        assert_eq!(split("\"\" x"), (vec![], "x".to_string()));
+        let f = NameFilter::new("\"Hello World\" *.md *.TXT");
+        assert_eq!(f.inside(), ["hello world"]);
+        assert!(f.keeps("notes.md", String::new) && f.keeps("a.txt", String::new) && !f.keeps("a.png", String::new));
+        assert!(f.reads("notes.md") && f.reads_any());
+        let plain = NameFilter::new("\"hello\"");
+        assert!(plain.keeps("anything.png", String::new), "the name doesn't matter");
+        assert!(plain.reads("a.md") && plain.reads("x.glint") && !plain.reads("a.png") && !plain.reads("noext") && !plain.reads_any());
+        let named = NameFilter::new("\"hello\" report");
+        assert!(named.keeps("report.txt", String::new) && !named.keeps("notes.txt", String::new));
+        // Without quotes, nothing changes: no looking inside, and a pattern is still the whole text.
+        let old = NameFilter::new("tax 2024");
+        assert!(old.inside().is_empty() && !old.reads("a.txt"));
+        assert!(NameFilter::new("*.md *.txt").keeps("a.md *.txt", String::new));
     }
 
     #[test]

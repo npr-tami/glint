@@ -360,12 +360,20 @@ fn work_through() {
     let _com = ComGuard::init();
     let wic = thumbs::wic_factory();
     let mut last_repaint: Option<Instant> = None;
+    // Values kept since the last repaint: shown before the thread waits, so the last ones never
+    // stay off screen (the rest's queue can still hold files already read on screen, so "more
+    // work" alone doesn't say whether this was the last value).
+    let mut unshown = false;
     loop {
         let job = {
             let mut s = state();
             loop {
                 if let Some(job) = s.next() {
                     break job;
+                }
+                if std::mem::take(&mut unshown) {
+                    last_repaint = Some(Instant::now());
+                    thumbs::repaint(&WINDOW);
                 }
                 let (guard, wait) = READY.wait_timeout(s, IDLE_END).unwrap_or_else(|e| e.into_inner());
                 s = guard;
@@ -384,10 +392,12 @@ fn work_through() {
             if s.kept.contains_key(&job.listing) || s.wishes.iter().any(|w| w.listing == job.listing) {
                 s.kept.entry(job.listing).or_default().insert(job.ask.key, Value { modified: job.ask.modified, facts });
                 ARRIVED.fetch_add(1, Ordering::SeqCst);
+                unshown = true;
             }
             s.has_work()
         };
-        if !more || last_repaint.is_none_or(|t| t.elapsed() >= REPAINT_EVERY) {
+        if unshown && (!more || last_repaint.is_none_or(|t| t.elapsed() >= REPAINT_EVERY)) {
+            unshown = false;
             last_repaint = Some(Instant::now());
             thumbs::repaint(&WINDOW);
         }

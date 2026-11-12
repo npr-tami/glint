@@ -1,6 +1,6 @@
 [package]
 name = "glint"
-version = "1.0.24-beta.4"
+version = "1.0.24-beta.5"
 edition = "2021"
 description = "A fast, lightweight file explorer for Windows that draws everything itself"
 license = "MIT"
@@ -68,6 +68,8 @@ features = [
     "Win32_System_Ole",
     "Win32_System_ProcessStatus",
     "Win32_System_Registry",
+    # Naming the program that has a file open, when a delete, move or rename fails (inuse.rs).
+    "Win32_System_RestartManager",
     "Win32_System_SystemServices",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",

@@ -135,6 +135,13 @@ fn mutex_exists(name: &str) -> bool {
     }
 }
 
+/// `name` made this Glint's own, as the main Glint's mutex and door are (`own_name`): for the
+/// Win+E catcher's (catcher.rs).
+pub fn own_name_here(name: &str) -> String {
+    let (now, after) = crate::settings::whose_files();
+    own_name(name, pick_files(now, after, mutex_exists).as_deref())
+}
+
 fn mutex_name() -> PCWSTR {
     PCWSTR(own_names().0.as_ptr())
 }
@@ -154,6 +161,8 @@ pub struct Switches {
     pub set_default: bool,
     pub with_win_e: bool,
     pub restore_explorer: bool,
+    /// `--win-e-catcher`: run only the Win+E catcher (catcher.rs).
+    pub win_e_catcher: bool,
 }
 
 impl Switches {
@@ -166,6 +175,7 @@ impl Switches {
             "--set-default" => &mut self.set_default,
             "--with-win-e" => &mut self.with_win_e,
             "--restore-explorer" => &mut self.restore_explorer,
+            crate::catcher::SWITCH => &mut self.win_e_catcher,
             _ => return false,
         };
         *flag = true;
@@ -219,6 +229,7 @@ pub fn registry_switch(s: &Switches) -> Option<i32> {
     // The process ends right after, so Explorer is told before that, not on a thread of its own.
     let places = Places::current().telling_the_shell_at_once();
     let result = if s.restore_explorer {
+        crate::catcher::sync(false);
         registry::restore_explorer(&places, &exe)
     } else if let Some(why) = registry::risky_place(&exe) {
         Err(why.to_string())
@@ -566,7 +577,7 @@ pub fn quit_hidden_main_too() {
 
 /// At the main Glint's start: Win+E is caught while Glint runs (if "Win+E opens Glint" is on), and
 /// what points at a glint.exe that was moved is repaired (on a thread of its own).
-pub fn main_started(zip_icon: ZipIcon) {
+pub fn main_started(zip_icon: ZipIcon, win_e_after_quit: bool) {
     let Some(exe) = registry::this_exe() else { return };
     let Some(door) = door() else { return };
     if registry::win_e_on(&Places::current(), &exe) {
@@ -579,6 +590,9 @@ pub fn main_started(zip_icon: ZipIcon) {
     shell::background("repair registry", move || {
         registry::repair_if_moved(&Places::current(), &exe);
         sync_zip_icon(zip_icon);
+        // "Temp Win+E Fix": the catcher runs when it should (it may have been ended, or this is the
+        // first start since the setting was switched on).
+        crate::catcher::sync(crate::catcher::wanted(win_e_after_quit));
         // SAFETY: posting to a window handle is safe even if the window is gone.
         unsafe {
             let _ = PostMessageW(Some(HWND(door as *mut _)), WM_APP_WIN_E_CHANGED, WPARAM(0), LPARAM(0));
@@ -637,7 +651,7 @@ pub fn open_new_window(owner: Owner, folder: &str) {
 
 /// Whether settings that reach outside Glint (the Run key) are left alone: a test run with its own
 /// settings folder (GLINT_SETTINGS_DIR) and no test registry key.
-fn testing_without_registry() -> bool {
+pub fn testing_without_registry() -> bool {
     let set = |v: &str| std::env::var_os(v).is_some_and(|v| !v.is_empty());
     set("GLINT_SETTINGS_DIR") && !set("GLINT_TEST_REGISTRY")
 }
@@ -700,6 +714,8 @@ pub fn apply_win_e(on: bool) -> Result<(), String> {
         return Err(why.to_string());
     }
     registry::set_win_e(&Places::current(), on, &exe)?;
+    // The catcher follows ("Temp Win+E Fix" only works with Win+E on).
+    crate::catcher::sync(on && crate::catcher::setting_on());
     match door() {
         Some(door) if on => winekey::start(door),
         Some(_) => winekey::stop(),

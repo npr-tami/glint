@@ -909,7 +909,11 @@ fn rename_many_by(pairs: &[(String, String)], mut rename: impl FnMut(&str, &str)
         format!("Renamed {}", items_text(&done.iter().map(|(a, _)| a.clone()).collect::<Vec<_>>()))
     } else {
         let left: Vec<String> = todo.iter().map(|(a, _, _)| a.clone()).chain(aside.iter().map(|(a, _)| a.clone())).collect();
-        let mut note = format!("Failed to rename {}: the name is taken, or it's in use", items_text(&left));
+        // One of them open in a program: that one is named, with the program.
+        let mut note = match left.iter().take(20).find_map(|p| crate::inuse::open_in(p)) {
+            Some(said) => format!("Failed to rename {}. {}", items_text(&left), said.trim_end_matches('.')),
+            None => format!("Failed to rename {}: the name is taken, or it's in use", items_text(&left)),
+        };
         for (was, now) in &aside {
             note.push_str(&format!(". \u{201c}{}\u{201d} is called \u{201c}{}\u{201d} now: its own name was taken", file_name(was), file_name(now)));
         }
@@ -1241,7 +1245,10 @@ fn rename(path: &str, new_name: &str) -> Outcome {
             Outcome {
                 changed: vec![dir],
                 retry: taken.then(|| (path.to_string(), new_name.to_string())),
-                ..Outcome::note(format!("Failed to rename \u{201c}{old}\u{201d}: {}", explain(hr)))
+                ..Outcome::note(match is_in_use(hr).then(|| crate::inuse::open_in(path)).flatten() {
+                    Some(said) => format!("Failed to rename: {said}"),
+                    None => format!("Failed to rename \u{201c}{old}\u{201d}: {}", explain(hr)),
+                })
             }
         }
     }
@@ -1306,6 +1313,8 @@ struct Done {
     unopened: Option<String>,
     /// Deleted items that didn't go to the Recycle Bin: Windows asked, and they were deleted for good.
     gone_for_good: Vec<String>,
+    /// The first item that failed because it's open in another program (so the line can say which).
+    in_use: Option<String>,
 }
 
 impl Done {
@@ -1316,7 +1325,7 @@ impl Done {
     /// A status-bar line when something didn't go through.
     fn problem(&self, lead: &str) -> Option<String> {
         match self.error {
-            Some(hr) => Some(format!("{lead}: {}", explain(hr))),
+            Some(hr) => Some(format!("{lead}: {}", self.in_use.as_deref().filter(|_| is_in_use(hr)).and_then(crate::inuse::open_in).unwrap_or_else(|| explain(hr)))),
             None if self.aborted => Some("Cancelled before it was finished.".to_string()),
             None => self.unopened.as_ref().map(|name| format!("{lead}: {}", cant_open(name))),
         }
@@ -1331,6 +1340,16 @@ impl Done {
 struct Sink(Arc<Mutex<Done>>);
 
 impl Sink {
+    /// An item that failed because a program has it open: kept, so the line can name the program.
+    fn note_in_use(&self, hr: HRESULT, item: Option<&IShellItem>) {
+        if is_in_use(hr) {
+            let mut done = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if done.in_use.is_none() {
+                done.in_use = item.and_then(item_path);
+            }
+        }
+    }
+
     fn after(&self, hr: HRESULT, made: Option<&IShellItem>) {
         let mut done = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if hr.is_err() {
@@ -1360,7 +1379,8 @@ impl IFileOperationProgressSink_Impl for Sink_Impl {
     fn PreRenameItem(&self, _: u32, _: Ref<IShellItem>, _: &PCWSTR) -> WinResult<()> {
         Ok(())
     }
-    fn PostRenameItem(&self, _: u32, _: Ref<IShellItem>, _: &PCWSTR, hr: HRESULT, made: Ref<IShellItem>) -> WinResult<()> {
+    fn PostRenameItem(&self, _: u32, item: Ref<IShellItem>, _: &PCWSTR, hr: HRESULT, made: Ref<IShellItem>) -> WinResult<()> {
+        self.note_in_use(hr, item.as_ref());
         self.after(hr, made.as_ref());
         Ok(())
     }
@@ -1368,6 +1388,7 @@ impl IFileOperationProgressSink_Impl for Sink_Impl {
         go_on()
     }
     fn PostMoveItem(&self, _: u32, item: Ref<IShellItem>, _: Ref<IShellItem>, _: &PCWSTR, hr: HRESULT, made: Ref<IShellItem>) -> WinResult<()> {
+        self.note_in_use(hr, item.as_ref());
         self.after(hr, made.as_ref());
         // Where it went, for Ctrl+Z (its name may have changed: "keep both").
         if hr.is_ok() {
@@ -1380,7 +1401,8 @@ impl IFileOperationProgressSink_Impl for Sink_Impl {
     fn PreCopyItem(&self, _: u32, _: Ref<IShellItem>, _: Ref<IShellItem>, _: &PCWSTR) -> WinResult<()> {
         go_on()
     }
-    fn PostCopyItem(&self, _: u32, _: Ref<IShellItem>, _: Ref<IShellItem>, _: &PCWSTR, hr: HRESULT, made: Ref<IShellItem>) -> WinResult<()> {
+    fn PostCopyItem(&self, _: u32, item: Ref<IShellItem>, _: Ref<IShellItem>, _: &PCWSTR, hr: HRESULT, made: Ref<IShellItem>) -> WinResult<()> {
+        self.note_in_use(hr, item.as_ref());
         self.after(hr, made.as_ref());
         Ok(())
     }
@@ -1395,6 +1417,7 @@ impl IFileOperationProgressSink_Impl for Sink_Impl {
                 self.0.lock().unwrap_or_else(|e| e.into_inner()).gone_for_good.push(path);
             }
         }
+        self.note_in_use(hr, item.as_ref());
         self.after(hr, None);
         Ok(())
     }
@@ -1608,6 +1631,12 @@ fn win32_code(hr: HRESULT) -> Option<u32> {
 fn engine_code(hr: HRESULT) -> Option<u32> {
     let v = hr.0 as u32;
     (v & 0xFFFF_0000 == 0x8027_0000).then_some(v & 0xFFFF)
+}
+
+/// The item is open in another program (ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, or the copy
+/// engine's own COPYENGINE_E_SHARING_VIOLATION_SRC/DEST).
+fn is_in_use(hr: HRESULT) -> bool {
+    matches!(win32_code(hr), Some(32 | 33)) || matches!(engine_code(hr), Some(0x27 | 0x28))
 }
 
 /// The person stopped it ("Cancel" in Windows' progress window, or a question answered with Cancel).
@@ -2516,7 +2545,9 @@ mod tests {
         }
         assert_eq!(names_in(&s.0).unwrap().len(), 3);
         assert!(out.undo.is_none());
-        assert_eq!(out.note.as_deref(), Some("Failed to rename 3 items: the name is taken, or it's in use."));
+        // (The program that has it open is named: here the test itself.)
+        let note = out.note.unwrap_or_default();
+        assert!(note.starts_with("Failed to rename 3 items. ") && note.contains("Report 1.xlsx") && note.contains(" is open in "), "{note}");
     }
 
     /// 1 and 2 swap (2 is in use), a and b swap: a and b still do. Ctrl+Z and Ctrl+Y too.
@@ -2536,7 +2567,9 @@ mod tests {
             assert_eq!((read(&s.at("a [1] & b's.jpg")), read(&s.at("b #2 ~ (x).jpg"))), ("b #2 ~ (x).jpg".into(), "a [1] & b's.jpg".into()), "{:?}", out.note);
             assert_eq!((read(&s.at("1.jpg")), read(&s.at("2.jpg"))), ("1.jpg".into(), "2.jpg".into()), "each back under its own name");
             assert!(no_temporary_name(&s.0), "{:?}", names_in(&s.0));
-            assert_eq!(out.note.as_deref(), Some("Failed to rename 2 items: the name is taken, or it's in use."));
+            // (The program that has it open is named: here the test itself.)
+            let note = out.note.clone().unwrap_or_default();
+            assert!(note.starts_with("Failed to rename 2 items. ") && note.contains(locked) && note.contains(" is open in "), "{note}");
             let step = out.undo.clone().unwrap();
             assert!(matches!(&step, crate::undo::Step::Moved { pairs } if pairs.len() == 2), "{step:?}");
             for (job, swapped) in [(step.undo_job(), false), (step.redo_job(), true), (step.undo_job(), false)] {

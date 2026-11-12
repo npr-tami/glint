@@ -30,6 +30,12 @@ pub const PAGES: [&str; 5] = ["General", "Appearance", "Files", "Keys", "About"]
 pub const ABOUT: usize = 4;
 pub const ABOUT_ROW: &str = "Updates";
 
+/// Why "Temp Win+E Fix" is there, behind its (i).
+/// The (i) next to "Setup info" in About.
+pub const SETUP_INFO: &str = "Copies your Glint and Windows versions and the settings that change how Glint works. Paste it into a bug report: then whoever looks at the bug can set up Glint the same way and see it happen. No file, folder, user or PC names are included.";
+
+pub const TEMP_WIN_E_FIX: &str = "On newer Windows 11, Win+E can open File Explorer instead of Glint. This keeps a tiny part of Glint running in the background (no window, no tray icon), so Win+E always opens Glint. It's temporary, until there's a proper fix.";
+
 /// What works in this version: settings by their name in settings.json, and "@" names for the
 /// rest (buttons, things Windows keeps). Rows about anything else are hidden.
 pub const LIVE: &[&str] = &[
@@ -50,6 +56,7 @@ pub const LIVE: &[&str] = &[
     "RememberSplit",
     "@Folders",
     "@WinE",
+    "WinEAfterQuit",
     "StayRunning",
     "TrayIcon",
     "StartWithWindows",
@@ -91,6 +98,7 @@ pub const LIVE: &[&str] = &[
     "@Update",
     "CheckForUpdates",
     "@ReportBug",
+    "@BugInfo",
     "@SettingsFolder",
     "@Portable",
     "@Cache",
@@ -144,6 +152,8 @@ pub fn plain_facts(values: &Map<String, Value>) -> Facts<'_> {
         cache_said: None,
         clear_asked: false,
         portable_said: None,
+        bug_said: None,
+        info_open: None,
         portable_locked: false,
         skins: &[],
         update_said: String::new(),
@@ -226,6 +236,11 @@ pub fn after_change(key: &str, before: &Settings, app: &mut AppState) -> Option<
         "ShowSystem" => {
             let on = app.settings.show_system;
             app.set_show_system(on);
+            None
+        }
+        // The Win+E catcher starts or ends, and its Run value comes or goes (catcher.rs).
+        "WinEAfterQuit" => {
+            crate::catcher::sync(crate::catcher::wanted(app.settings.win_e_after_quit));
             None
         }
         // Every tab is sorted again (by the rules, or by its column).
@@ -372,6 +387,8 @@ pub enum Act {
     SortEditor,
     /// GitHub's issues page, to report a bug.
     ReportBug,
+    /// Copy the bug info (bugreport.rs) to the clipboard.
+    CopyBugInfo,
     /// Glint's Discord (not there yet: the row is hidden).
     Discord,
 }
@@ -416,6 +433,8 @@ pub struct Row {
     pub only_if: Option<(&'static str, Val)>,
     /// Not an everyday setting: hidden behind "More" while Settings shows the basics.
     pub more: bool,
+    /// An (i) after the title: clicking it shows (or hides) why the setting is there, as its note.
+    pub info: bool,
     /// A choice shown as round buttons, one per line, also when choices are ticks (a short choice,
     /// as File Explorer shows them).
     pub radios: bool,
@@ -425,7 +444,11 @@ pub struct Row {
 
 impl Row {
     fn new(key: &'static str, title: &str, note: Option<&str>, ctl: Ctl) -> Row {
-        Row { title: title.to_string(), note: note.map(str::to_string), ctl, key, indent: false, needs: None, only_if: None, more: false, radios: false, long: false }
+        Row { title: title.to_string(), note: note.map(str::to_string), ctl, key, indent: false, needs: None, only_if: None, more: false, radios: false, long: false, info: false }
+    }
+    fn info(mut self) -> Row {
+        self.info = true;
+        self
     }
     fn more(mut self) -> Row {
         self.more = true;
@@ -481,6 +504,10 @@ pub struct Facts<'a> {
     pub clear_asked: bool,
     /// What switching Portable said last.
     pub portable_said: Option<String>,
+    /// What COPY next to Setup info said last.
+    pub bug_said: Option<String>,
+    /// The row whose (i) is open: its words show as its note.
+    pub info_open: Option<&'static str>,
     /// Portable can't be switched (the folders were pointed elsewhere for testing).
     pub portable_locked: bool,
     /// Every skin, built-in ones first: id, name and its one line about itself (skin.rs).
@@ -572,7 +599,11 @@ fn general(f: &Facts) -> Vec<Item> {
             toggle("StartWithWindows", "Start with Windows", None),
         ]),
         Item::Heading("Default file explorer"),
-        Item::Card(vec![toggle("@Folders", "Open folders and drives in Glint", None), toggle("@WinE", "Win+E opens Glint", None)]),
+        Item::Card(vec![
+            toggle("@Folders", "Open folders and drives in Glint", None),
+            toggle("@WinE", "Win+E opens Glint", None),
+            toggle("WinEAfterQuit", "Temp Win+E Fix", f.info_open.filter(|k| *k == "WinEAfterQuit").map(|_| TEMP_WIN_E_FIX)).indent().needs("@WinE").info(),
+        ]),
         Item::Heading("Right-click menu"),
         Item::Card(vec![
             toggle("ShellItemsInMenu", "Other apps' items", None).more(),
@@ -711,6 +742,13 @@ fn about(f: &Facts) -> Vec<Item> {
     if let Some(said) = &f.cache_said {
         cache_note = format!("{cache_note}\n{said}");
     }
+    // The explanation shows while its (i) is open; what COPY said shows under it either way.
+    let bug_note: Option<String> = match (f.info_open.filter(|k| *k == "@BugInfo").map(|_| SETUP_INFO), &f.bug_said) {
+        (Some(why), Some(said)) => Some(format!("{why}\n{said}")),
+        (Some(why), None) => Some(why.to_string()),
+        (None, Some(said)) => Some(said.clone()),
+        (None, None) => None,
+    };
     let mut portable_note = "Keep Glint's files next to Glint.exe, in \u{201c}Glint data\u{201d}".to_string();
     if f.portable_locked {
         portable_note.push_str("\nPortable is locked while testing.");
@@ -728,6 +766,7 @@ fn about(f: &Facts) -> Vec<Item> {
         Item::Heading("Help"),
         Item::Card(vec![
             Row::new("@ReportBug", "Report a bug", None, Ctl::Button("REPORT".into(), Act::ReportBug)),
+            Row::new("@BugInfo", "Setup info", bug_note.as_deref(), Ctl::Button("COPY".into(), Act::CopyBugInfo)).info(),
             Row::new("@Discord", "Discord", None, Ctl::Button("OPEN".into(), Act::Discord)),
         ]),
         Item::Heading("Glint's files"),
@@ -757,6 +796,8 @@ mod tests {
             cache_said: None,
             clear_asked: false,
             portable_said: None,
+            bug_said: None,
+            info_open: None,
             portable_locked: false,
             skins: &[],
             update_said: "You have the newest Glint.".into(),

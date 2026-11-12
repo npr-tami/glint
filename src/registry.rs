@@ -58,6 +58,8 @@ const MARKER: &str = "GlintOwned";
 const FOLDER_TYPES: [&str; 2] = ["Directory", "Drive"];
 /// The value under Run for "Start with Windows".
 const RUN_VALUE: &str = "Glint";
+/// The Run value that starts the Win+E catcher at sign-in ("Temp Win+E Fix", catcher.rs).
+const CATCHER_RUN_VALUE: &str = "Glint Win+E";
 /// The switch "Start with Windows" adds: start hidden in the background.
 pub const BACKGROUND_SWITCH: &str = "--background";
 
@@ -510,6 +512,22 @@ fn win_e(places: &Places, on: bool, exe: &str, backup: &Key) -> Result<(), Strin
     Ok(())
 }
 
+/// The Win+E catcher's Run value: set to `command`, or removed (None).
+pub fn set_catcher_run(places: &Places, command: Option<&str>) -> Result<(), String> {
+    match command {
+        Some(c) => Key::create(&places.run)?.set_string(CATCHER_RUN_VALUE, c, &places.run),
+        None => match Key::open(&places.run, true) {
+            Some(run) if run.string(CATCHER_RUN_VALUE).is_some() => run.delete_value(CATCHER_RUN_VALUE, &places.run),
+            _ => Ok(()),
+        },
+    }
+}
+
+/// The Win+E catcher's Run value, if it's there.
+pub fn catcher_run(places: &Places) -> Option<String> {
+    Key::open(&places.run, false)?.string(CATCHER_RUN_VALUE)
+}
+
 /// Turns "Start with Windows" on (for `exe`, started hidden in the background) or off.
 pub fn set_start_with_windows(places: &Places, on: bool, exe: &str) -> Result<(), String> {
     if on {
@@ -773,6 +791,19 @@ mod tests {
         set_start_with_windows(p, false, EXE).unwrap();
         assert!(run_exe(p).is_none());
         set_start_with_windows(p, false, EXE).unwrap(); // off twice is fine
+    }
+
+    #[test]
+    fn the_win_e_catcher_has_a_run_value_of_its_own() {
+        let t = TestRoot::new("catcher");
+        let p = &t.1;
+        set_start_with_windows(p, true, EXE).unwrap();
+        set_catcher_run(p, Some(r#""C:\Tools\Glint\glint.exe" --win-e-catcher"#)).unwrap();
+        assert_eq!(catcher_run(p).as_deref(), Some(r#""C:\Tools\Glint\glint.exe" --win-e-catcher"#));
+        assert_eq!(run_exe(p).as_deref(), Some(EXE), "Start with Windows keeps its own value");
+        set_catcher_run(p, None).unwrap();
+        assert!(catcher_run(p).is_none() && run_exe(p).is_some());
+        set_catcher_run(p, None).unwrap(); // off twice is fine
     }
 
     #[test]

@@ -2103,7 +2103,10 @@ impl AppState {
             // In This PC, typing in the filter searches every drive straight away (its own list is
             // just the drives).
             let typed = !t.filter.trim().is_empty();
-            dupes || (t.path.is_empty() && typed) || (self.subfolders && typed && !folder::is_place(&t.path) && !unreadable && crate::archive::split(&t.path).is_none())
+            // Words in quotes look inside files: a search of the folder itself, Subfolders or not.
+            let inside = typed && !folder::split_quotes(&t.filter.to_lowercase()).0.is_empty();
+            let searchable = !folder::is_place(&t.path) && !unreadable && crate::archive::split(&t.path).is_none();
+            dupes || (t.path.is_empty() && typed) || ((self.subfolders || inside) && typed && searchable)
         })
     }
 
@@ -2212,7 +2215,8 @@ impl AppState {
                 listing
             }
         };
-        let ask = search::Ask { root, query, generation, show_hidden, show_system, pause: typing, dupes };
+        let deep = self.subfolders || root.is_empty();
+        let ask = search::Ask { root, query, generation, show_hidden, show_system, pause: typing, dupes, deep };
         let started = search::start(ask, listing, move |batch| {
             if tx.send(Loaded::Search { tab_id, generation, batch }).is_err() {
                 return false;

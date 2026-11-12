@@ -1139,6 +1139,9 @@ pub struct Settings {
     /// "Start with Windows": start hidden in the background at sign-in. The Run value in the
     /// registry is what really does it (registry.rs); change both with `life::apply_start_with_windows`.
     pub start_with_windows: bool,
+    /// "Temp Win+E Fix": a tiny glint.exe that only catches Win+E keeps running after Ctrl+Q, and
+    /// starts with Windows (catcher.rs), for Windows that no longer reads the Win+E registry key.
+    pub win_e_after_quit: bool,
 
     // ----- updates (update.rs)
     /// "Check for updates automatically": about 30 seconds after Glint starts, and then every 12
@@ -1272,6 +1275,7 @@ impl Default for Settings {
             stay_running: true,
             tray_icon: true,
             start_with_windows: false,
+            win_e_after_quit: false,
             check_for_updates: true,
             update_repo: UPDATE_REPO.to_string(),
             skipped_update: None,
@@ -1311,6 +1315,7 @@ impl Default for Settings {
 const CHOICES: &[&str] = &[
     "Startup",
     "StartupFolder",
+    "WinEAfterQuit",
     "HomeOpens",
     "SettingsOpens",
     "SettingsPages",
