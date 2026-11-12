@@ -142,6 +142,8 @@ fn main() {
     // Dropped last, when main ends: waits for copies still running, so closing Glint never cuts
     // one short (Windows' progress window stays on screen meanwhile).
     let _finish_file_jobs = fileops::FinishOnExit;
+    // Older versions of changed archives (kept for Ctrl+Z) from earlier days go.
+    let _ = shell::background("old archive versions", archive::forget_old_versions);
     // SAFETY: process-wide set-up calls with constant arguments, made once before any window exists.
     unsafe {
         // An empty DVD drive or card reader must give an error code, not a "no disk" dialog.

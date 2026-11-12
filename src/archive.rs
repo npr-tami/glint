@@ -31,6 +31,9 @@ use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToFileTime, SystemTimeToTzSpecificLocalTime, TzSpecificLocalTimeToSystemTime};
 
 use crate::folder::{self, Entry, EntryKind, Folder};
+
+mod edit;
+pub use edit::{change, forget_old_versions, swap, Change};
 use crate::icons;
 
 const ATTR_DIRECTORY: u32 = 0x10;
@@ -1003,7 +1006,8 @@ pub fn plan_pack(paths: &[String], stop: &AtomicBool) -> Result<Option<Packing>,
     let mut plan = Packing { items: Vec::new(), total: 0 };
     let mut taken: HashSet<String> = HashSet::new();
     for p in paths {
-        let path = Path::new(p);
+        let disk = on_disk(Path::new(p));
+        let path = disk.as_path();
         let meta = std::fs::metadata(path).map_err(|e| read_error(path, &e))?;
         let name = free_name(folder::file_name(p), meta.is_dir(), |n| taken.contains(&n.to_lowercase()));
         taken.insert(name.to_lowercase());
@@ -1032,7 +1036,7 @@ fn walk(dir: &Path, name: &str, plan: &mut Packing, stop: &AtomicBool) -> Result
         }
         for entry in std::fs::read_dir(&dir).map_err(|e| read_error(&dir, &e))? {
             let entry = entry.map_err(|e| read_error(&dir, &e))?;
-            let path = entry.path();
+            let path = on_disk(&entry.path());
             let inner = format!("{name}/{}", entry.file_name().to_string_lossy());
             let kind = entry.file_type().map_err(|e| read_error(&path, &e))?;
             let meta = if kind.is_symlink() {
@@ -1054,6 +1058,19 @@ fn walk(dir: &Path, name: &str, plan: &mut Packing, stop: &AtomicBool) -> Result
         }
     }
     Ok(true)
+}
+
+/// A path the file system takes as it is: one with a name ending in a dot or space (made by
+/// another system) gets the "\\?\" prefix, or Windows would trim the name and not find it.
+fn on_disk(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if !folder::odd_name_in(&s) || s.starts_with("\\\\?\\") {
+        return path.to_path_buf();
+    }
+    match s.strip_prefix("\\\\") {
+        Some(unc) => PathBuf::from(format!("\\\\?\\UNC\\{unc}")),
+        None => PathBuf::from(format!("\\\\?\\{s}")),
+    }
 }
 
 /// Makes the archive `out` (a new file: nothing is ever replaced) from `plan`, with each file's
@@ -1467,7 +1484,9 @@ fn open_error(e: &io::Error) -> String {
 }
 
 fn read_error(path: &Path, e: &io::Error) -> String {
-    let path = path.display();
+    // (Shown without the "\\?\" prefix `on_disk` may have added.)
+    let path = path.display().to_string();
+    let path = path.strip_prefix("\\\\?\\UNC\\").map(|p| format!("\\\\{p}")).or_else(|| path.strip_prefix("\\\\?\\").map(str::to_string)).unwrap_or(path);
     match e.kind() {
         io::ErrorKind::NotFound => format!("\u{201c}{path}\u{201d} isn't there any more."),
         io::ErrorKind::PermissionDenied => format!("Glint isn't allowed to read \u{201c}{path}\u{201d}."),
@@ -1523,7 +1542,7 @@ mod tests {
         dir
     }
 
-    fn s(p: &Path) -> String {
+    pub(crate) fn s(p: &Path) -> String {
         p.to_string_lossy().into_owned()
     }
 
@@ -1563,7 +1582,7 @@ mod tests {
         w.finish().expect("finish");
     }
 
-    fn names(f: &Folder) -> Vec<String> {
+    pub(crate) fn names(f: &Folder) -> Vec<String> {
         let mut v: Vec<String> = f.entries.iter().map(|e| format!("{}{}", e.name, if e.kind == EntryKind::Folder { "\\" } else { "" })).collect();
         v.sort();
         v
@@ -1770,7 +1789,7 @@ mod tests {
     }
 
     /// Every file and folder under `dir` as (path inside, contents; None for folders), sorted.
-    fn tree(dir: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+    pub(crate) fn tree(dir: &Path) -> Vec<(String, Option<Vec<u8>>)> {
         let mut out = Vec::new();
         let mut todo = vec![dir.to_path_buf()];
         while let Some(d) = todo.pop() {
@@ -1816,6 +1835,24 @@ mod tests {
             assert_eq!(tree(&back.join("Stuff")), tree(&top), "{format:?}");
             // The file's date came along (a zip keeps it to two seconds).
             assert!(modified(&back.join("Stuff").join("a.txt")).abs_diff(1_500_000_000) <= 2, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn names_ending_in_a_dot_or_space_are_packed() {
+        let dir = scratch("odd-names");
+        let top = dir.join("odd ");
+        let verbatim = |p: &Path| PathBuf::from(format!("\\\\?\\{}", p.display()));
+        std::fs::create_dir_all(verbatim(&top)).expect("mkdir");
+        std::fs::write(verbatim(&top.join("notes.")), b"dot").expect("write");
+        std::fs::write(verbatim(&dir.join("alone.")), b"alone").expect("write");
+        let never = AtomicBool::new(false);
+        for format in [Format::Zip, Format::SevenZ] {
+            let plan = plan_pack(&[s(&top), s(&dir.join("alone."))], &never).expect("plan").expect("not stopped");
+            let out = dir.join(format!("odd{}", format.ext()));
+            pack(&plan, &s(&out), format).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+            assert!(std::fs::metadata(&out).expect("made").len() > 0);
+            let _ = std::fs::remove_file(&out);
         }
     }
 
@@ -1899,22 +1936,22 @@ mod tests {
 
     /// A fresh folder for one test under the temporary folder (with the process id in its name),
     /// removed again at the end.
-    struct Scratch(PathBuf);
+    pub(crate) struct Scratch(pub(crate) PathBuf);
 
     impl Scratch {
-        fn new(name: &str) -> Scratch {
+        pub(crate) fn new(name: &str) -> Scratch {
             let dir = std::env::temp_dir().join(format!("glint-archive-test-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("scratch dir");
             Scratch(dir)
         }
 
-        fn join(&self, part: &str) -> PathBuf {
+        pub(crate) fn join(&self, part: &str) -> PathBuf {
             self.0.join(part)
         }
 
         /// A new, empty folder in it.
-        fn dir(&self, part: &str) -> PathBuf {
+        pub(crate) fn dir(&self, part: &str) -> PathBuf {
             let dir = self.0.join(part);
             std::fs::create_dir_all(&dir).expect("mkdir");
             dir
@@ -1928,7 +1965,7 @@ mod tests {
     }
 
     /// A zip of these entries, named exactly so (a name ending in `/` or `\` is a folder).
-    fn zip_with(path: &Path, entries: &[(&str, &[u8])]) {
+    pub(crate) fn zip_with(path: &Path, entries: &[(&str, &[u8])]) {
         use zip::write::SimpleFileOptions;
         let mut w = zip::ZipWriter::new(File::create(path).expect("create"));
         let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
@@ -1962,7 +1999,7 @@ mod tests {
     }
 
     /// Either kind of archive of these entries.
-    fn archive_with(path: &Path, entries: &[(&str, &[u8])]) {
+    pub(crate) fn archive_with(path: &Path, entries: &[(&str, &[u8])]) {
         match kind_of(&s(path)) {
             Some(Kind::Zip) => zip_with(path, entries),
             _ => seven_with(path, entries),
@@ -1970,7 +2007,7 @@ mod tests {
     }
 
     /// Replaces every `from` in the file with `to` (as long), as a hex editor would.
-    fn patch(path: &Path, from: &[u8], to: &[u8]) {
+    pub(crate) fn patch(path: &Path, from: &[u8], to: &[u8]) {
         assert_eq!(from.len(), to.len());
         let mut bytes = std::fs::read(path).expect("read");
         let mut i = 0;
@@ -1987,13 +2024,13 @@ mod tests {
     }
 
     /// What `tree` should find: (path inside, contents; None for folders), sorted.
-    fn expected(items: &[(&str, Option<&[u8]>)]) -> Vec<(String, Option<Vec<u8>>)> {
+    pub(crate) fn expected(items: &[(&str, Option<&[u8]>)]) -> Vec<(String, Option<Vec<u8>>)> {
         let mut v: Vec<(String, Option<Vec<u8>>)> = items.iter().map(|(p, d)| (p.to_string(), d.map(<[u8]>::to_vec))).collect();
         v.sort();
         v
     }
 
-    fn names_in(dir: &Path) -> Vec<String> {
+    pub(crate) fn names_in(dir: &Path) -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_dir(dir).expect("list").map(|e| e.expect("entry").file_name().to_string_lossy().into_owned()).collect();
         v.sort();
         v
@@ -2206,7 +2243,7 @@ mod tests {
     }
 
     /// A zip of these entries, as bytes (to go inside another one).
-    fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(crate) fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
         use zip::write::SimpleFileOptions;
         let mut w = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
         let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);

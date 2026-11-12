@@ -29,6 +29,12 @@ pub enum Step {
     Moved { pairs: Vec<(String, String)> },
     /// These items went to the Recycle Bin.
     Recycled { paths: Vec<String> },
+    /// What's inside the .zip or .7z `archive` changed; `other` (in Glint's temporary folder) is
+    /// the archive as it was. `recycled`: items moved into it, now in the Recycle Bin; `made`:
+    /// items moved out of it. `what` says what it was (deleting "a.txt"). `stamps`: the
+    /// archive as changed and as it was ([`crate::fileops::archive_stamp`]), so a Ctrl+Z or Ctrl+Y
+    /// never swaps away a version changed since (by Glint or another program).
+    ArchiveChanged { archive: String, other: String, recycled: Vec<String>, made: Vec<String>, what: String, stamps: (u64, u64) },
 }
 
 impl Step {
@@ -39,6 +45,7 @@ impl Step {
             Step::Made { paths, .. } => Job::Delete { paths: paths.clone(), recycle: true },
             Step::Moved { pairs } => Job::MoveEach { pairs: pairs.iter().map(|(a, b)| (b.clone(), a.clone())).collect() },
             Step::Recycled { paths } => Job::Restore { paths: paths.clone() },
+            Step::ArchiveChanged { archive, other, recycled, made, stamps, .. } => Job::ArchiveSwap { archive: archive.clone(), other: other.clone(), restore: recycled.clone(), recycle: made.clone(), expect: stamps.0 },
         }
     }
 
@@ -49,6 +56,8 @@ impl Step {
             Step::Made { paths, .. } => Job::Restore { paths: paths.clone() },
             Step::Moved { pairs } => Job::MoveEach { pairs: pairs.clone() },
             Step::Recycled { paths } => Job::Delete { paths: paths.clone(), recycle: true },
+            // (The archive and its other version swap places either way.)
+            Step::ArchiveChanged { archive, other, recycled, made, stamps, .. } => Job::ArchiveSwap { archive: archive.clone(), other: other.clone(), restore: made.clone(), recycle: recycled.clone(), expect: stamps.1 },
         }
     }
 
@@ -58,7 +67,7 @@ impl Step {
         match self {
             Step::Renamed { dir, from, to } => vec![(crate::folder::join(dir, from), crate::folder::join(dir, to))],
             Step::Moved { pairs } => pairs.clone(),
-            Step::Made { .. } | Step::Recycled { .. } => Vec::new(),
+            Step::Made { .. } | Step::Recycled { .. } | Step::ArchiveChanged { .. } => Vec::new(),
         }
     }
 
@@ -74,6 +83,7 @@ impl Step {
                 format!("{} {}", if renamed { "renaming" } else { "moving" }, items_text(&from))
             }
             Step::Recycled { paths } => format!("deleting {}", items_text(paths)),
+            Step::ArchiveChanged { what, .. } => what.clone(),
         }
     }
 }
@@ -94,9 +104,9 @@ impl History {
     pub fn done(&mut self, step: Step) {
         self.undo.push(step);
         if self.undo.len() > KEPT {
-            self.undo.remove(0);
+            forget(self.undo.remove(0));
         }
-        self.redo.clear();
+        self.redo.drain(..).for_each(forget);
     }
 
     /// The step Ctrl+Z turns around, taken off the list (it goes on the redo list once the job
@@ -118,7 +128,7 @@ impl History {
     pub fn redone(&mut self, step: Step) {
         self.undo.push(step);
         if self.undo.len() > KEPT {
-            self.undo.remove(0);
+            forget(self.undo.remove(0));
         }
     }
 
@@ -162,11 +172,28 @@ impl History {
                 Step::Made { paths, .. } if !undone => paths.iter_mut().for_each(|p| fix(p, true)),
                 Step::Recycled { paths } if undone => paths.iter_mut().for_each(|p| fix(p, true)),
                 Step::Made { .. } | Step::Recycled { .. } => {} // in the Recycle Bin
+                Step::ArchiveChanged { archive, made, .. } => {
+                    fix(archive, true);
+                    if !undone {
+                        made.iter_mut().for_each(|p| fix(p, true));
+                    }
+                }
                 Step::Moved { pairs } => pairs.iter_mut().for_each(|(a, b)| {
                     fix(a, undone);
                     fix(b, !undone);
                 }),
             }
+        }
+    }
+}
+
+/// A step no key can reach any more: an archive's other version (which can be as big as the
+/// archive) is removed from Glint's temporary folder.
+fn forget(step: Step) {
+    if let Step::ArchiveChanged { other, .. } = step {
+        let _ = std::fs::remove_file(&other);
+        if let Some(dir) = std::path::Path::new(&other).parent() {
+            let _ = std::fs::remove_dir(dir);
         }
     }
 }

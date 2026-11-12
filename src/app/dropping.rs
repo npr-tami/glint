@@ -6,7 +6,8 @@
 use super::files::AfterJob;
 use super::{wake, AppState, Loaded};
 use crate::dragdrop::{Action, Dest, Plan, Signal};
-use crate::fileops::{self, is_full_item_path, Job};
+use crate::fileops::{self, is_full_item_path, same_path, DropHow, Job};
+use crate::folder::parent;
 
 impl AppState {
     /// Carries out a drop the window decided on. Returns true when a file job was started; its end
@@ -14,9 +15,28 @@ impl AppState {
     /// starts nothing, so nothing is waited for.
     pub fn drop_files(&mut self, plan: &Plan, action: Action, signal: Option<Signal>) -> bool {
         match (action, &plan.dest) {
-            (Action::Transfer(_), Dest::Folder(dest)) if crate::archive::split(dest).is_some() => {
-                self.say(super::files::ARCHIVE_NOTE);
-                false
+            (Action::Transfer(how), Dest::Folder(dest)) if crate::archive::split(dest).is_some() => {
+                let Some((archive, into)) = crate::archive::split(dest) else { return false };
+                let files: Vec<String> = plan.files.iter().filter(|p| is_full_item_path(p)).cloned().collect();
+                // Dragged from this same archive (taken out to Glint's temporary folder for the
+                // drag): moved within it, as in a folder.
+                let within = self.drag_from_archive.as_ref().filter(|(a, _, dir)| same_path(a, &archive) && !files.is_empty() && files.iter().all(|f| parent(f).is_some_and(|p| same_path(&p, dir))));
+                let job = match within {
+                    Some((_, items, _)) => Job::ArchiveChange { archive, change: crate::archive::Change::Move { items: items.clone(), into }, recycle: Vec::new() },
+                    None if how == DropHow::Link => {
+                        self.say("Shortcuts can't be made inside a zip or 7z file.");
+                        return false;
+                    }
+                    None => {
+                        if let Some(s) = files.iter().find(|s| fileops::is_same_or_inside(&archive, s)) {
+                            self.say(format!("\u{201c}{}\u{201d} can't be put into itself.", crate::folder::file_name(s)));
+                            return false;
+                        }
+                        let recycle = if how == DropHow::Move { files.clone() } else { Vec::new() };
+                        Job::ArchiveChange { archive, change: crate::archive::Change::Add { sources: files, into }, recycle }
+                    }
+                };
+                self.start_drop_job(job, AfterJob::new(plan.tab_id), signal)
             }
             (Action::Transfer(how), Dest::Folder(dest)) => {
                 let job = Job::Drop { sources: plan.files.clone(), dest: dest.clone(), how };

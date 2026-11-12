@@ -18,7 +18,6 @@
 //! They carry no Windows items (Windows' menu for a deleted item would act on where it's kept).
 
 use crate::app::{can_pin, AppState, SortKey};
-use crate::fileops::clipboard_has_files;
 use crate::folder::EntryKind;
 use crate::recycle;
 use crate::settings::ViewMode;
@@ -170,11 +169,9 @@ pub fn for_items(app: &AppState, at: Point, how: How) -> Effect {
     }
     items.push(MenuItem::separator());
     if files {
-        if !inside {
-            items.push(MenuItem::new(PICK_CUT, "Cut\tCtrl+X"));
-        }
+        items.push(MenuItem::new(PICK_CUT, "Cut\tCtrl+X"));
         items.push(MenuItem::new(PICK_COPY, "Copy\tCtrl+C"));
-        if single && first.is_container() && clipboard_has_files() && !inside {
+        if single && first.is_container() && app.can_paste() {
             items.push(MenuItem::new(PICK_PASTE_INTO, "Paste into folder"));
         }
         if split && !inside {
@@ -192,6 +189,12 @@ pub fn for_items(app: &AppState, at: Point, how: How) -> Effect {
         }
         items.push(MenuItem::new(PICK_ZIP, "Compress to zip"));
         items.push(MenuItem::new(PICK_7Z, "Compress to 7z"));
+    }
+    if files && inside {
+        // Inside a .zip or .7z: one at a time, and a delete there can always be undone.
+        items.push(MenuItem::separator());
+        items.push(MenuItem::new(PICK_RENAME, "Rename\tF2").disabled(!single));
+        items.push(MenuItem::new(PICK_DELETE, "Delete\tDel"));
     }
     if files && !inside {
         items.push(MenuItem::separator());
@@ -264,9 +267,10 @@ pub fn for_background(app: &AppState, at: Point, how: How) -> Effect {
         return bin_background(app, at);
     }
     let t = app.tab();
-    // (Inside a .zip or .7z nothing can be made or pasted: archive.rs only reads it. Home is a
-    // page, not a folder: no path to copy, nothing to make or paste there.)
-    let real = !t.path.is_empty() && !crate::folder::is_place(&t.path) && crate::archive::split(&t.path).is_none();
+    // (Home is a page, not a folder: no path to copy, nothing to make or paste there. Inside a .zip
+    // or .7z things can be made and pasted, but it's no folder of the disk.)
+    let inside = crate::archive::split(&t.path).is_some();
+    let real = !t.path.is_empty() && !crate::folder::is_place(&t.path) && !inside;
     // While the custom sort order decides here, no column is checked (as in the SORT menu).
     let custom = t.custom_here().is_some();
     let key = |id, label, k| MenuItem::new(id, label).checked(t.sort == k && !custom);
@@ -290,8 +294,8 @@ pub fn for_background(app: &AppState, at: Point, how: How) -> Effect {
     if app.history.can_redo() {
         items.push(MenuItem::new(PICK_REDO, "Redo\tCtrl+Y"));
     }
-    if real {
-        items.push(MenuItem::new(PICK_PASTE, "Paste\tCtrl+V").disabled(!clipboard_has_files()));
+    if real || inside {
+        items.push(MenuItem::new(PICK_PASTE, "Paste\tCtrl+V").disabled(!app.can_paste()));
         items.push(MenuItem::new(PICK_NEW_FOLDER, "New folder\tCtrl+Shift+N"));
         items.push(MenuItem::new(PICK_NEW_TEXT, "New text file"));
         items.push(MenuItem::separator());
@@ -318,7 +322,6 @@ pub fn for_background(app: &AppState, at: Point, how: How) -> Effect {
     if real {
         items.push(MenuItem::new(PICK_PROPERTIES, "Properties\tAlt+Enter"));
     }
-    let inside = crate::archive::split(&t.path).is_some();
     finish(items, MENU_BACKGROUND, 0, at, how, app, || (!inside).then(|| ShellTarget::Background(t.path.clone())))
 }
 

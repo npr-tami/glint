@@ -165,16 +165,19 @@ pub fn folder_effect(sources: &[String], dest: &str, keys: u32, allowed: u32) ->
     let keyed = ctrl || shift || alt;
     // (Items from several drives move only if they're all on the folder's: the others are copied.)
     let here = volume(dest);
+    // Into a .zip or .7z things are copied unless Shift says move, as File Explorer does (dragged
+    // within the same one, they're moved: app/dropping.rs). Shortcuts can't go in.
+    let into_archive = crate::archive::split(dest).is_some();
     let wanted = if alt || (ctrl && shift) {
         DropHow::Link
     } else if ctrl {
         DropHow::Copy
-    } else if shift || items.iter().all(|s| volume(s) == here) {
+    } else if shift || (!into_archive && items.iter().all(|s| volume(s) == here)) {
         DropHow::Move
     } else {
         DropHow::Copy
     };
-    let possible = |how: DropHow| allowed & effect_of(how) != 0 && !(how == DropHow::Move && same_folder);
+    let possible = |how: DropHow| allowed & effect_of(how) != 0 && !(how == DropHow::Move && same_folder) && !(how == DropHow::Link && into_archive);
     if possible(wanted) {
         return Some(wanted);
     }

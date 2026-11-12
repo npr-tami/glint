@@ -1195,7 +1195,7 @@ pub fn wide(s: &str) -> Vec<u16> {
 pub fn wide_path(path: &str) -> Vec<u16> {
     // Comfortably under the limit even for "folder\*" and a file name on top.
     const LONG: usize = 240;
-    if path.len() < LONG || path.starts_with("\\\\?\\") || path.starts_with("\\\\.\\") || !is_absolute(path) {
+    if (path.len() < LONG && !odd_name_in(path)) || path.starts_with("\\\\?\\") || path.starts_with("\\\\.\\") || !is_absolute(path) {
         return wide(path);
     }
     match path.strip_prefix("\\\\") {
@@ -1204,9 +1204,29 @@ pub fn wide_path(path: &str) -> Vec<u16> {
     }
 }
 
+/// Whether a part of the full path `path` ends in a dot or a space ("notes." or "draft "): names
+/// other systems (and archives) make, which Windows quietly trims (and then can't find) unless
+/// the path goes with the "\\?\" prefix. A path with "/" or "." or ".." parts never counts: those
+/// the prefix would take literally.
+pub fn odd_name_in(path: &str) -> bool {
+    let parts: Vec<&str> = path.split('\\').skip(1).filter(|p| !p.is_empty()).collect();
+    !path.contains('/') && !parts.iter().any(|p| *p == "." || *p == "..") && parts.iter().any(|p| p.ends_with('.') || p.ends_with(' '))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_ending_in_a_dot_or_space_go_with_the_prefix() {
+        assert!(odd_name_in("X:\\files\\dot.end."));
+        assert!(odd_name_in("X:\\folder \\a.txt"));
+        assert!(!odd_name_in("X:\\files\\a.txt"));
+        assert!(!odd_name_in("X:\\files\\..\\a."), "never with .. parts");
+        assert!(!odd_name_in("X:\\"));
+        assert_eq!(String::from_utf16_lossy(&wide_path("X:\\files\\dot.end.")), "\\\\?\\X:\\files\\dot.end.\0");
+        assert_eq!(String::from_utf16_lossy(&wide_path("X:\\files\\a.txt")), "X:\\files\\a.txt\0");
+    }
 
     /// A file for the sort tests: `name`, of type `kind`, `size` bytes.
     fn sort_entry(name: &str, kind: Arc<str>, size: u64) -> Entry {

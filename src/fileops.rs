@@ -75,6 +75,18 @@ pub enum Job {
     Extract { archive: String, own_folder: bool },
     /// Pack these items (all of one folder) into a new .zip or .7z next to them (Compress to zip).
     Compress { paths: Vec<String>, format: crate::archive::Format },
+    /// Change what's inside the .zip or .7z `archive` (archive.rs), in the copy queue. `recycle`:
+    /// items moved into it, sent to the Recycle Bin once they're in.
+    ArchiveChange { archive: String, change: crate::archive::Change, recycle: Vec<String> },
+    /// Ctrl+V into the folder `into` of a .zip or .7z: the files on the clipboard go in (and leave
+    /// where they were, when they were cut).
+    PasteIntoArchive { archive: String, into: String },
+    /// Items cut from a .zip or .7z (paths inside it) pasted into the real folder `dest`: taken
+    /// out, moved there, then removed from the archive.
+    TakeOut { archive: String, items: Vec<String>, dest: String },
+    /// Ctrl+Z or Ctrl+Y of a change to an archive (undo.rs): it's swapped with its other version;
+    /// `restore` come back from the Recycle Bin, and `recycle` go to it.
+    ArchiveSwap { archive: String, other: String, restore: Vec<String>, recycle: Vec<String>, expect: u64 },
 }
 
 /// What dropping items into a folder does (Explorer's rules decide which: dragdrop.rs).
@@ -101,6 +113,10 @@ impl Job {
                 | Job::Restore { .. }
                 | Job::Extract { .. }
                 | Job::Compress { .. }
+                | Job::ArchiveChange { .. }
+                | Job::PasteIntoArchive { .. }
+                | Job::TakeOut { .. }
+                | Job::ArchiveSwap { .. }
         )
     }
 }
@@ -224,6 +240,10 @@ fn run(job: Job) -> Outcome {
         Job::Restore { paths } => crate::recycle::restore_paths(&paths),
         Job::Extract { archive, own_folder } => extract(&archive, own_folder),
         Job::Compress { paths, format } => compress(&paths, format),
+        Job::ArchiveChange { archive, change, recycle } => archive_change(&archive, &change, &recycle),
+        Job::PasteIntoArchive { archive, into } => paste_into_archive(&archive, &into),
+        Job::TakeOut { archive, items, dest } => take_out(&archive, &items, &dest),
+        Job::ArchiveSwap { archive, other, restore, recycle, expect } => archive_swap(&archive, &other, &restore, &recycle, expect),
     }
 }
 
@@ -384,7 +404,7 @@ fn transfer(sources: &[String], dest: &str, moving: bool, same_folder: bool) -> 
             }
             if queued == 0 {
                 return Outcome::note(match engine.unopened() {
-                    Some(name) => format!("Failed to {verb}: Windows can't open \u{201c}{name}\u{201d}."),
+                    Some(name) => format!("Failed to {verb}: {}", cant_open(&name)),
                     None => format!("Failed to {verb}: {} isn't there any more.", items_text(&sources)),
                 });
             }
@@ -552,6 +572,211 @@ fn compress(paths: &[String], format: crate::archive::Format) -> Outcome {
         },
         Err(why) => Outcome { changed, note: Some(format!("Failed to compress {what}: {why}")), ..Default::default() },
     }
+}
+
+/// The path Glint shows for `inner` (a path inside it) of `archive`.
+pub fn in_archive(archive: &str, inner: &str) -> String {
+    if inner.is_empty() {
+        archive.to_string()
+    } else {
+        join(archive, inner)
+    }
+}
+
+/// What a change to an archive does, in words: (to do it, doing it, done, what it's done to, and
+/// the word before the archive's name: "Deleted x from", "Added x to", "Made x in").
+fn change_words(change: &crate::archive::Change) -> (&'static str, &'static str, &'static str, String, &'static str) {
+    use crate::archive::Change;
+    match change {
+        Change::Remove(items) => ("delete", "Deleting", "Deleted", items_text(items), "from"),
+        Change::Rename { from, .. } => ("rename", "Renaming", "Renamed", items_text(std::slice::from_ref(from)), "in"),
+        Change::Move { items, .. } => ("move", "Moving", "Moved", items_text(items), "in"),
+        Change::Add { sources, .. } => ("add", "Adding", "Added", items_text(sources), "to"),
+        Change::New { folder, .. } => ("make", "Making", "Made", if *folder { "a new folder" } else { "a new text file" }.to_string(), "in"),
+    }
+}
+
+/// Changes what's inside `archive` (see [`Job::ArchiveChange`]), in the copy queue. When it fails
+/// or is cancelled, the archive is as it was.
+fn archive_change(archive: &str, change: &crate::archive::Change, recycle: &[String]) -> Outcome {
+    let name = file_name(archive).to_string();
+    let (verb, doing, did, what, to) = change_words(change);
+    let changed = vec![parent(archive).unwrap_or_default(), archive.to_string()];
+    let cancelled_note = format!("Cancelled: \u{201c}{name}\u{201d} wasn't changed.");
+    let ticket = crate::copyqueue::Ticket::join(format!("{doing} {what} {to} \u{201c}{name}\u{201d}"));
+    ticket.set_total(std::fs::metadata(archive).map(|m| m.len()).unwrap_or(0));
+    if !ticket.wait_turn() {
+        return Outcome::note(cancelled_note);
+    }
+    let result = crate::archive::change(archive, change, ticket.cancel_flag());
+    let cancelled = ticket.cancel_flag().load(std::sync::atomic::Ordering::SeqCst);
+    drop(ticket);
+    let done = match result {
+        Ok(Some(done)) => done,
+        Ok(None) => return Outcome { ok: true, ..Default::default() },
+        Err(_) if cancelled => return Outcome { changed, ..Outcome::note(cancelled_note) },
+        Err(why) => {
+            // A name that's taken: the name box opens again, to type another.
+            let retry = match change {
+                crate::archive::Change::Rename { from, name } if why.starts_with("There's already") => Some((in_archive(archive, from), name.clone())),
+                _ => None,
+            };
+            return Outcome { changed, retry, ..Outcome::note(format!("Failed to {verb} {what}: {why}")) };
+        }
+    };
+    let mut out = Outcome {
+        ok: true,
+        changed,
+        created: done.made.map(|(dir, names)| (in_archive(archive, &dir), names)),
+        rename_new: matches!(change, crate::archive::Change::New { .. }),
+        note: Some(format!("{did} {what} {to} \u{201c}{name}\u{201d}")),
+        ..Default::default()
+    };
+    // (A rename says nothing, as on the disk. Tabs inside a renamed folder follow it: app/files.rs.)
+    if let crate::archive::Change::Rename { .. } = change {
+        out.note = None;
+    }
+    // Moved in: what came in leaves where it was (to the Recycle Bin, so Ctrl+Z brings it back).
+    let mut recycled = Vec::new();
+    if !recycle.is_empty() {
+        let gone = delete(recycle, true);
+        out.changed.extend(gone.changed);
+        if let Some(crate::undo::Step::Recycled { paths }) = gone.undo {
+            recycled = paths;
+        }
+        out.note = Some(format!("Moved {what} into \u{201c}{name}\u{201d}"));
+        if !gone.ok || recycled.len() < recycle.len() {
+            out.ok = false;
+            out.note = Some(format!("Added {what} to \u{201c}{name}\u{201d}, but some of them couldn't be removed from where they were."));
+        }
+    }
+    let stamps = (archive_stamp(archive), archive_stamp(&done.backup));
+    out.undo = Some(crate::undo::Step::ArchiveChanged { archive: archive.to_string(), other: done.backup, recycled, made: Vec::new(), what: format!("{} {what}", doing.to_lowercase()), stamps });
+    out
+}
+
+/// Ctrl+V into a .zip or .7z (see [`Job::PasteIntoArchive`]).
+fn paste_into_archive(archive: &str, into: &str) -> Outcome {
+    let mut clip = match read_clipboard() {
+        Ok(c) => c,
+        Err(msg) => return Outcome::note(msg),
+    };
+    clip.files.retain(|p| is_full_item_path(p));
+    if clip.files.is_empty() {
+        return Outcome::note("There are no files on the clipboard to paste.");
+    }
+    // (The archive itself, or a folder it's in, would be packed into itself.)
+    if let Some(s) = clip.files.iter().find(|s| is_same_or_inside(archive, s)) {
+        return Outcome::note(format!("\u{201c}{}\u{201d} can't be put into itself.", file_name(s)));
+    }
+    let _moving = if clip.cut {
+        match MovingCut::begin(clip.seq) {
+            Some(m) => Some(m),
+            None => return Outcome::note("Those items are still being moved. Wait until that's done."),
+        }
+    } else {
+        None
+    };
+    let recycle = if clip.cut { clip.files.clone() } else { Vec::new() };
+    let mut out = archive_change(archive, &crate::archive::Change::Add { sources: clip.files, into: into.to_string() }, &recycle);
+    if clip.cut && out.ok {
+        clear_clipboard_if(clip.seq);
+        out.moved_cut = true;
+    }
+    out
+}
+
+/// Items cut from a .zip or .7z pasted into a real folder (see [`Job::TakeOut`]): taken out to
+/// Glint's temporary folder, moved to `dest` as any move is (Windows asks about names taken there),
+/// and what really arrived is removed from the archive.
+fn take_out(archive: &str, items: &[String], dest: &str) -> Outcome {
+    let name = file_name(archive).to_string();
+    let what = items_text(items);
+    if !is_folder(dest) {
+        return Outcome::note(format!("Failed to move here: \u{201c}{}\u{201d} isn't there any more.", file_name(dest)));
+    }
+    let taken = crate::archive::temp_dir_for(archive).and_then(|tmp| crate::archive::extract(archive, items, &tmp).map(|tops| (tmp, tops)));
+    let (tmp, tops) = match taken {
+        Ok(t) => t,
+        Err(why) => return Outcome::note(format!("Failed to move {what}: {why}")),
+    };
+    let mut out = transfer(&tops, dest, true, false);
+    let moved: Vec<(String, String)> = match &out.undo {
+        Some(crate::undo::Step::Moved { pairs }) => pairs.clone(),
+        _ => Vec::new(),
+    };
+    // The archive's items whose copies arrived (one skipped stays in the archive).
+    let arrived: Vec<String> = items.iter().filter(|i| moved.iter().any(|(from, _)| same_path(from, &join(&tmp, file_name(i))))).cloned().collect();
+    if arrived.is_empty() {
+        return out;
+    }
+    let made: Vec<String> = moved.iter().map(|(_, to)| to.clone()).collect();
+    out.changed.extend([parent(archive).unwrap_or_default(), archive.to_string()]);
+    match crate::archive::change(archive, &crate::archive::Change::Remove(arrived.clone()), &std::sync::atomic::AtomicBool::new(false)) {
+        Ok(Some(done)) => {
+            let stamps = (archive_stamp(archive), archive_stamp(&done.backup));
+            out.undo = Some(crate::undo::Step::ArchiveChanged { archive: archive.to_string(), other: done.backup, recycled: Vec::new(), made, what: format!("moving {}", items_text(&arrived)), stamps });
+            if out.ok {
+                out.note = Some(format!("Moved {} out of \u{201c}{name}\u{201d}", items_text(&arrived)));
+            }
+        }
+        Ok(None) => {}
+        Err(why) => {
+            out.ok = false;
+            out.undo = Some(crate::undo::Step::Made { paths: made, what: "copy" });
+            out.note = Some(format!("Copied {} out, but couldn't remove {} from \u{201c}{name}\u{201d}: {why}", items_text(&arrived), if arrived.len() == 1 { "it" } else { "them" }));
+        }
+    }
+    out
+}
+
+/// Ctrl+Z or Ctrl+Y of a change to an archive (see [`Job::ArchiveSwap`]). What goes to the Recycle
+/// Bin goes first: when it can't, the archive stays as it is.
+/// Which version of a file this is: its size and last-written time (100 ns steps), mixed. A version
+/// moved elsewhere and back keeps it. 0 when it can't be read.
+pub fn archive_stamp(path: &str) -> u64 {
+    let Ok(m) = std::fs::metadata(path) else { return 0 };
+    let written = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| (d.as_nanos() / 100) as u64);
+    written ^ m.len().rotate_left(40)
+}
+
+fn archive_swap(archive: &str, other: &str, restore: &[String], recycle: &[String], expect: u64) -> Outcome {
+    let mut changed = vec![parent(archive).unwrap_or_default(), archive.to_string()];
+    // In the copy queue too: a change to this archive still being written goes first, so Ctrl+Z
+    // never swaps in the middle of it.
+    let name = file_name(archive).to_string();
+    let ticket = crate::copyqueue::Ticket::join(format!("Changing \u{201c}{name}\u{201d} back"));
+    if !ticket.wait_turn() {
+        return Outcome::note(format!("Cancelled: \u{201c}{name}\u{201d} wasn't changed."));
+    }
+    // Changed since (a newer change, or another program): swapping would lose that, so it stays.
+    if expect != 0 && archive_stamp(archive) != expect {
+        return Outcome { changed, ..Outcome::note(format!("\u{201c}{name}\u{201d} was changed after that, so it was left as it is.")) };
+    }
+    if !recycle.is_empty() {
+        let gone = delete(recycle, true);
+        changed.extend(gone.changed);
+        if !gone.ok || recycle.iter().any(|p| exists(p)) {
+            return Outcome { changed, ..Outcome::note(format!("Failed to remove {} again.", items_text(recycle))) };
+        }
+    }
+    if let Err(why) = crate::archive::swap(archive, other) {
+        // (What went to the bin comes back: nothing changed.)
+        if !recycle.is_empty() {
+            crate::recycle::restore_paths(recycle);
+        }
+        return Outcome { changed, ..Outcome::note(why) };
+    }
+    let mut out = Outcome { ok: true, changed, ..Default::default() };
+    if !restore.is_empty() {
+        let back = crate::recycle::restore_paths(restore);
+        out.changed.extend(back.changed);
+        if !back.ok {
+            out.ok = false;
+            out.note = back.note;
+        }
+    }
+    out
 }
 
 /// Removes what a cancelled job made (all new: nothing that was there before).
@@ -930,7 +1155,7 @@ fn delete(paths: &[String], recycle: bool) -> Outcome {
             }
             if queued == 0 {
                 let note = match engine.unopened() {
-                    Some(name) => format!("Failed to delete: Windows can't open \u{201c}{name}\u{201d}."),
+                    Some(name) => format!("Failed to delete: {}", cant_open(&name)),
                     None => format!("{} isn't there any more.", items_text(paths)),
                 };
                 return Outcome { changed, ..Outcome::note(note) };
@@ -979,7 +1204,9 @@ fn rename(path: &str, new_name: &str) -> Outcome {
     }
     // Errors go to the status bar (FOF_NOERRORUI) instead of a Windows message box.
     let flags = FOF_ALLOWUNDO | FOFX_ADDUNDORECORD | FOF_NOERRORUI | FOF_SILENT;
-    let error = match Engine::new(flags) {
+    // (A name ending in a dot or space, made elsewhere, the shell can't find: a plain rename can.)
+    let engine = if crate::folder::odd_name_in(path) || crate::folder::odd_name_in(&target) { None } else { Engine::new(flags) };
+    let error = match engine {
         Some(engine) => {
             let Some(item) = shell_item(path) else {
                 return Outcome { changed: vec![dir], ..Outcome::note(format!("\u{201c}{old}\u{201d} isn't there any more.")) };
@@ -1091,7 +1318,7 @@ impl Done {
         match self.error {
             Some(hr) => Some(format!("{lead}: {}", explain(hr))),
             None if self.aborted => Some("Cancelled before it was finished.".to_string()),
-            None => self.unopened.as_ref().map(|name| format!("{lead}: Windows can't open \u{201c}{name}\u{201d}.")),
+            None => self.unopened.as_ref().map(|name| format!("{lead}: {}", cant_open(name))),
         }
     }
 }
@@ -1265,6 +1492,16 @@ impl Engine {
         }
         done.aborted |= aborted.unwrap_or(false);
         done
+    }
+}
+
+/// Why an item couldn't be worked on: Windows couldn't open it. A name ending in a dot or space
+/// (made by another system) is one Windows' copy engine never can: renaming it works (`rename`).
+fn cant_open(name: &str) -> String {
+    if name.ends_with('.') || name.ends_with(' ') {
+        format!("Windows can't open \u{201c}{name}\u{201d}: its name ends in a {}. Rename it (F2) first.", if name.ends_with('.') { "dot" } else { "space" })
+    } else {
+        format!("Windows can't open \u{201c}{name}\u{201d}.")
     }
 }
 
@@ -1802,6 +2039,47 @@ mod tests {
         back.sort();
         assert_eq!(back, ["a (2).txt", "inner (2)"]);
         assert!(!extract(&join(&dir, "missing.zip"), false).ok);
+    }
+
+    #[test]
+    fn a_change_inside_an_archive_can_be_undone_and_redone() {
+        use crate::archive::{Change, Format};
+        let _com = ComGuard::init();
+        let dir = scratch("archive-change");
+        let docs = join(&dir, "Docs");
+        std::fs::create_dir_all(join(&docs, "inner")).unwrap();
+        std::fs::write(join(&docs, "a.txt"), b"alpha").unwrap();
+        std::fs::write(join(&join(&docs, "inner"), "b.txt"), b"beta").unwrap();
+        for format in [Format::Zip, Format::SevenZ] {
+            let made = compress(&[docs.clone()], format);
+            let archive = join(&dir, &made.created.unwrap().1[0]);
+            let before = std::fs::read(&archive).unwrap();
+            let out = run(Job::ArchiveChange { archive: archive.clone(), change: Change::Rename { from: "Docs\\inner".into(), name: "Inside".into() }, recycle: Vec::new() });
+            assert!(out.ok, "{:?}", out.note);
+            assert_eq!(out.created, Some((join(&archive, "Docs"), vec!["Inside".to_string()])));
+            assert!(out.changed.contains(&archive) && out.changed.contains(&dir));
+            let after = std::fs::read(&archive).unwrap();
+            let step = out.undo.expect("can be undone");
+            assert_eq!(step.describe(), "renaming \u{201c}inner\u{201d}");
+            assert!(run(step.undo_job()).ok);
+            assert_eq!(std::fs::read(&archive).unwrap(), before, "{format:?}: undone");
+            assert!(run(step.redo_job()).ok);
+            assert_eq!(std::fs::read(&archive).unwrap(), after, "{format:?}: redone");
+            // Changed since by another program: Ctrl+Z leaves it as it is.
+            let f = std::fs::OpenOptions::new().write(true).open(&archive).unwrap();
+            f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5)).unwrap();
+            drop(f);
+            let refused = run(step.undo_job());
+            assert!(!refused.ok && refused.note.as_deref().is_some_and(|n| n.contains("changed after that")), "{:?}", refused.note);
+            assert_eq!(std::fs::read(&archive).unwrap(), after, "{format:?}: left as it is");
+            // A name that's taken: the name box opens again with what was typed.
+            let taken = run(Job::ArchiveChange { archive: archive.clone(), change: Change::Rename { from: "Docs\\a.txt".into(), name: "Inside".into() }, recycle: Vec::new() });
+            assert!(!taken.ok && taken.undo.is_none());
+            assert_eq!(taken.retry, Some((join(&archive, "Docs\\a.txt"), "Inside".to_string())));
+            // A new folder gets its name box.
+            let new = run(Job::ArchiveChange { archive: archive.clone(), change: Change::New { into: String::new(), folder: true }, recycle: Vec::new() });
+            assert!(new.rename_new && new.created == Some((archive.clone(), vec!["New folder".to_string()])));
+        }
     }
 
     #[test]

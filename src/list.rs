@@ -2897,9 +2897,10 @@ impl Component for ListView {
         if tab.folder.error.is_some() {
             return None;
         }
-        // A folder's (or in This PC a drive's) row: into it. Search results by their full path.
+        // A folder's (or in This PC a drive's) row: into it, and a .zip or .7z's too (added to it).
+        // Search results by their full path.
         if let Some(e) = self.row_at(tab, p).and_then(|row| tab.entry_at(row)) {
-            if e.is_container() {
+            if e.is_container() || crate::archive::is_archive_name(&e.name) {
                 return Some(DropTarget::Folder(e.path_in(&tab.folder.path)));
             }
         }

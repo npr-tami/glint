@@ -537,6 +537,12 @@ pub struct AppState {
     clip_turn: u32,
     /// Ctrl+C inside an archive is taking its items out: Ctrl+V waits for them.
     taking_out: bool,
+    /// Items cut inside a .zip or .7z (Ctrl+X there): Ctrl+V moves them (files.rs).
+    archive_cut: Option<files::ArchiveCut>,
+    /// Items being dragged out of a .zip or .7z, as (the archive, their paths inside it, the
+    /// temporary folder they were taken out to): dropped in the same archive, they're moved within
+    /// it (dropping.rs).
+    pub drag_from_archive: Option<(String, Vec<String>, String)>,
     /// The "Subfolders" switch next to the filter (Ctrl+Shift+F): the filter searches the
     /// subfolders too (search.rs). Not remembered.
     pub subfolders: bool,
@@ -641,6 +647,8 @@ impl AppState {
             cut: None,
             clip_turn: 0,
             taking_out: false,
+            archive_cut: None,
+            drag_from_archive: None,
             subfolders: false,
             hwnd,
             tx,
@@ -718,6 +726,8 @@ impl AppState {
             cut: None,
             clip_turn: 0,
             taking_out: false,
+            archive_cut: None,
+            drag_from_archive: None,
             hwnd,
             tx,
             rx,

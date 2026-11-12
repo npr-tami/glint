@@ -463,6 +463,7 @@ impl Window {
             match taken {
                 Ok((dir, paths)) => {
                     d.names = paths.iter().map(|p| crate::folder::file_name(p).to_string()).collect();
+                    self.app.drag_from_archive = Some((archive, items, dir.clone()));
                     d.folder = dir;
                 }
                 Err(why) => {
@@ -492,6 +493,7 @@ pub(super) fn run_drag_out(hwnd: HWND, ptr: *mut Window, d: DragOut) {
     unsafe {
         let w = &mut *ptr;
         w.drag.out = false;
+        w.app.drag_from_archive = None;
         if let Err(why) = result {
             w.app.say(why);
         }

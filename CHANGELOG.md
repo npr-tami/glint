@@ -2,6 +2,13 @@
 
 The newest version is at the top.
 
+## 1.0.24-beta.4 · 12/11/2026 10:44
+
+- Added changing what's inside zip and 7z files: delete, rename, new folders and text files, paste or drag files in, and cut them out, all undoable with Ctrl+Z
+- Added dropping files onto a zip or 7z file to put them in it
+- Fixed files whose names end in a dot or a space: they can be renamed and zipped now
+- Some other improvements and bugfixes
+
 ## 1.0.24-beta.3 · 08/11/2026 18:56
 
 - Changed the bars on Disk space's Biggest tab to your skin's colour

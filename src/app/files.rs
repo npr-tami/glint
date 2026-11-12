@@ -23,8 +23,8 @@ use crate::ui::MenuAbout;
 
 /// The status-bar note for file commands in This PC.
 pub const THIS_PC_NOTE: &str = "This PC only holds drives. Open a drive or folder first.";
-/// The status-bar note for changes inside a .zip or .7z (archive.rs only reads them).
-pub const ARCHIVE_NOTE: &str = "Zip and 7z files can't be changed here. Copy things out (Ctrl+C) to change them.";
+/// The status-bar note for what can't be done inside a .zip or .7z.
+pub const ARCHIVE_NOTE: &str = "That can't be done inside a zip or 7z file.";
 
 /// How long a name box waits for its item to turn up in the list (a new folder being read).
 const RENAME_WAIT: Duration = Duration::from_secs(3);
@@ -72,6 +72,17 @@ pub(super) struct CutMark {
     folder: String,
     /// Their names in lower case.
     names: HashSet<String>,
+}
+
+/// Items cut inside a .zip or .7z (Ctrl+X there). Nothing goes on the clipboard for them: a paste in
+/// Glint moves them, into a real folder or another folder of the same archive.
+#[derive(Clone, Debug)]
+pub(super) struct ArchiveCut {
+    /// The clipboard's change counter once it was emptied for them: anything copied since wins.
+    seq: u32,
+    archive: String,
+    /// Their paths inside it.
+    items: Vec<String>,
 }
 
 /// Items to select when a tab's next listing of `dir` arrives (after a paste, rename or delete).
@@ -252,6 +263,9 @@ impl AppState {
     /// Ctrl+C / Ctrl+X: the selected items go on the clipboard as files, to be pasted here, in
     /// another folder or in File Explorer.
     pub(super) fn copy_files(&mut self, cut: bool) {
+        if let Some((archive, items)) = self.archive_chosen().filter(|_| cut) {
+            return self.cut_in_archive(archive, items);
+        }
         // Inside a .zip or .7z: copying takes the items out first (they're files on the clipboard
         // only once they're real files); cutting would change the archive.
         if let Some((archive, items)) = self.archive_chosen().filter(|_| !cut) {
@@ -299,11 +313,64 @@ impl AppState {
         self.say(format!("{} {}.", if cut { "Cut" } else { "Copied" }, items_text(&paths)));
     }
 
+    /// Ctrl+X inside a .zip or .7z: the items are marked to be moved by the next Ctrl+V in Glint
+    /// (and drawn faded meanwhile). The clipboard is emptied, so nothing older is pasted instead.
+    fn cut_in_archive(&mut self, archive: String, items: Vec<String>) {
+        if items.is_empty() {
+            return self.say("Select what to cut first.");
+        }
+        if self.tab().waiting_long() {
+            return;
+        }
+        if !fileops::clear_clipboard(HWND(self.hwnd.load(Ordering::SeqCst) as *mut _)) {
+            return self.say("The clipboard is busy. Try again.");
+        }
+        self.clip_turn = self.clip_turn.wrapping_add(1);
+        self.taking_out = false;
+        let seq = fileops::clipboard_sequence();
+        let t = self.tab();
+        self.cut = Some(CutMark { seq, folder: t.folder.path.clone(), names: t.selected_entries().iter().map(|&i| t.folder.entries[i].lower.clone()).collect() });
+        self.say(format!("Cut {}. Paste (Ctrl+V) in a folder to move {} there.", items_text(&items), if items.len() == 1 { "it" } else { "them" }));
+        self.archive_cut = Some(ArchiveCut { seq, archive, items });
+    }
+
     /// Ctrl+V: the files on the clipboard (from Glint or File Explorer) are copied here - or moved,
     /// when they were cut. `into`: a folder in the list instead (right-click > Paste into folder).
+    /// Into a .zip or .7z, they're added to it.
     pub(super) fn paste(&mut self, into: Option<String>) {
         if self.taking_out {
             return self.say("Still extracting. Try again in a moment.");
+        }
+        let dest = into.clone().unwrap_or_else(|| self.tab().path.clone());
+        let dest_archive = crate::archive::split(&dest);
+        // Items cut inside an archive, while nothing else was copied since.
+        if let Some(cut) = self.archive_cut.clone().filter(|c| c.seq == fileops::clipboard_sequence()) {
+            let job = match dest_archive {
+                Some((archive, inner)) if same_path(&archive, &cut.archive) => Job::ArchiveChange { archive, change: crate::archive::Change::Move { items: cut.items, into: inner }, recycle: Vec::new() },
+                Some(_) => return self.say("Items cut in an archive can be pasted in a folder, or in another folder of the same archive."),
+                None if !self.files_here() => return,
+                None if dest.is_empty() => return self.say(THIS_PC_NOTE),
+                None => Job::TakeOut { archive: cut.archive, items: cut.items, dest },
+            };
+            if self.tab().waiting_long() {
+                return;
+            }
+            self.archive_cut = None;
+            self.cut = None;
+            let after = AfterJob::new(self.tab().id);
+            self.start_job(job, after);
+            return;
+        }
+        if let Some((archive, inner)) = dest_archive {
+            if self.tab().waiting_long() {
+                return;
+            }
+            if !fileops::clipboard_has_files() {
+                return self.say("There are no files on the clipboard to paste.");
+            }
+            let after = AfterJob::new(self.tab().id);
+            self.start_job(Job::PasteIntoArchive { archive, into: inner }, after);
+            return;
         }
         if !self.files_here() {
             return;
@@ -325,6 +392,22 @@ impl AppState {
     /// Del (to the Recycle Bin) and Shift+Del (`permanent`), asking first as the "Ask before
     /// deleting" setting says.
     pub(super) fn delete(&mut self, permanent: bool) {
+        // Inside a .zip or .7z: out of the archive (Ctrl+Z puts it back, so it's asked as a move to
+        // the Recycle Bin is).
+        if let Some((archive, items)) = self.archive_chosen() {
+            if items.is_empty() || self.tab().waiting_long() {
+                return;
+            }
+            let after = AfterJob { select_next: self.next_after_selection(), ..AfterJob::new(self.tab().id) };
+            let title = format!("Delete {} from \u{201c}{}\u{201d}?", items_text(&items), file_name(&archive));
+            let job = Job::ArchiveChange { archive, change: crate::archive::Change::Remove(items), recycle: Vec::new() };
+            if self.settings.ask_before_deleting(false) {
+                self.ask(title, "Ctrl+Z brings it back.".into(), "DELETE", job, after);
+            } else {
+                self.start_job(job, after);
+            }
+            return;
+        }
         let paths = match self.home_chosen(false) {
             Some(paths) => paths,
             None if self.files_here() => self.chosen(),
@@ -379,6 +462,17 @@ impl AppState {
 
     /// Ctrl+Shift+N (`folder`) and New text file: made here, then selected with its name box open.
     pub(super) fn new_item(&mut self, folder: bool) {
+        if let Some((archive, inner)) = crate::archive::split(&self.tab().path) {
+            if self.tab().waiting_long() {
+                return;
+            }
+            if !self.tab().filter.is_empty() {
+                self.set_filter(String::new());
+            }
+            let after = AfterJob::new(self.tab().id);
+            self.start_job(Job::ArchiveChange { archive, change: crate::archive::Change::New { into: inner, folder }, recycle: Vec::new() }, after);
+            return;
+        }
         if !self.files_here() {
             return;
         }
@@ -417,7 +511,10 @@ impl AppState {
             return;
         }
         let after = AfterJob { renamed_from: Some(from.clone()), ..AfterJob::new(self.tab().id) };
-        let job = Job::Rename { path: join(&dir, &from), new_name: name.clone() };
+        let job = match crate::archive::split(&dir) {
+            Some((archive, inner)) => Job::ArchiveChange { archive, change: crate::archive::Change::Rename { from: join_inner(&inner, &from), name: name.clone() }, recycle: Vec::new() },
+            None => Job::Rename { path: join(&dir, &from), new_name: name.clone() },
+        };
         // Explorer asks before a file's extension changes: the file may then open in another app,
         // or not at all.
         let t = self.tab();
@@ -589,7 +686,9 @@ impl AppState {
             // (Also when it changed a folder open in the tab's tree view: it's read again with it. And
             // Home, when it changed a folder that holds something Home lists.)
             let in_home = |f: &String| t.folder.home.is_some() && t.folder.entries.iter().any(|e| e.target.as_deref().and_then(parent).is_some_and(|d| same_path(&d, f)));
-            if !outcome.changed.iter().any(|f| same_path(f, &t.path) || t.tree.has(f) || in_home(f)) {
+            // (And a tab inside an archive that changed.)
+            let in_archive = |f: &String| crate::archive::is_archive_name(f) && fileops::is_same_or_inside(&t.path, f);
+            if !outcome.changed.iter().any(|f| same_path(f, &t.path) || t.tree.has(f) || in_home(f) || in_archive(f)) {
                 continue;
             }
             if t.id == after.tab_id {
@@ -655,6 +754,11 @@ impl AppState {
             self.say("The folder changed while the menu was open, so nothing was done.");
         }
         ok
+    }
+
+    /// Whether Ctrl+V has something to paste: files on the clipboard, or items cut in an archive.
+    pub fn can_paste(&self) -> bool {
+        fileops::clipboard_has_files() || self.archive_cut.as_ref().is_some_and(|c| c.seq == fileops::clipboard_sequence())
     }
 
     /// The lower-case names of the items cut to the clipboard from `folder`, while they're still on
