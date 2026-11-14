@@ -209,6 +209,8 @@ pub struct Sidebar {
     indent: f32,
     headings: Headings,
     drive_bar_h: f32,
+    /// With panels: the drives' bar thickness (the skin's drive-bar-height, else PANEL_BAR_H).
+    panel_bar_h: f32,
     drive_bars: DriveBars,
     text: f32,
     /// The skin's `scrollbar-show: using` (see `list::bar_in_use`).
@@ -264,6 +266,7 @@ impl Sidebar {
             indent: PAD_LEFT,
             headings: Headings::Shown,
             drive_bar_h: BAR_H,
+            panel_bar_h: PANEL_BAR_H,
             drive_bars: DriveBars::Always,
             text: 0.0,
             bars_while_used: false,
@@ -290,6 +293,7 @@ impl Sidebar {
         self.indent = parts.num(P::SidebarIndent);
         self.headings = parts.sidebar_headings();
         self.drive_bar_h = parts.num(P::DriveBarH);
+        self.panel_bar_h = parts.get(P::DriveBarH).unwrap_or(PANEL_BAR_H);
         self.drive_bars = parts.drive_bars();
         self.text = parts.num(P::SidebarText);
         self.bars_while_used = parts.scrollbars_while_used();
@@ -303,7 +307,8 @@ impl Sidebar {
         let heading_h = if self.headings == Headings::Hidden { 0.0 } else { heading_h };
         // 98 / 2000: a little taller, for the progress bar under the name (`classic_usage`).
         let drive_h = if self.panels {
-            self.row_h + PANEL_DRIVE_EXTRA
+            // (A thicker bar than the panels' own makes the row taller by the difference.)
+            self.row_h + PANEL_DRIVE_EXTRA + (self.panel_bar_h - PANEL_BAR_H).max(0.0)
         } else if app.theme.era.classic() {
             self.drive_text_h() + CLASSIC_BAR_GAP + CLASSIC_BAR_H + BAR_BOTTOM
         } else {
@@ -618,7 +623,8 @@ impl Sidebar {
             RowState::Normal => {}
         }
         let (top_h, bar_h, bar_bottom) = match item {
-            Item::Drive(_) if self.panels => (row.h - PANEL_BAR_H - 8.0, PANEL_BAR_H, 6.0),
+            // (The name keeps its place whatever the bar's thickness.)
+            Item::Drive(_) if self.panels => (row.h - self.panel_bar_h.max(PANEL_BAR_H) - 8.0, self.panel_bar_h, 6.0),
             _ => (self.drive_text_h(), self.drive_bar_h, BAR_BOTTOM),
         };
         // A drive's icon sits beside its name, above the bar.
@@ -1167,7 +1173,7 @@ impl Component for Sidebar {
         // A drive's usage bar (under its name): Disk space for that drive, when that's turned on (it's
         // easily hit by mistake; the right-click menu has Disk space too).
         if let (MouseButton::Left, Item::Drive(i), Some(root), true) = (e.button, item, path.as_ref(), app.settings.disk_bar_click) {
-            let name_h = if self.panels { self.items[at].h - PANEL_BAR_H - 8.0 } else { self.drive_text_h() };
+            let name_h = if self.panels { self.items[at].h - self.panel_bar_h.max(PANEL_BAR_H) - 8.0 } else { self.drive_text_h() };
             let below_name = e.pos.y - self.rect.y + self.scroll >= self.items[at].top + name_h;
             if below_name && app.drives.get(i).and_then(usage).is_some() {
                 return Effect::Command(Command::DiskSpace(Some(root.clone())));

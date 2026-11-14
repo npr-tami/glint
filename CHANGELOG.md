@@ -2,6 +2,12 @@
 
 The newest version is at the top.
 
+## 26.11.2 · 14/11/2026 23:12
+
+- Changed the Skins window: every setting is now in the section of the part it changes, with clearer names
+- Fixed drive bar thickness in the Panels sidebar style
+- Fixed Buttons show (words, icons or both) in the older Windows looks
+
 ## 26.11.1 · 14/11/2026 18:44
 
 - Added a picture behind the whole window, with see-through panels

@@ -635,9 +635,34 @@ pub fn go_button(r: &mut Renderer, theme: &Theme, b: Rect, look: Look) {
 
 /// SORT, VIEW or SETTINGS as the era's button, its word in title case ("Sort"): 98 / 2000's raised
 /// push button; XP's flat toolbar button with a picture; 7's command bar word. `menu`: it opens a
-/// menu (a small down arrow after the word).
-pub fn word_button(r: &mut Renderer, theme: &Theme, b: Rect, word: &str, hot: bool, menu: bool) {
+/// menu (a small down arrow after the word). `show`: the skin's toolbar-buttons (words, icons or
+/// both); None keeps the era's own look (98 / 2000 / XP: picture and word, 7: the word).
+pub fn word_button(r: &mut Renderer, theme: &Theme, b: Rect, word: &str, hot: bool, menu: bool, show: Option<crate::parts::ToolButtons>) {
+    use crate::parts::ToolButtons;
     let label = title_case(word);
+    let (pic_on, word_on) = match show {
+        None => (theme.era != Era::Win7, true),
+        Some(ToolButtons::Words) => (false, true),
+        Some(ToolButtons::Icons) => (true, false),
+        Some(ToolButtons::Both) => (true, true),
+    };
+    // The picture (16 square) and the word with its arrow, or only one of them, centred in `b`.
+    let show_face = |r: &mut Renderer, b: Rect, color: Color, w: f32, pad: f32, pic: &dyn Fn(&mut Renderer, Rect)| {
+        if pic_on && word_on {
+            let at = Rect::new(b.x + pad, b.y + (b.h - 16.0) / 2.0, 16.0, 16.0);
+            pic(r, at);
+            text_and_arrow(r, Rect::new(at.right(), b.y, b.right() - at.right(), b.h), &label, color, menu, w, 0.0);
+        } else if pic_on {
+            let total = 16.0 + if menu { 4.0 + w } else { 0.0 };
+            let x = (b.x + (b.w - total) / 2.0).round();
+            pic(r, Rect::new(x, b.y + (b.h - 16.0) / 2.0, 16.0, 16.0));
+            if menu {
+                triangle_down(r, Point::new(x + 16.0 + 4.0 + w / 2.0, b.y + b.h / 2.0 + 1.0), w, color);
+            }
+        } else {
+            text_and_arrow(r, b, &label, color, menu, w, 0.0);
+        }
+    };
     match theme.era {
         Era::Win98 | Era::Win2000 => {
             let face = theme.toolbar;
@@ -645,29 +670,26 @@ pub fn word_button(r: &mut Renderer, theme: &Theme, b: Rect, word: &str, hot: bo
             r.fill_rect(b, face);
             retro::edge(r, theme, b, Edge::Raised, face);
             // Its small picture, in colour (98: grey until the mouse is over it, as its toolbars).
-            let pic = Rect::new(b.x + 5.0, b.y + (b.h - 16.0) / 2.0, 16.0, 16.0);
             let ink = if theme.era == Era::Win98 && !hot { Ink::Grey } else { Ink::Colour };
-            r.set_aliased(true);
-            classic_word_picture(r, word, pic, ink);
-            r.set_aliased(false);
-            let rest = Rect::new(pic.right(), b.y, b.right() - pic.right(), b.h);
-            text_and_arrow(r, rest, &label, theme.button_text, menu, 5.0, 0.0);
+            show_face(r, b, theme.button_text, 5.0, 4.0, &|r: &mut Renderer, at: Rect| {
+                r.set_aliased(true);
+                classic_word_picture(r, word, at, ink);
+                r.set_aliased(false);
+            });
         }
         Era::Xp => {
             let b = b.inset(1.0, 1.0);
             let radius = theme.parts.get(crate::parts::P::ButtonRadius).unwrap_or_else(|| theme.era_corner(b.h, 3.0));
             xp_frame_round(r, theme, b, Look { enabled: true, hot, ..Look::default() }, radius);
-            let pic = Rect::new(b.x + 6.0, b.y + (b.h - 16.0) / 2.0, 16.0, 16.0);
-            xp_word_picture(r, word, pic);
-            let rest = Rect::new(pic.right(), b.y, b.right() - pic.right(), b.h);
-            text_and_arrow(r, rest, &label, theme.button_text, menu, 5.0, 0.0);
+            show_face(r, b, theme.button_text, 5.0, 5.0, &|r: &mut Renderer, at: Rect| xp_word_picture(r, word, at));
         }
         Era::Win7 => {
             let b = b.center(b.w - 4.0, 24.0);
             if hot {
                 seven_box(r, b, false);
             }
-            text_and_arrow(r, b, &label, c(0x1e395b), menu, 7.0, 0.0);
+            let ink = c(0x1e395b);
+            show_face(r, b, ink, 7.0, 6.0, &|r: &mut Renderer, at: Rect| crate::toolbar::Toolbar::word_glyph(r, word, Point::new(at.x + 8.0, at.y + 8.0), ink));
         }
         Era::None => {}
     }

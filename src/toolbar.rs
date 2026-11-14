@@ -184,6 +184,8 @@ pub struct Toolbar {
     /// What SORT, VIEW and SETTINGS show (`toolbar-buttons`), their words in capitals
     /// (`button-capitals`), and the filter box's width when the skin fixes it (`filter-width`).
     buttons: ToolButtons,
+    /// An older Windows' toolbar: what the skin's toolbar-buttons asks for (None: the era's own look).
+    era_show: Option<ToolButtons>,
     caps: bool,
     filter_fixed: Option<f32>,
     /// The skin's older Windows, if any (taken in `layout`): its own toolbar (retrotool.rs).
@@ -221,6 +223,7 @@ impl Toolbar {
             lean: WORD_LEAN,
             line_w: 2.0,
             buttons: ToolButtons::Words,
+            era_show: None,
             caps: true,
             filter_fixed: None,
             era: Era::None,
@@ -545,6 +548,16 @@ impl Toolbar {
         }
     }
 
+    /// SORT's, VIEW's or SETTINGS' icon (by its word), centred on `c`: for an older Windows' toolbar.
+    pub(crate) fn word_glyph(r: &mut Renderer, word: &str, c: Point, ink: Color) {
+        let part = match word.to_ascii_lowercase().as_str() {
+            "sort" => Part::Sort,
+            "view" => Part::View,
+            _ => Part::Settings,
+        };
+        Self::word_icon(r, part, c, ink);
+    }
+
     /// SORT's arrows, VIEW's squares or SETTINGS' cog, about 13 DIPs across, centred on `c`.
     fn word_icon(r: &mut Renderer, part: Part, c: Point, ink: Color) {
         let p = |x: f32, y: f32| Point::new(c.x + x, c.y + y);
@@ -856,7 +869,7 @@ impl Toolbar {
         Self::paint_subfolders(r, Point::new(sub.x + sub.w / 2.0, sub.y + sub.h / 2.0), color);
 
         for (part, label, menu) in [(Part::Sort, "SORT", true), (Part::View, "VIEW", true), (Part::Settings, "SETTINGS", false)] {
-            retrotool::word_button(r, theme, self.rect_of(part), label, self.hover == Some(part), menu);
+            retrotool::word_button(r, theme, self.rect_of(part), label, self.hover == Some(part), menu, self.era_show);
         }
     }
 }
@@ -871,10 +884,11 @@ impl Component for Toolbar {
         self.era = app.theme.era;
         self.lean = app.theme.button_lean(WORD_LEAN);
         self.line_w = app.theme.toolbar_line_w;
-        // (An older Windows' toolbar keeps its own word buttons.)
+        // (An older Windows' toolbar keeps its own word buttons unless the skin says otherwise.)
         let parts = &app.theme.parts;
         let modern = !app.theme.era.old();
-        self.buttons = if modern { parts.tool_buttons() } else { ToolButtons::Words };
+        self.era_show = if modern { None } else { parts.get(P::ToolButtons).map(|_| parts.tool_buttons()) };
+        self.buttons = if modern { parts.tool_buttons() } else { self.era_show.unwrap_or(ToolButtons::Words) };
         self.caps = parts.on(P::ButtonCaps) || !modern;
         self.filter_fixed = parts.filter_w();
         let path = self.rect_of(Part::Path);
