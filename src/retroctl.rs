@@ -511,10 +511,13 @@ pub fn scrollbar(r: &mut Renderer, theme: &Theme, lane: Rect, thumb: Rect, look:
         Rect::new(x, lane.y, r.snap(thumb.w).min(last.x - x).max(0.0), lane.h)
     };
     let (from, to) = if upright { (Point::new(lane.x, 0.0), Point::new(lane.right(), 0.0)) } else { (Point::new(0.0, lane.y), Point::new(0.0, lane.bottom())) };
+    // Over a see-through part the track is see-through too; the thumb and arrows stay solid.
+    let keep = r.fade();
     match theme.era {
         Era::Win98 | Era::Win2000 => {
             let face = theme.toolbar;
             retro::dither(r, theme, lane, face);
+            r.set_fade(1.0);
             // The part of the track held down to page darkens while the button is down.
             if let Hold::Page(way) = hold {
                 let part = match (upright, way) {
@@ -536,6 +539,7 @@ pub fn scrollbar(r: &mut Renderer, theme: &Theme, lane: Rect, thumb: Rect, look:
         Era::Xp => {
             let track = g(&[(0.0, 0xeeede5), (0.06, 0xf3f1ec), (0.5, 0xf9f9f7), (0.94, 0xfefefb), (1.0, 0xeeede5)]);
             r.fill_rect_toward(lane, 0.0, &track, from, to);
+            r.set_fade(1.0);
             let t = thumb.inset(1.0, 1.0);
             let (body, edge, grip) = if silver(theme) {
                 (g(&[(0.0, 0xd5d5d5), (0.15, 0xe1e1e1), (0.7, 0xdfdfdf), (1.0, 0xd4d4d4)]), 0xb8b8b8, (0xf6f6f6, 0xc2c2c2))
@@ -558,6 +562,7 @@ pub fn scrollbar(r: &mut Renderer, theme: &Theme, lane: Rect, thumb: Rect, look:
         Era::Win7 => {
             let track = g(&[(0.0, 0xe3e3e3), (0.1, 0xe7e7e7), (0.4, 0xefefef), (1.0, 0xf1f1f1)]);
             r.fill_rect_toward(lane, 0.0, &track, from, to);
+            r.set_fade(1.0);
             let t = thumb.inset(1.0, 1.0);
             let (body, border, grip) = if dragged {
                 (g(&[(0.0, 0xcdebfc), (0.49, 0xa9dcf7), (0.5, 0x6ec2ee), (1.0, 0x64b9e6)]), 0x2c628b, (0xeef9fe, 0x3c7fb1))
@@ -579,6 +584,7 @@ pub fn scrollbar(r: &mut Renderer, theme: &Theme, lane: Rect, thumb: Rect, look:
         arrow_button(r, theme, first, dirs.0, held == Held::Start, hot, room.start);
         arrow_button(r, theme, last, dirs.1, held == Held::End, hot, room.end);
     }
+    r.set_fade(keep);
 }
 
 /// One arrow button of a scroll bar in `b`: 98 / 2000's raised grey box with a black triangle

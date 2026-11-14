@@ -121,6 +121,15 @@ impl Side {
         }
     }
 
+    /// The pane on screen (none while nothing shows): the skin's panel-radius rounds it.
+    pub fn pane_rect(&self) -> Rect {
+        if self.rect.is_empty() {
+            Rect::default()
+        } else {
+            self.pane()
+        }
+    }
+
     /// The pane itself, right of the gap.
     fn pane(&self) -> Rect {
         Rect::new(self.rect.x + self.gap, self.rect.y, (self.rect.w - self.gap).max(0.0), self.rect.h)

@@ -15,7 +15,7 @@ impl AppState {
     /// skin whose file is gone looks like AMD Radeon until it's back.
     pub fn apply_skin(&mut self) {
         let mut theme = self.skins.theme(&self.settings.skin, self.dark);
-        theme.logo_style = self.settings.logo;
+        theme.logo_style = theme.logo_own.unwrap_or(self.settings.logo);
         if theme == self.theme {
             return;
         }

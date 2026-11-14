@@ -1842,6 +1842,14 @@ mod tests {
     }
 
     #[test]
+    fn the_year_month_numbers_come_after_the_betas() {
+        // 26.11.1 follows 1.0.25-beta.1 as an ordinary (not required) update, and 26.11.2 follows it.
+        let v = |t: &str| Version::parse(t).unwrap();
+        assert!(v("26.11.1") > v("1.0.25-beta.1") && !v("1.0.25-beta.1").hotfixed_by(&v("26.11.1")));
+        assert!(v("26.11.2") > v("26.11.1") && v("26.12.1") > v("26.11.9") && v("27.1.1") > v("26.12.30"));
+    }
+
+    #[test]
     fn only_a_later_beta_of_the_same_release_is_a_required_hotfix() {
         let v = |t: &str| Version::parse(t).unwrap();
         let cases = [

@@ -15,10 +15,8 @@
 //!   swatch that opens Windows' colour picker and a box for its #hex - or for a gradient,
 //!   "#fdfdfd, #c3cddb 45%, #dfe6f0", whose first colour the picker changes. A colour that follows
 //!   another ("tab-line: accent") shows that colour, says which it follows, and keeps following it
-//!   until it's changed here. The Logo choice is the same as Settings' (not part of the skin).
-//!   "Show as text" swaps the controls for the skin's text itself, typed like code (codebox.rs,
-//!   skincode.rs: line numbers, suggestions, what each line does, colour squares), with what
-//!   Glint couldn't understand under it (clicking a problem goes to its line) and GUIDE.
+//!   until it's changed here. (No text view: every setting has its control, and the skin's file
+//!   can still be opened in a text editor from the skins folder.)
 //! - **Live, and saved by itself.** Every change goes into the skin's text (`skin::with_value`, so
 //!   the rest of the text stays as it was), the main window shows it at once (`AppState::apply_skin`),
 //!   and the file is written a moment later (SAVE_TIMER) by the skin file worker - never on this
@@ -35,7 +33,7 @@
 //! presses, flips or opens; Ctrl+Shift+L switches light / dark as in the main window; Esc (or
 //! Ctrl+W) closes.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -64,7 +62,7 @@ use windows::Win32::UI::Shell::{
     FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindow, IsIconic, KillTimer, LoadCursorW, LoadIconW, PostMessageW, RegisterClassExW, SetForegroundWindow,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindow, IsIconic, KillTimer, LoadCursorW, LoadIconW, PostMessageW, RegisterClassExW, 
     SetTimer, SetWindowPos, ShowWindow, CS_DBLCLKS, GW_OWNER,
     HTCLIENT, IDC_ARROW, MINMAXINFO, SIZE_MINIMIZED, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE, SW_SHOW, WA_INACTIVE, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_CHAR,
     WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_KEYDOWN,
@@ -75,18 +73,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::app::AppState;
 use crate::ask::{Answer, AskBox};
-use crate::codebox::{CodeBox, Done, Mark, PROBLEM_RED};
-use crate::skincode::SkinLang;
 use crate::frame;
 use crate::kit::{self, size as ksize, Look, Scroller};
 use crate::log;
 use crate::render::{Align, FrameResult, Renderer, TextStyle};
 use crate::shell;
-use crate::skin::{self, Entry};
+use crate::skin;
 use crate::textbox::{self, TextBox, TextEvent, TextEventKind, WM_APP_TEXT};
 use crate::thumbs;
-use crate::settings::LogoStyle;
-use crate::theme::{size, ButtonStyle, CaptionStyle, Color, Era, IconSet, Paint, Shape, SidebarStyle, Stop, TabStyle, Theme, WallpaperFit};
+use crate::settings::{LogoStyle, SkinsWindow as Layout};
+use crate::theme::{size, ButtonStyle, CaptionStyle, Color, Era, IconSet, Paint, Shape, SidebarStyle, Stop, TabStyle, Theme, WallpaperArea, WallpaperFit};
 use crate::ui::{Command, Menu, MenuItem, Point, Rect};
 use crate::winutil::{hi_word, lo_word, place_visible, visible_rect};
 
@@ -144,65 +140,490 @@ const PICTURE_HINT: &str = "None";
 const LOGO_HINT: &str = "GLINT";
 /// The box above the colours that finds them by name: its width, and what it says while empty.
 const SEARCH_W: f32 = 220.0;
-const SEARCH_HINT: &str = "Find a colour";
-/// What Glint couldn't understand in the skin's text, under the text.
-const NOTES_H: f32 = 86.0;
-/// At most this many problems are listed under the skin's text (then "and N more").
-const MAX_NOTES: usize = 8;
-/// The skin's text box keeps at least this much height when the problems' list grows.
-const MIN_TEXT_H: f32 = 160.0;
-/// The GUIDE button under the skin's text, and the guide's lines.
-const GUIDE_W: f32 = 104.0;
-const GUIDE_LINE: f32 = 16.0;
-const GUIDE_MONO: f32 = 11.5;
-/// The guide is in two columns from this wide, this far apart.
-const GUIDE_TWO_COLUMNS: f32 = 620.0;
-const GUIDE_GAP: f32 = 24.0;
+/// The search at the top of the smaller layouts, which finds any setting.
+const SEARCH_ANY: &str = "Find any setting";
+/// A small icon button (undo, redo, the menu; the slim layout's nine).
+const ICON: f32 = 26.0;
 
-/// The guide's first column: an example first (lines starting with "|", shown as typed), then the
-/// words. Short lines, plain words.
-const GUIDE: &[&str] = &[
-    "For example:",
-    "|name: Moss              // its name in the list",
-    "|description: Green and calm",
-    "|dark: true              // false for a light skin",
-    "|twin: Moss (Light)      // its light or dark half",
-    "|accent: #3a7d44         // a colour",
-    "|tab-line: accent        // the same as accent",
-    "|selection: accent 20%   // accent, see-through",
-    "|shape: rounded          // or straight, slanted",
-    "Each line sets one value.",
-    "A colour is #rrggbb, #rrggbbaa (see-through), another colour's name, or none.",
-    "Anything left out comes from AMD Radeon, or AMD Radeon (Light) for a light skin.",
-    "Moss and Moss (Light) pair up by name. Other names need a twin line.",
-    "// starts a note. Ctrl+/ adds or removes it.",
-    "Ctrl+Space shows what fits. Alt+Up and Alt+Down move a line.",
-];
-
-/// The guide's second column: gradients, numbers and wallpapers.
-const GUIDE_PICTURES: &[&str] = &[
-    "Fade one colour into another: put commas between them. Example:",
-    "|title-bar: #ff0000, #0000ff",
-    "Every number has a lowest and highest value.",
-    "The faint text after a line shows them.",
-    "A wallpaper is a picture behind the files:",
-    "|wallpaper: beach.jpg         // next to the skin",
-    "|wallpaper-opacity: 50        // 0 to 100",
-    "|wallpaper-fit: fill  // whole, stretch, tile, actual",
-    "|wallpaper-position: 50% 50%  // across, down",
-    "|wallpaper-zoom: 0            // -500 to 500",
-    "|wallpaper-size: 50%          // of the list's width",
-    "|wallpaper-offset: 20 -10     // across, down",
-    "|wallpaper-blur: 0            // 0 to 50",
-    "|wallpaper-fade: 0            // soft edges, 0 to 50",
-    "Left out: opacity 50, fill, in the middle, no zoom, blur or fade.",
-    "Browse writes just the name if the picture is next to the skin, else its path.",
-];
 const NOTE_LINE: f32 = 17.0;
 /// The window's size, and the smallest it gets (DIPs).
 const DEFAULT_W: f32 = 780.0;
 const MIN_W: f32 = 780.0;
 const MIN_H: f32 = 540.0;
+/// The window's layout's message to itself: the layout changed, so dock it again at its width.
+const WM_APP_DOCK: u32 = WM_APP + 83;
+
+/// Sizes that differ between the window's layouts (the SkinsWindow setting).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Metrics {
+    /// How wide the window opens, and how narrow it can get.
+    width: f32,
+    min_width: f32,
+    /// The list of skins on the left (0 wide: none, the skin is picked at the top): its width, the
+    /// first group's top, a group's title with the gap under it, the title's own height, the gap
+    /// above the second group, a skin's height, how far in its name starts, the titles' size.
+    list_w: f32,
+    list_top: f32,
+    group_h: f32,
+    group_text_h: f32,
+    group_gap: f32,
+    item_h: f32,
+    item_x: f32,
+    group_font: f32,
+    header_h: f32,
+    /// The page: the margin each side of the cards, the room kept for the scroll bar, a card's
+    /// least width, the first heading's top, a heading's height, the gap under it, the gap under
+    /// a card.
+    pad_x: f32,
+    gutter: f32,
+    min_card_w: f32,
+    first_y: f32,
+    heading_h: f32,
+    heading_gap: f32,
+    card_gap: f32,
+    /// A row's height, with a note under its title, and the room at its ends.
+    row_h: f32,
+    row_note_h: f32,
+    row_pad: f32,
+    /// A colour: its swatch, its box and what clears it (NONE, or a small x).
+    swatch: f32,
+    hex_w: f32,
+    hex_h: f32,
+    clear_w: f32,
+    clear_h: f32,
+    /// Drop-downs and the other boxes.
+    dropdown_w: f32,
+    field_h: f32,
+    logo_w: f32,
+    browse_w: f32,
+    picture_w: f32,
+    /// A slider (its knob's room each end included), the gap after it, and its number's box.
+    slider_w: f32,
+    value_gap: f32,
+    value_w: f32,
+    value_h: f32,
+    toggle_w: f32,
+    toggle_h: f32,
+    /// The pictures next to the skin, the room their row leaves for its title, and the row.
+    thumb_w: f32,
+    thumb_h: f32,
+    thumbs_title: f32,
+    thumbs_h: f32,
+    /// The position pad: its height, how wide it can get, and its row.
+    pad_h: f32,
+    pad_max_w: f32,
+    place_h: f32,
+}
+
+impl Metrics {
+    fn of(layout: Layout) -> Metrics {
+        let wide = Metrics {
+            width: DEFAULT_W,
+            min_width: MIN_W,
+            list_w: LIST_W,
+            list_top: 6.0,
+            group_h: GROUP_H,
+            group_text_h: GROUP_H,
+            group_gap: 10.0,
+            item_h: ITEM_H,
+            item_x: 18.0,
+            group_font: ksize::NOTE_FONT,
+            header_h: HEADER_H,
+            pad_x: PAD_X,
+            gutter: GUTTER,
+            min_card_w: 300.0,
+            first_y: 10.0,
+            heading_h: HEADING_H,
+            heading_gap: 6.0,
+            card_gap: 18.0,
+            row_h: ROW_H,
+            row_note_h: ROW_NOTE_H,
+            row_pad: ROW_PAD_X,
+            swatch: SWATCH,
+            hex_w: HEX_W,
+            hex_h: ksize::FIELD_H,
+            clear_w: NONE_W,
+            clear_h: ksize::FIELD_H,
+            dropdown_w: DROPDOWN_W,
+            field_h: ksize::FIELD_H,
+            logo_w: LOGO_FIELD_W,
+            browse_w: BROWSE_W,
+            picture_w: HEX_W,
+            slider_w: SLIDER_W,
+            value_gap: VALUE_GAP,
+            value_w: VALUE_W,
+            value_h: ksize::FIELD_H,
+            toggle_w: ksize::TOGGLE_W,
+            toggle_h: ksize::TOGGLE_H,
+            thumb_w: THUMB_W,
+            thumb_h: THUMB_H,
+            thumbs_title: 140.0,
+            thumbs_h: THUMBS_H,
+            pad_h: PAD_H,
+            pad_max_w: PAD_MAX_W,
+            place_h: PLACE_H,
+        };
+        // (The sliders' tracks are 120 and 150 wide: the knob takes 7 more each end.)
+        let small = Metrics {
+            list_w: 0.0,
+            pad_x: 12.0,
+            gutter: 0.0,
+            min_card_w: 200.0,
+            first_y: 10.0,
+            heading_h: 17.0,
+            heading_gap: 4.0,
+            card_gap: 10.0,
+            row_h: 32.0,
+            row_note_h: 44.0,
+            row_pad: 10.0,
+            swatch: 20.0,
+            hex_w: 84.0,
+            hex_h: 24.0,
+            clear_w: 22.0,
+            clear_h: 22.0,
+            dropdown_w: 170.0,
+            field_h: 24.0,
+            logo_w: 110.0,
+            browse_w: 76.0,
+            picture_w: 110.0,
+            slider_w: 134.0,
+            value_gap: 1.0,
+            value_w: 44.0,
+            value_h: 26.0,
+            toggle_w: 34.0,
+            toggle_h: 18.0,
+            thumb_w: 56.0,
+            thumb_h: 36.0,
+            thumbs_title: 80.0,
+            thumbs_h: 50.0,
+            pad_h: 84.0,
+            pad_max_w: 150.0,
+            place_h: 100.0,
+            ..wide
+        };
+        match layout {
+            Layout::Wide => wide,
+            Layout::Compact => Metrics { width: 420.0, min_width: 360.0, ..small },
+            Layout::Slim => Metrics {
+                width: 600.0,
+                min_width: 520.0,
+                list_w: 150.0,
+                list_top: 10.0,
+                group_h: 18.0,
+                group_text_h: 14.0,
+                group_gap: 8.0,
+                item_h: 26.0,
+                item_x: 12.0,
+                group_font: 10.5,
+                header_h: 52.0,
+                pad_x: 16.0,
+                first_y: 4.0,
+                card_gap: 12.0,
+                row_h: 34.0,
+                row_note_h: 46.0,
+                row_pad: 12.0,
+                swatch: 22.0,
+                hex_w: 104.0,
+                hex_h: 26.0,
+                clear_w: 24.0,
+                clear_h: 24.0,
+                field_h: 26.0,
+                logo_w: 120.0,
+                browse_w: 76.0,
+                picture_w: 120.0,
+                slider_w: 164.0,
+                thumb_w: 60.0,
+                thumb_h: 38.0,
+                thumbs_title: 90.0,
+                thumbs_h: 54.0,
+                pad_h: 90.0,
+                pad_max_w: 160.0,
+                place_h: 106.0,
+                ..small
+            },
+        }
+    }
+}
+
+/// How wide a row's controls are together (the smaller layouts: its title has the rest).
+fn controls_w(m: &Metrics, ctl: Ctl) -> f32 {
+    match ctl {
+        Ctl::Colour(_) => m.swatch + 6.0 + m.hex_w + 2.0 + m.clear_w,
+        Ctl::Picture => m.browse_w + 6.0 + m.picture_w + 2.0 + m.clear_w,
+        Ctl::Slide(_) => m.slider_w + m.value_gap + m.value_w,
+        Ctl::LogoText => m.logo_w,
+        Ctl::Search => SEARCH_W,
+        Ctl::Dark | Ctl::Grip => m.toggle_w,
+        Ctl::Part(p) if crate::parts::is_flag(p) => m.toggle_w,
+        Ctl::Place => 3.0 * GRID_CELL + 2.0 * GRID_GAP + 22.0 + m.pad_max_w,
+        Ctl::Thumbs => 0.0,
+        _ => m.dropdown_w,
+    }
+}
+
+/// The sections folded at first: all but the wallpaper and the main colours.
+fn first_folded() -> Vec<&'static str> {
+    CARDS.iter().copied().filter(|t| !["Overall look", "Main colours", "Wallpaper"].contains(t)).collect()
+}
+/// The cards and their rows: one card for each part of the window, in the order they sit on
+/// screen (top to bottom), each with everything about that part: its sizes, shapes, text and
+/// colours (CARDS has their titles). `hints`: a colour's "follows ..." note, by COLOURS' order.
+fn cards(hints: &[String]) -> Vec<(&'static str, Vec<(Ctl, &'static str, &'static str)>)> {
+    use crate::parts::P;
+    let part = |p: P, title: &'static str| (Ctl::Part(p), title, "");
+    // A colour by the skin's name for it, with its title in this card.
+    let col = |key: &str, title: &'static str| -> (Ctl, &'static str, &'static str) {
+        let i = COLOURS.iter().position(|(k, _)| *k == key).unwrap_or(0);
+        (Ctl::Colour(i), title, if hints.get(i).is_some_and(|h| !h.is_empty()) { FOLLOWS } else { "" })
+    };
+    vec![
+        (
+            "Overall look",
+            vec![
+                (Ctl::Dark, "Dark skin", ""),
+                (Ctl::Era, "Old Windows look", ""),
+                (Ctl::Shape, "Shape", ""),
+                (Ctl::Slant, "Slant amount", "When Shape is Slanted"),
+                (Ctl::Icons, "Icon set", ""),
+                (Ctl::Font, "Font", ""),
+                (Ctl::FontSize, "Text size", ""),
+            ],
+        ),
+        (
+            "Main colours",
+            vec![
+                col("accent", "Accent"),
+                col("accent-text", "Text on accent"),
+                col("background", "Background"),
+                col("text", "Text"),
+                col("text-bright", "Bright text"),
+                col("muted", "Faint text"),
+                col("disabled", "Greyed-out text"),
+                col("line", "Lines"),
+                col("hover", "Under the mouse"),
+                col("highlight", "Shine on bars"),
+            ],
+        ),
+        (
+            "Wallpaper",
+            vec![
+                (Ctl::Picture, "Picture", ""),
+                (Ctl::Thumbs, "Same folder", ""),
+                (Ctl::Area, "Covers", ""),
+                (Ctl::Fit, "Fit", ""),
+                (Ctl::Place, "Position", "Drag the picture"),
+                (Ctl::Slide(Slide::Across), "Left / right", ""),
+                (Ctl::Slide(Slide::Down), "Up / down", ""),
+                (Ctl::Slide(Slide::Zoom), "Zoom", ""),
+                (Ctl::Slide(Slide::Opacity), "Picture strength", ""),
+                (Ctl::Slide(Slide::Blur), "Blur", ""),
+                (Ctl::Slide(Slide::Fade), "Soft edges", ""),
+                (Ctl::Slide(Slide::Panels), "See-through panels", "When Covers is Whole window"),
+                (Ctl::Part(P::SeeTitle), "Title bar and tabs", "See-through; Auto: as panels"),
+                (Ctl::Part(P::SeeToolbar), "Toolbar", "See-through; Auto: as panels"),
+                (Ctl::Part(P::SeeSidebar), "Sidebar", "See-through; Auto: as panels"),
+                (Ctl::Part(P::SeeList), "File list", "See-through; Auto: as panels"),
+                (Ctl::Part(P::SeeDetails), "Details panel", "See-through; Auto: as panels"),
+                (Ctl::Part(P::SeeStatus), "Status bar", "See-through; Auto: as panels"),
+            ],
+        ),
+        ("Panels", vec![part(P::Gap, "Space between panels"), part(P::PanelRadius, "Panel corners"), col("panel", "Panel background")]),
+        (
+            "Title bar",
+            vec![
+                part(P::TitleH, "Title bar height"),
+                (Ctl::Logo, "Logo", ""),
+                (Ctl::LogoText, "Logo text", ""),
+                col("title-bar", "Title bar"),
+                col("title-bar-inactive", "Title bar, inactive"),
+                col("title-gloss", "Title bar shine"),
+                col("title-text", "Title text"),
+                col("title-text-inactive", "Title text, inactive"),
+                col("title-text-shadow", "Title text shadow"),
+                col("logo", "Logo box"),
+                col("logo-letters", "Logo letters"),
+            ],
+        ),
+        (
+            "Window buttons",
+            vec![
+                (Ctl::Caption, "Window button style", ""),
+                col("caption-hover", "Under the mouse"),
+                col("caption-pressed", "Pressed"),
+                col("close-hover", "Close, under the mouse"),
+                col("marble", "Marbles"),
+                col("marble-close", "Close marble"),
+            ],
+        ),
+        (
+            "Tabs",
+            vec![
+                (Ctl::Tabs, "Tab style", ""),
+                part(P::TabMin, "Narrowest tab width"),
+                part(P::TabMax, "Widest tab width"),
+                part(P::TabGap, "Space between tabs"),
+                part(P::TabText, "Text size"),
+                part(P::TabBold, "Current tab in bold"),
+                part(P::TabIcon, "Folder icon"),
+                part(P::TabClose, "Close button"),
+                (Ctl::TabLine, "Current tab line width", ""),
+                col("tab", "Tabs"),
+                col("tab-text", "Tab text"),
+                col("tab-active", "Current tab"),
+                col("tab-active-text", "Current tab text"),
+                col("tab-border", "Tab edges"),
+                col("tab-line", "Current tab line"),
+            ],
+        ),
+        (
+            "Toolbar",
+            vec![
+                part(P::ToolbarH, "Toolbar height"),
+                part(P::PathSep, "Sign between folders"),
+                part(P::PathCurrent, "Current folder in the path"),
+                part(P::FilterW, "Filter box width"),
+                part(P::BoxRadius, "Text box corners"),
+                (Ctl::ToolbarLine, "Bottom line width", ""),
+                col("toolbar", "Toolbar"),
+                col("toolbar-line", "Bottom line"),
+                col("tool-hover", "Toolbar buttons, under the mouse"),
+                col("tool-pressed", "Toolbar buttons, pressed"),
+                col("tool-border", "Toolbar button edges"),
+                col("back-button", "Back and forward"),
+                col("input", "Text boxes"),
+                col("input-border", "Text box edges"),
+                col("path-hover", "Path, under the mouse"),
+            ],
+        ),
+        (
+            "Sort, View and Settings buttons",
+            vec![
+                (Ctl::Buttons, "Button style", ""),
+                part(P::ToolButtons, "Show"),
+                part(P::ButtonCaps, "Words in capitals"),
+                part(P::ButtonRadius, "Button corners"),
+                col("button", "Buttons"),
+                col("button-hover", "Under the mouse"),
+                col("button-text", "Button text"),
+            ],
+        ),
+        (
+            "Sidebar",
+            vec![
+                (Ctl::Sidebar, "Sidebar style", ""),
+                part(P::SidebarW, "Sidebar width"),
+                (Ctl::SidebarRow, "Row height", ""),
+                part(P::SidebarText, "Text size"),
+                part(P::SidebarIcon, "Icon size"),
+                part(P::SidebarIndent, "Indent"),
+                part(P::SidebarHeadings, "Headings"),
+                (Ctl::SidebarEdge, "Selection line width", ""),
+                part(P::DriveBars, "Drive bars"),
+                part(P::DriveBarH, "Drive bar thickness"),
+                col("sidebar", "Sidebar"),
+                col("sidebar-text", "Text"),
+                col("sidebar-panel", "Panels"),
+                col("panel-header", "Heading background"),
+                col("panel-header-text", "Heading text"),
+                col("sidebar-selection", "Selection"),
+                col("sidebar-selection-text", "Selection text"),
+                col("sidebar-selection-edge", "Selection line"),
+                col("usage-bar", "Drive bar"),
+                col("usage-fill", "Drive bar fill"),
+            ],
+        ),
+        (
+            "File list",
+            vec![
+                (Ctl::RowHeight, "Row height", ""),
+                part(P::ListText, "Text size"),
+                part(P::ListIcon, "Icon size"),
+                part(P::ListRows, "Between rows"),
+                part(P::ColumnLines, "Show lines between columns"),
+                part(P::FoldersBold, "Folder names in bold"),
+                part(P::HeaderH, "Column titles height"),
+                part(P::HeaderWeight, "Column titles boldness"),
+                col("list-header", "Column titles"),
+                col("list-header-text", "Column title text"),
+                col("column-line", "Lines between columns"),
+            ],
+        ),
+        (
+            "Selected rows",
+            vec![
+                part(P::SelectLook, "Selected row look"),
+                part(P::SelectLine, "Selection line side"),
+                (Ctl::RowEdge, "Selection line width", ""),
+                part(P::SelectBold, "Selected name in bold"),
+                part(P::HoverLook, "Row under the mouse"),
+                part(P::RowRadius, "Row corners"),
+                col("selection", "Selected rows"),
+                col("selection-text", "Selected row text"),
+                col("selection-edge", "Selection line"),
+                col("selection-border", "Selected row outline"),
+            ],
+        ),
+        (
+            "Scroll bars",
+            vec![
+                (Ctl::ScrollWidth, "Scroll bar width", ""),
+                part(P::ScrollShow, "Show"),
+                part(P::ScrollEnds, "Ends"),
+                part(P::ScrollGap, "Space from the edge"),
+                (Ctl::Grip, "Show grip lines", ""),
+                col("scrollbar", "Scroll bars"),
+                col("scrollbar-hover", "Under the mouse"),
+                col("scrollbar-track", "Track"),
+                col("scrollbar-border", "Edges"),
+                col("scrollbar-grip-lines", "Grip lines"),
+            ],
+        ),
+        ("Status bar", vec![part(P::StatusH, "Status bar height"), col("status-bar", "Status bar"), col("status-text", "Text"), col("status-line", "Top line")]),
+        (
+            "Menus",
+            vec![
+                part(P::MenuRowH, "Row height"),
+                part(P::MenuPick, "Item under the mouse, look"),
+                part(P::MenuGroups, "Between groups"),
+                part(P::MenuRadius, "Menu corners"),
+                part(P::MenuShadow, "Shadow"),
+                col("menu", "Menus"),
+                col("menu-text", "Text"),
+                col("menu-selection", "Item under the mouse"),
+                col("menu-selection-text", "Item under the mouse, text"),
+                col("menu-border", "Edges"),
+            ],
+        ),
+        (
+            "3D edges",
+            vec![
+                col("bevel-highlight", "Outer light edge"),
+                col("bevel-light", "Inner light edge"),
+                col("bevel-shadow", "Inner shadow edge"),
+                col("bevel-dark", "Outer shadow edge"),
+            ],
+        ),
+    ]
+}
+/// The cards, in order: one for each part of the window, top to bottom.
+const CARDS: [&str; 16] = [
+    "Overall look",
+    "Main colours",
+    "Wallpaper",
+    "Panels",
+    "Title bar",
+    "Window buttons",
+    "Tabs",
+    "Toolbar",
+    "Sort, View and Settings buttons",
+    "Sidebar",
+    "File list",
+    "Selected rows",
+    "Scroll bars",
+    "Status bar",
+    "Menus",
+    "3D edges",
+];
 const WHEEL_STEP: f32 = 96.0;
 /// Text box ids (textbox.rs: 600-699 belong to the customiser): the one-line box (a colour's
 /// #hex, the logo's word, renaming) and the skin's whole text.
@@ -219,117 +640,99 @@ const UNDO_STEPS: usize = 200;
 const TYPING_PAUSE: f64 = 1.5;
 /// The undo group for typing in the skin's text (a box being edited has its own number).
 const TEXT_GROUP: u64 = u64::MAX;
-/// The skin's text is kept to this, like the files Glint reads (bytes).
-const MAX_TEXT: usize = 256 * 1024;
 
 /// Every colour a skin has (skin::COLOURS), by the skin's name for it, with its title here, in
-/// COLOUR_GROUPS' order: what belongs together sits together.
-const COLOURS: [(&str, &str); 75] = [
+/// the order the skin's text lists them in (`cards` places each in its card).
+const COLOURS: [(&str, &str); 76] = [
     // Main colours
     ("accent", "Accent"),
     ("accent-text", "Text on accent"),
     ("background", "Background"),
     ("text", "Text"),
     ("text-bright", "Bright text"),
-    ("muted", "Muted text"),
-    ("disabled", "Disabled"),
+    ("muted", "Faint text"),
+    ("disabled", "Greyed-out text"),
     ("line", "Lines"),
-    ("hover", "Hover"),
+    ("hover", "Under the mouse"),
     // Title bar
     ("title-bar", "Title bar"),
     ("title-bar-inactive", "Title bar, inactive"),
     ("title-gloss", "Title bar shine"),
     ("highlight", "Shine on bars"),
-    ("title-text", "Window titles"),
-    ("title-text-inactive", "Window titles, inactive"),
-    ("title-text-shadow", "Window title shadow"),
+    ("title-text", "Title text"),
+    ("title-text-inactive", "Title text, inactive"),
+    ("title-text-shadow", "Title text shadow"),
     ("logo", "Logo box"),
     ("logo-letters", "Logo letters"),
     // Window buttons
-    ("caption-hover", "Window buttons hover"),
-    ("caption-pressed", "Window buttons pressed"),
-    ("close-hover", "Close hover"),
-    ("marble", "Window marbles"),
+    ("caption-hover", "Window buttons, under the mouse"),
+    ("caption-pressed", "Window buttons, pressed"),
+    ("close-hover", "Close, under the mouse"),
+    ("marble", "Marbles"),
     ("marble-close", "Close marble"),
     // Tabs
     ("tab", "Tabs"),
-    ("tab-text", "Tab names"),
+    ("tab-text", "Tab text"),
     ("tab-active", "Current tab"),
-    ("tab-active-text", "Current tab name"),
+    ("tab-active-text", "Current tab text"),
     ("tab-border", "Tab edges"),
-    ("tab-line", "Line on current tab"),
+    ("tab-line", "Current tab line"),
     // Toolbar
     ("toolbar", "Toolbar"),
-    ("toolbar-line", "Line under toolbar"),
-    ("tool-hover", "Toolbar icons hover"),
-    ("tool-pressed", "Toolbar icons pressed"),
+    ("toolbar-line", "Toolbar bottom line"),
+    ("tool-hover", "Toolbar buttons, under the mouse"),
+    ("tool-pressed", "Toolbar buttons, pressed"),
     ("tool-border", "Toolbar button edges"),
     ("back-button", "Back and forward"),
     ("input", "Text boxes"),
     ("input-border", "Text box edges"),
-    ("path-hover", "Path hover"),
+    ("path-hover", "Path, under the mouse"),
     // Buttons
-    ("button", "Buttons"),
-    ("button-hover", "Buttons hover"),
+    ("button", "Sort, View and Settings buttons"),
+    ("button-hover", "Sort, View and Settings, under the mouse"),
     ("button-text", "Button text"),
     // Sidebar
     ("sidebar", "Sidebar"),
-    ("sidebar-text", "Sidebar names"),
+    ("sidebar-text", "Sidebar text"),
     ("sidebar-panel", "Sidebar panels"),
-    ("panel-header", "Panel headers"),
+    ("panel-header", "Sidebar heading background"),
     ("panel-header-text", "Sidebar heading text"),
     ("sidebar-selection", "Sidebar selection"),
     ("sidebar-selection-text", "Sidebar selection text"),
+    ("sidebar-selection-edge", "Sidebar selection line"),
     // File list
-    ("panel", "Panels"),
+    ("panel", "Panel background"),
     ("list-header", "Column titles"),
     ("list-header-text", "Column title text"),
     ("column-line", "Lines between columns"),
     ("selection", "Selected rows"),
-    ("selection-edge", "Selected row left edge"),
+    ("selection-edge", "Selection line"),
     ("selection-text", "Selected row text"),
     ("selection-border", "Selected row outline"),
     // Scroll bars
     ("scrollbar", "Scroll bars"),
-    ("scrollbar-hover", "Scroll bars hover"),
+    ("scrollbar-hover", "Scroll bars, under the mouse"),
     ("scrollbar-track", "Scroll bar track"),
     ("scrollbar-border", "Scroll bar edges"),
     ("scrollbar-grip-lines", "Grip lines"),
     // Status bar
     ("status-bar", "Status bar"),
     ("status-text", "Status bar text"),
-    ("status-line", "Line above status bar"),
+    ("status-line", "Status bar top line"),
     // Drive usage bars
-    ("usage-bar", "Usage bar"),
-    ("usage-fill", "Usage bar fill"),
+    ("usage-bar", "Drive bar"),
+    ("usage-fill", "Drive bar fill"),
     // Menus
     ("menu", "Menus"),
     ("menu-text", "Menu text"),
-    ("menu-selection", "Menu item hover"),
-    ("menu-selection-text", "Menu item hover text"),
-    ("menu-border", "Menu edge"),
+    ("menu-selection", "Menu item under the mouse"),
+    ("menu-selection-text", "Menu item under the mouse, text"),
+    ("menu-border", "Menu edges"),
     // 3D edges
-    ("bevel-highlight", "3D edge, lit outside"),
-    ("bevel-light", "3D edge, lit inside"),
-    ("bevel-shadow", "3D edge, shaded inside"),
-    ("bevel-dark", "3D edge, shaded outside"),
-];
-
-/// The cards the colours are shown in: a heading and how many of COLOURS (in order) it holds.
-const COLOUR_GROUPS: [(&str, usize); 13] = [
-    ("Main colours", 9),
-    ("Title bar", 9),
-    ("Window buttons", 5),
-    ("Tabs", 6),
-    ("Toolbar", 9),
-    ("Buttons", 3),
-    ("Sidebar", 7),
-    ("File list", 8),
-    ("Scroll bars", 5),
-    ("Status bar", 3),
-    ("Drive usage bars", 2),
-    ("Menus", 5),
-    ("3D edges", 4),
+    ("bevel-highlight", "Outer light edge"),
+    ("bevel-light", "Inner light edge"),
+    ("bevel-shadow", "Inner shadow edge"),
+    ("bevel-dark", "Outer shadow edge"),
 ];
 
 /// The choices of the drop-downs.
@@ -338,20 +741,39 @@ const SLANTS: [f32; 9] = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0];
 const ROW_HEIGHTS: [f32; 7] = [24.0, 26.0, 28.0, 30.0, 32.0, 34.0, 36.0];
 const FONT_SIZES: [f32; 8] = [8.0, 8.5, 9.0, 9.5, 10.0, 10.5, 11.0, 12.0];
 const LINE_WIDTHS: [f32; 7] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-const BUTTON_STYLES: [(ButtonStyle, &str, &str); 2] = [(ButtonStyle::Flat, "flat", "Flat"), (ButtonStyle::Liquid, "liquid", "Liquid")];
+const SIDEBAR_ROWS: [f32; 9] = [20.0, 22.0, 24.0, 26.0, 28.0, 30.0, 32.0, 36.0, 40.0];
+const SCROLL_WIDTHS: [f32; 8] = [4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0];
+
+/// A line-width drop-down's skin setting and what the skin has it at now.
+fn line_width(ctl: Ctl, t: &crate::theme::Theme) -> Option<(&'static str, f32)> {
+    match ctl {
+        Ctl::TabLine => Some(("tab-line-width", t.tab_line_w)),
+        Ctl::ToolbarLine => Some(("toolbar-line-width", t.toolbar_line_w)),
+        Ctl::RowEdge => Some(("selection-edge-width", t.select_edge_w)),
+        Ctl::SidebarEdge => Some(("sidebar-selection-edge-width", t.sidebar_select_edge_w)),
+        _ => None,
+    }
+}
+const BUTTON_STYLES: [(ButtonStyle, &str, &str); 2] = [(ButtonStyle::Flat, "flat", "Flat"), (ButtonStyle::Liquid, "liquid", "Glossy")];
 const CAPTION_STYLES: [(CaptionStyle, &str, &str); 3] = [(CaptionStyle::Symbols, "symbols", "Symbols"), (CaptionStyle::Marbles, "marbles", "Marbles"), (CaptionStyle::Tiles, "tiles", "Tiles")];
-const TAB_STYLES: [(TabStyle, &str, &str); 2] = [(TabStyle::Attached, "attached", "Attached"), (TabStyle::Pills, "pills", "Pills")];
+const TAB_STYLES: [(TabStyle, &str, &str); 2] = [(TabStyle::Attached, "attached", "Joined"), (TabStyle::Pills, "pills", "Pills")];
 const SIDEBAR_STYLES: [(SidebarStyle, &str, &str); 2] = [(SidebarStyle::Plain, "plain", "Plain"), (SidebarStyle::Panels, "panels", "Panels")];
-const ERAS: [(Era, &str, &str); 5] = [(Era::None, "none", "None"), (Era::Win98, "98", "Windows 98"), (Era::Win2000, "2000", "Windows 2000"), (Era::Xp, "xp", "Windows XP"), (Era::Win7, "7", "Windows 7")];
-const ICON_SETS: [(IconSet, &str, &str); 4] = [(IconSet::Windows, "windows", "Windows"), (IconSet::Classic, "classic", "Classic"), (IconSet::Xp, "xp", "XP"), (IconSet::Aero, "aero", "Aero")];
+const ERAS: [(Era, &str, &str); 5] = [(Era::None, "none", "Off"), (Era::Win98, "98", "Windows 98"), (Era::Win2000, "2000", "Windows 2000"), (Era::Xp, "xp", "Windows XP"), (Era::Win7, "7", "Windows 7")];
+const ICON_SETS: [(IconSet, &str, &str); 4] = [(IconSet::Windows, "windows", "Windows"), (IconSet::Classic, "classic", "Classic"), (IconSet::Xp, "xp", "Windows XP"), (IconSet::Aero, "aero", "Windows 7 (Aero)")];
 /// The Logo setting (as Settings > Appearance offers it).
-const LOGOS: [(LogoStyle, &str); 4] = [(LogoStyle::Box, "Box"), (LogoStyle::Chrome, "Chrome"), (LogoStyle::Caps, "GLiNT"), (LogoStyle::None, "None")];
+const LOGOS: [(LogoStyle, &str, &str); 4] = [(LogoStyle::Box, "box", "In a box"), (LogoStyle::Chrome, "chrome", "Chrome letters"), (LogoStyle::Caps, "caps", "GLiNT"), (LogoStyle::None, "none", "None")];
 const FITS: [(WallpaperFit, &str, &str); 5] = [
     (WallpaperFit::Fill, "fill", "Fill"),
-    (WallpaperFit::Whole, "whole", "Whole"),
+    (WallpaperFit::Whole, "whole", "Whole picture"),
     (WallpaperFit::Stretch, "stretch", "Stretch"),
     (WallpaperFit::Tile, "tile", "Tile"),
-    (WallpaperFit::Actual, "actual", "Actual"),
+    (WallpaperFit::Actual, "actual", "Actual size"),
+];
+const AREAS: [(WallpaperArea, &str, &str); 4] = [
+    (WallpaperArea::Middle, "middle", "Middle, stays put"),
+    (WallpaperArea::Shrinks, "middle-shrinks", "Middle, shrinks"),
+    (WallpaperArea::WindowSized, "window-sized", "Window size, in middle"),
+    (WallpaperArea::Window, "window", "Whole window"),
 ];
 /// DIPs in a point (9 pt = 12 DIPs).
 const PT: f32 = 96.0 / 72.0;
@@ -361,6 +783,10 @@ const FOLLOWS: &str = "(follows)";
 thread_local! {
     /// The text boxes' colours (background COLORREF, text COLORREF, brush), for WM_CTLCOLOREDIT.
     static EDIT_COLORS: Cell<(u32, u32, isize)> = const { Cell::new((0, 0, 0)) };
+    /// How narrow the window can get (its layout's), for WM_GETMINMAXINFO.
+    static MIN_WIDTH: Cell<f32> = const { Cell::new(MIN_W) };
+    /// The folded sections, kept while Glint runs (None: as at first).
+    static FOLDED: RefCell<Option<Vec<&'static str>>> = const { RefCell::new(None) };
 }
 
 /// Windows' colour picker remembers 16 colours of the person's ("custom colours") while Glint runs.
@@ -378,6 +804,10 @@ enum Ctl {
     /// How thick the line on the current tab and the one under the toolbar are.
     TabLine,
     ToolbarLine,
+    /// The selected rows' edge width (selection-edge-width).
+    RowEdge,
+    /// The sidebar's selected place's edge width (sidebar-selection-edge-width).
+    SidebarEdge,
     LogoText,
     Dark,
     /// The style: buttons, window buttons, tabs, sidebar, scrollbar grip.
@@ -396,11 +826,20 @@ enum Ctl {
     /// The pictures next to the skin, to click.
     Thumbs,
     Fit,
+    /// Where it lies (wallpaper-area).
+    Area,
     /// Where it sits: the pad (across and down at once), the 3x3 squares and the two numbers.
     Place,
     Slide(Slide),
     /// The box above the colours: only colours whose name has what's typed in it show.
     Search,
+    /// One of the main window's parts' settings (parts.rs): a drop-down, or a switch for one that
+    /// is true or false.
+    Part(crate::parts::P),
+    /// The skin's font (the fonts installed), the sidebar's row height, the scroll bars' thickness.
+    Font,
+    SidebarRow,
+    ScrollWidth,
 }
 
 /// A wallpaper slider.
@@ -413,16 +852,19 @@ enum Slide {
     Down,
     Blur,
     Fade,
+    /// How much shows through the bars and panels behind the whole window (wallpaper-panels).
+    Panels,
 }
 
 /// Each slider: its setting, smallest and biggest, a key's step and PageUp / PageDown's.
-const SLIDES: [(Slide, &str, f32, f32, f32, f32); 6] = [
+const SLIDES: [(Slide, &str, f32, f32, f32, f32); 7] = [
     (Slide::Opacity, "wallpaper-opacity", 0.0, 100.0, 1.0, 10.0),
     (Slide::Zoom, "wallpaper-zoom", -500.0, 500.0, 5.0, 50.0),
     (Slide::Across, "wallpaper-position", 0.0, 100.0, 1.0, 10.0),
     (Slide::Down, "wallpaper-position", 0.0, 100.0, 1.0, 10.0),
     (Slide::Blur, "wallpaper-blur", 0.0, 50.0, 1.0, 5.0),
     (Slide::Fade, "wallpaper-fade", 0.0, 50.0, 1.0, 5.0),
+    (Slide::Panels, "wallpaper-panels", 0.0, 90.0, 1.0, 10.0),
 ];
 
 /// Which part of a control: the main one (a colour's swatch), a colour's #hex box, or its NONE
@@ -450,6 +892,9 @@ enum Btn {
     Import,
     Export,
     Folder,
+    /// One column: the skin drop-down at the top, and the menu with New and the rest.
+    Skin,
+    More,
 }
 
 const BUTTONS: [(Btn, &str); 9] = [
@@ -464,6 +909,77 @@ const BUTTONS: [(Btn, &str); 9] = [
     (Btn::Folder, "OPEN SKINS FOLDER"),
 ];
 
+/// The slim layout's icon buttons under the list (their names show over them under the mouse).
+const ICONS: [(Btn, &str); 9] = [
+    (Btn::Undo, "Undo"),
+    (Btn::Redo, "Redo"),
+    (Btn::New, "New"),
+    (Btn::Duplicate, "Duplicate"),
+    (Btn::Rename, "Rename"),
+    (Btn::Delete, "Delete"),
+    (Btn::Import, "Import\u{2026}"),
+    (Btn::Export, "Export\u{2026}"),
+    (Btn::Folder, "Open skins folder"),
+];
+
+/// The one-column layout's menu (a line after Delete).
+const MORE: [(Btn, &str); 7] = [
+    (Btn::New, "New"),
+    (Btn::Duplicate, "Duplicate"),
+    (Btn::Rename, "Rename"),
+    (Btn::Delete, "Delete"),
+    (Btn::Import, "Import\u{2026}"),
+    (Btn::Export, "Export\u{2026}"),
+    (Btn::Folder, "Open skins folder"),
+];
+
+/// The menu open that isn't a drop-down's on the page.
+#[derive(Clone, Debug, PartialEq)]
+enum Pop {
+    /// The skins, by id in the menu's order.
+    Skins(Vec<String>),
+    /// MORE.
+    More,
+}
+
+/// The small drawn icons (the sort order's editor's too).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Glyph {
+    Undo,
+    Redo,
+    More,
+    New,
+    Duplicate,
+    Rename,
+    Delete,
+    Import,
+    Export,
+    Folder,
+    Search,
+    Clear,
+    /// ⇱ and ⇲: DETACH and DOCK.
+    Detach,
+    Dock,
+    /// ? (GUIDE) and ☰ (START FROM…).
+    Help,
+    Menu,
+}
+
+fn glyph_of(b: Btn) -> Glyph {
+    match b {
+        Btn::Undo => Glyph::Undo,
+        Btn::Redo => Glyph::Redo,
+        Btn::New => Glyph::New,
+        Btn::Duplicate => Glyph::Duplicate,
+        Btn::Rename => Glyph::Rename,
+        Btn::Delete => Glyph::Delete,
+        Btn::Import => Glyph::Import,
+        Btn::Export => Glyph::Export,
+        Btn::Folder => Glyph::Folder,
+        Btn::Skin | Btn::More => Glyph::More,
+    }
+}
+
 /// What is under the mouse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Hot {
@@ -471,15 +987,11 @@ enum Hot {
     /// A skin in the list (index into the laid-out items).
     Item(usize),
     Button(Btn),
-    /// "Show as text".
-    Advanced,
     Ctl(Ctl, Part),
-    /// The skin's text, GUIDE under it, and a problem under it (by its line).
-    Code,
-    Guide,
-    Note(usize),
     ListThumb,
     PageThumb,
+    /// A section's heading, which folds it (one column).
+    Fold(&'static str),
 }
 
 /// What has the keyboard.
@@ -487,10 +999,9 @@ enum Hot {
 enum Spot {
     List,
     Button(Btn),
-    Advanced,
     Ctl(Ctl, Part),
-    /// The skin's text (the EDIT has the keyboard itself).
-    Text,
+    /// A section's heading (one column): Space or Enter folds it.
+    Fold(&'static str),
 }
 
 /// What the one-line text box is for while it's shown.
@@ -581,6 +1092,9 @@ pub enum Job {
     Activate,
     /// A drop-down's list: a native menu at `menu.at` (this window's client DIPs).
     Menu(Menu),
+    /// A drop-down's list drawn by Glint under the box at this rect (client DIPs): at most a
+    /// dozen rows, the rest scrolled to (a long list - the fonts - never fills the screen).
+    Drop(crate::droplist::DropList, crate::ui::Rect),
     /// Windows' colour picker for COLOURS[at], starting at this COLORREF.
     Colour { at: usize, initial: u32 },
     /// Windows' "Open" dialog for a skin file.
@@ -591,6 +1105,8 @@ pub enum Job {
     Picture(Option<PathBuf>),
     /// Put the window here (after a DPI change).
     Place(RECT),
+    /// Docked beside the main window again, this wide (pixels): its layout changed.
+    Dock(i32),
     Close,
 }
 
@@ -663,8 +1179,18 @@ struct Row {
 #[derive(Clone, Debug)]
 enum Block {
     Heading(Rect, &'static str),
+    /// A heading that folds its section (one column), and whether it's open.
+    Fold(Rect, &'static str, bool),
     Card(Rect),
     Line(Rect),
+}
+
+impl Block {
+    fn rect(&self) -> Rect {
+        match self {
+            Block::Heading(r, _) | Block::Fold(r, _, _) | Block::Card(r) | Block::Line(r) => *r,
+        }
+    }
 }
 
 pub struct SkinWindow {
@@ -705,23 +1231,6 @@ pub struct SkinWindow {
     edit_fresh: bool,
     /// What the search above the colours has in it (empty: every colour shows).
     colour_search: String,
-    /// "Show as text": the skin's text, typed like code (codebox.rs), instead of the controls.
-    advanced: bool,
-    code: CodeBox,
-    /// What the text view was last given (a change from elsewhere is shown when it's not being typed in).
-    text_shown: String,
-    /// The skin that text is of. Another skin in use (its light or dark twin, after Ctrl+Shift+L)
-    /// is shown even while the text is being typed in, and the old text never goes into it.
-    text_for: String,
-    /// The guide under the skin's text shows (GUIDE), and how tall it was last drawn.
-    guide: bool,
-    guide_h: f32,
-    /// The problems under the skin's text, as last drawn: (where, its line).
-    note_rects: Vec<(Rect, usize)>,
-    /// What Glint couldn't understand in the skin's text, read once a paint, and how tall the
-    /// list of them under the text was last drawn.
-    notes: Vec<skin::Note>,
-    notes_h: f32,
     /// Skins changed and waiting for SAVE_TIMER to save them.
     save_due: Vec<String>,
     /// Undo and redo: a skin's text before a change, with its id; newest last.
@@ -744,6 +1253,8 @@ pub struct SkinWindow {
     status_mine: bool,
     /// The drop-down whose list is open.
     menu_for: Option<Ctl>,
+    /// The fonts installed (read when the font drop-down first opens).
+    fonts: Vec<String>,
     /// The skin the colour picker or the Save dialog was opened for (the one in use can change
     /// meanwhile, from the main window).
     dialog_for: Option<String>,
@@ -753,8 +1264,6 @@ pub struct SkinWindow {
     next_question: u64,
     /// Space or Enter on a drop-down: its list opens when that key's character arrives.
     act_on_char: Option<Spot>,
-    /// The first half of a character typed in two (an emoji, say), waiting for the second.
-    half_char: Option<u16>,
     /// Under Wine a hidden text box stays on screen until a later frame: paint until then.
     repaint_until: f64,
     /// The switches the person just flipped ("Show as text", "Dark skin"), gliding to their new
@@ -778,6 +1287,12 @@ pub struct SkinWindow {
     current_pic: Option<(Arc<thumbs::Picture>, (f32, f32))>,
     /// The main window's file list, roughly (DIPs): the pad is a small copy of it.
     list_size: (f32, f32),
+    /// How the window is laid out (the SkinsWindow setting).
+    layout: Layout,
+    /// The folded sections.
+    folded: Vec<&'static str>,
+    /// The skins' drop-down or the menu of the rest, while it's open.
+    pop: Option<Pop>,
 }
 
 /// Registers the window class (once; registering again just fails harmlessly).
@@ -801,15 +1316,17 @@ fn register_class() {
 }
 
 /// Makes the customiser (hidden: show it with [`Job::Show`] once its state is kept), owned by
-/// `owner`, centred over it. None if Windows can't make it.
-pub fn create(owner: HWND, theme: &Theme) -> Option<SkinWindow> {
+/// `owner`, beside it, laid out as `layout`. None if Windows can't make it.
+pub fn create(owner: HWND, theme: &Theme, layout: Layout) -> Option<SkinWindow> {
     register_class();
     let title: Vec<u16> = TITLE.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: window creation and plain queries on our own windows; all structs are valid.
     unsafe {
         let scale = GetDpiForWindow(owner).max(96) as f32 / 96.0;
         // As tall as the main window, beside it (`beside`).
-        let (x, y, w, h) = beside(owner, (DEFAULT_W * scale) as i32);
+        let metrics = Metrics::of(layout);
+        MIN_WIDTH.with(|m| m.set(metrics.min_width));
+        let (x, y, w, h) = beside(owner, (metrics.width * scale) as i32);
         let instance = GetModuleHandleW(None).ok()?;
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -866,15 +1383,6 @@ pub fn create(owner: HWND, theme: &Theme) -> Option<SkinWindow> {
             edit_at: None,
             colour_search: String::new(),
             edit_fresh: false,
-            advanced: false,
-            code: CodeBox::default(),
-            text_shown: String::new(),
-            text_for: String::new(),
-            guide: false,
-            guide_h: 0.0,
-            note_rects: Vec::new(),
-            notes: Vec::new(),
-            notes_h: NOTES_H,
             save_due: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -886,12 +1394,12 @@ pub fn create(owner: HWND, theme: &Theme) -> Option<SkinWindow> {
             status: None,
             status_mine: false,
             menu_for: None,
+            fonts: Vec::new(),
             dialog_for: None,
             ask: AskBox::default(),
             asking: None,
             next_question: 1,
             act_on_char: None,
-            half_char: None,
             repaint_until: 0.0,
             flips: kit::Flips::default(),
             bar: kit::Bar::default(),
@@ -903,6 +1411,9 @@ pub fn create(owner: HWND, theme: &Theme) -> Option<SkinWindow> {
             thumbs_for: None,
             current_pic: None,
             list_size: (900.0, 560.0),
+            layout,
+            folded: FOLDED.with(|f| f.borrow().clone()).unwrap_or_else(first_folded),
+            pop: None,
         };
         window.apply_theme(theme);
         let mut rc = RECT::default();
@@ -929,15 +1440,23 @@ pub fn run_job(hwnd: HWND, scale: f32, job: Job, show_menu: fn(HWND, &Menu, f32)
                 }
                 let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
                 frame::cloak(hwnd, false);
-                let _ = SetForegroundWindow(hwnd);
+                let _ = crate::testhide::front(hwnd);
             }
             Job::Activate => {
                 if IsIconic(hwnd).as_bool() {
                     let _ = ShowWindow(hwnd, SW_RESTORE);
                 }
-                let _ = SetForegroundWindow(hwnd);
+                let _ = crate::testhide::front(hwnd);
             }
             Job::Menu(menu) => return JobDone::Picked(show_menu(hwnd, &menu, scale)),
+            Job::Drop(mut list, at) => {
+                let mut corners = [POINT { x: (at.x * scale).round() as i32, y: (at.y * scale).round() as i32 }, POINT { x: (at.right() * scale).round() as i32, y: (at.bottom() * scale).round() as i32 }];
+                for p in &mut corners {
+                    let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, p);
+                }
+                list.under = RECT { left: corners[0].x, top: corners[0].y, right: corners[1].x, bottom: corners[1].y };
+                return JobDone::Picked(crate::droplist::show(hwnd, &list));
+            }
             Job::Colour { at, initial } => return pick_colour(hwnd, initial).map_or(JobDone::Nothing, |c| JobDone::Colour(at, c)),
             Job::Import => return open_file(hwnd).map_or(JobDone::Nothing, JobDone::Import),
             Job::Export(name) => return save_file(hwnd, &name).map_or(JobDone::Nothing, JobDone::Export),
@@ -945,10 +1464,15 @@ pub fn run_job(hwnd: HWND, scale: f32, job: Job, show_menu: fn(HWND, &Menu, f32)
             Job::Place(r) => {
                 let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
             }
+            Job::Dock(w) => {
+                if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
+                    place_visible(hwnd, beside(owner, w));
+                }
+            }
             Job::Close => {
                 // The main window gets the focus back (not whatever Windows would pick).
                 if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
-                    let _ = SetForegroundWindow(owner);
+                    let _ = crate::testhide::front(owner);
                 }
                 let _ = DestroyWindow(hwnd);
             }
@@ -981,10 +1505,18 @@ fn pick_colour(owner: HWND, initial: u32) -> Option<u32> {
 /// The file types the file dialogs offer.
 fn filters() -> [COMDLG_FILTERSPEC; 3] {
     [
-        COMDLG_FILTERSPEC { pszName: w!("Skins (*.glint)"), pszSpec: w!("*.glint") },
+        COMDLG_FILTERSPEC { pszName: w!("Skins (*.glint, *.zip)"), pszSpec: w!("*.glint;*.zip") },
         COMDLG_FILTERSPEC { pszName: w!("Text files (*.txt)"), pszSpec: w!("*.txt") },
         COMDLG_FILTERSPEC { pszName: w!("All files"), pszSpec: w!("*.*") },
     ]
+}
+
+/// The file types EXPORT… offers: a skin with its wallpaper (a zip) first when it has one.
+fn save_filters(zip: bool) -> Vec<COMDLG_FILTERSPEC> {
+    let packed = COMDLG_FILTERSPEC { pszName: w!("Skin with its wallpaper (*.zip)"), pszSpec: w!("*.zip") };
+    let plain = COMDLG_FILTERSPEC { pszName: w!("Skin only (*.glint)"), pszSpec: w!("*.glint") };
+    let all = COMDLG_FILTERSPEC { pszName: w!("All files"), pszSpec: w!("*.*") };
+    if zip { vec![packed, plain, all] } else { vec![plain, all] }
 }
 
 /// Windows' "Open" dialog for a skin file. None if cancelled.
@@ -1041,8 +1573,9 @@ fn save_file(owner: HWND, file_name: &str) -> Option<PathBuf> {
         let options = dialog.GetOptions().ok()?;
         let _ = dialog.SetOptions(options | FOS_FORCEFILESYSTEM | FOS_OVERWRITEPROMPT);
         let _ = dialog.SetTitle(w!("Export the skin"));
-        let _ = dialog.SetFileTypes(&filters());
-        let _ = dialog.SetDefaultExtension(w!("glint"));
+        let zip = file_name.to_ascii_lowercase().ends_with(".zip");
+        let _ = dialog.SetFileTypes(&save_filters(zip));
+        let _ = dialog.SetDefaultExtension(if zip { w!("zip") } else { w!("glint") });
         let _ = dialog.SetFileName(&HSTRING::from(file_name));
         dialog.Show(Some(owner)).ok()?;
         let name = dialog.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
@@ -1051,7 +1584,6 @@ fn save_file(owner: HWND, file_name: &str) -> Option<PathBuf> {
         text.filter(|t| !t.is_empty()).map(PathBuf::from)
     }
 }
-
 
 /// The window procedure. Messages that need no state are answered here; the rest go to the state,
 /// which the main window keeps, through its guard (window::skin_message).
@@ -1070,7 +1602,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             unsafe {
                 let info = &mut *(lparam.0 as *mut MINMAXINFO);
                 let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
-                info.ptMinTrackSize = POINT { x: (MIN_W * scale) as i32, y: (MIN_H * scale) as i32 };
+                info.ptMinTrackSize = POINT { x: (MIN_WIDTH.with(Cell::get) * scale) as i32, y: (MIN_H * scale) as i32 };
             }
             return LRESULT(0);
         }
@@ -1216,51 +1748,6 @@ fn typed_value(key: &str, typed: &str) -> Option<String> {
     (parsed.notes.is_empty() && skin::value_in(&line, key).as_deref() == Some(typed.as_str())).then_some(typed)
 }
 
-/// How a line under the skin's text is drawn.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Said {
-    /// In the text colour.
-    Plain,
-    /// Faint.
-    Quiet,
-    /// In red: something Glint couldn't understand.
-    Problem,
-}
-
-/// The lines under the skin's text, in at most `room` lines: what Glint couldn't understand (up to
-/// MAX_NOTES, then "and N more"), each with its line in the text (0: none).
-fn note_lines(notes: &[skin::Note], built_in: bool, room: usize) -> Vec<(String, Said, usize)> {
-    let mut lines = Vec::new();
-    if built_in {
-        lines.push(("Default skins are read-only. Press DUPLICATE to make your own copy.".to_string(), Said::Plain, 0));
-    }
-    if notes.is_empty() {
-        lines.push(("Every line is understood.".to_string(), Said::Quiet, 0));
-        lines.truncate(room.max(1));
-        return lines;
-    }
-    let left = room.saturating_sub(lines.len());
-    let shown = if notes.len() <= left.min(MAX_NOTES) { notes.len() } else { left.saturating_sub(1).min(MAX_NOTES) };
-    for n in &notes[..shown] {
-        let at = if n.line > 0 { format!("Line {}: ", n.line) } else { String::new() };
-        lines.push((format!("{at}{}", n.text), Said::Problem, n.line));
-    }
-    let more = notes.len() - shown;
-    if more > 0 {
-        let line = match (shown, more) {
-            (0, 1) => "Mistake in 1 line (marked in red).".to_string(),
-            (0, _) => format!("Mistakes in {more} lines (marked in red)."),
-            _ => format!("\u{2026}and {more} more."),
-        };
-        lines.push((line, if shown == 0 { Said::Problem } else { Said::Quiet }, 0));
-    }
-    // (A window too short for even one problem: the problems before the built-in line.)
-    if lines.len() > room.max(1) {
-        lines.drain(..lines.len() - room.max(1));
-    }
-    lines
-}
-
 /// The paint a typed value makes in colour `key`'s place (names followed in the standard skins).
 #[cfg(test)]
 fn typed_paint(key: &str, typed: &str) -> Option<Paint> {
@@ -1312,6 +1799,7 @@ fn slide_value(s: Slide, t: &Theme) -> f32 {
         Slide::Down => t.wallpaper_at_y.unwrap_or_else(|| default_down(t.wallpaper_fit)) * 100.0,
         Slide::Blur => t.wallpaper_blur as f32,
         Slide::Fade => t.wallpaper_fade * 100.0,
+        Slide::Panels => t.wallpaper_panels * 100.0,
     };
     let (_, min, max, ..) = slide_spec(s);
     v.round().clamp(min, max)
@@ -1382,6 +1870,7 @@ fn slide_default(s: Slide, t: &Theme) -> f32 {
         Slide::Across => 50.0,
         Slide::Down => default_down(t.wallpaper_fit) * 100.0,
         Slide::Zoom | Slide::Blur | Slide::Fade => 0.0,
+        Slide::Panels => 50.0,
     }
 }
 
@@ -1616,7 +2105,6 @@ impl SkinWindow {
     pub fn apply_theme(&mut self, theme: &Theme) {
         self.renderer.set_font(&theme.font, 1.0);
         self.renderer.set_title_font(&theme.title_font);
-        self.code.forget_font();
         self.layout_dirty = true;
         self.bar = kit::Bar::of(theme);
         self.edit_at = None;
@@ -1715,10 +2203,87 @@ impl SkinWindow {
 
     // ------------------------------------------------------------ layout
 
-    /// The list of skins (its visible part, on screen).
+    /// The sizes of the window's layout.
+    fn m(&self) -> Metrics {
+        Metrics::of(self.layout)
+    }
+
+    /// Another layout (the SkinsWindow setting changed): laid out again, then docked again at its
+    /// width (once this message is done).
+    fn set_layout(&mut self, layout: Layout) {
+        self.layout = layout;
+        MIN_WIDTH.with(|w| w.set(Metrics::of(layout).min_width));
+        self.layout_dirty = true;
+        self.edit_at = None;
+        self.list.jump_to(0.0);
+        self.page.jump_to(0.0);
+        if matches!(self.focus, Spot::Button(_) | Spot::Fold(_) | Spot::Ctl(Ctl::Search, _)) {
+            self.focus = Spot::List;
+        }
+        // SAFETY: posting to our own window.
+        unsafe {
+            let _ = PostMessageW(Some(self.hwnd), WM_APP_DOCK, WPARAM(0), LPARAM(0));
+        }
+    }
+
+    /// The list of skins (its visible part, on screen; none in one column).
     fn list_rect(&self) -> Rect {
-        let buttons = 5.0 * ksize::BUTTON_H + 4.0 * BUTTON_GAP + 2.0 * BUTTONS_PAD;
-        Rect::new(0.0, size::TITLE_H, LIST_W, (self.size.1 - size::TITLE_H - buttons).max(0.0))
+        let buttons = match self.layout {
+            Layout::Wide => 5.0 * ksize::BUTTON_H + 4.0 * BUTTON_GAP + 2.0 * BUTTONS_PAD,
+            Layout::Slim => 8.0 + 2.0 * ICON + 2.0 + 8.0,
+            Layout::Compact => return Rect::new(0.0, size::TITLE_H, 0.0, 0.0),
+        };
+        Rect::new(0.0, size::TITLE_H, self.m().list_w, (self.size.1 - size::TITLE_H - buttons).max(0.0))
+    }
+
+    /// One column: the skin drop-down at the top (renaming puts the name's box over it).
+    fn skin_box(&self) -> Rect {
+        Rect::new(12.0, size::TITLE_H + 4.0, (self.size.0 - 24.0 - 3.0 * (ICON + 6.0)).max(60.0), 28.0)
+    }
+
+    /// A small icon button: undo, redo and the menu right of the skin drop-down (one column), or
+    /// the nine under the list, five to a line (slim).
+    fn icon_rect(&self, b: Btn) -> Rect {
+        if self.layout == Layout::Slim {
+            let n = ICONS.iter().position(|(x, _)| *x == b).unwrap_or(0);
+            let (col, row) = ((n % 5) as f32, (n / 5) as f32);
+            let top = self.size.1 - 8.0 - 2.0 * ICON - 2.0;
+            return Rect::new(8.0 + col * (ICON + 1.0), top + row * (ICON + 2.0), ICON, ICON);
+        }
+        let n = match b {
+            Btn::Undo => 0.0,
+            Btn::Redo => 1.0,
+            _ => 2.0,
+        };
+        let s = self.skin_box();
+        Rect::new(s.right() + 6.0 + n * (ICON + 6.0), s.y + 1.0, ICON, ICON)
+    }
+
+    /// The search for any setting at the top (the smaller layouts; the wide one's is a row).
+    fn search_rect(&self) -> Rect {
+        let h = self.header_rect();
+        match self.layout {
+            Layout::Slim => Rect::new(h.right() - 16.0 - 190.0, h.y + 13.0, 190.0, 26.0),
+            _ => Rect::new(12.0, size::TITLE_H + 40.0, (h.right() - 12.0 - 12.0).max(60.0), 26.0),
+        }
+    }
+
+    /// Whether a button can be used now.
+    fn button_on(&self, b: Btn, app: &AppState) -> bool {
+        let entry = app.skins.find(&app.settings.skin);
+        match b {
+            Btn::Rename | Btn::Delete => entry.is_some_and(|e| !e.built_in()),
+            Btn::Duplicate | Btn::Export => entry.is_some(),
+            Btn::Undo => self.can_undo(app, false),
+            Btn::Redo => self.can_undo(app, true),
+            _ => true,
+        }
+    }
+
+    fn button_look(&self, b: Btn, app: &AppState) -> Look {
+        let me = Hot::Button(b);
+        let focused = self.cues && if b == Btn::Skin { self.focus == Spot::List } else { self.focus == Spot::Button(b) };
+        Look { hover: self.hover == Some(me), pressed: self.pressed == Some(me) && self.hover == Some(me), focused, enabled: self.button_on(b, app) }
     }
 
     fn button_rect(&self, b: Btn) -> Rect {
@@ -1734,7 +2299,7 @@ impl SkinWindow {
             Btn::Delete => (2, 1, false),
             Btn::Import => (3, 0, false),
             Btn::Export => (3, 1, false),
-            Btn::Folder => (4, 0, true),
+            Btn::Folder | Btn::Skin | Btn::More => (4, 0, true),
         };
         let y = list.bottom() + BUTTONS_PAD + row as f32 * (ksize::BUTTON_H + BUTTON_GAP);
         let x = BUTTONS_PAD + col as f32 * (half + BUTTON_GAP);
@@ -1745,20 +2310,17 @@ impl SkinWindow {
         Rect::new(self.size.0 - ksize::CLOSE_W, 0.0, ksize::CLOSE_W, size::TITLE_H)
     }
 
-    /// The right side's top: the skin's name, notes and "Show as text".
+    /// The right side's top (one column: the whole top): the skin's name and notes.
     fn header_rect(&self) -> Rect {
-        Rect::new(LIST_W, size::TITLE_H, (self.size.0 - LIST_W).max(0.0), HEADER_H)
+        let m = self.m();
+        Rect::new(m.list_w, size::TITLE_H, (self.size.0 - m.list_w).max(0.0), m.header_h)
     }
 
-    fn advanced_rect(&self) -> Rect {
-        let h = self.header_rect();
-        Rect::new(h.right() - PAD_X - ksize::TOGGLE_W, h.y + 22.0, ksize::TOGGLE_W, ksize::TOGGLE_H)
-    }
-
-    /// The scrolling controls (or the skin's text) under the header.
+    /// The scrolling controls under the header.
     fn page_rect(&self) -> Rect {
-        let top = size::TITLE_H + HEADER_H;
-        Rect::new(LIST_W, top, (self.size.0 - LIST_W).max(0.0), (self.size.1 - top).max(0.0))
+        let m = self.m();
+        let top = size::TITLE_H + m.header_h;
+        Rect::new(m.list_w, top, (self.size.0 - m.list_w).max(0.0), (self.size.1 - top).max(0.0))
     }
 
     fn list_track(&self) -> Rect {
@@ -1767,18 +2329,6 @@ impl SkinWindow {
 
     fn page_track(&self) -> Rect {
         self.bar.track(self.page_rect())
-    }
-
-    /// The skin's text box (on screen), while "Show as text" is on.
-    fn text_rect(&self) -> Rect {
-        let p = self.page_rect();
-        Rect::new(p.x + PAD_X, p.y + 4.0, (p.w - 2.0 * PAD_X).max(80.0), (p.h - self.notes_h - 16.0 - self.guide_h).max(60.0))
-    }
-
-    /// GUIDE, at the right of the line under the skin's text.
-    fn guide_button(&self) -> Rect {
-        let t = self.text_rect();
-        Rect::new(t.right() - GUIDE_W, t.bottom() + self.guide_h + 8.0, GUIDE_W, 26.0)
     }
 
     /// A list item on screen.
@@ -1793,29 +2343,39 @@ impl SkinWindow {
 
     /// Where a control's parts are, in page coordinates.
     fn part_rect(&self, row: &Row, part: Part) -> Option<Rect> {
-        let right = row.rect.right() - ROW_PAD_X;
+        let m = self.m();
+        let wide = self.layout == Layout::Wide;
+        let right = row.rect.right() - m.row_pad;
         let mid = |h: f32| row.rect.y + ((row.rect.h - h) / 2.0).round();
         match (row.ctl, part) {
-            (Ctl::Colour(_), Part::Hex) => Some(Rect::new(right - HEX_W, mid(ksize::FIELD_H), HEX_W, ksize::FIELD_H)),
-            (Ctl::Colour(_), Part::Main) => Some(Rect::new(right - HEX_W - 10.0 - SWATCH, mid(SWATCH), SWATCH, SWATCH)),
-            (Ctl::Colour(_), Part::Clear) => Some(Rect::new(right - HEX_W - 10.0 - SWATCH - 8.0 - NONE_W, mid(ksize::FIELD_H), NONE_W, ksize::FIELD_H)),
-            (Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Era | Ctl::Icons | Ctl::Logo | Ctl::Fit, Part::Main) => {
-                Some(Rect::new(right - DROPDOWN_W, mid(ksize::FIELD_H), DROPDOWN_W, ksize::FIELD_H))
+            // A colour: NONE, the swatch and its box - or, smaller, the swatch, its box and a small x.
+            (Ctl::Colour(_), Part::Hex) if wide => Some(Rect::new(right - m.hex_w, mid(m.hex_h), m.hex_w, m.hex_h)),
+            (Ctl::Colour(_), Part::Main) if wide => Some(Rect::new(right - m.hex_w - 10.0 - m.swatch, mid(m.swatch), m.swatch, m.swatch)),
+            (Ctl::Colour(_), Part::Clear) if wide => Some(Rect::new(right - m.hex_w - 10.0 - m.swatch - 8.0 - m.clear_w, mid(m.clear_h), m.clear_w, m.clear_h)),
+            (Ctl::Colour(_), Part::Clear) => Some(Rect::new(right - m.clear_w, mid(m.clear_h), m.clear_w, m.clear_h)),
+            (Ctl::Colour(_), Part::Hex) => Some(Rect::new(right - m.clear_w - 2.0 - m.hex_w, mid(m.hex_h), m.hex_w, m.hex_h)),
+            (Ctl::Colour(_), Part::Main) => Some(Rect::new(right - m.clear_w - 2.0 - m.hex_w - 6.0 - m.swatch, mid(m.swatch), m.swatch, m.swatch)),
+            (Ctl::Part(p), Part::Main) if crate::parts::is_flag(p) => Some(Rect::new(right - m.toggle_w, mid(m.toggle_h), m.toggle_w, m.toggle_h)),
+            (Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::RowEdge | Ctl::SidebarEdge | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Era | Ctl::Icons | Ctl::Logo | Ctl::Fit | Ctl::Area | Ctl::Part(_) | Ctl::Font | Ctl::SidebarRow | Ctl::ScrollWidth, Part::Main) => {
+                Some(Rect::new(right - m.dropdown_w, mid(m.field_h), m.dropdown_w, m.field_h))
             }
-            (Ctl::LogoText, Part::Main) => Some(Rect::new(right - LOGO_FIELD_W, mid(ksize::FIELD_H), LOGO_FIELD_W, ksize::FIELD_H)),
-            (Ctl::Search, Part::Main) => Some(Rect::new(right - SEARCH_W, mid(ksize::FIELD_H), SEARCH_W, ksize::FIELD_H)),
-            // The wallpaper: NONE, BROWSE… and its name.
-            (Ctl::Picture, Part::Hex) => Some(Rect::new(right - HEX_W, mid(ksize::FIELD_H), HEX_W, ksize::FIELD_H)),
-            (Ctl::Picture, Part::Main) => Some(Rect::new(right - HEX_W - 8.0 - BROWSE_W, mid(ksize::FIELD_H), BROWSE_W, ksize::FIELD_H)),
-            (Ctl::Picture, Part::Clear) => Some(Rect::new(right - HEX_W - 8.0 - BROWSE_W - 8.0 - NONE_W, mid(ksize::FIELD_H), NONE_W, ksize::FIELD_H)),
+            (Ctl::LogoText, Part::Main) => Some(Rect::new(right - m.logo_w, mid(m.field_h), m.logo_w, m.field_h)),
+            (Ctl::Search, Part::Main) => Some(Rect::new(right - SEARCH_W, mid(m.field_h), SEARCH_W, m.field_h)),
+            // The wallpaper: NONE, BROWSE… and its name - or, smaller, BROWSE…, its name and a small x.
+            (Ctl::Picture, Part::Hex) if wide => Some(Rect::new(right - m.picture_w, mid(m.field_h), m.picture_w, m.field_h)),
+            (Ctl::Picture, Part::Main) if wide => Some(Rect::new(right - m.picture_w - 8.0 - m.browse_w, mid(m.field_h), m.browse_w, m.field_h)),
+            (Ctl::Picture, Part::Clear) if wide => Some(Rect::new(right - m.picture_w - 8.0 - m.browse_w - 8.0 - m.clear_w, mid(m.field_h), m.clear_w, m.field_h)),
+            (Ctl::Picture, Part::Clear) => Some(Rect::new(right - m.clear_w, mid(m.clear_h), m.clear_w, m.clear_h)),
+            (Ctl::Picture, Part::Hex) => Some(Rect::new(right - m.clear_w - 2.0 - m.picture_w, mid(m.field_h), m.picture_w, m.field_h)),
+            (Ctl::Picture, Part::Main) => Some(Rect::new(right - m.clear_w - 2.0 - m.picture_w - 6.0 - m.browse_w, mid(m.field_h), m.browse_w, m.field_h)),
             // A slider, then its number.
-            (Ctl::Slide(_), Part::Main) => Some(Rect::new(right - VALUE_W - VALUE_GAP - SLIDER_W, mid(ksize::FIELD_H), SLIDER_W, ksize::FIELD_H)),
-            (Ctl::Slide(_), Part::Hex) => Some(Rect::new(right - VALUE_W, mid(ksize::FIELD_H), VALUE_W, ksize::FIELD_H)),
+            (Ctl::Slide(_), Part::Main) => Some(Rect::new(right - m.value_w - m.value_gap - m.slider_w, mid(m.field_h), m.slider_w, m.field_h)),
+            (Ctl::Slide(_), Part::Hex) => Some(Rect::new(right - m.value_w, mid(m.value_h), m.value_w, m.value_h)),
             // Position: the pad, then the 3x3 squares (the sliders under it say the numbers).
             (Ctl::Place, Part::Main) => {
                 let grid = 3.0 * GRID_CELL + 2.0 * GRID_GAP;
                 let w = self.pad_w();
-                Some(Rect::new(right - grid - 22.0 - w, mid(PAD_H), w, PAD_H))
+                Some(Rect::new(right - grid - 22.0 - w, mid(m.pad_h), w, m.pad_h))
             }
             (Ctl::Place, Part::Grid(i)) => {
                 let grid = 3.0 * GRID_CELL + 2.0 * GRID_GAP;
@@ -1828,11 +2388,11 @@ impl SkinWindow {
                 let n = self.thumb_count(row);
                 let i = i as usize;
                 (i < n).then(|| {
-                    let x0 = right - n as f32 * THUMB_W - (n as f32 - 1.0) * THUMB_GAP;
-                    Rect::new(x0 + i as f32 * (THUMB_W + THUMB_GAP), mid(THUMB_H), THUMB_W, THUMB_H)
+                    let x0 = right - n as f32 * m.thumb_w - (n as f32 - 1.0) * THUMB_GAP;
+                    Rect::new(x0 + i as f32 * (m.thumb_w + THUMB_GAP), mid(m.thumb_h), m.thumb_w, m.thumb_h)
                 })
             }
-            (Ctl::Dark | Ctl::Grip, Part::Main) => Some(Rect::new(right - ksize::TOGGLE_W, mid(ksize::TOGGLE_H), ksize::TOGGLE_W, ksize::TOGGLE_H)),
+            (Ctl::Dark | Ctl::Grip, Part::Main) => Some(Rect::new(right - m.toggle_w, mid(m.toggle_h), m.toggle_w, m.toggle_h)),
             _ => None,
         }
     }
@@ -1840,19 +2400,20 @@ impl SkinWindow {
     /// The pad's width: the file list's shape at PAD_H tall.
     fn pad_w(&self) -> f32 {
         let (w, h) = self.list_size;
-        (PAD_H * w / h.max(1.0)).clamp(PAD_MIN_W, PAD_MAX_W)
+        let m = self.m();
+        (m.pad_h * w / h.max(1.0)).clamp(PAD_MIN_W.min(m.pad_max_w), m.pad_max_w)
     }
 
     /// The main window's file list, roughly: its window less the sidebar, the bars at the top and
-    /// the status bar.
-    fn read_list_size(&mut self) {
+    /// the status bar (`whole`: the wallpaper's laid out over the whole window: that).
+    fn read_list_size(&mut self, whole: bool) {
         let mut rc = RECT::default();
         // SAFETY: plain queries on our owner window with a valid out-struct.
         let ok = unsafe { GetWindow(self.hwnd, GW_OWNER).is_ok_and(|o| GetClientRect(o, &mut rc).is_ok()) };
         if ok && rc.right > rc.left && rc.bottom > rc.top {
             let s = self.scale();
             let (w, h) = ((rc.right - rc.left) as f32 / s, (rc.bottom - rc.top) as f32 / s);
-            self.list_size = ((w - 230.0).max(200.0), (h - 120.0).max(150.0));
+            self.list_size = if whole { (w.max(200.0), h.max(150.0)) } else { ((w - 230.0).max(200.0), (h - 120.0).max(150.0)) };
         }
     }
 
@@ -1875,7 +2436,8 @@ impl SkinWindow {
 
     /// How many of the pictures next to the skin fit in their row.
     fn thumb_count(&self, row: &Row) -> usize {
-        let room = ((row.rect.w - 2.0 * ROW_PAD_X - 140.0 + THUMB_GAP) / (THUMB_W + THUMB_GAP)).floor().max(0.0) as usize;
+        let m = self.m();
+        let room = ((row.rect.w - 2.0 * m.row_pad - m.thumbs_title + THUMB_GAP) / (m.thumb_w + THUMB_GAP)).floor().max(0.0) as usize;
         self.thumbs.len().min(room)
     }
 
@@ -1892,36 +2454,73 @@ impl SkinWindow {
     fn layout(&mut self, app: &AppState) {
         self.layout_dirty = false;
         self.refresh_colours(app);
-        // The list: the built-in skins, then the person's own.
+        let m = self.m();
+        // The list: the built-in skins, then the person's own (one column has no list, but the
+        // keyboard and the skins' drop-down go by these).
         let mut items = Vec::new();
-        let mut y = 6.0 + GROUP_H;
+        let mut y = m.list_top + m.group_h;
         let entries = app.skins.entries();
         for e in entries.iter().filter(|e| e.built_in()) {
-            items.push(Item { id: e.id.clone(), name: app.skins.shown_name(e), rect: Rect::new(0.0, y, LIST_W, ITEM_H) });
-            y += ITEM_H;
+            items.push(Item { id: e.id.clone(), name: app.skins.shown_name(e), rect: Rect::new(0.0, y, m.list_w, m.item_h) });
+            y += m.item_h;
         }
-        y += 10.0 + GROUP_H;
+        y += m.group_gap + m.group_h;
         let own_top = y;
         for e in entries.iter().filter(|e| !e.built_in()) {
-            items.push(Item { id: e.id.clone(), name: app.skins.shown_name(e), rect: Rect::new(0.0, y, LIST_W, ITEM_H) });
-            y += ITEM_H;
+            items.push(Item { id: e.id.clone(), name: app.skins.shown_name(e), rect: Rect::new(0.0, y, m.list_w, m.item_h) });
+            y += m.item_h;
         }
         if y == own_top {
-            y += ITEM_H; // room for "None yet"
+            y += m.item_h; // room for "None yet"
         }
         self.items = items;
-        self.list.set_extent(y + 10.0, self.list_rect().h);
+        self.list.set_page(y, 10.0, self.list_rect().h);
 
         // The controls: shapes, style, then the colours in groups.
         let page = self.page_rect();
-        let card_w = (page.w - 2.0 * PAD_X - GUTTER).clamp(300.0, MAX_CARD_W);
-        let x0 = page.x + PAD_X;
+        let card_w = (page.w - 2.0 * m.pad_x - m.gutter).clamp(m.min_card_w, MAX_CARD_W);
+        let x0 = page.x + m.pad_x;
+        let layout = self.layout;
+        // The wide layout's search finds colours (it's a row there); the others' finds any setting
+        // (by its title or its section's), and shows every section with something found, open.
+        let typed = self.colour_search.trim().to_lowercase();
+        let folded = if typed.is_empty() { self.folded.clone() } else { Vec::new() };
+        let hints: Vec<String> = self.colours.iter().map(|c| c.hint.clone()).collect();
+        let (title_style, note_style) = (TextStyle::new(Color::hex(0)), TextStyle::new(Color::hex(0)).size(ksize::NOTE_FONT));
+        let renderer = &mut self.renderer;
         let mut blocks = Vec::new();
         let mut rows = Vec::new();
-        let mut y = 10.0;
-        let card = |title: &'static str, ctls: &[(Ctl, &'static str, &'static str)], y: &mut f32, blocks: &mut Vec<Block>, rows: &mut Vec<Row>| {
-            blocks.push(Block::Heading(Rect::new(x0 + 1.0, *y, card_w, HEADING_H), title));
-            *y += HEADING_H + 6.0;
+        let mut y = m.first_y;
+        let mut card = |title: &'static str, ctls: &[(Ctl, &'static str, &'static str)], y: &mut f32, blocks: &mut Vec<Block>, rows: &mut Vec<Row>| {
+            let ctls: Vec<_> = ctls
+                .iter()
+                .copied()
+                .filter(|(c, t, _)| {
+                    typed.is_empty()
+                        || *c == Ctl::Search
+                        || found_by(title, &typed)
+                        || found_by(t, &typed)
+                        // (a colour also by its whole name and its name in the skin's text, a
+                        // part by its name there: "hover" finds every hover colour)
+                        || matches!(c, Ctl::Colour(i) if COLOURS.get(*i).is_some_and(|(key, full)| found_by(full, &typed) || found_by(key, &typed)))
+                        || matches!(c, Ctl::Part(p) if found_by(crate::parts::SPECS[*p as usize].key, &typed))
+                })
+                .collect();
+            if ctls.is_empty() {
+                return;
+            }
+            if title != "Search" {
+                // Its heading folds it (the wide layout's search card stays open).
+                let open = !folded.contains(&title);
+                blocks.push(Block::Fold(Rect::new(x0, *y, card_w, m.heading_h), title, open));
+                if !open {
+                    *y += m.heading_h + m.card_gap;
+                    return;
+                }
+            } else {
+                blocks.push(Block::Heading(Rect::new(x0 + 1.0, *y, card_w, m.heading_h), title));
+            }
+            *y += m.heading_h + m.heading_gap;
             let top = *y;
             // The card goes under its rows' lines (drawn first).
             let at = blocks.len();
@@ -1929,72 +2528,49 @@ impl SkinWindow {
                 if i > 0 {
                     blocks.push(Block::Line(Rect::new(x0 + 1.0, *y, card_w - 2.0, 1.0)));
                 }
+                // The smaller layouts put a note after its title when both fit on the line.
+                let inline = layout != Layout::Wide && !n.is_empty() && !matches!(ctl, Ctl::Place | Ctl::Thumbs) && {
+                    let note = match ctl {
+                        Ctl::Colour(c) if *n == FOLLOWS => hints.get(*c).map_or("", String::as_str),
+                        _ => n,
+                    };
+                    let room = card_w - 2.0 * m.row_pad - controls_w(&m, *ctl) - 8.0;
+                    renderer.measure(t, &title_style) + 8.0 + renderer.measure(note, &note_style) <= room
+                };
                 let h = match ctl {
-                    Ctl::Place => PLACE_H,
-                    Ctl::Thumbs => THUMBS_H,
-                    _ if n.is_empty() => ROW_H,
-                    _ => ROW_NOTE_H,
+                    Ctl::Place => m.place_h,
+                    Ctl::Thumbs => m.thumbs_h,
+                    _ if n.is_empty() || inline => m.row_h,
+                    _ => m.row_note_h,
                 };
                 rows.push(Row { ctl: *ctl, rect: Rect::new(x0, *y, card_w, h), title: t, note: n });
                 *y += h;
             }
             blocks.insert(at, Block::Card(Rect::new(x0, top, card_w, *y - top)));
-            *y += 18.0;
+            *y += m.card_gap;
         };
-        // A colour that follows another says which under its title (FOLLOWS stands for that).
-        let colours: Vec<(Ctl, &'static str, &'static str)> =
-            COLOURS.iter().zip(&self.colours).enumerate().map(|(i, ((_, t), c))| (Ctl::Colour(i), *t, if c.hint.is_empty() { "" } else { FOLLOWS })).collect();
-        let shapes = [
-            (Ctl::Shape, "Button shape", ""),
-            (Ctl::Slant, "Slant", ""),
-            (Ctl::RowHeight, "Row height", ""),
-            (Ctl::FontSize, "Text size", ""),
-            (Ctl::TabLine, "Tab line width", ""),
-            (Ctl::ToolbarLine, "Toolbar line width", ""),
-            (Ctl::Logo, "Logo", "For every skin"),
-            (Ctl::LogoText, "Logo text", ""),
-            (Ctl::Dark, "Dark skin", ""),
-        ];
-        card("Shapes and text", &shapes, &mut y, &mut blocks, &mut rows);
-        let style = [
-            (Ctl::Buttons, "Buttons", ""),
-            (Ctl::Caption, "Window buttons", ""),
-            (Ctl::Tabs, "Tabs", ""),
-            (Ctl::Sidebar, "Sidebar", ""),
-            (Ctl::Grip, "Scroll bar grip", ""),
-            (Ctl::Era, "Older Windows", ""),
-            (Ctl::Icons, "Icons", ""),
-        ];
-        card("Style", &style, &mut y, &mut blocks, &mut rows);
-        let wallpaper = [
-            (Ctl::Picture, "Picture", ""),
-            (Ctl::Thumbs, "Nearby", ""),
-            (Ctl::Fit, "Fit", ""),
-            (Ctl::Place, "Position", "Drag the picture"),
-            (Ctl::Slide(Slide::Across), "Across (X)", ""),
-            (Ctl::Slide(Slide::Down), "Down (Y)", ""),
-            (Ctl::Slide(Slide::Opacity), "Opacity", ""),
-            (Ctl::Slide(Slide::Zoom), "Zoom", ""),
-            (Ctl::Slide(Slide::Blur), "Blur", ""),
-            (Ctl::Slide(Slide::Fade), "Soft edges", ""),
-        ];
-        card("Wallpaper", &wallpaper, &mut y, &mut blocks, &mut rows);
-        // The search, then the colours whose name has what it says (a group with none is left out).
-        card("Colours", &[(Ctl::Search, "Search", "")], &mut y, &mut blocks, &mut rows);
-        let mut from = 0;
-        for (title, n) in COLOUR_GROUPS {
-            let found: Vec<_> = colours[from..from + n].iter().copied().filter(|(_, t, _)| found_by(t, &self.colour_search)).collect();
-            if !found.is_empty() {
-                card(title, &found, &mut y, &mut blocks, &mut rows);
-            }
-            from += n;
+        // One card for each part of the window, top to bottom (`cards`).
+        if layout == Layout::Wide {
+            card("Search", &[(Ctl::Search, "Find", "")], &mut y, &mut blocks, &mut rows);
         }
+        let cards = cards(&hints);
+        for (title, ctls) in &cards {
+            card(title, ctls, &mut y, &mut blocks, &mut rows);
+        }
+        // Scrolls only when the cards don't fit (`y` has the gap for a next card in it).
+        let end = blocks.iter().map(Block::rect).chain(rows.iter().map(|r| r.rect)).map(|r| r.bottom()).fold(0.0, f32::max);
         self.rows = rows;
         self.blocks = blocks;
-        self.page.set_extent(y + 18.0, page.h);
-        // The keyboard can't stay on a control that's gone.
+        self.page.set_page(end, 36.0, page.h);
+        // The keyboard can't stay on a control that's gone (the smaller layouts' search is at the top).
         if let Spot::Ctl(c, _) = self.focus {
-            if self.advanced || !self.rows.iter().any(|r| r.ctl == c) {
+            let top = c == Ctl::Search && layout != Layout::Wide;
+            if !top && !self.rows.iter().any(|r| r.ctl == c) {
+                self.focus = Spot::List;
+            }
+        }
+        if let Spot::Fold(t) = self.focus {
+            if !self.blocks.iter().any(|b| matches!(b, Block::Fold(_, f, _) if *f == t)) {
                 self.focus = Spot::List;
             }
         }
@@ -2003,22 +2579,24 @@ impl SkinWindow {
     // ------------------------------------------------------------ painting
 
     fn paint(&mut self, app: &mut AppState) {
+        if app.settings.skins_window != self.layout {
+            // (Typing in a box ends: its place is gone.)
+            let _ = self.end_editing(app, true);
+            self.set_layout(app.settings.skins_window);
+        }
         let seen = (app.skins.generation, app.theme_generation, app.settings.skin.clone());
         if seen != self.seen {
             self.seen = seen;
             self.layout_dirty = true;
-            self.sync_text(app);
         }
         if self.layout_dirty {
             self.layout(app);
         }
-        if !self.advanced {
-            self.read_pictures(app);
-            let was = self.pad_w();
-            self.read_list_size();
-            if (self.pad_w() - was).abs() > 0.5 {
-                self.edit_at = None;
-            }
+        self.read_pictures(app);
+        let was = self.pad_w();
+        self.read_list_size(matches!(app.theme.wallpaper_area, WallpaperArea::WindowSized | WallpaperArea::Window));
+        if (self.pad_w() - was).abs() > 0.5 {
+            self.edit_at = None;
         }
         let now = self.now();
         let mut more = self.list.tick(now) | self.page.tick(now) | self.flips.tick(now) || now < self.repaint_until;
@@ -2038,19 +2616,14 @@ impl SkinWindow {
         let below = Rect::new(0.0, size::TITLE_H, self.size.0, (self.size.1 - size::TITLE_H).max(0.0));
         self.renderer.fill_paint(below, 0.0, &theme.sidebar_paint);
         let list = self.list_rect();
-        kit::page_list_well(&mut self.renderer, &theme, list);
+        if list.w > 0.0 {
+            kit::page_list_well(&mut self.renderer, &theme, list);
+        }
         self.paint_caption(&theme);
         self.paint_list(&theme, app);
         self.paint_header(&theme, app);
-        if self.advanced {
-            self.paint_code(&theme, app);
-            self.paint_notes(&theme, app);
-        } else {
-            self.paint_page(&theme, app);
-        }
-        if self.advanced && self.asking.is_none() {
-            self.code.paint_list(&mut self.renderer, &theme);
-        }
+        self.paint_page(&theme, app);
+        self.paint_tip(&theme);
         if let Some((id, skin_id)) = &self.asking {
             let name = app.skins.find(skin_id).map_or_else(|| skin_id.clone(), |e| e.name.clone());
             let area = Rect::new(0.0, size::TITLE_H, self.size.0, (self.size.1 - size::TITLE_H).max(0.0));
@@ -2089,17 +2662,22 @@ impl SkinWindow {
     }
 
     fn paint_list(&mut self, theme: &Theme, app: &AppState) {
+        if self.layout == Layout::Compact {
+            return;
+        }
+        let m = self.m();
         let list = self.list_rect();
         let dy = list.y - self.list.offset;
         self.renderer.push_clip(list);
-        let heading = TextStyle::new(if theme.era.old() { theme.sidebar_text } else { theme.muted }).size(ksize::NOTE_FONT).semibold();
-        self.renderer.text("DEFAULT", Rect::new(18.0, 6.0 + dy, LIST_W - 26.0, GROUP_H), &heading);
-        let own_heading_y = self.items.iter().filter(|i| !i.id.starts_with(skin::FILE_PREFIX)).map(|i| i.rect.bottom()).fold(6.0 + GROUP_H, f32::max) + 10.0;
-        self.renderer.text("YOUR SKINS", Rect::new(18.0, own_heading_y + dy, LIST_W - 26.0, GROUP_H), &heading);
+        let heading = TextStyle::new(if theme.era.old() { theme.sidebar_text } else { theme.muted }).size(m.group_font).semibold();
+        let (hx, hw) = (m.item_x, m.list_w - m.item_x - 8.0);
+        self.renderer.text("DEFAULT", Rect::new(hx, m.list_top + dy, hw, m.group_text_h), &heading);
+        let own_heading_y = self.items.iter().filter(|i| !i.id.starts_with(skin::FILE_PREFIX)).map(|i| i.rect.bottom()).fold(m.list_top + m.group_h, f32::max) + m.group_gap;
+        self.renderer.text("YOUR SKINS", Rect::new(hx, own_heading_y + dy, hw, m.group_text_h), &heading);
         if !self.items.iter().any(|i| i.id.starts_with(skin::FILE_PREFIX)) {
             let style = TextStyle::new(theme.muted.with_alpha(0.8)).size(ksize::NOTE_FONT);
-            let y = own_heading_y + GROUP_H + dy;
-            self.renderer.text("None yet", Rect::new(18.0, y, LIST_W - 26.0, NOTE_LINE), &style);
+            let y = own_heading_y + m.group_h + dy;
+            self.renderer.text("None yet", Rect::new(hx, y, hw, NOTE_LINE), &style);
         }
         for (i, item) in self.items.iter().enumerate() {
             let rect = Rect::new(item.rect.x, item.rect.y + dy, item.rect.w, item.rect.h);
@@ -2117,43 +2695,52 @@ impl SkinWindow {
                 }
                 continue;
             }
-            kit::nav_item(&mut self.renderer, theme, rect, &name, selected, look);
+            kit::nav_item_inset(&mut self.renderer, theme, rect, &name, selected, look, m.item_x);
         }
         self.renderer.pop_clip();
         let hover = matches!(self.hover, Some(Hot::ListThumb)) || matches!(self.drag, Some((Hot::ListThumb, _)));
         let track = self.list_track();
         kit::scrollbar(&mut self.renderer, theme, track, &self.list, hover, self.holding.hold_of(0));
-        // The buttons.
-        let own = app.skins.find(&app.settings.skin).is_some_and(|e| !e.built_in());
-        let exists = app.skins.find(&app.settings.skin).is_some();
+        // The buttons (slim: small icons).
+        if self.layout == Layout::Slim {
+            for (b, _) in ICONS {
+                let (rect, look) = (self.icon_rect(b), self.button_look(b, app));
+                icon_button(&mut self.renderer, theme, rect, glyph_of(b), look);
+            }
+            return;
+        }
         for (b, label) in BUTTONS {
-            let enabled = match b {
-                Btn::Rename | Btn::Delete => own,
-                Btn::Duplicate | Btn::Export => exists,
-                Btn::Undo => self.can_undo(app, false),
-                Btn::Redo => self.can_undo(app, true),
-                _ => true,
-            };
-            let me = Hot::Button(b);
-            let look = Look { hover: self.hover == Some(me), pressed: self.pressed == Some(me) && self.hover == Some(me), focused: self.cues && self.focus == Spot::Button(b), enabled };
-            let rect = self.button_rect(b);
+            let (rect, look) = (self.button_rect(b), self.button_look(b, app));
             kit::button(&mut self.renderer, theme, rect, label, look);
         }
     }
 
+    /// Slim: the name of the icon button under the mouse, in a small box over it (on top of all).
+    fn paint_tip(&mut self, theme: &Theme) {
+        let Some(Hot::Button(b)) = self.hover else { return };
+        let Some((_, name)) = ICONS.iter().find(|(x, _)| *x == b).filter(|_| self.layout == Layout::Slim && self.asking.is_none()) else { return };
+        let (at, top) = (self.icon_rect(b), self.icon_rect(ICONS[0].0).y - 6.0 - 22.0);
+        let r = &mut self.renderer;
+        let style = TextStyle::new(theme.text).size(ksize::NOTE_FONT);
+        let w = (r.measure(name, &style) + 14.0).ceil();
+        let x = at.x.min(self.size.0 - w - 4.0).max(4.0);
+        let tip = Rect::new(x, top, w, 22.0);
+        r.fill_rect(tip, theme.panel);
+        r.stroke_rect(tip, 1.0, theme.line);
+        r.text(name, tip, &style.align(Align::Center));
+    }
+
     fn paint_header(&mut self, theme: &Theme, app: &AppState) {
+        if self.layout != Layout::Wide {
+            return self.paint_top(theme, app);
+        }
         let right = Rect::new(LIST_W, size::TITLE_H, (self.size.0 - LIST_W).max(0.0), (self.size.1 - size::TITLE_H).max(0.0));
         self.renderer.fill_paint(right, 0.0, &theme.toolbar_paint);
         let h = self.header_rect();
         let x = h.x + PAD_X;
-        let w = (self.advanced_rect().x - 120.0 - x).max(60.0);
+        let w = (h.right() - PAD_X - 110.0 - x).max(60.0);
         let entry = app.skins.find(&app.settings.skin);
         let name = entry.map_or_else(|| app.settings.skin.clone(), |e| e.name.clone());
-        let t = self.advanced_rect();
-        let me = Hot::Advanced;
-        let look = Look { hover: self.hover == Some(me), pressed: self.pressed == Some(me), focused: self.cues && self.focus == Spot::Advanced, enabled: true };
-        let now = self.now();
-        let advanced = self.flips.at("text", self.advanced, now);
         let r = &mut self.renderer;
         kit::page_title(r, theme, Rect::new(x, h.y + 14.0, w, 30.0), &name);
         let note = match entry {
@@ -2179,114 +2766,71 @@ impl SkinWindow {
                 r.text(&text, Rect::new(x, line_y + n as f32 * NOTE_LINE, w + 110.0, NOTE_LINE), &style);
             }
         }
-        // "Show as text", and its switch.
-        let label = Rect::new(t.x - 110.0, t.y - 2.0, 102.0, t.h + 4.0);
-        r.text("Show as text", label, &TextStyle::new(theme.text).size(ksize::NOTE_FONT + 1.0).align(Align::Right));
-        kit::toggle(r, theme, t, advanced, look);
         r.fill_rect(Rect::new(h.x + PAD_X, h.bottom() - 1.0, (h.w - 2.0 * PAD_X).max(0.0), 1.0), theme.line);
     }
 
-    /// The skin's text, typed like code, and the guide under it (GUIDE).
-    fn paint_code(&mut self, theme: &Theme, app: &AppState) {
-        let width = (self.page_rect().w - 2.0 * PAD_X).max(80.0);
-        let (columns, column_w) = if self.guide { self.guide_lines(width) } else { (Vec::new(), width) };
-        let tallest = columns.iter().map(Vec::len).max().unwrap_or(0);
-        let page_h = self.page_rect().h;
-        self.guide_h = if tallest == 0 { 0.0 } else { (30.0 + tallest as f32 * GUIDE_LINE).min((page_h * 0.5).max(120.0)) };
-        self.notes = app.skins.notes(&app.settings.skin);
-        // The problems' list grows to show up to MAX_NOTES of them, while the text keeps room.
-        let built_in = app.skins.find(&app.settings.skin).is_some_and(Entry::built_in);
-        let wanted = note_lines(&self.notes, built_in, usize::MAX).len() as f32 * NOTE_LINE + 1.0;
-        let spare = page_h - self.guide_h - 16.0 - MIN_TEXT_H;
-        self.notes_h = wanted.min(spare).max(NOTES_H);
-        self.code.set_marks(self.notes.iter().filter(|n| n.line > 0).map(|n| Mark { line: n.line, text: n.text.clone() }).collect());
-        self.code.focused = self.focus == Spot::Text && self.active;
-        let t = self.text_rect();
-        let room = Rect::new(0.0, size::TITLE_H, self.size.0, (self.size.1 - size::TITLE_H).max(0.0));
-        self.code.paint(&mut self.renderer, theme, &SkinLang, t, room);
-        if self.guide_h > 0.0 {
-            let g = Rect::new(t.x, t.bottom() + 8.0, t.w, self.guide_h - 8.0);
-            let r = &mut self.renderer;
-            r.push_clip(g);
-            r.text("Guide", Rect::new(g.x, g.y, 100.0, 18.0), &TextStyle::new(theme.text).semibold());
-            let style = TextStyle::new(theme.muted).size(ksize::NOTE_FONT);
-            let cw = r.mono_char_width(GUIDE_MONO);
-            for (c, lines) in columns.iter().enumerate() {
-                let x0 = g.x + c as f32 * (column_w + GUIDE_GAP);
-                for (i, (line, example)) in lines.iter().enumerate() {
-                    let at = Rect::new(x0, g.y + 22.0 + i as f32 * GUIDE_LINE, column_w, GUIDE_LINE);
-                    if *example {
-                        // As in the text: the name in the accent colour, the note after // muted.
-                        let (code, note) = line.split_at(line.find("//").unwrap_or(line.len()));
-                        let (name, value) = code.split_at(code.find(':').map_or(0, |i| i + 1));
-                        r.mono_text(name, Rect::new(at.x + 8.0, at.y, at.w, at.h), GUIDE_MONO, theme.accent);
-                        let x = at.x + 8.0 + name.chars().count() as f32 * cw;
-                        r.mono_text(value, Rect::new(x, at.y, (at.right() - x).max(0.0), at.h), GUIDE_MONO, theme.text);
-                        if !note.is_empty() {
-                            let x = at.x + 8.0 + code.chars().count() as f32 * cw;
-                            r.mono_text(note, Rect::new(x, at.y, (at.right() - x).max(0.0), at.h), GUIDE_MONO, theme.muted);
-                        }
-                    } else {
-                        r.text(line, at, &style);
-                    }
-                }
+    /// The smaller layouts' top. One column: the skin's drop-down with undo, redo and the menu of
+    /// the rest beside it; under it the search for any setting; then one line of what just
+    /// happened. Slim: the skin's name over that line, and the search right of it.
+    fn paint_top(&mut self, theme: &Theme, app: &AppState) {
+        let m = self.m();
+        let compact = self.layout == Layout::Compact;
+        let page = self.page_rect();
+        // The page (slim: the whole right side) on the toolbar's colour, the rest on the sidebar's.
+        let fill = if compact { Rect::new(0.0, page.y, self.size.0, page.h) } else { Rect::new(m.list_w, size::TITLE_H, (self.size.0 - m.list_w).max(0.0), (self.size.1 - size::TITLE_H).max(0.0)) };
+        self.renderer.fill_paint(fill, 0.0, &theme.toolbar_paint);
+        let entry = app.skins.find(&app.settings.skin);
+        let name = entry.map_or_else(|| app.settings.skin.clone(), |e| e.name.clone());
+        let unsaved = app.skins.unsaved(&app.settings.skin) || self.save_due.iter().any(|id| id.eq_ignore_ascii_case(&app.settings.skin));
+        let name = if unsaved { format!("{name} \u{2022}") } else { name };
+        let note = match entry {
+            Some(e) if e.built_in() => "A default skin. Changes go into your own copy.",
+            Some(_) => "",
+            None => "Its file is missing, so AMD Radeon is shown.",
+        };
+        let (search, skin_box, header) = (self.search_rect(), self.skin_box(), self.header_rect());
+        let search_look = self.look_of(Ctl::Search, Part::Main, true);
+        let skin_look = Look { enabled: true, ..self.button_look(Btn::Skin, app) };
+        let icons: Vec<(Btn, Rect, Look)> = if compact { [Btn::Undo, Btn::Redo, Btn::More].iter().map(|b| (*b, self.icon_rect(*b), self.button_look(*b, app))).collect() } else { Vec::new() };
+        let editing_search = matches!(self.editing, Some(Editing::Search(_)));
+        let renaming = matches!(self.editing, Some(Editing::Rename(_)));
+        let line = if compact {
+            Rect::new(12.0, size::TITLE_H + 70.0, (self.size.0 - 24.0).max(0.0), 15.0)
+        } else {
+            let x = header.x + m.pad_x;
+            Rect::new(x, size::TITLE_H + 29.0, (search.x - 10.0 - x).max(40.0), 15.0)
+        };
+        let r = &mut self.renderer;
+        if compact {
+            if renaming {
+                // The name's box sits there.
+                kit::field(r, theme, skin_box, None, true, Look::enabled());
+            } else {
+                kit::dropdown(r, theme, skin_box, "", skin_look);
+                let at = Rect::new(skin_box.x + ksize::FIELD_PAD, skin_box.y, (skin_box.w - ksize::FIELD_PAD - ksize::ARROW_W).max(0.0), skin_box.h);
+                r.text(&name, at, &TextStyle::new(theme.text).semibold());
             }
-            r.pop_clip();
+            for (b, at, look) in &icons {
+                icon_button(r, theme, *at, glyph_of(*b), *look);
+            }
+        } else {
+            let x = header.x + m.pad_x;
+            r.text(&name, Rect::new(x, size::TITLE_H + 8.0, (search.x - 10.0 - x).max(40.0), 21.0), &TextStyle::new(theme.text_strong).size(16.0).semibold());
         }
-        let me = Hot::Guide;
-        let look = Look { hover: self.hover == Some(me), pressed: self.pressed == Some(me), focused: false, enabled: true };
-        let b = self.guide_button();
-        kit::button(&mut self.renderer, theme, b, if self.guide { "HIDE GUIDE" } else { "GUIDE" }, look);
-    }
-
-    /// The guide, in two columns side by side when there's room (else one under the other): each
-    /// line with whether it's an example (written "|..." here, shown as typed), and how wide a
-    /// column is.
-    fn guide_lines(&mut self, width: f32) -> (Vec<Vec<(String, bool)>>, f32) {
-        let side_by_side = width >= GUIDE_TWO_COLUMNS;
-        let column_w = if side_by_side { (width - GUIDE_GAP) / 2.0 } else { width };
-        let style = TextStyle::new(Color::hex(0)).size(ksize::NOTE_FONT);
-        let mut columns: Vec<Vec<(String, bool)>> = Vec::new();
-        for part in [GUIDE, GUIDE_PICTURES] {
-            let mut out = Vec::new();
-            for g in part {
-                match g.strip_prefix('|') {
-                    Some(code) => out.push((code.to_string(), true)),
-                    None => out.extend(kit::wrap(&mut self.renderer, g, &style, column_w).into_iter().map(|l| (l, false))),
-                }
-            }
-            match columns.last_mut() {
-                Some(first) if !side_by_side => first.extend(out),
-                _ => columns.push(out),
-            }
+        // The search, with its magnifier (the text box goes right of it while typing).
+        kit::field(r, theme, search, None, editing_search, search_look);
+        let ink = if search_look.enabled { theme.muted } else { theme.muted.with_alpha(theme.muted.a * 0.45) };
+        glyph(r, Glyph::Search, Rect::new(search.x + 3.0, search.y, 18.0, search.h), ink);
+        if !editing_search {
+            let typed = self.colour_search.as_str();
+            let (words, color) = if typed.is_empty() { (SEARCH_ANY, ink) } else { (typed, theme.text) };
+            r.text(words, Rect::new(search.x + 24.0, search.y, (search.w - 30.0).max(0.0), search.h), &TextStyle::new(color));
         }
-        (columns, column_w)
-    }
-
-    /// Under the skin's text: what Glint couldn't understand in it.
-    fn paint_notes(&mut self, theme: &Theme, app: &AppState) {
-        let t = self.text_rect();
-        let y0 = t.bottom() + self.guide_h + 12.0;
-        let t = Rect::new(t.x, t.y, (t.w - GUIDE_W - 12.0).max(40.0), t.h);
-        let style = TextStyle::new(theme.muted).size(ksize::NOTE_FONT);
-        let built_in = app.skins.find(&app.settings.skin).is_some_and(Entry::built_in);
-        let room = (((self.notes_h - 1.0) / NOTE_LINE).floor() as usize).max(1);
-        let lines = note_lines(&self.notes, built_in, room);
-        self.note_rects.clear();
-        // (Each problem with a line: clicking it goes there.)
-        for (i, (line, said, n)) in lines.iter().enumerate() {
-            let at = Rect::new(t.x, y0 + i as f32 * NOTE_LINE, t.w, NOTE_LINE);
-            let hot = *n > 0 && self.hover == Some(Hot::Note(*n));
-            let color = match said {
-                Said::Plain => theme.text,
-                Said::Quiet => theme.muted,
-                // The red of the marks in the text (codebox.rs).
-                Said::Problem => PROBLEM_RED,
-            };
-            self.renderer.text(line, at, &style.color(if hot { theme.text_strong } else { color }));
-            if *n > 0 {
-                self.note_rects.push((at, *n));
-            }
+        // What just happened, or else what this skin is.
+        match &self.status {
+            Some((said, true)) => r.text(said, line, &TextStyle::new(theme.accent).size(ksize::NOTE_FONT).semibold()),
+            Some((said, false)) => r.text(said, line, &TextStyle::new(theme.muted).size(ksize::NOTE_FONT)),
+            None => r.text(note, line, &TextStyle::new(theme.muted).size(ksize::NOTE_FONT)),
         }
     }
 
@@ -2296,6 +2840,8 @@ impl SkinWindow {
     }
 
     fn paint_page(&mut self, theme: &Theme, app: &AppState) {
+        let m = self.m();
+        let wide = self.layout == Layout::Wide;
         let page = self.page_rect();
         let dy = page.y - self.page.offset;
         let shift = |r: Rect| Rect::new(r.x, r.y + dy, r.w, r.h);
@@ -2303,6 +2849,11 @@ impl SkinWindow {
         let now = self.now();
         let dark = self.flips.at("dark", app.theme.dark, now);
         let grip = self.flips.at("grip", app.theme.scrollbar_grip, now);
+        // The parts' switches, each where it's drawn now (0 off to 1 on).
+        let flag_at: Vec<f32> = crate::parts::ALL
+            .iter()
+            .map(|&p| if crate::parts::is_flag(p) { self.flips.at(crate::parts::SPECS[p as usize].key, app.theme.parts.on(p), now) } else { 0.0 })
+            .collect();
         self.refresh_colours(app);
         self.renderer.push_clip(page);
         // 98 / 2000: a card's heading is drawn with it, on its top line.
@@ -2312,6 +2863,11 @@ impl SkinWindow {
             match block {
                 Block::Heading(..) if classic && matches!(self.blocks.get(k + 1), Some(Block::Card(_))) => {}
                 Block::Heading(rect, text) => kit::heading(r, theme, shift(*rect), text),
+                Block::Fold(rect, text, open) => {
+                    let me = Hot::Fold(*text);
+                    let look = Look { hover: self.hover == Some(me), pressed: false, focused: self.cues && self.focus == Spot::Fold(*text), enabled: true };
+                    fold_heading(r, theme, shift(*rect), text, *open, look);
+                }
                 Block::Card(rect) => match k.checked_sub(1).and_then(|j| self.blocks.get(j)) {
                     Some(Block::Heading(h, text)) if classic => kit::titled_group(r, theme, shift(*rect), shift(*h), text),
                     _ => kit::card(r, theme, shift(*rect)),
@@ -2326,30 +2882,51 @@ impl SkinWindow {
             if rect.bottom() < page.y || rect.y > page.bottom() {
                 continue;
             }
-            // (A colour's name ends a little before its NONE button.)
-            let text_w = match row.ctl {
-                Ctl::Colour(_) => rect.w - 2.0 * ROW_PAD_X - HEX_W - 10.0 - SWATCH - 8.0 - NONE_W - 8.0,
-                Ctl::Picture => rect.w - 2.0 * ROW_PAD_X - HEX_W - 8.0 - BROWSE_W - 8.0 - NONE_W - 8.0,
-                _ => rect.w - 2.0 * ROW_PAD_X - HEX_W - SWATCH - 40.0,
-            }
-            .max(80.0);
-            let title_color = if enabled { theme.text } else { theme.muted };
-            if row.note.is_empty() {
-                self.renderer.text(row.title, Rect::new(rect.x + ROW_PAD_X, rect.y + ((rect.h - 19.0) / 2.0).round(), text_w, 19.0), &TextStyle::new(title_color));
+            // (A colour's name ends a little before its NONE button; the smaller layouts' titles
+            // have the room their controls leave.)
+            let text_w = if wide {
+                match row.ctl {
+                    Ctl::Colour(_) => rect.w - 2.0 * ROW_PAD_X - HEX_W - 10.0 - SWATCH - 8.0 - NONE_W - 8.0,
+                    Ctl::Picture => rect.w - 2.0 * ROW_PAD_X - HEX_W - 8.0 - BROWSE_W - 8.0 - NONE_W - 8.0,
+                    _ => rect.w - 2.0 * ROW_PAD_X - HEX_W - SWATCH - 40.0,
+                }
+                .max(80.0)
             } else {
-                self.renderer.text(row.title, Rect::new(rect.x + ROW_PAD_X, rect.y + 9.0, text_w, 19.0), &TextStyle::new(title_color));
-                let note = match row.ctl {
-                    Ctl::Colour(c) if row.note == FOLLOWS => self.colours.get(c).map_or("", |s| s.hint.as_str()),
-                    _ => row.note,
-                };
-                self.renderer.text(note, Rect::new(rect.x + ROW_PAD_X, rect.y + 28.0, text_w, 16.0), &TextStyle::new(theme.muted).size(ksize::NOTE_FONT));
+                match row.ctl {
+                    Ctl::Thumbs => m.thumbs_title - 8.0,
+                    Ctl::Place => rect.w - 2.0 * m.row_pad - (3.0 * GRID_CELL + 2.0 * GRID_GAP + 22.0 + self.pad_w()) - 8.0,
+                    _ => rect.w - 2.0 * m.row_pad - controls_w(&m, row.ctl) - 8.0,
+                }
+                .max(40.0)
+            };
+            let title_style = TextStyle::new(if enabled { theme.text } else { theme.muted });
+            let note_style = TextStyle::new(theme.muted).size(ksize::NOTE_FONT);
+            let x = rect.x + m.row_pad;
+            let note = match row.ctl {
+                Ctl::Colour(c) if row.note == FOLLOWS => self.colours.get(c).map_or("", |s| s.hint.as_str()),
+                _ => row.note,
+            };
+            if row.note.is_empty() {
+                self.renderer.text(row.title, Rect::new(x, rect.y + ((rect.h - 19.0) / 2.0).round(), text_w, 19.0), &title_style);
+            } else if wide {
+                self.renderer.text(row.title, Rect::new(x, rect.y + 9.0, text_w, 19.0), &title_style);
+                self.renderer.text(note, Rect::new(x, rect.y + 28.0, text_w, 16.0), &note_style);
+            } else if rect.h <= m.row_h + 0.5 {
+                // On one line: the note after the title.
+                let y = rect.y + ((rect.h - 19.0) / 2.0).round();
+                self.renderer.text(row.title, Rect::new(x, y, text_w, 19.0), &title_style);
+                let after = self.renderer.measure(row.title, &title_style).ceil() + 8.0;
+                self.renderer.text(note, Rect::new(x + after, y, (text_w - after).max(0.0), 19.0), &note_style);
+            } else {
+                let y = rect.y + ((rect.h - 35.0) / 2.0).round();
+                self.renderer.text(row.title, Rect::new(x, y, text_w, 19.0), &title_style);
+                self.renderer.text(note, Rect::new(x, y + 19.0, text_w, 16.0), &note_style);
             }
             let main = self.part_rect(&row, Part::Main).map(shift);
             let hex = self.part_rect(&row, Part::Hex).map(shift);
-            // The Logo setting isn't the skin's: it can always be changed.
             // How the wallpaper looks means nothing until it has a picture.
-            let enabled = enabled && (has_picture || !matches!(row.ctl, Ctl::Fit | Ctl::Slide(_) | Ctl::Place));
-            let main_look = self.look_of(row.ctl, Part::Main, enabled || matches!(row.ctl, Ctl::Logo | Ctl::Search));
+            let enabled = enabled && (has_picture || !matches!(row.ctl, Ctl::Fit | Ctl::Area | Ctl::Slide(_) | Ctl::Place));
+            let main_look = self.look_of(row.ctl, Part::Main, enabled || matches!(row.ctl, Ctl::Search));
             let hex_look = self.look_of(row.ctl, Part::Hex, enabled);
             let clear = self.part_rect(&row, Part::Clear).map(shift);
             let picture = if row.ctl == Ctl::Picture { app.skins.find(&app.settings.skin).map(|e| picture_of(&e.text)).unwrap_or_default() } else { String::new() };
@@ -2369,7 +2946,11 @@ impl SkinWindow {
                 Ctl::Colour(i) => {
                     let Some(c) = self.colours.get(i) else { continue };
                     if let Some(n) = clear {
-                        kit::button(r, theme, n, "NONE", clear_look);
+                        if wide {
+                            kit::button(r, theme, n, "NONE", clear_look);
+                        } else {
+                            icon_button(r, theme, n, Glyph::Clear, clear_look);
+                        }
                     }
                     if let Some(s) = main {
                         swatch(r, theme, s, &c.paint, main_look);
@@ -2379,7 +2960,12 @@ impl SkinWindow {
                         kit::field(r, theme, hx, (!editing).then_some(c.text.as_str()), editing, hex_look);
                     }
                 }
-                Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Era | Ctl::Icons | Ctl::Logo | Ctl::Fit => {
+                Ctl::Part(p) if crate::parts::is_flag(p) => {
+                    if let Some(m) = main {
+                        kit::toggle(r, theme, m, flag_at[p as usize], main_look);
+                    }
+                }
+                Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::RowEdge | Ctl::SidebarEdge | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Era | Ctl::Icons | Ctl::Logo | Ctl::Fit | Ctl::Area | Ctl::Part(_) | Ctl::Font | Ctl::SidebarRow | Ctl::ScrollWidth => {
                     if let Some(m) = main {
                         kit::dropdown(r, theme, m, &label, main_look);
                     }
@@ -2403,7 +2989,7 @@ impl SkinWindow {
                         let typed = self.colour_search.as_str();
                         kit::field(r, theme, m, (!editing && !typed.is_empty()).then_some(typed), editing, main_look);
                         if !editing && typed.is_empty() {
-                            r.text(SEARCH_HINT, Rect::new(m.x + 8.0, m.y, (m.w - 16.0).max(0.0), m.h), &TextStyle::new(theme.muted));
+                            r.text(SEARCH_ANY, Rect::new(m.x + 8.0, m.y, (m.w - 16.0).max(0.0), m.h), &TextStyle::new(theme.muted));
                         }
                     }
                 }
@@ -2414,7 +3000,11 @@ impl SkinWindow {
                 }
                 Ctl::Picture => {
                     if let Some(n) = clear {
-                        kit::button(r, theme, n, "NONE", clear_look);
+                        if wide {
+                            kit::button(r, theme, n, "NONE", clear_look);
+                        } else {
+                            icon_button(r, theme, n, Glyph::Clear, clear_look);
+                        }
                     }
                     if let Some(b) = main {
                         kit::button(r, theme, b, "BROWSE\u{2026}", main_look);
@@ -2445,7 +3035,8 @@ impl SkinWindow {
                 }
                 Ctl::Thumbs => {
                     if self.thumbs.is_empty() && self.thumbs_for.is_some() {
-                        let at = Rect::new(rect.x + 150.0, rect.y, (rect.w - 150.0 - ROW_PAD_X).max(0.0), rect.h);
+                        let skip = m.thumbs_title + 10.0;
+                        let at = Rect::new(rect.x + skip, rect.y, (rect.w - skip - m.row_pad).max(0.0), rect.h);
                         r.text("No pictures next to this skin yet", at, &TextStyle::new(theme.muted).size(ksize::NOTE_FONT).align(Align::Right));
                     }
                     for (part, at, look) in &extra {
@@ -2525,14 +3116,21 @@ impl SkinWindow {
             Ctl::FontSize => size_label(t.font_size / PT),
             Ctl::TabLine => width_label(t.tab_line_w),
             Ctl::ToolbarLine => width_label(t.toolbar_line_w),
+            Ctl::RowEdge => width_label(t.select_edge_w),
+            Ctl::SidebarEdge => width_label(t.sidebar_select_edge_w),
             Ctl::Buttons => label_of(&BUTTON_STYLES, t.buttons),
             Ctl::Caption => label_of(&CAPTION_STYLES, t.caption_buttons),
             Ctl::Tabs => label_of(&TAB_STYLES, t.tabs),
             Ctl::Sidebar => label_of(&SIDEBAR_STYLES, t.sidebar_style),
             Ctl::Era => label_of(&ERAS, t.era),
             Ctl::Icons => label_of(&ICON_SETS, t.icons),
-            Ctl::Logo => LOGOS.iter().find(|(l, _)| *l == t.logo_style).map_or("", |(_, l)| l).to_string(),
+            Ctl::Logo => label_of(&LOGOS, t.logo_style),
             Ctl::Fit => label_of(&FITS, t.wallpaper_fit),
+            Ctl::Area => label_of(&AREAS, t.wallpaper_area),
+            Ctl::Part(p) => t.parts.label(p),
+            Ctl::Font => t.font.clone(),
+            Ctl::SidebarRow => number(t.sidebar_row_h),
+            Ctl::ScrollWidth => number(t.scrollbar_w),
             _ => String::new(),
         }
     }
@@ -2543,13 +3141,31 @@ impl SkinWindow {
         let want = match &self.editing {
             Some(Editing::Hex(i, _)) => self.rows.iter().find(|r| r.ctl == Ctl::Colour(*i)).and_then(|r| self.part_rect(r, Part::Hex)).map(|r| self.on_page(r)),
             Some(Editing::LogoText(_)) => self.rows.iter().find(|r| r.ctl == Ctl::LogoText).and_then(|r| self.part_rect(r, Part::Main)).map(|r| self.on_page(r)),
+            // (The smaller layouts' search is at the top: the box goes right of its magnifier.)
+            Some(Editing::Search(_)) if self.layout != Layout::Wide => {
+                let s = self.search_rect();
+                Some(Rect::new(s.x + 16.0, s.y, (s.w - 16.0).max(20.0), s.h))
+            }
             Some(Editing::Search(_)) => self.rows.iter().find(|r| r.ctl == Ctl::Search).and_then(|r| self.part_rect(r, Part::Main)).map(|r| self.on_page(r)),
             Some(Editing::Picture(_)) => self.rows.iter().find(|r| r.ctl == Ctl::Picture).and_then(|r| self.part_rect(r, Part::Hex)).map(|r| self.on_page(r)),
             Some(Editing::Number(s, _)) => self.rows.iter().find(|r| r.ctl == Ctl::Slide(*s)).and_then(|r| self.part_rect(r, Part::Hex)).map(|r| self.on_page(r)),
+            // (One column: over the skin's drop-down.)
+            Some(Editing::Rename(_)) if self.layout == Layout::Compact => Some(self.skin_box()),
             Some(Editing::Rename(id)) => self.items.iter().find(|i| i.id == *id).map(|i| self.item_on_screen(i.rect).inset(6.0, 3.0)),
             None => None,
         };
-        let area = if matches!(self.editing, Some(Editing::Rename(_))) { self.list_rect() } else { self.page_rect() };
+        let top = match self.editing {
+            Some(Editing::Rename(_)) => self.layout == Layout::Compact,
+            Some(Editing::Search(_)) => self.layout != Layout::Wide,
+            _ => false,
+        };
+        let area = if top {
+            self.header_rect()
+        } else if matches!(self.editing, Some(Editing::Rename(_))) {
+            self.list_rect()
+        } else {
+            self.page_rect()
+        };
         let want = want.filter(|r| r.y >= area.y && r.bottom() <= area.bottom() && self.asking.is_none());
         if want != self.edit_at {
             match want {
@@ -2579,42 +3195,13 @@ impl SkinWindow {
         }
     }
 
-    /// Shows the skin's text in the text view, unless someone is typing there (then their text is
-    /// the truth) - but always when another skin is in use now; a built-in skin's text can't be
-    /// changed.
-    fn sync_text(&mut self, app: &AppState) {
-        let entry = app.skins.find(&app.settings.skin);
-        self.code.read_only = entry.is_none_or(Entry::built_in);
-        let same_skin = self.text_for.eq_ignore_ascii_case(&app.settings.skin);
-        if self.focus == Spot::Text && self.advanced && same_skin {
-            return;
-        }
-        let text = entry.map(|e| e.text.replace("\r\n", "\n")).unwrap_or_default();
-        if text != self.text_shown || !same_skin {
-            self.code.set_text(&text);
-            self.text_shown = text;
-        }
-        self.text_for = app.settings.skin.clone();
-    }
-
     // ------------------------------------------------------------ the mouse
 
     fn target_at(&self, p: Point) -> Option<Hot> {
         if p.y < size::TITLE_H {
             return self.close_rect().contains(p).then_some(Hot::Close);
         }
-        if self.advanced && self.asking.is_none() {
-            if self.code.contains(p) {
-                return Some(Hot::Code);
-            }
-            if kit::button_contains(self.guide_button(), p) {
-                return Some(Hot::Guide);
-            }
-            if let Some((_, n)) = self.note_rects.iter().find(|(r, _)| r.contains(p)) {
-                return Some(Hot::Note(*n));
-            }
-        }
-        if p.x < LIST_W {
+        if p.x < self.m().list_w {
             if let Some(thumb) = self.list.thumb(self.list_track()) {
                 if thumb.inset(-4.0, 0.0).contains(p) {
                     return Some(Hot::ListThumb);
@@ -2623,12 +3210,23 @@ impl SkinWindow {
             if self.list_rect().contains(p) {
                 return self.items.iter().position(|i| self.item_on_screen(i.rect).contains(p)).map(Hot::Item);
             }
+            if self.layout == Layout::Slim {
+                return ICONS.iter().find(|(b, _)| self.icon_rect(*b).contains(p)).map(|(b, _)| Hot::Button(*b));
+            }
             return BUTTONS.iter().find(|(b, _)| kit::button_contains(self.button_rect(*b), p)).map(|(b, _)| Hot::Button(*b));
         }
-        if kit::toggle_contains(self.advanced_rect(), p) {
-            return Some(Hot::Advanced);
+        if self.layout == Layout::Compact {
+            if self.skin_box().contains(p) {
+                return Some(Hot::Button(Btn::Skin));
+            }
+            if let Some(b) = [Btn::Undo, Btn::Redo, Btn::More].into_iter().find(|b| self.icon_rect(*b).contains(p)) {
+                return Some(Hot::Button(b));
+            }
         }
-        if self.advanced || !self.page_rect().contains(p) {
+        if self.layout != Layout::Wide && self.search_rect().contains(p) {
+            return Some(Hot::Ctl(Ctl::Search, Part::Main));
+        }
+        if !self.page_rect().contains(p) {
             return None;
         }
         if let Some(thumb) = self.page.thumb(self.page_track()) {
@@ -2636,11 +3234,19 @@ impl SkinWindow {
                 return Some(Hot::PageThumb);
             }
         }
+        for block in &self.blocks {
+            if let Block::Fold(r, t, _) = block {
+                if self.on_page(*r).contains(p) {
+                    return Some(Hot::Fold(*t));
+                }
+            }
+        }
         for row in &self.rows {
             for part in [Part::Clear, Part::Main, Part::Hex].into_iter().chain(self.extra_parts(row)) {
                 let Some(r) = self.part_rect(row, part).map(|r| self.on_page(r)) else { continue };
                 let hit = match (row.ctl, part) {
                     (Ctl::Dark | Ctl::Grip, _) => kit::toggle_contains(r, p),
+                    (Ctl::Part(q), _) if crate::parts::is_flag(q) => kit::toggle_contains(r, p),
                     // (The pad's dot can sit on its edge: a little room round it.)
                     (Ctl::Place, Part::Main) => r.inset(-8.0, -8.0).contains(p),
                     (Ctl::Place | Ctl::Thumbs, _) => r.contains(p),
@@ -2679,15 +3285,6 @@ impl SkinWindow {
         if let Some((s, pad)) = self.sliding.as_ref().map(|d| (d.slide, d.pad)) {
             return if pad { self.place_to_point(p, app) } else { self.slide_to_point(s, p, app) };
         }
-        if self.code.busy() || (self.advanced && self.asking.is_none()) {
-            let busy = self.code.busy();
-            if self.code.mouse_move(p) {
-                self.invalidate();
-            }
-            if busy {
-                return Vec::new();
-            }
-        }
         if let Some((which, grab)) = self.drag {
             let (track, scroller) = if which == Hot::ListThumb { (self.list_track(), &mut self.list) } else { (self.page_track(), &mut self.page) };
             if let Some(thumb) = scroller.thumb(track) {
@@ -2717,7 +3314,7 @@ impl SkinWindow {
         // track a page, again and again while the button is held.
         let (now, list, page) = (self.now(), self.bar.place(self.list_rect()), self.bar.place(self.page_rect()));
         if self.holding.press(self.hwnd, list, &mut self.list, 0, p, now)
-            || (!self.advanced && self.holding.press(self.hwnd, page, &mut self.page, 1, p, now))
+            || (self.holding.press(self.hwnd, page, &mut self.page, 1, p, now))
         {
             self.invalidate();
             return Vec::new();
@@ -2754,8 +3351,9 @@ impl SkinWindow {
                     self.drag = Some((Hot::PageThumb, p.y - thumb.y));
                 }
             }
+            Some(Hot::Button(Btn::Skin)) => self.focus = Spot::List,
             Some(Hot::Button(b)) => self.focus = Spot::Button(b),
-            Some(Hot::Advanced) => self.focus = Spot::Advanced,
+            Some(Hot::Fold(t)) => self.focus = Spot::Fold(t),
             // A slider: its knob jumps to the click, and follows the mouse while it's held.
             // The pad: the dot jumps to the click and follows the mouse; a double-click puts it back.
             Some(Hot::Ctl(Ctl::Place, Part::Main)) if double => {
@@ -2802,21 +3400,6 @@ impl SkinWindow {
                 }
             }
             Some(Hot::Ctl(c, part)) => self.focus = Spot::Ctl(c, part),
-            Some(Hot::Code) => {
-                self.focus = Spot::Text;
-                self.code.focused = true;
-                if self.code.mouse_down(p, double, &SkinLang).0 == Done::Changed {
-                    asks.extend(self.text_typed(app));
-                }
-            }
-            Some(Hot::Guide) => {
-                self.guide = !self.guide;
-                self.focus = Spot::Text;
-            }
-            Some(Hot::Note(n)) => {
-                self.focus = Spot::Text;
-                self.code.go_to_line(n);
-            }
             _ => {}
         }
         self.invalidate();
@@ -2839,7 +3422,6 @@ impl SkinWindow {
         let was = self.pressed.take();
         self.drag = None;
         self.end_sliding();
-        self.code.mouse_up();
         // SAFETY: releasing our own capture.
         unsafe {
             let _ = ReleaseCapture();
@@ -2851,12 +3433,12 @@ impl SkinWindow {
         match was {
             Some(Hot::Close) => vec![Ask::Job(Job::Close)],
             Some(Hot::Button(b)) => self.press(b, app),
-            Some(Hot::Advanced) => {
-                self.set_advanced(!self.advanced, app);
-                Vec::new()
-            }
             Some(Hot::Ctl(Ctl::Slide(_) | Ctl::Place, Part::Main)) => Vec::new(),
             Some(Hot::Ctl(c, part)) => self.activate(c, part, app),
+            Some(Hot::Fold(t)) => {
+                self.toggle_fold(t);
+                Vec::new()
+            }
             _ => Vec::new(),
         }
     }
@@ -3000,15 +3582,8 @@ impl SkinWindow {
     }
 
     fn wheel(&mut self, p: Point, notches: f32) {
-        if self.advanced && self.asking.is_none() && self.code.rect.contains(p) {
-            // SAFETY: a plain key-state query.
-            let across = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
-            self.code.wheel(notches, across);
-            self.invalidate();
-            return;
-        }
         let now = self.now();
-        let moved = if p.x < LIST_W { self.list.scroll_by(-notches * WHEEL_STEP, now) } else { !self.advanced && self.page.scroll_by(-notches * WHEEL_STEP, now) };
+        let moved = if p.x < self.m().list_w { self.list.scroll_by(-notches * WHEEL_STEP, now) } else { self.page.scroll_by(-notches * WHEEL_STEP, now) };
         if moved {
             self.invalidate();
         }
@@ -3019,31 +3594,43 @@ impl SkinWindow {
     /// The places that can have the keyboard, in Tab order.
     fn spots(&self, app: &AppState) -> Vec<Spot> {
         let own = app.skins.find(&app.settings.skin).is_some_and(|e| !e.built_in());
+        // (One column: the skin's drop-down is the list's place.)
         let mut spots = vec![Spot::List];
-        for (b, _) in BUTTONS {
+        let buttons: Vec<Btn> = match self.layout {
+            Layout::Wide => BUTTONS.iter().map(|(b, _)| *b).collect(),
+            Layout::Slim => ICONS.iter().map(|(b, _)| *b).collect(),
+            Layout::Compact => vec![Btn::Undo, Btn::Redo, Btn::More],
+        };
+        for b in buttons {
             if own || !matches!(b, Btn::Rename | Btn::Delete) {
                 spots.push(Spot::Button(b));
             }
         }
-        spots.push(Spot::Advanced);
-        if self.advanced {
-            spots.push(Spot::Text);
-        } else if app.skins.find(&app.settings.skin).is_some() {
+        if self.layout != Layout::Wide {
+            spots.push(Spot::Ctl(Ctl::Search, Part::Main));
+        }
+        // In the page's order: the sections' headings (one column), and the rows when there's
+        // a skin.
+        let mut placed: Vec<(f32, Spot)> = self.blocks.iter().filter_map(|b| if let Block::Fold(r, t, _) = b { Some((r.y, Spot::Fold(*t))) } else { None }).collect();
+        if app.skins.find(&app.settings.skin).is_some() {
             for row in &self.rows {
+                let y = row.rect.y;
                 if row.ctl == Ctl::Thumbs {
-                    spots.extend(self.extra_parts(row).into_iter().map(|p| Spot::Ctl(row.ctl, p)));
+                    placed.extend(self.extra_parts(row).into_iter().map(|p| (y, Spot::Ctl(row.ctl, p))));
                     continue;
                 }
-                spots.push(Spot::Ctl(row.ctl, Part::Main));
+                placed.push((y, Spot::Ctl(row.ctl, Part::Main)));
                 if matches!(row.ctl, Ctl::Slide(_)) {
-                    spots.push(Spot::Ctl(row.ctl, Part::Hex));
+                    placed.push((y, Spot::Ctl(row.ctl, Part::Hex)));
                 }
                 if matches!(row.ctl, Ctl::Colour(_) | Ctl::Picture) {
-                    spots.push(Spot::Ctl(row.ctl, Part::Hex));
-                    spots.push(Spot::Ctl(row.ctl, Part::Clear));
+                    placed.push((y, Spot::Ctl(row.ctl, Part::Hex)));
+                    placed.push((y, Spot::Ctl(row.ctl, Part::Clear)));
                 }
             }
         }
+        placed.sort_by(|a, b| a.0.total_cmp(&b.0));
+        spots.extend(placed.into_iter().map(|(_, s)| s));
         spots
     }
 
@@ -3062,6 +3649,11 @@ impl SkinWindow {
                 if let Some(r) = self.rows.iter().find(|r| r.ctl == c).and_then(|r| self.part_rect(r, part)) {
                     let row = Rect::new(r.x, r.y - 14.0, r.w, r.h + 28.0);
                     self.page.reveal(row.y, row.bottom(), 8.0, self.now());
+                }
+            }
+            Spot::Fold(t) => {
+                if let Some(r) = self.blocks.iter().find_map(|b| if let Block::Fold(r, f, _) = b { (*f == t).then_some(*r) } else { None }) {
+                    self.page.reveal(r.y - 8.0, r.bottom() + 8.0, 8.0, self.now());
                 }
             }
             _ => {}
@@ -3084,28 +3676,6 @@ impl SkinWindow {
                 asks.extend(self.answer(a, app));
             }
             return true;
-        }
-        // The skin's text has the keyboard: its keys first.
-        if self.focus == Spot::Text && self.advanced {
-            match self.code.key(vk, self.hwnd, &SkinLang) {
-                Done::Changed => {
-                    asks.extend(self.text_typed(app));
-                    self.invalidate();
-                    return true;
-                }
-                Done::Moved => {
-                    self.invalidate();
-                    return true;
-                }
-                // Esc leaves the text (it doesn't close the window); Tab moves on.
-                Done::NotMine if is(VK_ESCAPE) => {
-                    self.focus = Spot::Advanced;
-                    self.cues = true;
-                    self.invalidate();
-                    return true;
-                }
-                Done::NotMine => {}
-            }
         }
         if self.sliding.is_some() {
             if is(VK_ESCAPE) {
@@ -3204,8 +3774,10 @@ impl SkinWindow {
                 self.cues = true;
                 let dropdown = matches!(
                     self.focus,
-                    Spot::Ctl(Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Era | Ctl::Icons | Ctl::Logo | Ctl::Fit, _)
+                    Spot::Ctl(Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::RowEdge | Ctl::SidebarEdge | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Era | Ctl::Icons | Ctl::Logo | Ctl::Fit | Ctl::Area | Ctl::Part(_) | Ctl::Font | Ctl::SidebarRow | Ctl::ScrollWidth, _)
                 );
+                // (One column: the skin's drop-down and the menu of the rest open as drop-downs do.)
+                let dropdown = dropdown || (self.layout == Layout::Compact && matches!(self.focus, Spot::List | Spot::Button(Btn::More)));
                 if dropdown && (is(VK_SPACE) || is(VK_RETURN)) {
                     // Opened when the key's character has come (it would close the menu again).
                     self.act_on_char = Some(self.focus);
@@ -3228,12 +3800,13 @@ impl SkinWindow {
     fn activate_spot(&mut self, spot: Spot, app: &mut AppState) -> Vec<Ask> {
         match spot {
             Spot::Button(b) => self.press(b, app),
-            Spot::Advanced => {
-                self.set_advanced(!self.advanced, app);
+            Spot::Ctl(c, part) => self.activate(c, part, app),
+            Spot::Fold(t) => {
+                self.toggle_fold(t);
                 Vec::new()
             }
-            Spot::Ctl(c, part) => self.activate(c, part, app),
-            Spot::List | Spot::Text => Vec::new(),
+            Spot::List if self.layout == Layout::Compact => self.press(Btn::Skin, app),
+            Spot::List => Vec::new(),
         }
     }
 
@@ -3361,9 +3934,6 @@ impl SkinWindow {
             app.pick_skin(&id);
         }
         self.save_soon(&id);
-        if self.advanced {
-            self.sync_text(app);
-        }
         self.layout_dirty = true;
         self.invalidate();
         vec![Ask::RedrawMain]
@@ -3382,15 +3952,21 @@ impl SkinWindow {
 
     /// A control was clicked, or Space / Enter was pressed on it.
     fn activate(&mut self, ctl: Ctl, part: Part, app: &mut AppState) -> Vec<Ask> {
-        // (The Logo setting isn't the skin's: it works whatever the skin. So does the search.)
-        if app.skins.find(&app.settings.skin).is_none() && !matches!(ctl, Ctl::Logo | Ctl::Search) {
+        self.pop = None;
+        // (The search works whatever the skin.)
+        if app.skins.find(&app.settings.skin).is_none() && !matches!(ctl, Ctl::Search) {
             return Vec::new();
         }
         let anchor = self.rows.iter().find(|r| r.ctl == ctl).and_then(|r| self.part_rect(r, part)).map(|r| self.on_page(r));
         let border = self.border();
+        let look = crate::droplist::DropLook::of(&app.theme);
         let menu = |items: Vec<MenuItem>| {
-            let at = anchor.map_or(Point::new(LIST_W + PAD_X, size::TITLE_H + HEADER_H), |a| Point::new(a.x, a.bottom() + 2.0));
-            let at = Point::new(at.x + border, at.y + border);
+            if let Some(a) = anchor {
+                let under = crate::ui::Rect::new(a.x + border, a.y + border, a.w, a.h);
+                let list = crate::droplist::DropList { items, under: RECT::default(), look: look.clone(), menu: false, right: false };
+                return vec![Ask::Job(Job::Drop(list, under))];
+            }
+            let at = Point::new(LIST_W + PAD_X + border, size::TITLE_H + HEADER_H + border);
             vec![Ask::Job(Job::Menu(Menu { tag: 1, at, items, right_aligned: false }))]
         };
         let t = app.theme.clone();
@@ -3432,6 +4008,33 @@ impl SkinWindow {
                 app.pick_skin(&id);
                 asks
             }
+            (Ctl::Part(q), _) if crate::parts::is_flag(q) => {
+                let key = crate::parts::SPECS[q as usize].key;
+                let on = t.parts.on(q);
+                let now = self.now();
+                self.flips.start(key, !on, now, kit::SWITCH_TIME);
+                self.change(app, &[(key, (!on).to_string())])
+            }
+            (Ctl::Part(q), _) => {
+                self.menu_for = Some(ctl);
+                let now = t.parts.label(q);
+                menu(crate::parts::choices(q).iter().enumerate().map(|(n, (l, _))| MenuItem::new(n as u32 + 1, l).checked(*l == now)).collect())
+            }
+            (Ctl::Font, _) => {
+                self.menu_for = Some(ctl);
+                if self.fonts.is_empty() {
+                    self.fonts = crate::render::system_fonts();
+                }
+                menu(self.fonts.iter().enumerate().map(|(n, f)| MenuItem::new(n as u32 + 1, f).checked(f.eq_ignore_ascii_case(&t.font))).collect())
+            }
+            (Ctl::SidebarRow, _) => {
+                self.menu_for = Some(ctl);
+                menu(SIDEBAR_ROWS.iter().enumerate().map(|(n, v)| MenuItem::new(n as u32 + 1, &number(*v)).checked((*v - t.sidebar_row_h).abs() < 0.01)).collect())
+            }
+            (Ctl::ScrollWidth, _) => {
+                self.menu_for = Some(ctl);
+                menu(SCROLL_WIDTHS.iter().enumerate().map(|(n, v)| MenuItem::new(n as u32 + 1, &number(*v)).checked((*v - t.scrollbar_w).abs() < 0.01)).collect())
+            }
             (Ctl::Shape, _) => {
                 self.menu_for = Some(ctl);
                 menu(SHAPES.iter().enumerate().map(|(n, (s, _, l))| MenuItem::new(n as u32 + 1, l).checked(*s == t.shape)).collect())
@@ -3444,9 +4047,9 @@ impl SkinWindow {
                 self.menu_for = Some(ctl);
                 menu(ROW_HEIGHTS.iter().enumerate().map(|(n, v)| MenuItem::new(n as u32 + 1, &row_label(*v)).checked((*v - t.row_h).abs() < 0.01)).collect())
             }
-            (Ctl::TabLine | Ctl::ToolbarLine, _) => {
+            (Ctl::TabLine | Ctl::ToolbarLine | Ctl::RowEdge | Ctl::SidebarEdge, _) => {
                 self.menu_for = Some(ctl);
-                let now = if ctl == Ctl::TabLine { t.tab_line_w } else { t.toolbar_line_w };
+                let now = line_width(ctl, &t).map_or(0.0, |(_, w)| w);
                 menu(LINE_WIDTHS.iter().enumerate().map(|(n, v)| MenuItem::new(n as u32 + 1, &width_label(*v)).checked((*v - now).abs() < 0.01)).collect())
             }
             (Ctl::FontSize, _) => {
@@ -3479,7 +4082,7 @@ impl SkinWindow {
             }
             (Ctl::Logo, _) => {
                 self.menu_for = Some(ctl);
-                menu(styles(&LOGOS.map(|(s, l)| (l, s == app.settings.logo))))
+                menu(styles(&LOGOS.map(|(s, _, l)| (l, s == t.logo_style))))
             }
             (Ctl::Grip, _) => {
                 let now = self.now();
@@ -3495,7 +4098,7 @@ impl SkinWindow {
                 self.set_picture(app, &name)
             }
             (Ctl::Thumbs, _) => Vec::new(),
-            (Ctl::Fit | Ctl::Slide(_) | Ctl::Place, _) if app.theme.wallpaper.is_empty() => Vec::new(),
+            (Ctl::Fit | Ctl::Area | Ctl::Slide(_) | Ctl::Place, _) if app.theme.wallpaper.is_empty() => Vec::new(),
             (Ctl::Place, Part::Grid(i)) => {
                 let (x, y) = grid_place(i as usize);
                 self.place_to(x, y, app)
@@ -3509,6 +4112,10 @@ impl SkinWindow {
             (Ctl::Fit, _) => {
                 self.menu_for = Some(ctl);
                 menu(styles(&FITS.map(|(s, _, l)| (l, s == t.wallpaper_fit))))
+            }
+            (Ctl::Area, _) => {
+                self.menu_for = Some(ctl);
+                menu(styles(&AREAS.map(|(s, _, l)| (l, s == t.wallpaper_area))))
             }
             (Ctl::Picture, Part::Hex) => {
                 let now = app.skins.find(&app.settings.skin).map(|e| picture_of(&e.text)).unwrap_or_default();
@@ -3589,8 +4196,11 @@ impl SkinWindow {
                 Some(v) => vec![("font-size", format!("{}pt", number(*v)))],
                 None => return Vec::new(),
             },
-            Ctl::TabLine | Ctl::ToolbarLine => match LINE_WIDTHS.get(n) {
-                Some(v) => vec![(if ctl == Ctl::TabLine { "tab-line-width" } else { "toolbar-line-width" }, number(*v))],
+            Ctl::TabLine | Ctl::ToolbarLine | Ctl::RowEdge | Ctl::SidebarEdge => match LINE_WIDTHS.get(n) {
+                Some(v) => match line_width(ctl, &t) {
+                    Some((key, _)) => vec![(key, number(*v))],
+                    None => return Vec::new(),
+                },
                 None => return Vec::new(),
             },
             Ctl::Buttons => word_at(&BUTTON_STYLES, n, "buttons"),
@@ -3600,17 +4210,29 @@ impl SkinWindow {
             Ctl::Era => word_at(&ERAS, n, "era"),
             Ctl::Icons => word_at(&ICON_SETS, n, "icons"),
             Ctl::Fit => word_at(&FITS, n, "wallpaper-fit"),
-            Ctl::Logo => {
-                // The setting, as Settings changes it: every title bar follows.
-                let Some((logo, _)) = LOGOS.get(n) else { return Vec::new() };
-                if app.settings.logo == *logo {
-                    return Vec::new();
+            Ctl::Area => word_at(&AREAS, n, "wallpaper-area"),
+            Ctl::Part(q) => {
+                let key = crate::parts::SPECS[q as usize].key;
+                match crate::parts::choices(q).into_iter().nth(n) {
+                    Some((_, Some(word))) => vec![(key, word)],
+                    // Auto: the skin's line goes.
+                    Some((_, None)) => return self.change_text(app, |text| skin::without_value(text, key)),
+                    None => return Vec::new(),
                 }
-                app.settings.logo = *logo;
-                app.apply_skin();
-                self.invalidate();
-                return vec![Ask::RedrawMain];
             }
+            Ctl::Font => match self.fonts.get(n) {
+                Some(f) => vec![("font", f.clone())],
+                None => return Vec::new(),
+            },
+            Ctl::SidebarRow => match SIDEBAR_ROWS.get(n) {
+                Some(v) => vec![("sidebar-row-height", number(*v))],
+                None => return Vec::new(),
+            },
+            Ctl::ScrollWidth => match SCROLL_WIDTHS.get(n) {
+                Some(v) => vec![("scrollbar-width", number(*v))],
+                None => return Vec::new(),
+            },
+            Ctl::Logo => word_at(&LOGOS, n, "logo-style"),
             _ => return Vec::new(),
         };
         if changes.is_empty() {
@@ -3634,7 +4256,7 @@ impl SkinWindow {
         self.edit_box.set_hint(match what {
             Editing::LogoText(_) => LOGO_HINT,
             Editing::Picture(_) => PICTURE_HINT,
-            Editing::Search(_) => SEARCH_HINT,
+            Editing::Search(_) => SEARCH_ANY,
             _ => "",
         });
         self.editing = Some(what);
@@ -3755,18 +4377,6 @@ impl SkinWindow {
         }
     }
 
-    /// "Show as text" on or off (the person flipped its switch).
-    fn set_advanced(&mut self, on: bool, app: &mut AppState) {
-        self.end_editing(app, true);
-        let now = self.now();
-        self.flips.start("text", on, now, kit::SWITCH_TIME);
-        self.advanced = on;
-        self.text_shown.clear();
-        self.sync_text(app);
-        self.layout_dirty = true;
-        self.invalidate();
-    }
-
     /// One of the buttons under the list.
     fn press(&mut self, b: Btn, app: &mut AppState) -> Vec<Ask> {
         self.end_editing(app, true);
@@ -3811,7 +4421,9 @@ impl SkinWindow {
             Btn::Export => match current {
                 Some(e) => {
                     self.dialog_for = Some(e.id.clone());
-                    vec![Ask::Job(Job::Export(format!("{}.{}", skin::file_stem(&e.name), skin::EXTENSION)))]
+                    // A skin with a wallpaper goes out as a zip with its picture.
+                    let ext = if skin::has_wallpaper(&e.text) { "zip" } else { skin::EXTENSION };
+                    vec![Ask::Job(Job::Export(format!("{}.{ext}", skin::file_stem(&e.name))))]
                 }
                 None => Vec::new(),
             },
@@ -3824,7 +4436,75 @@ impl SkinWindow {
                 });
                 Vec::new()
             }
+            Btn::Skin => self.skins_menu(app),
+            Btn::More => self.more_menu(app),
         }
+    }
+
+    /// One column: the skin drop-down's list - the built-in skins, a line, then the person's own -
+    /// under it.
+    fn skins_menu(&mut self, app: &AppState) -> Vec<Ask> {
+        let (mut items, mut ids) = (Vec::new(), Vec::new());
+        for item in &self.items {
+            if item.id.starts_with(skin::FILE_PREFIX) && !ids.iter().any(|id: &String| id.starts_with(skin::FILE_PREFIX)) && !ids.is_empty() {
+                items.push(MenuItem::separator());
+            }
+            ids.push(item.id.clone());
+            let on = item.id.eq_ignore_ascii_case(&app.settings.skin);
+            let mut entry = MenuItem::new(ids.len() as u32, &item.name).checked(on);
+            entry.bold = on;
+            items.push(entry);
+        }
+        let (at, b) = (self.skin_box(), self.border());
+        self.menu_for = None;
+        self.pop = Some(Pop::Skins(ids));
+        vec![Ask::Job(Job::Menu(Menu { tag: 1, at: Point::new(at.x + b, at.bottom() + 2.0 + b), items, right_aligned: false }))]
+    }
+
+    /// One column: the menu of the rest (New to Open skins folder), under its button.
+    fn more_menu(&mut self, app: &AppState) -> Vec<Ask> {
+        let mut items = Vec::new();
+        for (n, (btn, label)) in MORE.iter().enumerate() {
+            if *btn == Btn::Import {
+                items.push(MenuItem::separator());
+            }
+            items.push(MenuItem::new(n as u32 + 1, label).disabled(!self.button_on(*btn, app)));
+        }
+        let (at, b) = (self.icon_rect(Btn::More), self.border());
+        self.menu_for = None;
+        self.pop = Some(Pop::More);
+        vec![Ask::Job(Job::Menu(Menu { tag: 1, at: Point::new(at.right() + b, at.bottom() + 4.0 + b), items, right_aligned: true }))]
+    }
+
+    /// A pick in the skins' drop-down or the menu of the rest (`id` 0: none).
+    fn popped(&mut self, pop: Pop, id: u32, app: &mut AppState) -> Vec<Ask> {
+        let Some(n) = id.checked_sub(1).map(|n| n as usize) else { return Vec::new() };
+        let asks = match pop {
+            Pop::Skins(ids) => match ids.get(n) {
+                Some(skin_id) => self.pick(app, skin_id),
+                None => Vec::new(),
+            },
+            Pop::More => match MORE.get(n) {
+                Some((b, _)) if self.button_on(*b, app) => self.press(*b, app),
+                _ => Vec::new(),
+            },
+        };
+        self.invalidate();
+        asks
+    }
+
+    /// Folds a section (one column), or opens it again; kept while Glint runs.
+    fn toggle_fold(&mut self, title: &'static str) {
+        match self.folded.iter().position(|t| *t == title) {
+            Some(i) => {
+                self.folded.remove(i);
+            }
+            None => self.folded.push(title),
+        }
+        let kept = self.folded.clone();
+        FOLDED.with(|f| *f.borrow_mut() = Some(kept));
+        self.layout_dirty = true;
+        self.invalidate();
     }
 
     /// A skin was just made: use it, and show it in the list.
@@ -3969,41 +4649,14 @@ impl SkinWindow {
         }
     }
 
-    /// The skin's text was typed in: the skin in use is that text from now on (built-in ones can't
-    /// be typed in: their box is read-only).
-    fn text_typed(&mut self, app: &mut AppState) -> Vec<Ask> {
-        let id = app.settings.skin.clone();
-        // (Typed into the text of a skin no longer in use, before the one in use now is shown: the
-        // next frame shows it, and nothing is written.)
-        if !self.text_for.eq_ignore_ascii_case(&id) || app.skins.find(&id).is_none_or(Entry::built_in) {
-            return Vec::new();
-        }
-        let typed = self.code.text.clone();
-        // Glint doesn't read a bigger file: the skin would drop out of the list.
-        if typed.len() > MAX_TEXT {
-            let text = app.skins.find(&id).map(|e| e.text.replace("\r\n", "\n")).unwrap_or_default();
-            self.code.set_text(&text);
-            self.text_shown = text;
-            self.say("That's too big for a skin (256 KB at most)", true);
-            self.invalidate();
-            return Vec::new();
-        }
-        self.text_shown = typed.clone();
-        if let Some(old) = app.skins.find(&id).map(|e| e.text.clone()).filter(|t| *t != typed) {
-            self.remember(&id, old, Some(TEXT_GROUP));
-        }
-        app.skins.set_text(&id, &typed);
-        app.apply_skin();
-        self.save_soon(&id);
-        self.invalidate();
-        vec![Ask::RedrawMain]
-    }
-
     /// What a job brought back (a drop-down's pick, a colour, a file).
     pub fn job_done(&mut self, done: JobDone, app: &mut AppState) -> Vec<Ask> {
         match done {
             JobDone::Nothing => Vec::new(),
             JobDone::Picked(id) => {
+                if let Some(pop) = self.pop.take() {
+                    return self.popped(pop, id, app);
+                }
                 let Some(ctl) = self.menu_for.take() else { return Vec::new() };
                 match id.checked_sub(1) {
                     Some(n) => self.picked(ctl, n as usize, app),
@@ -4093,31 +4746,11 @@ impl SkinWindow {
                 }
                 self.layout_dirty = true;
                 self.edit_at = None;
-                self.code.forget_font();
-                self.invalidate();
+                        self.invalidate();
                 // SAFETY: lparam points to the suggested window rectangle.
                 let suggested = unsafe { *(lparam.0 as *const RECT) };
                 asks.push(Ask::Job(Job::Place(suggested)));
                 Some(LRESULT(0))
-            }
-            // An I-beam over the skin's text, a hand over a problem under it.
-            windows::Win32::UI::WindowsAndMessaging::WM_SETCURSOR if lo_word(lparam.0 as usize) == windows::Win32::UI::WindowsAndMessaging::HTCLIENT && self.advanced => {
-                use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursor, IDC_ARROW, IDC_HAND, IDC_IBEAM};
-                let mut pt = POINT::default();
-                // SAFETY: plain cursor queries and setting the cursor's shape.
-                unsafe {
-                    let _ = GetCursorPos(&mut pt);
-                    let _ = ScreenToClient(self.hwnd, &mut pt);
-                    let (s, b) = (self.scale(), self.border());
-                    let p = Point::new(pt.x as f32 / s - b, pt.y as f32 / s - b);
-                    let shape = match self.target_at(p) {
-                        Some(Hot::Code) if self.code.rect.contains(p) => IDC_IBEAM,
-                        Some(Hot::Note(_)) => IDC_HAND,
-                        _ => IDC_ARROW,
-                    };
-                    SetCursor(LoadCursorW(None, shape).ok());
-                }
-                Some(LRESULT(1))
             }
             WM_MOUSEMOVE => {
                 let p = self.client_point(lparam);
@@ -4126,7 +4759,6 @@ impl SkinWindow {
             }
             WM_MOUSELEAVE => {
                 self.tracking = false;
-                self.code.mouse_leave();
                 if self.drag.is_none() && self.hover.take().is_some() {
                     self.invalidate();
                 }
@@ -4146,7 +4778,6 @@ impl SkinWindow {
                 self.pressed = None;
                 self.drag = None;
                 self.end_sliding();
-                self.code.mouse_up();
                 self.holding.release(self.hwnd);
                 self.invalidate();
                 Some(LRESULT(0))
@@ -4163,26 +4794,6 @@ impl SkinWindow {
                 Some(LRESULT(0))
             }
             WM_KEYDOWN | WM_SYSKEYDOWN => self.key(wparam.0 as u16, lparam.0 & 0x4000_0000 != 0, app, &mut asks).then_some(LRESULT(0)),
-            WM_CHAR if self.focus == Spot::Text && self.advanced && self.asking.is_none() => {
-                // A character past the first 65,536 (an emoji, say) comes in two halves, one
-                // message each: the first waits for the second.
-                let unit = wparam.0 as u32;
-                let c = match (self.half_char.take(), unit) {
-                    (_, 0xD800..=0xDBFF) => {
-                        self.half_char = Some(unit as u16);
-                        None
-                    }
-                    (Some(first), 0xDC00..=0xDFFF) => char::decode_utf16([first, unit as u16]).next().and_then(Result::ok),
-                    _ => char::from_u32(unit),
-                };
-                if let Some(c) = c {
-                    if self.code.char(c, &SkinLang) == Done::Changed {
-                        asks.extend(self.text_typed(app));
-                    }
-                    self.invalidate();
-                }
-                Some(LRESULT(0))
-            }
             WM_CHAR => {
                 if let Some(spot) = self.act_on_char.take() {
                     asks.extend(self.activate_spot(spot, app));
@@ -4246,6 +4857,10 @@ impl SkinWindow {
                 asks.extend(self.take_results(app));
                 Some(LRESULT(0))
             }
+            WM_APP_DOCK => {
+                asks.push(Ask::Job(Job::Dock((self.m().width * self.scale()).round() as i32)));
+                Some(LRESULT(0))
+            }
             _ => None,
         };
         (result, asks)
@@ -4262,6 +4877,129 @@ impl Drop for SkinWindow {
                 let _ = DeleteObject(HGDIOBJ(brush as *mut _));
             }
         }
+    }
+}
+
+/// A small icon, drawn in `ink` in the middle of `at` (about 12 across).
+pub(crate) fn glyph(r: &mut Renderer, g: Glyph, at: Rect, ink: Color) {
+    let c = Point::new(r.snap(at.x + at.w / 2.0), r.snap(at.y + at.h / 2.0));
+    let p = |x: f32, y: f32| Point::new(c.x + x, c.y + y);
+    let w = 1.2;
+    match g {
+        Glyph::Undo | Glyph::Redo => {
+            // Half a circle over the top, its arrow's head pointing down at its end (as the signs
+            // for undo and redo).
+            let s = if g == Glyph::Undo { 1.0 } else { -1.0 };
+            let (rad, cy) = (4.5, 1.5);
+            let arc: Vec<Point> = (0..=12)
+                .map(|i| {
+                    let a = std::f32::consts::PI * i as f32 / 12.0;
+                    p(s * rad * a.cos(), cy - rad * a.sin())
+                })
+                .collect();
+            r.polyline(&arc, w, ink);
+            let e = p(-s * rad, cy);
+            r.fill_polygon(&[Point::new(e.x - 3.0, e.y - 1.0), Point::new(e.x + 3.0, e.y - 1.0), Point::new(e.x, e.y + 3.0)], ink);
+        }
+        Glyph::More => {
+            for x in [-5.0, 0.0, 5.0] {
+                r.fill_ellipse(p(x, 0.0), 1.4, 1.4, ink);
+            }
+        }
+        Glyph::New => {
+            r.line(p(-5.0, 0.0), p(5.0, 0.0), w, ink);
+            r.line(p(0.0, -5.0), p(0.0, 5.0), w, ink);
+        }
+        Glyph::Duplicate => {
+            r.stroke_rect(Rect::new(c.x - 5.5, c.y - 5.5, 8.0, 8.0), 1.0, ink);
+            r.stroke_rect(Rect::new(c.x - 2.5, c.y - 2.5, 8.0, 8.0), 1.0, ink);
+        }
+        Glyph::Rename => {
+            // A pencil, its point down on the left.
+            r.stroke_polygon(&[p(-5.5, 5.5), p(-4.5, 2.0), p(3.0, -5.5), p(5.5, -3.0), p(-2.0, 4.5)], w, ink);
+            r.line(p(1.5, -4.0), p(4.0, -1.5), w, ink);
+        }
+        Glyph::Delete => {
+            // A bin: its lid with a handle, and its body.
+            r.line(p(-5.5, -3.5), p(5.5, -3.5), w, ink);
+            r.polyline(&[p(-2.0, -3.5), p(-2.0, -5.5), p(2.0, -5.5), p(2.0, -3.5)], w, ink);
+            r.polyline(&[p(-4.0, -3.5), p(-3.2, 5.5), p(3.2, 5.5), p(4.0, -3.5)], w, ink);
+            r.line(p(-1.2, -1.0), p(-1.2, 3.5), 1.0, ink);
+            r.line(p(1.2, -1.0), p(1.2, 3.5), 1.0, ink);
+        }
+        Glyph::Import | Glyph::Export => {
+            // An arrow down onto a line (import), or up to one (export).
+            let s = if g == Glyph::Import { 1.0 } else { -1.0 };
+            r.line(p(0.0, -4.5 * s), p(0.0, 3.0 * s), w, ink);
+            r.polyline(&[p(-3.5, 0.0), p(0.0, 3.5 * s), p(3.5, 0.0)], w, ink);
+            r.line(p(-5.0, 5.5 * s), p(5.0, 5.5 * s), w, ink);
+        }
+        Glyph::Folder => {
+            r.stroke_polygon(&[p(-6.0, -4.5), p(-2.0, -4.5), p(-0.5, -3.0), p(6.0, -3.0), p(6.0, 4.5), p(-6.0, 4.5)], w, ink);
+            r.line(p(-6.0, -1.0), p(6.0, -1.0), 1.0, ink);
+        }
+        Glyph::Search => {
+            r.stroke_ellipse(p(-1.0, -1.0), 3.8, 3.8, w, ink);
+            r.line(p(1.8, 1.8), p(4.8, 4.8), 1.4, ink);
+        }
+        Glyph::Clear => {
+            r.line(p(-3.5, -3.5), p(3.5, 3.5), 1.1, ink);
+            r.line(p(-3.5, 3.5), p(3.5, -3.5), 1.1, ink);
+        }
+        Glyph::Detach | Glyph::Dock => {
+            // An arrow to a corner under a line: up and left (DETACH), or down and right (DOCK).
+            let s = if g == Glyph::Detach { 1.0 } else { -1.0 };
+            r.line(p(-5.5 * s, -5.5 * s), p(5.5 * s, -5.5 * s), w, ink);
+            r.line(p(4.5 * s, 4.5 * s), p(-3.0 * s, -3.0 * s), w, ink);
+            r.polyline(&[p(-3.0 * s, 1.5 * s), p(-3.0 * s, -3.0 * s), p(1.5 * s, -3.0 * s)], w, ink);
+        }
+        Glyph::Help => r.text("?", at, &TextStyle::new(ink).size(13.0).bold().align(Align::Center)),
+        Glyph::Menu => {
+            for y in [-4.0, 0.0, 4.0] {
+                r.line(p(-5.5, y), p(5.5, y), w, ink);
+            }
+        }
+    }
+}
+
+/// A small icon button: its icon, on the hover colour while the mouse is over it (greyed when it
+/// can't be used; a colour's x in the muted colour until the mouse is over it).
+pub(crate) fn icon_button(r: &mut Renderer, theme: &Theme, at: Rect, g: Glyph, look: Look) {
+    if look.enabled && (look.hover || look.pressed) {
+        r.fill_round_rect(at, 4.0, if look.pressed { theme.button_pressed } else { theme.chip_hover });
+    }
+    let ink = match () {
+        _ if !look.enabled => theme.muted.with_alpha(theme.muted.a * 0.45),
+        _ if g == Glyph::Clear && !look.hover => theme.muted,
+        _ => theme.text,
+    };
+    glyph(r, g, at, ink);
+    if look.focused {
+        kit::focus_ring(r, theme, at, 0.0);
+    }
+}
+
+/// An icon on a button's face, in the skin's shape (the sort order's editor's ⋯, ? and ☰).
+pub(crate) fn icon_face(r: &mut Renderer, theme: &Theme, at: Rect, g: Glyph, look: Look) {
+    kit::button(r, theme, at, "", look);
+    let ink = if look.enabled { theme.text } else { theme.muted.with_alpha(theme.muted.a * 0.45) };
+    glyph(r, g, at, ink);
+}
+
+/// A section's heading that folds it (one column): a small triangle (pointing right while it's
+/// folded, down while it's open), then its title.
+fn fold_heading(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str, open: bool, look: Look) {
+    let ink = if look.hover { theme.text } else { theme.muted };
+    let c = Point::new(rect.x + 4.0, rect.y + (rect.h / 2.0).round());
+    let tri = if open {
+        [Point::new(c.x - 3.5, c.y - 2.0), Point::new(c.x + 3.5, c.y - 2.0), Point::new(c.x, c.y + 2.5)]
+    } else {
+        [Point::new(c.x - 2.0, c.y - 3.5), Point::new(c.x - 2.0, c.y + 3.5), Point::new(c.x + 2.5, c.y)]
+    };
+    r.fill_polygon(&tri, ink);
+    kit::heading(r, theme, Rect::new(rect.x + 14.0, rect.y, (rect.w - 14.0).max(0.0), rect.h), text);
+    if look.focused {
+        kit::focus_ring(r, theme, rect.inset(-2.0, -1.0), 0.0);
     }
 }
 
@@ -4357,7 +5095,7 @@ mod tests {
     #[test]
     fn the_search_finds_colours_by_name() {
         let found: Vec<&str> = COLOURS.iter().map(|(_, t)| *t).filter(|t| found_by(t, "scroll")).collect();
-        assert_eq!(found, ["Scroll bars", "Scroll bars hover", "Scroll bar track", "Scroll bar edges"]);
+        assert_eq!(found, ["Scroll bars", "Scroll bars, under the mouse", "Scroll bar track", "Scroll bar edges"]);
         assert!(found_by("Accent", " ACC "));
         assert!(COLOURS.iter().all(|(_, t)| found_by(t, "")));
     }
@@ -4380,7 +5118,18 @@ mod tests {
             assert_eq!(COLOURS.iter().filter(|(k, _)| k == key).count(), 1, "{key}");
         }
         assert_eq!(COLOURS.len(), skin::COLOURS.len());
-        assert_eq!(COLOUR_GROUPS.iter().map(|(_, n)| n).sum::<usize>(), COLOURS.len());
+        // Every colour and every part shows once, in a card of CARDS, in its order.
+        let cards = cards(&[]);
+        assert_eq!(cards.iter().map(|(t, _)| *t).collect::<Vec<_>>(), CARDS.to_vec());
+        for i in 0..COLOURS.len() {
+            assert_eq!(cards.iter().flat_map(|(_, r)| r).filter(|(c, ..)| *c == Ctl::Colour(i)).count(), 1, "{}", COLOURS[i].0);
+        }
+        for p in crate::parts::ALL {
+            assert_eq!(cards.iter().flat_map(|(_, r)| r).filter(|(c, ..)| *c == Ctl::Part(p)).count(), 1, "{p:?}");
+        }
+        let rows: Vec<Ctl> = cards.iter().flat_map(|(_, r)| r.iter().map(|(c, ..)| *c)).collect();
+        assert!(rows.iter().enumerate().all(|(n, c)| !rows[..n].contains(c)), "no row twice");
+        assert_eq!(rows.len(), 161, "85 settings and 76 colours");
         // Each shows what the skin says, read back from its own line.
         let text: String = COLOURS.iter().enumerate().map(|(i, (k, _))| format!("{k}: #{:02x}0203\n", i + 1)).collect();
         for (i, c) in shown_colours(&text).iter().enumerate() {
@@ -4443,7 +5192,7 @@ mod tests {
         assert_eq!(word_at(&TAB_STYLES, 1, "tabs"), [("tabs", "pills".to_string())]);
         assert!(word_at(&TAB_STYLES, 7, "tabs").is_empty());
         let chrome = skin::built_in_theme("chrome");
-        assert_eq!(label_of(&BUTTON_STYLES, chrome.buttons), "Liquid");
+        assert_eq!(label_of(&BUTTON_STYLES, chrome.buttons), "Glossy");
         assert_eq!(label_of(&SIDEBAR_STYLES, skin::built_in_theme(skin::DEFAULT).sidebar_style), "Plain");
     }
 
@@ -4462,65 +5211,6 @@ mod tests {
         }
     }
 
-    fn some_notes(n: usize) -> Vec<skin::Note> {
-        (1..=n).map(|i| skin::Note { line: i, text: format!("problem {i}") }).collect()
-    }
-
-    #[test]
-    fn up_to_eight_problems_are_listed_in_red() {
-        let said = |lines: &[(String, Said, usize)]| lines.iter().map(|l| l.1).collect::<Vec<_>>();
-        // None: one faint line.
-        let lines = note_lines(&[], false, 5);
-        assert_eq!((lines.len(), lines[0].1), (1, Said::Quiet));
-        // A few: each in red, by its line.
-        let lines = note_lines(&some_notes(3), false, usize::MAX);
-        assert_eq!(said(&lines), [Said::Problem; 3]);
-        assert_eq!(lines[2], ("Line 3: problem 3".to_string(), Said::Problem, 3));
-        // Eight fit; a ninth is "and 1 more".
-        assert_eq!(note_lines(&some_notes(8), false, usize::MAX).len(), 8);
-        let lines = note_lines(&some_notes(9), false, usize::MAX);
-        assert_eq!(lines.len(), 9);
-        assert_eq!(lines[8], ("\u{2026}and 1 more.".to_string(), Said::Quiet, 0));
-        // Built in: its line first, then the problems.
-        let lines = note_lines(&some_notes(12), true, usize::MAX);
-        assert_eq!((lines.len(), lines[0].1, lines[9].0.as_str()), (10, Said::Plain, "\u{2026}and 4 more."));
-        // Less room than problems: as many as fit, then how many more.
-        let lines = note_lines(&some_notes(12), false, 5);
-        assert_eq!(lines.len(), 5);
-        assert_eq!(lines[4].0, "\u{2026}and 8 more.");
-        let lines = note_lines(&some_notes(5), false, 5);
-        assert_eq!(said(&lines), [Said::Problem; 5], "exactly fits: no \"more\"");
-        // Room for one line: the count, in red.
-        let lines = note_lines(&some_notes(3), true, 1);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].1, Said::Problem);
-        assert_eq!(lines[0].0, "Mistakes in 3 lines (marked in red).");
-        assert_eq!(note_lines(&some_notes(1), true, 1)[0].0, "Mistake in 1 line (marked in red).");
-        // A problem with no line (the skin as a whole) says no "Line 0".
-        let lines = note_lines(&[skin::Note { line: 0, text: "whole".into() }], false, 5);
-        assert_eq!(lines[0], ("whole".to_string(), Said::Problem, 0));
-        // No room asked: still one line.
-        assert_eq!(note_lines(&[], true, 0).len(), 1);
-    }
-
-    #[test]
-    fn the_guide_shows_every_wallpaper_setting_in_short_lines() {
-        for (key, _) in skin::OTHERS.iter().filter(|(k, _)| k.starts_with("wallpaper")) {
-            assert!(GUIDE_PICTURES.iter().any(|l| l.starts_with(&format!("|{key}:"))), "{key} isn't in the guide");
-        }
-        // Each example is understood as it's written.
-        for g in GUIDE.iter().chain(GUIDE_PICTURES) {
-            if let Some(code) = g.strip_prefix('|') {
-                let line = code.split(" //").next().unwrap_or(code);
-                let p = skin::parse(line, "x");
-                // (The example picture isn't there.)
-                assert!(p.notes.iter().all(|n| n.text.contains("Can't find the wallpaper")), "{line}: {:?}", p.notes);
-                assert!(code.chars().count() <= 52, "too long for a column: {code}");
-            } else {
-                assert!(g.chars().count() <= 80, "too long: {g}");
-            }
-        }
-    }
 
     /// The skin's text after slider `s` is moved to `v` (as the customiser does it: read the skin,
     /// write what the slider says into its text).
@@ -4535,8 +5225,7 @@ mod tests {
 
     #[test]
     fn every_slider_value_is_written_and_read_back_the_same() {
-        for (s, key, min, max, ..) in SLIDES {
-            assert!(skin::range_of(key).is_some() || key == "wallpaper-position", "{key}");
+        for (s, _, min, max, ..) in SLIDES {
             let mut v = min;
             while v <= max {
                 let text = slid("dark: true\n", s, v);
@@ -4847,6 +5536,30 @@ mod tests {
         // Very near the default: exactly it; a bit further: where it was dragged.
         assert_eq!(pan_place((0.0, 0.0), (29.6, 0.0), (60.0, 40.0), d), (50.0, 0.0));
         assert_eq!(pan_place((0.0, 0.0), (28.8, 0.0), (60.0, 40.0), d), (48.0, 0.0));
+    }
+
+    /// The three layouts: the wide one is as it always was; one column is 420 wide with no list and
+    /// 32-tall rows (the default); slim is 600 wide with a 150-wide list and 34-tall rows. The menu
+    /// of the rest has what the wide one's buttons do but undo and redo, and slim's icons are those
+    /// buttons. At first only the wallpaper and the main colours are open.
+    #[test]
+    fn the_three_layouts_have_their_sizes_and_every_button() {
+        let (w, c, s) = (Metrics::of(Layout::Wide), Metrics::of(Layout::Compact), Metrics::of(Layout::Slim));
+        assert_eq!((w.width, w.list_w, w.row_h, w.header_h, w.row_pad), (780.0, 236.0, 46.0, 96.0, 16.0));
+        assert_eq!((c.width, c.list_w, c.row_h, c.header_h, c.row_pad), (420.0, 0.0, 32.0, 96.0, 10.0));
+        assert_eq!((s.width, s.list_w, s.row_h, s.item_h, s.header_h), (600.0, 150.0, 34.0, 26.0, 52.0));
+        for m in [w, c, s] {
+            assert!(m.min_width <= m.width);
+        }
+        assert_eq!(Layout::default(), Layout::Compact);
+        assert_eq!(serde_json::to_value(crate::settings::Settings::default()).unwrap()["SkinsWindow"], "compact");
+        let buttons: Vec<Btn> = BUTTONS.iter().map(|(b, _)| *b).collect();
+        assert_eq!(MORE.iter().map(|(b, _)| *b).collect::<Vec<_>>(), buttons[2..].to_vec());
+        assert_eq!(ICONS.iter().map(|(b, _)| *b).collect::<Vec<_>>(), buttons);
+        let folded = first_folded();
+        assert!(!folded.contains(&"Wallpaper") && !folded.contains(&"Main colours"));
+        assert!(!folded.contains(&"Overall look") && folded.contains(&"Tabs") && folded.contains(&"3D edges"));
+        assert_eq!(folded.len(), CARDS.len() - 3);
     }
 
     #[test]

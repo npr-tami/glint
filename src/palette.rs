@@ -569,7 +569,7 @@ impl CommandBox {
             let picked = i == self.pick;
             if picked {
                 r.fill_rect(row, theme.accent_tint);
-                r.fill_rect(Rect::new(row.x, row.y, 3.0, row.h), theme.select_edge);
+                r.fill_rect(Rect::new(row.x, row.y, theme.select_edge_w, row.h), theme.select_edge);
             } else if self.hover == Some(i) {
                 r.fill_rect(row, theme.hover);
             }

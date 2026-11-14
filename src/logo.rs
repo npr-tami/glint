@@ -257,6 +257,15 @@ pub fn draw(r: &mut Renderer, theme: &Theme, bar: Rect) -> f32 {
     if theme.logo_style == LogoStyle::None {
         return bar.x;
     }
+    // Always solid, even over a see-through title bar.
+    let keep = r.fade();
+    r.set_fade(1.0);
+    let end = draw_now(r, theme, bar);
+    r.set_fade(keep);
+    end
+}
+
+fn draw_now(r: &mut Renderer, theme: &Theme, bar: Rect) -> f32 {
     if theme.chrome_logo() {
         let caps = theme.logo_style == LogoStyle::Caps;
         let p = place(bar, r.scale(), caps);
@@ -270,10 +279,12 @@ pub fn draw(r: &mut Renderer, theme: &Theme, bar: Rect) -> f32 {
         // is being filled.
         let paint = &theme.logo_paint;
         if corner > 0.0 {
-            // Rounded skins round the one corner that isn't against the window's edges.
-            r.fill_paint_down(Rect::new(x, y, w, h), corner, paint, y, y + h);
-            r.fill_paint_down(Rect::new(x, y, w, corner), 0.0, paint, y, y + h);
-            r.fill_paint_down(Rect::new(x, y, corner, h), 0.0, paint, y, y + h);
+            // Rounded skins round the one corner that isn't against the window's edges: one box
+            // reaching out past the top and left, cut there (pieces laid over each other would
+            // show darker where they overlap when the title bar is see-through).
+            r.push_clip(Rect::new(x, y, w, h));
+            r.fill_paint_down(Rect::new(x - corner, y - corner, w + corner, h + corner), corner, paint, y, y + h);
+            r.pop_clip();
         } else {
             r.fill_polygon_paint(&[Point::new(x, y), Point::new(x + w, y), Point::new(x + w - lean, y + h), Point::new(x, y + h)], paint);
         }
@@ -281,6 +292,33 @@ pub fn draw(r: &mut Renderer, theme: &Theme, bar: Rect) -> f32 {
         r.text(&theme.logo_text, Rect::new(x, y, w - lean * 0.85, h), &style);
     }
     bar.x + width(theme)
+}
+
+/// A smaller logo for a smaller title bar `bar` (the sort order's editor, slim): the chrome
+/// wordmark at the bar's height, or the skin's own word in a small slanted box 18 tall. Returns
+/// where it ends.
+pub fn draw_small(r: &mut Renderer, theme: &Theme, bar: Rect) -> f32 {
+    if theme.logo_style == LogoStyle::None {
+        return bar.x;
+    }
+    if theme.chrome_logo() {
+        let caps = theme.logo_style == LogoStyle::Caps;
+        let p = place(bar, r.scale(), caps);
+        r.wordmark(theme.dark, caps, p.index, p.rect, p.exact);
+        return p.rect.right();
+    }
+    let h = 18.0;
+    let style = TextStyle::new(theme.logo_ink).size(10.0).bold().align(Align::Center);
+    let w = (r.measure(&theme.logo_text, &style) + 16.0).ceil();
+    let (x, y) = (bar.x + 12.0, (bar.y + (bar.h - h) / 2.0).round());
+    let (lean, corner) = (theme.logo_lean(h), theme.corner(h));
+    if corner > 0.0 {
+        r.fill_paint_down(Rect::new(x, y, w, h), corner, &theme.logo_paint, y, y + h);
+    } else {
+        r.fill_polygon_paint(&[Point::new(x + lean, y), Point::new(x + w, y), Point::new(x + w - lean, y + h), Point::new(x, y + h)], &theme.logo_paint);
+    }
+    r.text(&theme.logo_text, Rect::new(x, y, w, h), &style);
+    x + w
 }
 
 #[cfg(test)]

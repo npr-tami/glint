@@ -63,6 +63,7 @@ use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXDRAG, SM_CY
 
 use crate::app::{AppState, SortKey, Tab, THIS_PC_NOTE};
 use crate::fileops;
+use crate::parts::P;
 use crate::home;
 use crate::folder::{self, Entry, EntryKind};
 use crate::frame;
@@ -87,6 +88,8 @@ const SCROLL_TIME: f64 = 0.12;
 const FRAME_HEAD_START: f64 = 0.008;
 /// Space left of the icon (the red selection edge sits in it).
 const ROW_PAD: f32 = 12.0;
+/// With the skin's `list-rows: stripes`, every other row gets this much of the text colour over it.
+const STRIPE_ALPHA: f32 = 0.04;
 const MIN_COL: f32 = 48.0;
 /// The tree view: how far each level is pulled in, and the room for the ▸ arrow before the icon.
 const TREE_INDENT: f32 = 16.0;
@@ -355,6 +358,10 @@ pub struct ListView {
     arrows: f32,
     /// How far in the column titles sit (98 / 2000: inside the list's 2 DIP sunken edge).
     edge_in: f32,
+    /// How tall the column titles are (the skin's `column-titles-height`).
+    header_h: f32,
+    /// The skin's `scrollbar-show: using`: the scroll bar shows only while the mouse is over the list.
+    bars_while_used: bool,
     mouse: Option<Point>,
     /// What the mouse lit up in the last frame painted: a move that changes none of it needs no
     /// new frame.
@@ -413,8 +420,11 @@ pub struct ListView {
     home_on: bool,
     /// Disk space's page, drawn instead of rows while the tab shows it (diskpage.rs).
     disk: crate::diskpage::DiskPage,
-    /// Split view: where the wallpaper lies (both halves); None: this list.
+    /// Split view: where the list's background lies (both halves); None: this list.
     wall_area: Option<Rect>,
+    /// Where the wallpaper is laid out (`wallpaper-area`, set by window.rs): None: as the
+    /// background (`middle-shrinks`).
+    pic_area: Option<Rect>,
     /// SHOW THEM after "Only protected system files are here." (at the last frame), when it shows.
     show_system_at: Option<Rect>,
     /// How media.rs tells this list's asks from the other half's (split view), and what this list
@@ -489,6 +499,8 @@ impl ListView {
             bar_margin: size::SCROLLBAR_MARGIN,
             arrows: 0.0,
             edge_in: 0.0,
+            header_h: size::HEADER_H,
+            bars_while_used: false,
             mouse: None,
             painted_hover: HoverKey::default(),
             drag: Drag::None,
@@ -523,6 +535,7 @@ impl ListView {
             home_on: false,
             disk: crate::diskpage::DiskPage::default(),
             wall_area: None,
+            pic_area: None,
             show_system_at: None,
             media_id: NEXT_LIST.fetch_add(1, Ordering::Relaxed),
             media: MediaRead::default(),
@@ -550,8 +563,13 @@ impl ListView {
     fn take_size(&mut self, app: &AppState) {
         self.row_h = app.row_height();
         let large = app.settings.size == ListSize::Large;
-        self.icon = if large { size::ICON_LARGE } else { size::ICON };
-        self.font = if large { size::FONT_LARGE } else { size::FONT };
+        // (The skin's list-icon-size is the small and medium sizes' icon; list-text-size goes on
+        // any size's text.)
+        let parts = &app.theme.parts;
+        self.icon = if large { size::ICON_LARGE } else { parts.num(P::ListIcon) };
+        self.font = if large { size::FONT_LARGE } else { size::FONT } + parts.num(P::ListText);
+        self.header_h = app.theme.header_h();
+        self.bars_while_used = app.theme.parts.scrollbars_while_used();
         self.skin_text = app.theme.font_size / size::FONT;
         self.bar_w = app.theme.scrollbar_w;
         self.bar_margin = app.theme.scrollbar_margin();
@@ -700,7 +718,7 @@ impl ListView {
 
     /// The column titles (Details and Tree only: the other views have none).
     fn header(&self) -> Rect {
-        let h = if self.flow == Flow::Rows && !self.home_on { size::HEADER_H } else { 0.0 };
+        let h = if self.flow == Flow::Rows && !self.home_on { self.header_h } else { 0.0 };
         // 98 / 2000: inside the list's sunken edge, so its own raised edge shows all round.
         let e = self.edge_in;
         Rect::new(self.rect.x + e, self.rect.y + e, (self.rect.w - 2.0 * e).max(0.0), h)
@@ -711,7 +729,7 @@ impl ListView {
         if self.flow != Flow::Rows || self.home_on {
             return self.rect;
         }
-        let top = self.rect.y + self.edge_in + size::HEADER_H + 1.0;
+        let top = self.rect.y + self.edge_in + self.header_h + 1.0;
         Rect::new(self.rect.x, top, self.rect.w, (self.rect.bottom() - top).max(0.0))
     }
 
@@ -1473,14 +1491,14 @@ impl ListView {
             }
             return;
         }
-        r.fill_paint(header, 0.0, &theme.list_header);
+        r.fill_paint(header, 0.0, &theme.through(&theme.list_header));
         for (i, p) in self.cols.clone().iter().enumerate() {
             let cell = Rect::new(p.x, header.y, (p.x + p.w).min(end) - p.x, header.h);
             if cell.w <= 0.0 {
                 continue;
             }
             if hover_col == Some(p.col) && p.col.sort_key().is_some() {
-                r.fill_paint(cell, 0.0, &theme.hover_paint);
+                crate::pathbar::fill_solid(r, theme, cell, 0.0, &theme.hover_paint);
             }
             if theme.bevels {
                 crate::pathbar::bevel(r, theme, cell, true, theme.list_header.base());
@@ -1492,9 +1510,10 @@ impl ListView {
             let label = p.col.title(this_pc, bin, crate::recent::is_recent(&tab.folder.path));
             let right = p.col.right_aligned();
             let text_rect = if i == 0 { Rect::new(cell.x + ROW_PAD + 4.0, cell.y, cell.w - ROW_PAD - 16.0, cell.h) } else { cell.inset(10.0, 0.0) };
-            let style = TextStyle::new(theme.list_header_text).align(if right { Align::Right } else { Align::Left });
-            // With liquid buttons the titles are bold, as the sidebar's panel headers are.
-            let style = if theme.buttons == ButtonStyle::Liquid { style.bold() } else { style };
+            let mut style = TextStyle::new(theme.list_header_text).align(if right { Align::Right } else { Align::Left });
+            // With liquid buttons the titles are bold, as the sidebar's panel headers are; else as
+            // heavy as the skin's column-titles-weight says.
+            style.weight = if theme.buttons == ButtonStyle::Liquid { 700 } else { theme.parts.header_weight() };
             r.text(label, text_rect, &style);
             // (None while the custom sort order decides, or Recent keeps Windows' newest-first order.)
             if p.col.sort_key() == Some(tab.sort) && tab.custom_here().is_none() && !own_order && !(this_pc && p.col == Col::Free && tab.sort != SortKey::Date) {
@@ -1617,7 +1636,7 @@ impl ListView {
             }
         }
 
-        if let Some(thumb) = self.thumb(tab) {
+        if let Some(thumb) = self.thumb(tab).filter(|_| self.bar_shown()) {
             let state = match self.drag {
                 Drag::Thumb { .. } => ThumbState::Dragged,
                 Drag::Bar => ThumbState::Held(self.repeat.hold),
@@ -1683,6 +1702,17 @@ impl ListView {
         r.set_tint(tint.then(|| (Color { a: 1.0, ..theme.accent_tint_paint.base() }, 0.5)));
     }
 
+    /// A name's weight: bold when it's selected and the skin says `selection-bold`, or a folder's
+    /// and the skin says `folders-bold`.
+    fn name_weight(style: TextStyle, theme: &Theme, e: &Entry, selected: bool) -> TextStyle {
+        let p = &theme.parts;
+        if (selected && p.on(P::SelectBold)) || (e.kind == EntryKind::Folder && p.on(P::FoldersBold)) {
+            style.bold()
+        } else {
+            style
+        }
+    }
+
     /// The colour of an item's name.
     fn name_color(theme: &Theme, e: &Entry, selected: bool, is_cut: bool) -> crate::theme::Color {
         // (An older Windows' selection is dark: a cut item on it keeps the selection's colour.)
@@ -1693,6 +1723,11 @@ impl ListView {
         } else {
             theme.text
         }
+    }
+
+    /// Whether the scroll bar is drawn now (see `bar_in_use`).
+    fn bar_shown(&self) -> bool {
+        bar_in_use(self.bars_while_used, self.mouse.is_some(), self.drag != Drag::None)
     }
 
     /// Details and Tree: one row per item, with the columns.
@@ -1715,6 +1750,8 @@ impl ListView {
         let dupes = tab.search.as_ref().is_some_and(|s| s.is_dupes()) && !tab.column_now;
         // Colour tags: a dot after the name (tags.rs).
         let mut tags = app.tags.lookup(&tab.folder.path);
+        let rows_look = theme.parts.list_rows();
+        let column_lines = theme.parts.on(P::ColumnLines);
         for row in geo.visible(scroll) {
             let Some(index) = tab.index_at(row) else { continue };
             let e = &tab.folder.entries[index];
@@ -1729,16 +1766,29 @@ impl ListView {
             // 98 / 2000 mark only the name (below), as their Explorer did.
             let label_only = theme.era.classic();
             let (lit, label_paint) = self.classic_label(theme);
+            // The skin's list-rows: every other row a shade darker (under the selection).
+            if rows_look == crate::parts::ListRows::Stripes && row % 2 == 1 {
+                r.fill_rect(line, theme.text.with_alpha(STRIPE_ALPHA));
+            }
             if selected {
                 if !label_only {
-                    crate::pathbar::fill_row(r, theme, line, &theme.accent_tint_paint, false);
-                    r.fill_rect(Rect::new(line.x, line.y, size::SELECT_EDGE, line.h), theme.select_edge);
+                    crate::pathbar::paint_row(r, theme, line, true, &theme.accent_tint_paint, theme.select_edge, theme.select_edge_w, 0.0);
                 }
             } else if hover == Some(row) || dropping {
-                crate::pathbar::fill_row(r, theme, line, &theme.hover_paint, true);
+                crate::pathbar::paint_row(r, theme, line, false, &theme.hover_paint, theme.select_edge, theme.select_edge_w, 0.0);
             }
             if dropping {
                 r.stroke_rect(line, 1.0, theme.accent);
+            }
+            // The skin's list-rows: lines, a thin line under each row; column-lines: a line between
+            // the columns, down the rows.
+            if rows_look == crate::parts::ListRows::Lines {
+                r.fill_rect(Rect::new(line.x, line.bottom() - 1.0, line.w, 1.0), theme.line);
+            }
+            if column_lines {
+                for p in cols.iter().skip(1).filter(|p| p.x < end) {
+                    r.fill_rect(Rect::new(p.x, y, 1.0, row_h), theme.line);
+                }
             }
             let offset = Self::tree_offset(tab, index);
             if tree && e.is_container() {
@@ -1781,7 +1831,7 @@ impl ListView {
             let name_color = Self::name_color(theme, e, selected && (lit || !label_only), is_cut);
             let name_x = line.x + ROW_PAD + offset + self.icon + 8.0;
             let name_right = self.name_right();
-            let name_style = TextStyle::new(name_color).size(self.font);
+            let name_style = Self::name_weight(TextStyle::new(name_color).size(self.font), theme, e, selected);
             let tag = tags.of(e);
             if label_only && selected {
                 // The selection behind the name only, and the keyboard's dotted box round it.
@@ -1831,7 +1881,7 @@ impl ListView {
             // 98 / 2000: the name only (see `classic_label`).
             let label_only = theme.era.classic();
             let (lit, label_paint) = self.classic_label(theme);
-            let style = TextStyle::new(Self::name_color(theme, e, selected && (lit || !label_only), is_cut)).size(self.font);
+            let style = Self::name_weight(TextStyle::new(Self::name_color(theme, e, selected && (lit || !label_only), is_cut)).size(self.font), theme, e, selected);
             let name = shown_name(e, hide_ext);
             let name_x = cell.x + ROW_PAD + self.icon + 8.0;
             // (A colour tag's dot goes after the name, in the item: tags.rs.)
@@ -1848,10 +1898,9 @@ impl ListView {
                     crate::retroctl::dotted(r, label, theme.selection_text);
                 }
             } else if selected {
-                r.fill_paint(item, 0.0, &theme.accent_tint_paint);
-                r.fill_rect(Rect::new(item.x, item.y, size::SELECT_EDGE, item.h), theme.select_edge);
+                crate::pathbar::paint_row(r, theme, item, true, &theme.accent_tint_paint, theme.select_edge, theme.select_edge_w, 0.0);
             } else if hover == Some(row) || dropping {
-                r.fill_paint(item, 0.0, &theme.hover_paint);
+                crate::pathbar::paint_row(r, theme, item, false, &theme.hover_paint, theme.select_edge, theme.select_edge_w, 0.0);
             }
             if dropping {
                 r.stroke_rect(item, 1.0, theme.accent);
@@ -1893,10 +1942,15 @@ impl ListView {
             if selected {
                 if !label_only {
                     fill_box_paint(r, theme, tile, 0.0, &theme.accent_tint_paint);
-                    r.fill_rect(Rect::new(tile.x + 8.0, tile.bottom() - 2.0, tile.w - 16.0, 2.0), theme.select_edge);
+                    let bar = theme.thin_select_edge();
+                    r.fill_rect(Rect::new(tile.x + 8.0, tile.bottom() - bar, tile.w - 16.0, bar), theme.select_edge);
                 }
             } else if hover == Some(row) || dropping {
+                let keep = r.fade();
+                r.set_fade(1.0);
+                crate::pathbar::under_box(r, theme, tile, 0.0, &theme.hover_paint);
                 fill_box_paint(r, theme, tile, 0.0, &theme.hover_paint);
+                r.set_fade(keep);
             }
             if dropping {
                 outline_box(r, theme, tile.inset(0.5, 0.5), 0.0, 1.0, theme.accent);
@@ -1913,7 +1967,7 @@ impl ListView {
                 r.fill_rect(drawn, under.with_alpha(0.55));
             }
             let name = Rect::new(tile.x + 4.0, pic.bottom() + TILE_TEXT_GAP, tile.w - 8.0, self.tile.lines as f32 * NAME_LINE_H + 1.0);
-            let style = TextStyle::new(Self::name_color(theme, e, selected && (lit || !label_only), is_cut)).align(Align::Center);
+            let style = Self::name_weight(TextStyle::new(Self::name_color(theme, e, selected && (lit || !label_only), is_cut)).align(Align::Center), theme, e, selected);
             if selected && label_only {
                 // Behind the name's lines: as wide as the name (or the box, when it wraps).
                 let full = r.measure(shown_name(e, hide_ext), &style).ceil();
@@ -1935,24 +1989,20 @@ impl ListView {
     /// [`wallpaper_layout`]), faint enough for the names to read over it. It's read in the
     /// background (thumbs.rs): none until it's there.
     fn paint_wallpaper(&self, r: &mut Renderer, theme: &Theme) {
-        if theme.wallpaper.is_empty() || theme.wallpaper_opacity <= 0.0 {
-            // (The last skin's picture, if there was one, needn't stay in memory.)
-            thumbs::forget_wallpaper();
-            return;
-        }
-        // In split view the picture lies across both halves, as one (each shows its part), and
-        // so does its fade.
-        let b = self.wall_area.unwrap_or(self.rect);
-        // It's read no bigger than it's drawn.
-        let fit = wallpaper_fit(theme, (b.w * self.scale, b.h * self.scale));
-        let Some(pic) = thumbs::wallpaper(&theme.wallpaper, theme.wallpaper_blur, theme.wallpaper_fit == WallpaperFit::Tile, fit) else { return };
-        let Some(how) = wallpaper_layout(b, (pic.width() as f32, pic.height() as f32), theme, 1.0 / self.scale.max(0.1)) else { return };
-        r.wallpaper(&pic, how, b, theme.wallpaper_opacity, theme.wallpaper_fade);
+        // Laid out over the list's room, or the window (the list shows its part), or the list:
+        // in split view across both halves, as one, and so is its fade.
+        paint_wallpaper_in(r, theme, self.pic_area.or(self.wall_area).unwrap_or(self.rect), self.scale);
     }
 
-    /// Split view: the wallpaper is laid out over `area` (both halves) instead of this list alone.
+    /// Split view: the background (and with `middle-shrinks` the wallpaper) lies across `area`
+    /// (both halves) instead of this list alone.
     pub fn set_wall_area(&mut self, area: Option<Rect>) {
         self.wall_area = area;
+    }
+
+    /// Where the wallpaper is laid out (`wallpaper-area`); None: where the background lies.
+    pub fn set_picture_area(&mut self, area: Option<Rect>) {
+        self.pic_area = area;
     }
 
     fn paint_picture(&self, r: &mut Renderer, theme: &Theme, app: &AppState, dir: &str, e: &Entry, b: Rect) -> Rect {
@@ -2112,6 +2162,12 @@ pub(crate) fn picture(r: &mut Renderer, theme: &Theme, app: &AppState, dir: &str
 /// in the skin's `scrollbar` paint (a gradient shades it across, like a rod), its edge and three
 /// grip lines across its middle if the skin has them. Being dragged, a flat thumb takes the accent
 /// colour and a shaded one gets a little darker.
+/// Whether a scroll bar is drawn: always, or (the skin's `scrollbar-show: using`) only while the
+/// mouse is over its pane or the thumb is held.
+pub fn bar_in_use(while_used: bool, mouse_in: bool, held: bool) -> bool {
+    !while_used || mouse_in || held
+}
+
 pub fn paint_scrollbar(r: &mut Renderer, theme: &Theme, lane: Rect, thumb: Rect, state: ThumbState, room: crate::retroctl::Room) {
     if theme.era.old() {
         let hold = if let ThumbState::Held(h) = state { h } else { crate::retroctl::Hold::None };
@@ -2121,11 +2177,12 @@ pub fn paint_scrollbar(r: &mut Renderer, theme: &Theme, lane: Rect, thumb: Rect,
     }
     let upright = thumb.h >= thumb.w;
     if !theme.scrollbar_track.is_clear() {
-        r.fill_paint(lane, 0.0, &theme.scrollbar_track);
+        r.fill_paint(lane, 0.0, &theme.through(&theme.scrollbar_track));
         let edge = if upright { Rect::new(lane.x, lane.y, 1.0, lane.h) } else { Rect::new(lane.x, lane.y, lane.w, 1.0) };
         r.fill_rect(edge, theme.line);
     }
-    let radius = if theme.bevels { 0.0 } else { thumb.w.min(thumb.h) / 2.0 };
+    // (The skin's `scrollbar-ends: square` squares the thumb's round ends.)
+    let radius = if theme.bevels || theme.parts.square_scrollbars() { 0.0 } else { thumb.w.min(thumb.h) / 2.0 };
     let shaded = theme.scroll_thumb_paint.gradient().is_some();
     let paint = match state {
         ThumbState::Dragged if shaded => theme.scroll_thumb_hover_paint.darker(0.1),
@@ -2394,8 +2451,11 @@ impl Component for ListView {
         self.place_columns(app);
         // (In split view a shaded background also lies across both halves, as one.)
         r.push_clip(self.rect);
-        r.fill_paint(self.wall_area.unwrap_or(self.rect), 0.0, &theme.panel_paint);
-        self.paint_wallpaper(r, theme);
+        // (wallpaper-area: window - the window drew both behind everything.)
+        if !theme.wallpaper_behind() {
+            r.fill_paint(self.wall_area.unwrap_or(self.rect), 0.0, &theme.panel_paint);
+            self.paint_wallpaper(r, theme);
+        }
         if crate::diskspace::is_disk(&tab.path) {
             self.disk.paint(r, theme, app, self.rect);
             r.pop_clip();
@@ -2406,7 +2466,7 @@ impl Component for ListView {
             let area = Rect::new(self.rect.x, self.rect.y, self.rect.w - SCROLL_GUTTER.min(12.0), self.rect.h);
             let mouse = if self.drag == Drag::None { self.mouse } else { None };
             home::paint(r, theme, app, tab, &mut self.home, area, tab.scroll.clamp(0.0, max), mouse, self.scale);
-            if let Some(thumb) = self.thumb(tab) {
+            if let Some(thumb) = self.thumb(tab).filter(|_| self.bar_shown()) {
                 let state = match self.drag {
                     Drag::Thumb { .. } => ThumbState::Dragged,
                     Drag::Bar => ThumbState::Held(self.repeat.hold),
@@ -2449,6 +2509,8 @@ impl Component for ListView {
         if crate::diskspace::is_disk(&app.tab().path) {
             return self.disk.mouse_move(e);
         }
+        // (The mouse coming in shows a scroll bar that only shows while it's in use.)
+        let entered = self.mouse.is_none() && self.bars_while_used;
         self.mouse = Some(e.pos);
         self.was_active = ctx.active;
         // Moved far enough from where a button went down on an item: the selection is dragged out.
@@ -2506,7 +2568,7 @@ impl Component for ListView {
             // Only hovering: a new frame only when what is lit up changes (a frame for every
             // pixel moved would redraw the whole window at the screen's rate).
             Drag::None if self.press.is_none() && self.band.is_none() => {
-                return if self.hover_key(tab) != self.painted_hover { Effect::Redraw } else { Effect::None };
+                return if entered || self.hover_key(tab) != self.painted_hover { Effect::Redraw } else { Effect::None };
             }
             Drag::Bar | Drag::None => {}
         }
@@ -3008,6 +3070,21 @@ impl Component for ListView {
         self.take_rename_request(now, app);
         self.anim.running() || now < self.repaint_until || banding || resort
     }
+}
+
+/// The skin's wallpaper laid out over `area` (seen where the clip lets it), faint enough for what
+/// lies over it to read. It's read in the background (thumbs.rs): none until it's there.
+pub(crate) fn paint_wallpaper_in(r: &mut Renderer, theme: &Theme, area: Rect, scale: f32) {
+    if theme.wallpaper.is_empty() || theme.wallpaper_opacity <= 0.0 {
+        // (The last skin's picture, if there was one, needn't stay in memory.)
+        thumbs::forget_wallpaper();
+        return;
+    }
+    // It's read no bigger than it's drawn.
+    let fit = wallpaper_fit(theme, (area.w * scale, area.h * scale));
+    let Some(pic) = thumbs::wallpaper(&theme.wallpaper, theme.wallpaper_blur, theme.wallpaper_fit == WallpaperFit::Tile, fit) else { return };
+    let Some(how) = wallpaper_layout(area, (pic.width() as f32, pic.height() as f32), theme, 1.0 / scale.max(0.1)) else { return };
+    r.wallpaper(&pic, how, area, theme.wallpaper_opacity, theme.wallpaper_fade);
 }
 
 /// How big the skin's wallpaper is drawn at most, for reading it no bigger (thumbs.rs

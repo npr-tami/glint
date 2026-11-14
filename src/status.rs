@@ -163,6 +163,8 @@ impl StatusBar {
                 s.push_str(&format!("  \u{00b7}  showing the first {}", format_count(crate::search::LIMIT)));
             }
             s
+        } else if !app.settings.status_count {
+            String::new()
         } else if shown != total {
             format!("{} of {} items", format_count(shown), format_count(total))
         } else if total == 1 {
@@ -171,15 +173,23 @@ impl StatusBar {
             format!("{} items", format_count(total))
         };
         let (n, bytes) = tab.selection_summary();
-        if n > 0 {
+        if n > 0 && app.settings.status_selected {
             s.push_str(&format!("  \u{00b7}  {} selected", format_count(n)));
             if bytes > 0 {
                 s.push_str(&format!(" ({})", format_size(bytes)));
             }
         }
+        // The folder's total size (its files'; folders have no size here), when it's asked for.
+        if app.settings.status_total && tab.search.is_none() {
+            let sum: u64 = tab.view.iter().filter_map(|&i| tab.folder.entries.get(i as usize)).filter(|e| e.kind == crate::folder::EntryKind::File).map(|e| e.size).sum();
+            s.push_str(&format!("  \u{00b7}  Folder: {}", format_size(sum)));
+        }
         if tab.loading.is_some() && tab.path != tab.folder.path {
             s.push_str("  \u{00b7}  loading\u{2026}");
         }
+        // (With the number of items left out, the first thing has no dot before it.)
+        let s = s.strip_prefix("  \u{00b7}  ").map(str::to_string).unwrap_or(s);
+        let mut s = s;
         // The custom sort order decides (and for this folder, its own "in …" rules).
         if let Some(recipe) = tab.custom_here() {
             match recipe.folder_label(&tab.folder.path) {
@@ -198,21 +208,21 @@ impl StatusBar {
         let mut parts = Vec::new();
         // Free space and opening time are the shown folder's: left out while a slow one is coming.
         if !tab.waiting_long() {
-            if let Some(space) = &tab.folder.space {
+            if let Some(space) = tab.folder.space.as_ref().filter(|_| app.settings.status_free) {
                 parts.push(format!("{} {} free", space.drive, format_size(space.free)));
             }
             // The Recycle Bin: how much it holds.
             if let Some(bin) = &tab.folder.bin {
                 parts.push(bin.size_text());
             }
-            if let Some(t) = tab.load_ms {
+            if let Some(t) = tab.load_ms.filter(|_| app.settings.status_opened) {
                 parts.push(format!("opened in {}", ms(t)));
             }
         }
-        if let Some(t) = app.startup_ms {
+        if let Some(t) = app.startup_ms.filter(|_| app.settings.status_started) {
             parts.push(format!("started in {}", ms(t)));
         }
-        let mem = shown_memory();
+        let mem = if app.settings.status_memory { shown_memory() } else { 0 };
         if mem > 0 {
             parts.push(format!("{} RAM", format_size(mem)));
         }
@@ -281,7 +291,7 @@ impl Component for StatusBar {
             r.text(&Self::left_text(app), self.left, &style);
             return;
         }
-        r.fill_paint(self.rect, 0.0, &theme.statusbar_paint);
+        r.fill_paint(self.rect, 0.0, &theme.through(&theme.statusbar_paint));
         r.fill_rect(Rect::new(self.rect.x, self.rect.y, self.rect.w, 1.0), theme.status_line);
         if theme.bevels {
             let well = self.rect.inset(2.0, 3.0);

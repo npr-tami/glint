@@ -19,7 +19,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, GetSystemMetrics, KillTimer, LoadImageW, PostMessageW,
-    SetForegroundWindow, SetMenuDefaultItem, SetTimer, TrackPopupMenu, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, MF_SEPARATOR, MF_STRING,
+    SetMenuDefaultItem, SetTimer, TrackPopupMenu, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, MF_SEPARATOR, MF_STRING,
     SM_CXSMICON, SM_CYSMICON, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, WM_CONTEXTMENU, WM_LBUTTONUP,
     WM_NULL, WM_RBUTTONUP,
 };
@@ -179,7 +179,7 @@ fn menu(door: HWND) -> Option<Request> {
             let _ = SetMenuDefaultItem(h, PICK_OPEN as u32, 0);
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
-            let _ = SetForegroundWindow(door);
+            let _ = crate::testhide::front(door);
             picked = TrackPopupMenu(h, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_RIGHTALIGN | TPM_BOTTOMALIGN, pt.x, pt.y, None, door, None).0 as usize;
             let _ = PostMessageW(Some(door), WM_NULL, WPARAM(0), LPARAM(0));
             let _ = DestroyMenu(h);

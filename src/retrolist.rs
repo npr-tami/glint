@@ -67,10 +67,13 @@ pub fn header_item(r: &mut Renderer, theme: &Theme, cell: Rect, text: Rect, labe
         Era::Xp => {
             let (_, _, divider) = xp_header(theme);
             if hot {
+                let keep = r.fade();
+                r.set_fade(1.0);
                 r.fill_rect(Rect::new(cell.x, cell.y + 1.0, cell.w, cell.h - 4.0), c(0xfaf9f4));
                 for (k, col) in [0xf8a900, 0xf6c456, 0xf8b31f].iter().enumerate() {
                     r.fill_rect(Rect::new(cell.x, cell.bottom() - 3.0 + k as f32, cell.w, 1.0), c(*col));
                 }
+                r.set_fade(keep);
             }
             let x = (cell.right() - 2.0).round();
             r.fill_rect(Rect::new(x, cell.y + 4.0, 1.0, cell.h - 8.0), c(divider));

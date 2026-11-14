@@ -1106,7 +1106,7 @@ impl DetailsPanel {
             return;
         }
         self.take_answers();
-        r.fill_paint(rect, 0.0, &theme.panel_paint);
+        r.fill_paint(rect, 0.0, &theme.through(&theme.panel_paint));
         r.push_clip(rect);
         let sel = selection(app);
         let (can_open, open_with, can_copy) = Self::buttons(&sel);

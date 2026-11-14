@@ -81,7 +81,7 @@ use windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU;
 use crate::textbox::{self, TextEvent, TextEventKind, WM_APP_TEXT};
 // How Glint runs (life.rs): background mode, requests from other glint.exe's, Ctrl+N and Ctrl+Q.
 use crate::life::{self, Request, WM_APP_LIFE};
-use windows::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, SC_CLOSE, SW_HIDE, WM_CLOSE};
+use windows::Win32::UI::WindowsAndMessaging::{SC_CLOSE, SW_HIDE, WM_CLOSE};
 use crate::theme::size;
 use crate::titlebar::TitleBar;
 use crate::toolbar::{self, Toolbar};
@@ -839,7 +839,7 @@ fn bring_to_front(hwnd: HWND, ptr: *mut Window) {
         } else if IsIconic(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
-        let front = SetForegroundWindow(hwnd).as_bool();
+        let front = crate::testhide::front(hwnd).as_bool();
         log::line(&format!("brought to the front (visible: {}, in front: {front})", IsWindowVisible(hwnd).as_bool()));
     }
 }
@@ -953,7 +953,8 @@ fn open_skins(hwnd: HWND, ptr: *mut Window) {
             let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(s.hwnd()), WM_CLOSE, WPARAM(0), LPARAM(0));
         }
         let theme = (*ptr).app.theme.clone();
-        let Some(win) = skinwin::create(hwnd, &theme) else {
+        let layout = (*ptr).app.settings.skins_window;
+        let Some(win) = skinwin::create(hwnd, &theme, layout) else {
             BUSY.with(|b| b.set(true));
             (*ptr).app.say("Windows couldn't open Skins right now. Try again.");
             (*ptr).invalidate();
@@ -1243,13 +1244,15 @@ impl Window {
         let (w, h) = ((self.size.0 - 2.0 * b).max(0.0), (self.size.1 - 2.0 * b).max(0.0));
         let ctx = self.ctx();
         let gap = self.app.theme.gap();
-        let body_y = b + size::TITLE_H + size::TOOLBAR_H + gap;
+        let (title_h, toolbar_h) = (self.app.theme.title_h(), self.app.theme.toolbar_h());
+        let body_y = b + title_h + toolbar_h + gap;
         // "Show the status bar" off: the list goes down to the bottom (notes then show over it).
-        let status_h = if self.app.settings.show_status_bar { size::STATUS_H } else { gap };
+        let status_h = if self.app.settings.show_status_bar { self.app.theme.status_h() } else { gap };
         let status = Rect::new(b, b + h - status_h, w, if self.app.settings.show_status_bar { status_h } else { 0.0 });
         let body_h = (b + h - status_h - body_y).max(0.0);
+        crate::settingswin::main_bars(title_h + toolbar_h, if self.app.settings.show_status_bar { status_h } else { 0.0 });
         // Ctrl+B hides the sidebar ("ShowSidebar"): the list then takes its room.
-        let sidebar_w = if self.app.settings.show_sidebar { size::SIDEBAR_W } else { 0.0 };
+        let sidebar_w = if self.app.settings.show_sidebar { self.app.theme.sidebar_w() } else { 0.0 };
         // The details panel or the Space preview takes its width from the list's room, with the
         // same gap before it as between the other panels (side.rs; 0 when neither shows).
         let room = (w - sidebar_w - 2.0 * gap).max(0.0);
@@ -1279,8 +1282,8 @@ impl Window {
             (list, Rect::default())
         };
         let rects = [
-            (Part::Title, Rect::new(b, b, w, size::TITLE_H)),
-            (Part::Toolbar, Rect::new(b, b + size::TITLE_H, w, size::TOOLBAR_H)),
+            (Part::Title, Rect::new(b, b, w, title_h)),
+            (Part::Toolbar, Rect::new(b, b + title_h, w, toolbar_h)),
             (Part::Sidebar, Rect::new(b, body_y, sidebar_w, body_h)),
             (Part::List, mine),
             (Part::List2, other),
@@ -1290,10 +1293,21 @@ impl Window {
         for (part, rect) in rects {
             self.with_part(part, |c, app| c.layout(rect, &ctx, app));
         }
-        // Split view: one wallpaper across both halves.
+        // Split view: one background across both halves.
         let wall = self.app.split_index().is_some().then_some(list);
         self.list.set_wall_area(wall);
         self.list2.set_wall_area(wall);
+        // The wallpaper (wallpaper-area): over the list's room as if no details panel or preview
+        // were open (they cover its side), or the whole window (seen in the list, or behind
+        // everything: drawn in paint), or the list itself (both halves in split view).
+        use crate::theme::WallpaperArea;
+        let picture = match self.app.theme.wallpaper_area {
+            WallpaperArea::Middle => Some(Rect::new(list.x, body_y, room, body_h)),
+            WallpaperArea::Shrinks => None,
+            WallpaperArea::WindowSized | WallpaperArea::Window => Some(Rect::new(b, b, w, h)),
+        };
+        self.list.set_picture_area(picture);
+        self.list2.set_picture_area(picture);
     }
 
     /// Follows the skin: its font and text size, the text boxes' colours, the frame and Windows'
@@ -2074,54 +2088,105 @@ impl Window {
                 // A shaded background (in the gaps between the panels).
                 renderer.fill_paint(Rect::new(0.0, 0.0, client.0, client.1), 0.0, &app.theme.window_paint);
             }
+            if app.theme.wallpaper_behind() {
+                // wallpaper-area: window - the list's background and the picture over it lie
+                // behind everything; the bars and panels are see-through over them (Theme::through).
+                let all = Rect::new(0.0, 0.0, client.0, client.1);
+                renderer.fill_paint(all, 0.0, &app.theme.panel_paint);
+                crate::list::paint_wallpaper_in(renderer, &app.theme, all, ctx.scale);
+            }
             marks.mark("clear");
+            // (An older-Windows skin over a wallpaper behind the window: its bars see-through.)
+            // Each part as see-through as the skin says for it (Theme::see).
+            use crate::theme::Place;
+            let place = |renderer: &mut Renderer, theme: &crate::theme::Theme, p: Place| {
+                theme.set_place(p);
+                renderer.set_fade(theme.bar_fade());
+            };
+            place(renderer, &app.theme, Place::Title);
             titlebar.paint(renderer, &app.theme, app, &ctx);
             marks.mark("title bar");
+            place(renderer, &app.theme, Place::Toolbar);
             toolbar.paint(renderer, &app.theme, app, &ctx);
             titlebar.join_toolbar(renderer, &app.theme, app);
             marks.mark("toolbar");
+            // The skin's panel-radius: the panels' corners are round (each drawn inside its shape).
+            let round = app.theme.panel_corner();
+            place(renderer, &app.theme, Place::Sidebar);
             if app.settings.show_sidebar {
+                if round > 0.0 {
+                    renderer.push_round_clip(sidebar.rect(), round);
+                }
                 sidebar.paint(renderer, &app.theme, app, &ctx);
+                if round > 0.0 {
+                    renderer.pop_round_clip();
+                }
             }
             marks.mark("sidebar");
+            place(renderer, &app.theme, Place::List);
+            if round > 0.0 {
+                renderer.push_round_clip(list.rect(), round);
+            }
             list.paint(renderer, &app.theme, app, &ctx);
+            if round > 0.0 {
+                renderer.pop_round_clip();
+            }
             marks.mark("list");
             if let Some(other) = app.split_index() {
                 // Split view: the other half shows its own tab; a line in the skin's colour across
                 // the top of the half Glint works in.
                 let keep = std::mem::replace(&mut app.active, other);
+                if round > 0.0 {
+                    renderer.push_round_clip(list2.rect(), round);
+                }
                 list2.paint(renderer, &app.theme, app, &ctx);
+                if round > 0.0 {
+                    renderer.pop_round_clip();
+                }
                 app.active = keep;
                 // Each half's folder name over it; the half Glint works in has the skin's colour.
                 for (strip, i, mine) in [(split_strips[0], app.active, true), (split_strips[1], other, false)] {
                     let t = &app.theme;
-                    renderer.fill_rect(strip, t.panel);
+                    renderer.fill_paint(strip, 0.0, &t.through(&crate::theme::Paint::Flat(t.panel)));
                     renderer.fill_rect(Rect::new(strip.x, strip.bottom() - 2.0, strip.w, 2.0), if mine { t.accent } else { t.line });
                     let style = if mine { TextStyle::new(t.text_strong).bold() } else { TextStyle::new(t.muted) };
                     let name = app.display_name(&app.tabs[i].path);
                     renderer.text(&name, Rect::new(strip.x + 8.0, strip.y, (strip.w - 16.0).max(0.0), strip.h - 2.0), &style);
                 }
             }
+            let pane = side.pane_rect();
+            place(renderer, &app.theme, Place::Details);
+            if round > 0.0 && pane.w > 0.0 {
+                renderer.push_round_clip(pane, round);
+            }
             side.paint(renderer, &app.theme, app, &ctx);
+            if round > 0.0 && pane.w > 0.0 {
+                renderer.pop_round_clip();
+            }
             // The copy queue's list: over the bottom right of the files (in split view, of both).
             let files = match app.split_index() {
                 Some(_) => { let (a, b) = (list.rect(), list2.rect()); if a.x > b.x { a } else { b } }
                 None => list.rect(),
             };
+            place(renderer, &app.theme, Place::Other);
+            renderer.set_fade(1.0);
             queue.paint(renderer, &app.theme, files);
+            place(renderer, &app.theme, Place::Status);
             if app.settings.show_status_bar {
                 status.paint(renderer, &app.theme, app, &ctx);
             } else {
                 // Without the status bar, its notes ("Path copied") show at the bottom of the list.
                 crate::status::paint_note(renderer, &app.theme, app, list.rect());
             }
+            app.theme.set_place(Place::Other);
+            renderer.set_fade(1.0);
             let b = frame::classic_border(&app.theme, *maximized);
             if let Some(q) = &app.question {
                 // Over everything below the toolbar (see ask.rs for why not the toolbar too).
-                let top = b + size::TITLE_H + size::TOOLBAR_H;
+                let top = b + app.theme.title_h() + app.theme.toolbar_h();
                 ask.paint(renderer, &app.theme, q, Rect::new(b, top, (client.0 - 2.0 * b).max(0.0), (client.1 - top - b).max(0.0)));
             } else if let Some(f) = &app.form {
-                let top = b + size::TITLE_H + size::TOOLBAR_H;
+                let top = b + app.theme.title_h() + app.theme.toolbar_h();
                 let preview = app.form_preview(&form.values());
                 let area = Rect::new(b, top, (client.0 - 2.0 * b).max(0.0), (client.1 - top - b).max(0.0));
                 form.paint(renderer, &app.theme, *hwnd, ctx.scale, f, &preview, area);

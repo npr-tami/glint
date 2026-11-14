@@ -52,7 +52,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindow, GetWindowLongPtrW, GetWindowRect, IsIconic, KillTimer,
-    LoadCursorW, LoadIconW, RegisterClassExW, SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, CS_DBLCLKS, GWL_STYLE,
+    LoadCursorW, LoadIconW, PostMessageW, RegisterClassExW, SetCursor, SetTimer, SetWindowPos, ShowWindow, CS_DBLCLKS, GWL_STYLE,
     GW_OWNER, HTCAPTION, HTCLIENT, IDC_ARROW, IDC_HAND, IDC_IBEAM, MINMAXINFO, SIZE_MINIMIZED, SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, SW_SHOWNOACTIVATE, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_APP,
     WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO,
     WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST,
@@ -67,7 +67,9 @@ use crate::frame;
 use crate::kit::{self, size as ksize, Bar, Look};
 use crate::log;
 use crate::render::{Align, FrameResult, Renderer, TextStyle};
+use crate::settings::SortWindow as Shape;
 use crate::shell;
+use crate::skinwin::{icon_button, icon_face, Glyph};
 use crate::sortrecipe::{self, Message, Recipe, Source, Written};
 use crate::theme::{size, Color, Theme};
 use crate::ui::{Menu, MenuItem, Point, Rect};
@@ -76,12 +78,6 @@ use crate::winutil::{hi_word, lo_word};
 
 pub const TITLE: &str = "Sort order and views";
 
-/// The window's width beside the main window, in DIPs.
-const WIDTH: f32 = 470.0;
-const PAD: f32 = 16.0;
-/// The rules box's text: size and line height.
-const MONO: f32 = 12.5;
-const LINE_H: f32 = 19.0;
 const BOX_PAD: f32 = 8.0;
 /// A problem's first line, and each line it wraps onto.
 const PROBLEM_H: f32 = 18.0;
@@ -92,13 +88,16 @@ const PROBLEM_MAX_LINES: usize = 4;
 const PROBLEMS_MAX: f32 = 0.34;
 /// Room at the problems' right for their scrollbar.
 const PROBLEM_BAR: f32 = 10.0;
-/// The line saying which rules sort the folder on screen.
-const HERE_H: f32 = 18.0;
 /// The DETACH / DOCK button in the title bar (left of ×), in DIPs.
 const DETACH_W: f32 = 76.0;
-/// The smallest the window gets when it's on its own, in DIPs.
-const MIN_W: f32 = 360.0;
+/// The least height on its own, in DIPs (the least width is the layout's: [`Sizes`]).
 const MIN_H: f32 = 320.0;
+/// The smaller layouts: their icon buttons, their ×, their switch (width, height), and one
+/// column's folded line of problems.
+const ICON: f32 = 26.0;
+const SMALL_CLOSE_W: f32 = 40.0;
+const SMALL_TOGGLE: (f32, f32) = (34.0, 18.0);
+const FOLD_H: f32 = 28.0;
 /// The line numbers' column: room for a problem's mark, and the gap after the numbers.
 const GUTTER_MARK: f32 = 12.0;
 const GUTTER_GAP: f32 = 10.0;
@@ -111,14 +110,57 @@ const POPUP_W: f32 = 330.0;
 /// The red of a word Glint doesn't know.
 const PROBLEM_RED: Color = Color::hex(0xe5484d);
 
+/// Sizes that differ between the editor's layouts (the SortWindow setting).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Sizes {
+    /// Its width beside the main window, and the least it gets on its own.
+    width: f32,
+    min_width: f32,
+    title_h: f32,
+    /// The room at the window's sides and bottom.
+    pad: f32,
+    /// The rules box's text: size and line height.
+    mono: f32,
+    line_h: f32,
+    /// The line saying which rules sort the folder on screen: each line's height, its text's size.
+    here_h: f32,
+    here_font: f32,
+}
+
+impl Sizes {
+    fn of(shape: Shape) -> Sizes {
+        match shape {
+            Shape::Wide => Sizes { width: 470.0, min_width: 360.0, title_h: size::TITLE_H, pad: 16.0, mono: 12.5, line_h: 19.0, here_h: 18.0, here_font: ksize::NOTE_FONT + 0.5 },
+            Shape::Slim => Sizes { width: 410.0, min_width: 330.0, title_h: 34.0, pad: 12.0, mono: 12.0, line_h: 18.0, here_h: 17.0, here_font: ksize::NOTE_FONT + 0.5 },
+            Shape::Compact => Sizes { width: 360.0, min_width: 300.0, title_h: 34.0, pad: 12.0, mono: 11.5, line_h: 17.0, here_h: 15.0, here_font: ksize::NOTE_FONT },
+        }
+    }
+}
+
+/// What the window procedure needs of the layout `shape` without the window's state: the title
+/// bar's height and how far its buttons reach in from the right (`hit_test`), and the least width
+/// on its own (WM_GETMINMAXINFO).
+fn set_cells(shape: Shape) {
+    let s = Sizes::of(shape);
+    let reach = if shape == Shape::Wide { ksize::CLOSE_W + 8.0 + DETACH_W } else { SMALL_CLOSE_W + ICON };
+    TOP.with(|t| t.set((s.title_h, reach)));
+    MIN_W.with(|m| m.set(s.min_width));
+}
+
 thread_local! {
     /// The skin is 98 / 2000's: the window has their frame round it (for `hit_test`, which runs
     /// without the window's state).
     static CLASSIC: Cell<bool> = const { Cell::new(false) };
+    /// The layout's title bar height and its buttons' reach in from the right (for `hit_test`), and
+    /// its least width on its own (WM_GETMINMAXINFO): see `set_cells`.
+    static TOP: Cell<(f32, f32)> = const { Cell::new((40.0, 130.0)) };
+    static MIN_W: Cell<f32> = const { Cell::new(360.0) };
 }
 
 /// A folder's subfolders were listed for the suggestions (complete::Lister).
 const WM_APP_LISTED: u32 = WM_APP + 86;
+/// The layout changed while it's open: docked again at its width.
+const WM_APP_RESHAPE: u32 = WM_APP + 87;
 /// Typing stopped: use the rules (tabs, settings).
 const APPLY_TIMER: usize = 1;
 const APPLY_DELAY_MS: u32 = 250;
@@ -138,6 +180,12 @@ const EDIT_NOTE: u32 = 107;
 const EDIT_UP: u32 = 108;
 const EDIT_DOWN: u32 = 109;
 const EDIT_SUGGEST: u32 = 110;
+/// One column's ⋯ menu, and its items.
+const MENU_MORE: u32 = 3;
+const MORE_START: u32 = 201;
+const MORE_GUIDE: u32 = 202;
+const MORE_NOTE: u32 = 203;
+const MORE_DETACH: u32 = 204;
 /// Typing that goes on within this long (seconds) is taken back by one Ctrl+Z.
 const GROUP_SECS: f64 = 2.0;
 
@@ -179,6 +227,12 @@ pub enum Ask {
 enum Hot {
     Close,
     Detach,
+    /// The smaller layouts' icon buttons: undo, redo, and one column's ⋯ menu.
+    Undo,
+    Redo,
+    More,
+    /// One column's folded line of problems: opens their list, and folds it again.
+    Fold,
     Switch,
     StartFrom,
     Guide,
@@ -203,6 +257,8 @@ enum Hot {
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Here {
     text: String,
+    /// The same in a few words (one column).
+    short: String,
     link: Option<HereLink>,
     /// The line its words go to (from 1).
     line: Option<usize>,
@@ -242,6 +298,9 @@ enum Edit {
 struct Layout {
     close: Rect,
     detach: Rect,
+    undo: Rect,
+    redo: Rect,
+    more: Rect,
     switch: Rect,
     start_from: Rect,
     guide_button: Rect,
@@ -252,6 +311,10 @@ struct Layout {
     keep: Rect,
     editor: Rect,
     problems: Rect,
+    /// One column: the problems' folded line, and the box round it (and round their list when
+    /// it's open).
+    fold: Rect,
+    problem_box: Rect,
     guide: Rect,
 }
 
@@ -268,6 +331,12 @@ pub struct SortWindow {
     /// Dragging in the rules box to select.
     selecting: bool,
     lay: Layout,
+    /// How it's laid out (the SortWindow setting), and that layout's sizes.
+    shape: Shape,
+    s: Sizes,
+    /// One column: the problems' list is open over their folded line; that line's fix link.
+    problems_open: bool,
+    fold_fix: Option<(Rect, usize)>,
     /// The rules as typed, the cursor and the other end of the selection (byte offsets).
     text: String,
     caret: usize,
@@ -391,9 +460,9 @@ fn register_class() {
     }
 }
 
-/// Where the editor goes beside `owner` (screen pixels): on its right if there's room, else on its
-/// left, else at the screen's right edge; as tall as the main window.
-pub fn dock_rect(owner: HWND) -> RECT {
+/// Where the editor goes beside `owner` (screen pixels), `width` DIPs wide: on its right if there's
+/// room, else on its left, else at the screen's right edge; as tall as the main window.
+pub fn dock_rect(owner: HWND, width: f32) -> RECT {
     // SAFETY: plain queries on our own windows with valid out-structs.
     unsafe {
         let mut main = RECT::default();
@@ -404,7 +473,7 @@ pub fn dock_rect(owner: HWND) -> RECT {
         let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
         let work = if GetMonitorInfoW(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() { info.rcWork } else { main };
         let scale = GetDpiForWindow(owner).max(96) as f32 / 96.0;
-        let w = ((WIDTH * scale) as i32).min((work.right - work.left).max(200));
+        let w = ((width * scale) as i32).min((work.right - work.left).max(200));
         let x = if main.right + w <= work.right {
             main.right
         } else if main.left - w >= work.left {
@@ -461,7 +530,9 @@ pub fn create(owner: HWND, app: &mut AppState) -> Option<SortWindow> {
     register_class();
     let title: Vec<u16> = TITLE.encode_utf16().chain(std::iter::once(0)).collect();
     let detached = app.settings.sort_detached;
-    let docked = dock_rect(owner);
+    let shape = app.settings.sort_window;
+    set_cells(shape);
+    let docked = dock_rect(owner, Sizes::of(shape).width);
     // SAFETY: a plain query.
     let scale = unsafe { GetDpiForWindow(owner) }.max(96) as f32 / 96.0;
     let r = if detached { detached_rect(app.settings.sort_bounds, docked, scale) } else { docked };
@@ -506,6 +577,10 @@ pub fn create(owner: HWND, app: &mut AppState) -> Option<SortWindow> {
             pressed: None,
             selecting: false,
             lay: Layout::default(),
+            shape,
+            s: Sizes::of(shape),
+            problems_open: false,
+            fold_fix: None,
             recipe: Recipe::parse(&text),
             applied: text.clone(),
             caret: 0,
@@ -586,13 +661,13 @@ pub fn run_job(hwnd: HWND, scale: f32, job: Job, show_menu: fn(HWND, &Menu, f32)
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 frame::cloak(hwnd, false);
-                let _ = SetForegroundWindow(hwnd);
+                let _ = crate::testhide::front(hwnd);
             }
             Job::Activate => {
                 if IsIconic(hwnd).as_bool() {
                     let _ = ShowWindow(hwnd, SW_RESTORE);
                 }
-                let _ = SetForegroundWindow(hwnd);
+                let _ = crate::testhide::front(hwnd);
             }
             Job::Menu(menu) => return JobDone::Picked(show_menu(hwnd, &menu, scale)),
             Job::Place(r) => {
@@ -603,7 +678,7 @@ pub fn run_job(hwnd: HWND, scale: f32, job: Job, show_menu: fn(HWND, &Menu, f32)
             Job::Close => {
                 // The keyboard goes back to the main window first, so it doesn't land elsewhere.
                 if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
-                    let _ = SetForegroundWindow(owner);
+                    let _ = crate::testhide::front(owner);
                 }
                 let _ = DestroyWindow(hwnd);
             }
@@ -630,7 +705,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             unsafe {
                 let info = &mut *(lparam.0 as *mut MINMAXINFO);
                 let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
-                info.ptMinTrackSize = POINT { x: (MIN_W * scale) as i32, y: (MIN_H * scale) as i32 };
+                info.ptMinTrackSize = POINT { x: (MIN_W.with(Cell::get) * scale) as i32, y: (MIN_H * scale) as i32 };
             }
             return LRESULT(0);
         }
@@ -677,8 +752,8 @@ fn hit_test(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // 98 / 2000: the title bar is inside the window's frame.
     let b = if CLASSIC.with(Cell::get) && !frame::zoomed(hwnd) { frame::CLASSIC_BORDER } else { 0.0 };
     let (x, y, w) = (pt.x as f32 / scale - b, pt.y as f32 / scale - b, rc.right as f32 / scale - 2.0 * b);
-    let buttons = w - ksize::CLOSE_W - DETACH_W - 8.0;
-    let code = if (0.0..size::TITLE_H).contains(&y) && x < buttons { HTCAPTION } else { HTCLIENT };
+    let (title_h, reach) = TOP.with(Cell::get);
+    let code = if (0.0..title_h).contains(&y) && x < w - reach { HTCAPTION } else { HTCLIENT };
     LRESULT(code as isize)
 }
 
@@ -747,12 +822,22 @@ fn word_right(text: &str, pos: usize) -> usize {
 }
 
 /// The words saying which rules sort the folder on screen, and their link.
-fn here_style(color: Color) -> TextStyle {
-    TextStyle::new(color).size(ksize::NOTE_FONT + 0.5)
+fn here_style(color: Color, size: f32) -> TextStyle {
+    TextStyle::new(color).size(size)
 }
 
-fn here_link_style(color: Color) -> TextStyle {
-    TextStyle::new(color).semibold()
+fn here_link_style(color: Color, size: f32) -> TextStyle {
+    TextStyle::new(color).size(size + 0.5).semibold()
+}
+
+/// A problem in a few words, for one column's folded line: its line and the word it's about, asked
+/// ("Line 10: “newest_frist”?"), else as it reads under the rules box.
+fn short_problem(text: &str, m: &Message) -> String {
+    let word = m.span.and_then(|(a, b)| text.get(a..b)).map(str::trim).filter(|w| !w.is_empty() && !w.contains('\n'));
+    match word {
+        Some(w) if m.line > 0 => format!("Line {}: \u{201c}{w}\u{201d}?", m.line),
+        _ => problem_text(m),
+    }
 }
 
 /// A problem as it reads under the rules box: its line first.
@@ -774,16 +859,16 @@ fn fix_text(m: &sortrecipe::Message, fix: &str) -> String {
 /// typed, so the lines it names are the ones on screen).
 fn here(app: &AppState, recipe: &Recipe) -> Here {
     if !app.settings.custom_sort {
-        return Here { text: "Custom sort is off.".into(), link: Some(HereLink::TurnOn), ..Here::default() };
+        return Here { text: "Custom sort is off.".into(), short: "Custom sort is off.".into(), link: Some(HereLink::TurnOn), ..Here::default() };
     }
     let tab = app.tab();
     let path = &tab.folder.path;
     let name = app.display_name(path);
     if path.is_empty() {
-        return Here { text: format!("On screen: {name}, which these rules don't sort."), ..Here::default() };
+        return Here { text: format!("On screen: {name}, which these rules don't sort."), short: format!("{name}: no rules sort it"), ..Here::default() };
     }
     if tab.column_now {
-        return Here { text: format!("On screen: {name}, sorted by a column for now."), link: Some(HereLink::UseRules), ..Here::default() };
+        return Here { text: format!("On screen: {name}, sorted by a column for now."), short: format!("{name}: a column, for now"), link: Some(HereLink::UseRules), ..Here::default() };
     }
     match recipe.source(path) {
         Source::Folder { label, starts, own } => {
@@ -794,11 +879,12 @@ fn here(app: &AppState, recipe: &Recipe) -> Here {
             } else {
                 format!("On screen: {name}, sorted by the rules for {label} and the folders inside it{at}.")
             };
+            let short = if own { format!("{name}: its own rules{at}") } else { format!("{name}: the rules for {label}{at}") };
             let marked = recipe.blocks.iter().filter(|b| starts.iter().any(|&s| b.start <= s && s <= b.end)).map(|b| (b.start, b.end)).collect();
-            Here { text, link: None, line, marked }
+            Here { text, short, link: None, line, marked }
         }
-        Source::Everywhere => Here { text: format!("On screen: {name}, sorted by the rules for every folder."), ..Here::default() },
-        Source::Nothing => Here { text: format!("On screen: {name}. No rules here sort it, so its column does."), ..Here::default() },
+        Source::Everywhere => Here { text: format!("On screen: {name}, sorted by the rules for every folder."), short: format!("{name}: the rules for every folder"), ..Here::default() },
+        Source::Nothing => Here { text: format!("On screen: {name}. No rules here sort it, so its column does."), short: format!("{name}: its column (no rules for it)"), ..Here::default() },
     }
 }
 
@@ -995,6 +1081,21 @@ impl SortWindow {
         Point::new(at.x + b, at.y + b)
     }
 
+    /// Another layout (the SortWindow setting changed while it's open): laid out again now, and
+    /// docked again at its width on the next turn of the loop (WM_APP_RESHAPE).
+    fn set_shape(&mut self, shape: Shape) {
+        self.shape = shape;
+        self.s = Sizes::of(shape);
+        set_cells(shape);
+        self.char_w = 0.0;
+        self.problems_open = false;
+        // SAFETY: posts to our own window.
+        unsafe {
+            let _ = PostMessageW(Some(self.hwnd), WM_APP_RESHAPE, WPARAM(0), LPARAM(0));
+        }
+        self.invalidate();
+    }
+
     /// Opened again while it's open.
     pub fn reopen(&mut self) -> Vec<Ask> {
         self.invalidate();
@@ -1007,7 +1108,7 @@ impl SortWindow {
         if self.detached || unsafe { IsIconic(owner).as_bool() } {
             return None;
         }
-        let r = dock_rect(owner);
+        let r = dock_rect(owner, self.s.width);
         let mut now = RECT::default();
         // SAFETY: as above.
         unsafe {
@@ -1213,6 +1314,43 @@ impl SortWindow {
         self.invalidate();
     }
 
+    /// START FROM…'s ready-made orders, in a menu whose right edge is at `at`.
+    fn start_menu(&self, at: Point) -> Menu {
+        let items = sortrecipe::PRESETS.iter().enumerate().map(|(i, (name, _))| MenuItem::new(i as u32 + 1, name)).collect();
+        Menu { tag: MENU_START_FROM, at: self.menu_at(at), items, right_aligned: true }
+    }
+
+    /// One column's ⋯ menu, under it: what the other layouts have as buttons, and notes on / off.
+    fn more_menu(&self, app: &AppState) -> Menu {
+        let guide = if app.settings.sort_guide_shown { "Hide guide" } else { "Show guide" };
+        let items = vec![
+            MenuItem::new(MORE_START, "Start from\u{2026}"),
+            MenuItem::new(MORE_GUIDE, guide),
+            MenuItem::separator(),
+            MenuItem::new(MORE_NOTE, "Notes on / off\tCtrl+/"),
+            MenuItem::new(MORE_DETACH, if self.detached { "Dock" } else { "Detach" }),
+        ];
+        let m = self.lay.more;
+        Menu { tag: MENU_MORE, at: self.menu_at(Point::new(m.right(), m.bottom() + 4.0)), items, right_aligned: true }
+    }
+
+    /// What was picked in the ⋯ menu.
+    fn more_pick(&mut self, id: u32, app: &mut AppState) -> Vec<Ask> {
+        match id {
+            // The ready-made orders, where the menu was.
+            MORE_START => {
+                let m = self.lay.more;
+                return vec![Ask::Job(Job::Menu(self.start_menu(Point::new(m.right(), m.bottom() + 4.0))))];
+            }
+            MORE_GUIDE => app.settings.sort_guide_shown = !app.settings.sort_guide_shown,
+            MORE_NOTE => self.toggle_note(app),
+            MORE_DETACH => return self.toggle_detached(app),
+            _ => {}
+        }
+        self.invalidate();
+        Vec::new()
+    }
+
     /// The folders written in the rules that aren't there (a drive not plugged in, a name typed
     /// wrong): a tip each. Each folder is looked for once, in the background (WM_APP_LISTED
     /// comes back), and so are the folders beside it, for "did you mean".
@@ -1384,11 +1522,11 @@ impl SortWindow {
         }
         let (_, line) = line_of(&self.text, self.caret);
         let (vh, vw) = (e.h - 2.0 * BOX_PAD, e.w - 2.0 * BOX_PAD - self.gutter_w());
-        let y = line as f32 * LINE_H;
+        let y = line as f32 * self.s.line_h;
         if y < self.scroll.1 {
             self.scroll.1 = y;
-        } else if y + LINE_H > self.scroll.1 + vh {
-            self.scroll.1 = y + LINE_H - vh;
+        } else if y + self.s.line_h > self.scroll.1 + vh {
+            self.scroll.1 = y + self.s.line_h - vh;
         }
         let x = col_of(&self.text, self.caret) as f32 * self.char_w;
         if x < self.scroll.0 {
@@ -1401,7 +1539,7 @@ impl SortWindow {
     /// The text position under a point in the rules box.
     fn pos_at(&self, p: Point) -> usize {
         let e = self.lay.editor;
-        let line = ((p.y - e.y - BOX_PAD + self.scroll.1) / LINE_H).floor().max(0.0) as usize;
+        let line = ((p.y - e.y - BOX_PAD + self.scroll.1) / self.s.line_h).floor().max(0.0) as usize;
         let col = ((p.x - e.x - BOX_PAD - self.gutter_w() + self.scroll.0) / self.char_w.max(1.0)).round().max(0.0) as usize;
         let mut start = 0;
         for _ in 0..line {
@@ -1418,7 +1556,7 @@ impl SortWindow {
     fn caret_point(&self, pos: usize) -> Point {
         let e = self.lay.editor;
         let (_, line) = line_of(&self.text, pos);
-        Point::new(e.x + BOX_PAD + self.gutter_w() + col_of(&self.text, pos) as f32 * self.char_w - self.scroll.0, e.y + BOX_PAD + line as f32 * LINE_H - self.scroll.1)
+        Point::new(e.x + BOX_PAD + self.gutter_w() + col_of(&self.text, pos) as f32 * self.char_w - self.scroll.0, e.y + BOX_PAD + line as f32 * self.s.line_h - self.scroll.1)
     }
 
     // ------------------------------------------------------------ using the rules
@@ -1469,35 +1607,63 @@ impl SortWindow {
 
     fn layout(&mut self, app: &AppState) {
         let (w, h) = self.size;
-        let mut l = Layout { close: Rect::new(w - ksize::CLOSE_W, 0.0, ksize::CLOSE_W, size::TITLE_H), ..Layout::default() };
-        l.detach = Rect::new(l.close.x - 8.0 - DETACH_W, (size::TITLE_H - ksize::BUTTON_H) / 2.0, DETACH_W, ksize::BUTTON_H);
-        let mut y = size::TITLE_H + 10.0;
-        l.switch = Rect::new(PAD, y + 4.0, ksize::TOGGLE_W, ksize::TOGGLE_H);
-        let bw = kit::button_width(&mut self.renderer, "START FROM\u{2026}");
-        l.start_from = Rect::new(w - PAD - bw, y, bw, ksize::BUTTON_H);
-        let gw = kit::button_width(&mut self.renderer, guide_label(app));
-        l.guide_button = Rect::new(l.start_from.x - 8.0 - gw, y, gw, ksize::BUTTON_H);
-        y += ksize::BUTTON_H + 8.0;
+        let s = self.s;
+        let pad = s.pad;
+        let compact = self.shape == Shape::Compact;
+        let mut l = Layout::default();
+        let mut y;
+        if self.shape == Shape::Wide {
+            l.close = Rect::new(w - ksize::CLOSE_W, 0.0, ksize::CLOSE_W, s.title_h);
+            l.detach = Rect::new(l.close.x - 8.0 - DETACH_W, (s.title_h - ksize::BUTTON_H) / 2.0, DETACH_W, ksize::BUTTON_H);
+            y = s.title_h + 10.0;
+            l.switch = Rect::new(pad, y + 4.0, ksize::TOGGLE_W, ksize::TOGGLE_H);
+            let bw = kit::button_width(&mut self.renderer, "START FROM\u{2026}");
+            l.start_from = Rect::new(w - pad - bw, y, bw, ksize::BUTTON_H);
+            let gw = kit::button_width(&mut self.renderer, guide_label(app));
+            l.guide_button = Rect::new(l.start_from.x - 8.0 - gw, y, gw, ksize::BUTTON_H);
+            y += ksize::BUTTON_H + 8.0;
+        } else {
+            // A smaller title bar, with ⇱ (DETACH) left of ×. Then one row: the switch, and icon
+            // buttons at the right (one column: undo, redo and ⋯; slim: GUIDE and START FROM…).
+            l.close = Rect::new(w - SMALL_CLOSE_W, 0.0, SMALL_CLOSE_W, s.title_h);
+            l.detach = Rect::new(l.close.x - ICON, ((s.title_h - ICON) / 2.0).round(), ICON, ICON);
+            let top = s.title_h + if compact { 6.0 } else { 8.0 };
+            l.switch = Rect::new(pad, top + (ICON - SMALL_TOGGLE.1) / 2.0, SMALL_TOGGLE.0, SMALL_TOGGLE.1);
+            let right = w - pad;
+            if compact {
+                l.more = Rect::new(right - ICON, top, ICON, ICON);
+                l.redo = Rect::new(l.more.x - 6.0 - ICON, top, ICON, ICON);
+                l.undo = Rect::new(l.redo.x - 6.0 - ICON, top, ICON, ICON);
+                y = top + ICON + 4.0 + 2.0;
+            } else {
+                l.start_from = Rect::new(right - ICON, top, ICON, ICON);
+                l.guide_button = Rect::new(l.start_from.x - 8.0 - ICON, top, ICON, ICON);
+                y = top + ICON + 8.0;
+            }
+        }
+        TOP.with(|t| t.set((s.title_h, w - l.detach.x)));
+        // Which rules sort the folder on screen (one column: in a few words).
         self.here = here(app, &self.recipe);
-        let link_w = self.here.link.map_or(0.0, |k| self.renderer.measure(k.label(), &here_link_style(Color::hex(0))) + 12.0);
-        let bar_w = if self.here.marked.is_empty() { 0.0 } else { 9.0 };
-        let mut lines = kit::wrap(&mut self.renderer, &self.here.text, &here_style(Color::hex(0)), (w - 2.0 * PAD - bar_w - link_w).max(60.0));
+        let words = if compact { &self.here.short } else { &self.here.text };
+        let link_w = self.here.link.map_or(0.0, |k| self.renderer.measure(k.label(), &here_link_style(Color::hex(0), s.here_font)) + 12.0);
+        let bar_w = if self.here.marked.is_empty() { 0.0 } else if compact { 8.0 } else { 9.0 };
+        let mut lines = kit::wrap(&mut self.renderer, words, &here_style(Color::hex(0), s.here_font), (w - 2.0 * pad - bar_w - link_w).max(60.0));
         if lines.len() > 2 {
             let rest = lines[1..].join(" ");
             lines.truncate(1);
             lines.push(rest); // drawn with "…" where it doesn't fit
         }
         self.here_lines = lines;
-        l.here = Rect::new(PAD, y, w - 2.0 * PAD, HERE_H * self.here_lines.len().max(1) as f32);
+        l.here = Rect::new(pad, y, w - 2.0 * pad, s.here_h * self.here_lines.len().max(1) as f32);
         y += l.here.h + 6.0;
         // START FROM…'s question, when it asks.
         if let Some(i) = self.confirm {
             let name = sortrecipe::PRESETS.get(i).map_or("", |p| p.0);
             let style = TextStyle::new(Color::hex(0));
-            self.confirm_lines = kit::wrap(&mut self.renderer, &format!("Replace your rules with \u{201c}{name}\u{201d}?"), &style, w - 2.0 * PAD - 24.0);
+            self.confirm_lines = kit::wrap(&mut self.renderer, &format!("Replace your rules with \u{201c}{name}\u{201d}?"), &style, w - 2.0 * pad - 24.0);
             self.confirm_lines.truncate(2);
             let text_h = self.confirm_lines.len() as f32 * 18.0;
-            l.confirm = Rect::new(PAD, y, w - 2.0 * PAD, 10.0 + text_h + 8.0 + ksize::BUTTON_H + 10.0);
+            l.confirm = Rect::new(pad, y, w - 2.0 * pad, 10.0 + text_h + 8.0 + ksize::BUTTON_H + 10.0);
             let (rw, kw) = (kit::button_width(&mut self.renderer, "REPLACE"), kit::button_width(&mut self.renderer, "KEEP MINE"));
             let by = l.confirm.bottom() - 10.0 - ksize::BUTTON_H;
             l.replace = Rect::new(l.confirm.right() - 12.0 - rw, by, rw, ksize::BUTTON_H);
@@ -1506,17 +1672,19 @@ impl SortWindow {
         }
         // From the bottom up: the guide (when shown, at most half the window), the problems (at
         // most a third of it: they scroll), and the rules box in all the rest.
-        let mut bottom = h - PAD;
+        let mut bottom = h - pad;
         if app.settings.sort_guide_shown {
-            let lines = self.guide_lines(w - 2.0 * PAD).len() as f32;
+            let lines = self.guide_lines(w - 2.0 * pad).len() as f32;
             let gh = (22.0 + lines * GUIDE_LINE).min(((bottom - y) * 0.5).max(22.0 + 3.0 * GUIDE_LINE));
             bottom -= gh;
-            l.guide = Rect::new(PAD, bottom, w - 2.0 * PAD, gh);
+            l.guide = Rect::new(pad, bottom, w - 2.0 * pad, gh);
             bottom -= 10.0;
         }
-        self.problem_lines = self.wrap_problems(w - 2.0 * PAD - PROBLEM_BAR);
+        // (One column's list is inside the box of its folded line.)
+        let inset = if compact { 8.0 } else { 0.0 };
+        self.problem_lines = self.wrap_problems(w - 2.0 * pad - 2.0 * inset - PROBLEM_BAR);
         let ph: f32 = self.problem_lines.iter().map(|(_, lines)| PROBLEM_H + (lines.len().max(1) - 1) as f32 * PROBLEM_LINE).sum();
-        let shown = ph.min((h * PROBLEMS_MAX).max(2.0 * PROBLEM_H));
+        let most = (h * PROBLEMS_MAX).max(2.0 * PROBLEM_H);
         // The cursor's line's problem comes first: shown from the top when the cursor moves.
         let (_, caret_line) = line_of(&self.text, self.caret);
         if caret_line != self.problems_for {
@@ -1524,11 +1692,29 @@ impl SortWindow {
             self.problem_scroll = 0.0;
         }
         self.problem_content = ph;
-        self.problem_scroll = self.problem_scroll.clamp(0.0, (ph - shown).max(0.0));
-        bottom -= shown;
-        l.problems = Rect::new(PAD, bottom, w - 2.0 * PAD, shown);
-        bottom -= if shown > 0.0 { 6.0 } else { 0.0 };
-        l.editor = Rect::new(PAD, y, w - 2.0 * PAD, (bottom - y).max(4.0 * LINE_H + 2.0 * BOX_PAD));
+        if compact {
+            // One line of them at the bottom; their list opens above it, in the same box.
+            if self.problem_lines.is_empty() {
+                self.problems_open = false;
+            } else {
+                l.fold = Rect::new(pad, bottom - FOLD_H, w - 2.0 * pad, FOLD_H);
+                let mut top = l.fold.y;
+                if self.problems_open {
+                    let shown = ph.min(most);
+                    l.problems = Rect::new(pad + inset, top - 6.0 - shown, w - 2.0 * pad - 2.0 * inset, shown);
+                    top = l.problems.y - 6.0;
+                }
+                l.problem_box = Rect::new(pad, top, w - 2.0 * pad, l.fold.bottom() - top);
+                bottom = top - 6.0;
+            }
+        } else {
+            let shown = ph.min(most);
+            bottom -= shown;
+            l.problems = Rect::new(pad, bottom, w - 2.0 * pad, shown);
+            bottom -= if shown > 0.0 { 6.0 } else { 0.0 };
+        }
+        self.problem_scroll = self.problem_scroll.clamp(0.0, (ph - l.problems.h).max(0.0));
+        l.editor = Rect::new(pad, y, w - 2.0 * pad, (bottom - y).max(4.0 * s.line_h + 2.0 * BOX_PAD));
         self.lay = l;
     }
 
@@ -1579,8 +1765,11 @@ impl SortWindow {
     }
 
     fn paint(&mut self, app: &mut AppState) {
+        if app.settings.sort_window != self.shape {
+            self.set_shape(app.settings.sort_window);
+        }
         if self.char_w <= 0.0 {
-            self.char_w = self.renderer.mono_char_width(MONO);
+            self.char_w = self.renderer.mono_char_width(self.s.mono);
         }
         self.layout(app);
         let now = self.now();
@@ -1595,15 +1784,25 @@ impl SortWindow {
         let b = self.border();
         self.renderer.set_origin(b, b);
         kit::backdrop(&mut self.renderer, &theme, Rect::new(0.0, 0.0, self.size.0, self.size.1));
-        // The title bar: the logo, the name, ×.
+        // The title bar: the logo (slim: a small one; one column: none), the name, DETACH, ×.
+        let shape = self.shape;
         {
             let r = &mut self.renderer;
-            let bar = Rect::new(0.0, 0.0, self.size.0, size::TITLE_H);
+            let th = self.s.title_h;
+            let bar = Rect::new(0.0, 0.0, self.size.0, th);
             kit::title_bar(r, &theme, bar, self.active);
-            let x = kit::logo(r, &theme, bar);
-            crate::retro::title(r, &theme, Rect::new(x + 10.0, 0.0, (l.detach.x - x - 10.0).max(0.0), size::TITLE_H), "Sort order and views", self.active);
+            let (x, name) = match shape {
+                Shape::Wide => (kit::logo(r, &theme, bar) + 10.0, TITLE),
+                Shape::Slim => (crate::logo::draw_small(r, &theme, bar) + 10.0, TITLE),
+                Shape::Compact => (12.0, "Sort order"),
+            };
+            crate::retro::title(r, &theme, Rect::new(x, 0.0, (l.detach.x - x).max(0.0), th), name, self.active);
             let detach = Look { hover: self.hover == Some(Hot::Detach), pressed: self.pressed == Some(Hot::Detach), focused: false, enabled: true };
-            kit::button(r, &theme, l.detach, if self.detached { "DOCK" } else { "DETACH" }, detach);
+            if shape == Shape::Wide {
+                kit::button(r, &theme, l.detach, if self.detached { "DOCK" } else { "DETACH" }, detach);
+            } else {
+                icon_button(r, &theme, l.detach, if self.detached { Glyph::Dock } else { Glyph::Detach }, detach);
+            }
             let hot = self.hover == Some(Hot::Close);
             kit::close_button(r, &theme, l.close, hot, hot && self.pressed == Some(Hot::Close), self.active);
             if !self.detached && b <= 0.0 {
@@ -1616,17 +1815,40 @@ impl SortWindow {
         let look = |hot: Hot, s: &Self| Look { hover: s.hover == Some(hot), pressed: s.pressed == Some(hot), focused: false, enabled: true };
         let (switch_look, start_look, guide_look) = (look(Hot::Switch, self), look(Hot::StartFrom, self), look(Hot::Guide, self));
         let flip = self.flips.at("on", on, now);
+        let (undo_look, redo_look, more_look) =
+            (Look { enabled: !self.undo.is_empty(), ..look(Hot::Undo, self) }, Look { enabled: !self.redo.is_empty(), ..look(Hot::Redo, self) }, look(Hot::More, self));
         {
             let r = &mut self.renderer;
             kit::toggle(r, &theme, l.switch, flip, switch_look);
-            let label = if on { "Custom sort is on" } else { "Off: the columns decide" };
-            r.text(label, Rect::new(l.switch.right() + 10.0, l.switch.y - 4.0, 200.0, l.switch.h + 8.0), &TextStyle::new(theme.text));
-            kit::button(r, &theme, l.start_from, "START FROM\u{2026}", start_look);
-            kit::button(r, &theme, l.guide_button, guide_label(app), guide_look);
+            let label = match (shape, on) {
+                (Shape::Compact, _) => "Custom sort",
+                (_, true) => "Custom sort is on",
+                (_, false) => "Off: the columns decide",
+            };
+            // (Up to the first button right of it.)
+            let x = l.switch.right() + if shape == Shape::Slim { 8.0 } else { 10.0 };
+            let end = [l.undo, l.guide_button].iter().find(|b| b.w > 0.0).map_or(self.size.0, |b| b.x - 8.0);
+            r.text(label, Rect::new(x, l.switch.y - 4.0, (end - x).max(0.0), l.switch.h + 8.0), &TextStyle::new(theme.text));
+            match shape {
+                Shape::Wide => {
+                    kit::button(r, &theme, l.start_from, "START FROM\u{2026}", start_look);
+                    kit::button(r, &theme, l.guide_button, guide_label(app), guide_look);
+                }
+                Shape::Slim => {
+                    icon_face(r, &theme, l.guide_button, Glyph::Help, guide_look);
+                    icon_face(r, &theme, l.start_from, Glyph::Menu, start_look);
+                }
+                Shape::Compact => {
+                    icon_button(r, &theme, l.undo, Glyph::Undo, undo_look);
+                    icon_button(r, &theme, l.redo, Glyph::Redo, redo_look);
+                    icon_face(r, &theme, l.more, Glyph::More, more_look);
+                }
+            }
         }
         self.paint_here(&theme);
         self.paint_confirm(&theme);
         self.paint_editor(&theme);
+        self.paint_fold(&theme);
         self.paint_problems(&theme);
         if l.guide.h > 0.0 {
             let lines = self.guide_lines(l.guide.w);
@@ -1652,6 +1874,7 @@ impl SortWindow {
             r.pop_clip();
         }
         self.paint_suggestions(&theme);
+        self.paint_tip(app);
         if b > 0.0 {
             self.renderer.set_origin(0.0, 0.0);
             frame::paint_classic_border(&mut self.renderer, &theme, Rect::new(0.0, 0.0, self.size.0 + 2.0 * b, self.size.1 + 2.0 * b));
@@ -1668,29 +1891,33 @@ impl SortWindow {
     /// those rules in the rules box), with its link.
     fn paint_here(&mut self, theme: &Theme) {
         let l = self.lay.here;
+        let s = self.s;
         let r = &mut self.renderer;
-        let link_style = here_link_style(theme.accent);
+        let link_style = here_link_style(theme.accent, s.here_font);
         let link = self.here.link.map(HereLink::label);
-        let link_w = link.map_or(0.0, |s| r.measure(s, &link_style) + 4.0);
+        let link_w = link.map_or(0.0, |t| r.measure(t, &link_style) + 4.0);
         let mut x = l.x;
         if !self.here.marked.is_empty() {
-            r.fill_rect(Rect::new(x, l.y + 3.0, 2.5, l.h - 6.0), theme.accent);
-            x += 9.0;
+            // (One column: a little thinner and shorter.)
+            let (bw, bh, gap) = if self.shape == Shape::Compact { (2.0, 11.0, 8.0) } else { (2.5, 12.0, 9.0) };
+            let inset = ((s.here_h - bh) / 2.0).max(0.0);
+            r.fill_rect(Rect::new(x, l.y + inset, bw, l.h - 2.0 * inset), theme.accent);
+            x += gap;
         }
         let hot = self.here.line.is_some() && self.hover == Some(Hot::Here);
-        let style = here_style(if hot { theme.text_strong } else { theme.muted });
+        let style = here_style(if hot { theme.text_strong } else { theme.muted }, s.here_font);
         let room = (l.right() - x - if link.is_some() { link_w + 8.0 } else { 0.0 }).max(0.0);
         let mut last_w = 0.0_f32;
         let mut widest = 0.0_f32;
         for (i, line) in self.here_lines.iter().enumerate() {
             last_w = (r.measure(line, &style) + 2.0).min(room);
             widest = widest.max(last_w);
-            r.text(line, Rect::new(x, l.y + i as f32 * HERE_H, last_w, HERE_H), &style);
+            r.text(line, Rect::new(x, l.y + i as f32 * s.here_h, last_w, s.here_h), &style);
         }
         self.here_words = if self.here.line.is_some() { Rect::new(x, l.y, widest, l.h) } else { Rect::default() };
         self.here_link = Rect::default();
         if let Some(label) = link {
-            let rect = Rect::new(x + last_w + 8.0, l.bottom() - HERE_H, link_w, HERE_H);
+            let rect = Rect::new(x + last_w + 8.0, l.bottom() - s.here_h, link_w, s.here_h);
             let hot = self.hover == Some(Hot::HereLink);
             r.text(label, rect, &link_style.color(if hot { theme.text_strong } else { theme.accent }));
             if hot {
@@ -1740,7 +1967,7 @@ impl SortWindow {
         self.bar = Bar::of(theme);
         let (view_h, view_w) = (e.h - 2.0 * BOX_PAD, e.w - 2.0 * BOX_PAD - gutter);
         let lines = self.text.matches('\n').count() + 1;
-        self.vtrack = Track::new(self.bar.track(e), lines as f32 * LINE_H, view_h, self.scroll.1, false);
+        self.vtrack = Track::new(self.bar.track(e), lines as f32 * self.s.line_h, view_h, self.scroll.1, false);
         let across = Rect::new(e.x + BOX_PAD + gutter, e.bottom() - self.bar.w - self.bar.margin, (view_w - self.bar.w - self.bar.margin).max(0.0), self.bar.w);
         self.htrack = Track::new(across, self.widest(), view_w, self.scroll.0, true);
         let hot_bar = |h: Hot, s: &Self| s.hover == Some(h) || s.drag.is_some_and(|(d, _)| d == h);
@@ -1751,8 +1978,8 @@ impl SortWindow {
         // The rules that sort the folder on screen: an accent bar beside them.
         r.push_clip(Rect::new(e.x, inner.y, e.w, inner.h));
         for &(a, b) in &self.here.marked {
-            let top = inner.y + (a.max(1) - 1) as f32 * LINE_H - self.scroll.1;
-            let bottom = inner.y + b as f32 * LINE_H - self.scroll.1;
+            let top = inner.y + (a.max(1) - 1) as f32 * self.s.line_h - self.scroll.1;
+            let bottom = inner.y + b as f32 * self.s.line_h - self.scroll.1;
             r.fill_rect(Rect::new(e.x + 3.0, top + 2.0, 2.5, (bottom - top - 4.0).max(2.0)), theme.accent);
         }
         r.pop_clip();
@@ -1764,21 +1991,21 @@ impl SortWindow {
         let mut line = 0;
         loop {
             let end = line_end(&self.text, start);
-            let y = inner.y + line as f32 * LINE_H - self.scroll.1;
+            let y = inner.y + line as f32 * self.s.line_h - self.scroll.1;
             if y > inner.bottom() {
                 break;
             }
-            if y + LINE_H >= inner.y {
+            if y + self.s.line_h >= inner.y {
                 if block.as_ref().is_some_and(|b| b.start <= line + 1 && line < b.end) {
-                    r.fill_rect(Rect::new(text_area.x - 4.0, y, text_area.w + 4.0, LINE_H), theme.accent.with_alpha(0.07));
+                    r.fill_rect(Rect::new(text_area.x - 4.0, y, text_area.w + 4.0, self.s.line_h), theme.accent.with_alpha(0.07));
                 }
                 // The line's number (the cursor's in the text colour), with a mark for a problem.
                 let number = (line + 1).to_string();
                 let nx = inner.x + GUTTER_MARK + number_w - number.len() as f32 * cw;
-                r.mono_text(&number, Rect::new(nx, y, number.len() as f32 * cw + cw, LINE_H), MONO, if line == caret_line { theme.text } else { theme.muted.with_alpha(0.7) });
+                r.mono_text(&number, Rect::new(nx, y, number.len() as f32 * cw + cw, self.s.line_h), self.s.mono, if line == caret_line { theme.text } else { theme.muted.with_alpha(0.7) });
                 if let Some(&(_, error)) = marks.iter().find(|(l, _)| *l == line) {
                     let (mark, color) = if error { ("\u{25cf}", PROBLEM_RED) } else { ("\u{25b2}", theme.muted) };
-                    r.text(mark, Rect::new(inner.x, y, GUTTER_MARK, LINE_H), &TextStyle::new(color).size(8.0));
+                    r.text(mark, Rect::new(inner.x, y, GUTTER_MARK, self.s.line_h), &TextStyle::new(color).size(8.0));
                 }
                 r.push_clip(text_area);
                 let row = &self.text[start..end];
@@ -1789,13 +2016,13 @@ impl SortWindow {
                     let (a, b) = (col(sel_a.max(start)), col(sel_b.min(end)) + if sel_b > end { 0.5 } else { 0.0 });
                     // (An older Windows' selection is dark: only a wash of it, so the words stay readable.)
                     let wash = if theme.era.old() { theme.accent_tint.with_alpha(0.3) } else { theme.accent_tint };
-                    r.fill_rect(Rect::new(x0 + a * cw, y, ((b - a) * cw).max(2.0), LINE_H), wash);
+                    r.fill_rect(Rect::new(x0 + a * cw, y, ((b - a) * cw).max(2.0), self.s.line_h), wash);
                 }
                 // The brackets of the cursor's folder rules, boxed.
                 if let Some((open, close)) = brackets {
                     let at = if line + 1 == open { open_bracket(row) } else if line + 1 == close { close_bracket(row) } else { None };
                     if let Some(c) = at {
-                        let cell = Rect::new(x0 + c as f32 * cw - 1.0, y + 1.5, cw + 2.0, LINE_H - 3.0);
+                        let cell = Rect::new(x0 + c as f32 * cw - 1.0, y + 1.5, cw + 2.0, self.s.line_h - 3.0);
                         r.fill_rect(cell, theme.accent.with_alpha(0.14));
                         r.stroke_rect(cell, 1.0, theme.accent.with_alpha(0.85));
                     }
@@ -1821,20 +2048,20 @@ impl SortWindow {
                     let x = x0 + col(at) * cw;
                     if !word.is_empty() {
                         let color = word_color(theme, word, in_note, is_in);
-                        r.mono_text(word, Rect::new(x, y, word.chars().count() as f32 * cw + cw, LINE_H), MONO, color);
+                        r.mono_text(word, Rect::new(x, y, word.chars().count() as f32 * cw + cw, self.s.line_h), self.s.mono, color);
                     }
                     // The comma or semicolon after it.
                     let mark = piece[word.len()..].trim_end();
                     if !mark.is_empty() {
                         let mx = x + word.chars().count() as f32 * cw;
-                        r.mono_text(mark, Rect::new(mx, y, mark.chars().count() as f32 * cw + cw, LINE_H), MONO, if in_note { theme.muted } else { theme.text });
+                        r.mono_text(mark, Rect::new(mx, y, mark.chars().count() as f32 * cw + cw, self.s.line_h), self.s.mono, if in_note { theme.muted } else { theme.text });
                     }
                 }
                 // A red line under words Glint doesn't know.
                 for &(a, b) in &errors {
                     if a < end.max(start + 1) && b > start && a >= start {
                         let (ca, cb) = (col(a), col(b.min(end)));
-                        r.fill_rect(Rect::new(x0 + ca * cw, y + LINE_H - 3.0, ((cb - ca) * cw).max(cw), 1.5), PROBLEM_RED);
+                        r.fill_rect(Rect::new(x0 + ca * cw, y + self.s.line_h - 3.0, ((cb - ca) * cw).max(cw), 1.5), PROBLEM_RED);
                     }
                 }
                 r.pop_clip();
@@ -1852,17 +2079,17 @@ impl SortWindow {
             let c = caret_at;
             if let Some(ghost) = ghost {
                 let ghost: String = ghost.chars().take(80).collect();
-                r.mono_text(&ghost, Rect::new(c.x, c.y, ghost.chars().count() as f32 * cw + cw, LINE_H), MONO, theme.muted.with_alpha(0.75));
+                r.mono_text(&ghost, Rect::new(c.x, c.y, ghost.chars().count() as f32 * cw + cw, self.s.line_h), self.s.mono, theme.muted.with_alpha(0.75));
             } else if let Some((said, mistake)) = explained {
                 let x = text_area.x - self.scroll.0 + (caret_row_chars + 3) as f32 * cw;
                 let room = text_area.right() - x - if self.vtrack.is_some() { self.bar.w + 2.0 * self.bar.margin } else { 0.0 };
                 if room >= 90.0 {
                     let color = if mistake { PROBLEM_RED.with_alpha(0.85) } else { theme.muted.with_alpha(0.7) };
                     let style = TextStyle::new(color).size(ksize::NOTE_FONT);
-                    r.text(&said, Rect::new(x, c.y, room, LINE_H), &style);
+                    r.text(&said, Rect::new(x, c.y, room, self.s.line_h), &style);
                 }
             }
-            r.fill_rect(Rect::new(c.x.round() - 0.5, c.y + 2.0, 1.5, LINE_H - 4.0), theme.text);
+            r.fill_rect(Rect::new(c.x.round() - 0.5, c.y + 2.0, 1.5, self.s.line_h - 4.0), theme.text);
         }
         r.pop_clip();
         r.pop_clip();
@@ -1940,6 +2167,85 @@ impl SortWindow {
         }
     }
 
+    /// One column: the problems folded into one line under the rules (how many, the first in a few
+    /// words and its fix, ▲), in a box that opens upward into their whole list (▼ folds it again).
+    fn paint_fold(&mut self, theme: &Theme) {
+        self.fold_fix = None;
+        let (b, line) = (self.lay.problem_box, self.lay.fold);
+        let Some(&first) = self.problem_lines.first().map(|(i, _)| i) else { return };
+        let Some(m) = self.recipe.messages.get(first).filter(|_| line.h > 0.0) else { return };
+        let errors = self.recipe.messages.iter().filter(|m| m.error).count();
+        let n = self.recipe.messages.len();
+        let noun = match (errors > 0, n == 1) {
+            (true, true) => "problem",
+            (true, false) => "problems",
+            (false, true) => "tip",
+            (false, false) => "tips",
+        };
+        let open = self.problems_open;
+        let words = if open { format!("{n} {noun}") } else { format!("{n} {noun} \u{b7} {}", short_problem(&self.text, m)) };
+        let fix = m.fix.is_some() && !open;
+        let (mark, mark_color) = if m.error { ("\u{25cf}", PROBLEM_RED) } else { ("\u{25b2}", theme.muted) };
+        let (hot, fix_hot) = (self.hover == Some(Hot::Fold), self.hover == Some(Hot::Fix(first)));
+        let r = &mut self.renderer;
+        // The text boxes' colour, its edge a light red while there's a mistake.
+        r.fill_paint(b, 0.0, &theme.input_paint);
+        let edge = if errors > 0 { PROBLEM_RED.with_alpha(0.32) } else { theme.line };
+        r.stroke_rect(b.inset(0.5, 0.5), 1.0, edge);
+        if open {
+            r.fill_rect(Rect::new(b.x + 1.0, line.y, (b.w - 2.0).max(0.0), 1.0), theme.line);
+        }
+        let x = line.x + 8.0;
+        r.text(mark, Rect::new(x, line.y, 12.0, line.h), &TextStyle::new(mark_color).size(9.0));
+        // ▲ opens the list, ▼ folds it.
+        let c = Point::new(line.right() - 13.0, line.y + (line.h / 2.0).round());
+        let tri = if open {
+            [Point::new(c.x - 3.5, c.y - 2.0), Point::new(c.x + 3.5, c.y - 2.0), Point::new(c.x, c.y + 2.5)]
+        } else {
+            [Point::new(c.x - 3.5, c.y + 2.0), Point::new(c.x + 3.5, c.y + 2.0), Point::new(c.x, c.y - 2.5)]
+        };
+        r.fill_polygon(&tri, if hot { theme.text } else { theme.muted });
+        let mut end = c.x - 3.5 - 8.0;
+        if fix {
+            let style = TextStyle::new(if fix_hot { theme.text_strong } else { theme.accent }).size(11.5).semibold();
+            let w = (r.measure("Fix", &style) + 2.0).ceil();
+            let rect = Rect::new(end - w, line.y, w, line.h);
+            r.text("Fix", rect, &style);
+            if fix_hot {
+                r.fill_rect(Rect::new(rect.x, (line.y + line.h / 2.0 + 6.0).round(), rect.w - 2.0, 1.0), theme.text_strong);
+            }
+            self.fold_fix = Some((rect, first));
+            end = rect.x - 8.0;
+        }
+        let color = if hot { theme.text_strong } else { theme.text };
+        r.text(&words, Rect::new(x + 14.0, line.y, (end - x - 14.0).max(0.0), line.h), &TextStyle::new(color).size(11.5));
+    }
+
+    /// The smaller layouts: the name of the icon button under the mouse, in a small dark box under
+    /// it (on top of everything).
+    fn paint_tip(&mut self, app: &AppState) {
+        if self.shape == Shape::Wide || self.pressed.is_some() {
+            return;
+        }
+        let l = self.lay;
+        let (at, name) = match self.hover {
+            Some(Hot::Detach) => (l.detach, if self.detached { "Dock" } else { "Detach" }),
+            Some(Hot::Undo) => (l.undo, "Undo"),
+            Some(Hot::Redo) => (l.redo, "Redo"),
+            Some(Hot::More) => (l.more, "More"),
+            Some(Hot::Guide) => (l.guide_button, if app.settings.sort_guide_shown { "Hide guide" } else { "Show guide" }),
+            Some(Hot::StartFrom) => (l.start_from, "Start from\u{2026}"),
+            _ => return,
+        };
+        let r = &mut self.renderer;
+        let style = TextStyle::new(Color::hex(0xffffff)).size(ksize::NOTE_FONT);
+        let w = (r.measure(name, &style) + 14.0).ceil();
+        let x = (at.right() + 4.0 - w).clamp(4.0, (self.size.0 - w - 4.0).max(4.0));
+        let tip = Rect::new(x, at.bottom() + 4.0, w, 20.0);
+        r.fill_round_rect(tip, 3.0, Color::hex(0x333333));
+        r.text(name, tip, &style.align(Align::Center));
+    }
+
     /// Clicking a problem's words: the cursor goes to its line (to the word it's about, if any).
     fn go_to_problem(&mut self, i: usize, app: &AppState) {
         let Some(m) = self.recipe.messages.get(i) else { return };
@@ -1980,9 +2286,9 @@ impl SortWindow {
         let at = self.caret_point(self.completion.start);
         let n = self.completion.items.len().min(POPUP_MAX);
         let first = self.pick.saturating_sub(POPUP_MAX - 1).min(self.completion.items.len().saturating_sub(n));
-        let w = POPUP_W.min(self.size.0 - 2.0 * PAD);
-        let x = at.x.clamp(PAD, (self.size.0 - PAD - w).max(PAD));
-        let mut y = at.y + LINE_H + 2.0;
+        let w = POPUP_W.min(self.size.0 - 2.0 * self.s.pad);
+        let x = at.x.clamp(self.s.pad, (self.size.0 - self.s.pad - w).max(self.s.pad));
+        let mut y = at.y + self.s.line_h + 2.0;
         let h = n as f32 * POPUP_ROW + 6.0;
         if y + h > self.size.1 - 4.0 {
             y = at.y - h - 2.0; // no room under the line: above it
@@ -2014,7 +2320,7 @@ impl SortWindow {
                 }
             } else if picked {
                 r.fill_rect(row, theme.accent_tint);
-                r.fill_rect(Rect::new(row.x, row.y, 2.0, row.h), theme.select_edge);
+                r.fill_rect(Rect::new(row.x, row.y, theme.thin_select_edge(), row.h), theme.select_edge);
             } else if self.hover == Some(Hot::Suggestion(k)) {
                 r.fill_rect(row, theme.hover);
             }
@@ -2025,7 +2331,7 @@ impl SortWindow {
                 (true, false) => (theme.text_strong, theme.muted),
                 _ => (theme.text, theme.muted),
             };
-            r.mono_text(&s.label, Rect::new(row.x + 8.0, row.y, label_w, row.h), MONO, label_color);
+            r.mono_text(&s.label, Rect::new(row.x + 8.0, row.y, label_w, row.h), self.s.mono, label_color);
             r.text(&s.hint, Rect::new(row.x + 14.0 + label_w, row.y, (row.w - label_w - 20.0).max(0.0), row.h), &TextStyle::new(hint_color).size(11.0));
             self.suggestion_rects.push(row);
         }
@@ -2054,6 +2360,11 @@ impl SortWindow {
         if l.detach.contains(p) {
             return Some(Hot::Detach);
         }
+        for (rect, hot) in [(l.undo, Hot::Undo), (l.redo, Hot::Redo), (l.more, Hot::More)] {
+            if rect.w > 0.0 && rect.contains(p) {
+                return Some(hot);
+            }
+        }
         // The buttons first: in a narrow window the switch's words reach under them.
         if l.start_from.contains(p) {
             return Some(Hot::StartFrom);
@@ -2077,6 +2388,12 @@ impl SortWindow {
         }
         if self.here_words.contains(p) {
             return Some(Hot::Here);
+        }
+        if l.fold.contains(p) {
+            if let Some((_, i)) = self.fold_fix.filter(|(r, _)| r.contains(p)) {
+                return Some(Hot::Fix(i));
+            }
+            return Some(Hot::Fold);
         }
         if l.problems.contains(p) {
             if self.ptrack.is_some_and(|t| t.hit(p)) {
@@ -2189,9 +2506,7 @@ impl SortWindow {
             Some(Hot::Keep) => self.confirm = None,
             Some(Hot::StartFrom) => {
                 let b = self.lay.start_from;
-                let items = sortrecipe::PRESETS.iter().enumerate().map(|(i, (name, _))| MenuItem::new(i as u32 + 1, name)).collect();
-                let at = self.menu_at(Point::new(b.right(), b.bottom() + 2.0));
-                asks.push(Ask::Job(Job::Menu(Menu { tag: MENU_START_FROM, at, items, right_aligned: true })));
+                asks.push(Ask::Job(Job::Menu(self.start_menu(Point::new(b.right(), b.bottom() + 2.0)))));
             }
             Some(Hot::Guide) => {
                 app.settings.sort_guide_shown = !app.settings.sort_guide_shown;
@@ -2199,6 +2514,13 @@ impl SortWindow {
             Some(Hot::Fix(i)) => self.fix(i, app),
             Some(Hot::Problem(i)) => self.go_to_problem(i, app),
             Some(Hot::Detach) => asks.extend(self.toggle_detached(app)),
+            Some(Hot::Undo) => self.undo_redo(false, app),
+            Some(Hot::Redo) => self.undo_redo(true, app),
+            Some(Hot::More) => asks.push(Ask::Job(Job::Menu(self.more_menu(app)))),
+            Some(Hot::Fold) => {
+                self.problems_open = !self.problems_open;
+                self.problem_scroll = 0.0;
+            }
             Some(Hot::Editor) => {
                 let pos = self.pos_at(p);
                 if double {
@@ -2258,8 +2580,8 @@ impl SortWindow {
             self.scroll.0 = (self.scroll.0 - notches * 6.0 * self.char_w.max(4.0)).clamp(0.0, max);
         } else if self.lay.editor.contains(p) {
             let lines = self.text.matches('\n').count() as f32 + 1.0;
-            let max = (lines * LINE_H - (self.lay.editor.h - 2.0 * BOX_PAD)).max(0.0);
-            self.scroll.1 = (self.scroll.1 - notches * 3.0 * LINE_H).clamp(0.0, max);
+            let max = (lines * self.s.line_h - (self.lay.editor.h - 2.0 * BOX_PAD)).max(0.0);
+            self.scroll.1 = (self.scroll.1 - notches * 3.0 * self.s.line_h).clamp(0.0, max);
         }
         self.invalidate();
     }
@@ -2321,7 +2643,7 @@ impl SortWindow {
                 }
             }
             _ if vk == VK_PRIOR.0 || vk == VK_NEXT.0 => {
-                let lines = ((self.lay.editor.h - 2.0 * BOX_PAD) / LINE_H) as i32;
+                let lines = ((self.lay.editor.h - 2.0 * BOX_PAD) / self.s.line_h) as i32;
                 self.line_move(if vk == VK_NEXT.0 { lines } else { -lines });
                 self.list_closed = true;
             }
@@ -2396,6 +2718,9 @@ impl SortWindow {
     /// of your own), or the right-click menu's.
     pub fn job_done(&mut self, done: JobDone, app: &mut AppState) -> Vec<Ask> {
         let JobDone::Picked(n) = done else { return Vec::new() };
+        if n >= MORE_START {
+            return self.more_pick(n, app);
+        }
         if n >= EDIT_UNDO {
             self.edit_pick(n, app);
             return Vec::new();
@@ -2455,7 +2780,7 @@ impl SortWindow {
                     let p = Point::new(pt.x as f32 / s - b, pt.y as f32 / s - b);
                     let shape = match self.hot_at(p) {
                         Some(Hot::Editor) => IDC_IBEAM,
-                        Some(Hot::Problem(_) | Hot::Fix(_) | Hot::Here | Hot::HereLink) => IDC_HAND,
+                        Some(Hot::Problem(_) | Hot::Fix(_) | Hot::Here | Hot::HereLink | Hot::Fold) => IDC_HAND,
                         _ => IDC_ARROW,
                     };
                     SetCursor(LoadCursorW(None, shape).ok());
@@ -2509,7 +2834,7 @@ impl SortWindow {
             WM_CONTEXTMENU if lparam.0 == -1 || lparam.0 & 0xffff_ffff == 0xffff_ffff => {
                 let c = self.caret_point(self.caret);
                 self.list_closed = true;
-                asks.push(Ask::Job(Job::Menu(self.edit_menu(Point::new(c.x, c.y + LINE_H)))));
+                asks.push(Ask::Job(Job::Menu(self.edit_menu(Point::new(c.x, c.y + self.s.line_h)))));
                 self.invalidate();
                 Some(LRESULT(0))
             }
@@ -2585,6 +2910,13 @@ impl SortWindow {
             }
             WM_TIMER if wparam.0 == WATCH_TIMER => {
                 self.watch(app);
+                Some(LRESULT(0))
+            }
+            WM_APP_RESHAPE => {
+                // SAFETY: a plain query; the owner is the main window.
+                if let Ok(owner) = unsafe { GetWindow(self.hwnd, GW_OWNER) } {
+                    asks.extend(self.dock(owner).map(Ask::Job));
+                }
                 Some(LRESULT(0))
             }
             WM_APP_LISTED => {
@@ -2679,6 +3011,23 @@ mod tests {
         // Nothing close: just the tip.
         let m = missing_tip(text, w, Some(&["Music".to_string()])).expect("a tip");
         assert_eq!((m.fix, m.text.contains("Did you mean")), (None, false));
+    }
+
+    #[test]
+    fn the_three_layouts_have_their_sizes_and_short_words() {
+        assert_eq!(serde_json::to_value(Settings::default()).unwrap()["SortWindow"], "compact");
+        let w = |s| Sizes::of(s).width;
+        assert_eq!((w(Shape::Compact), w(Shape::Slim), w(Shape::Wide)), (360.0, 410.0, 470.0));
+        for s in [Shape::Compact, Shape::Slim, Shape::Wide] {
+            assert!(Sizes::of(s).min_width <= Sizes::of(s).width);
+        }
+        let text = "in Pictures (\n    newest_frist\n)";
+        let at = text.find("newest").unwrap();
+        let m = Message { line: 2, text: "Glint doesn't know it.".into(), error: true, span: Some((at, at + 12)), fix: None, fix_label: None };
+        assert_eq!(short_problem(text, &m), "Line 2: \u{201c}newest_frist\u{201d}?");
+        let mut app = AppState::for_tests(Settings { custom_sort: true, ..Default::default() });
+        app.tabs[0].folder.path = "C:\\t\\sub".into();
+        assert_eq!(here(&app, &Recipe::parse("-a_to_z\nin C:\\t\\sub (\n-newest_first\n)")).short, "sub: its own rules (line 2)");
     }
 
     #[test]

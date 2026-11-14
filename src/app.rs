@@ -611,7 +611,7 @@ impl AppState {
         skins.read_now(&loaded.skin);
         loaded.skin = skins.twin(&loaded.skin, dark);
         let mut theme = skins.theme(&loaded.skin, dark);
-        theme.logo_style = loaded.logo;
+        theme.logo_style = theme.logo_own.unwrap_or(loaded.logo);
         let hwnd = Arc::new(AtomicIsize::new(0));
         let mut app = AppState {
             tabs: Vec::new(),

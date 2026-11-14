@@ -15,7 +15,7 @@
 //! chevron.
 
 use crate::app::AppState;
-use crate::render::{Renderer, TextStyle};
+use crate::render::{Align, Renderer, TextStyle};
 use crate::theme::{size, ButtonStyle, Color, Paint, Stop, Theme};
 use crate::ui::{Point, Rect};
 
@@ -291,7 +291,7 @@ impl PathBar {
             self.layout(r, app);
             return self.paint_era(r, theme, mouse);
         }
-        fill_field(r, theme, self.rect);
+        fill_field(r, theme, self.rect, editing);
         if editing {
             return;
         }
@@ -302,7 +302,9 @@ impl PathBar {
         };
         // With liquid buttons the folder you're in is bold text rather than a button of glass, and
         // the steps before it are in the normal text colour.
-        let liquid = theme.buttons == ButtonStyle::Liquid;
+        // The skin's path-current: the folder you're in in its box (as always), in bold, or plain.
+        let current = theme.parts.path_current();
+        let liquid = theme.buttons == ButtonStyle::Liquid || current != crate::parts::PathCurrent::Box;
         let step_color = if liquid { theme.text } else { theme.muted };
         let style = TextStyle::new(step_color);
         let lean = theme.path_lean();
@@ -318,13 +320,19 @@ impl PathBar {
                     fill_box(r, theme, c.rect, lean, theme.crumb_hover);
                 }
                 color = theme.text_strong;
-                style = style.bold();
+                if current != crate::parts::PathCurrent::Plain {
+                    style = style.bold();
+                }
                 inset = PAD + lean;
             } else if c.current {
-                fill_box_paint(r, theme, c.rect, lean, if hot { &theme.chip_hover_paint } else { &theme.chip_paint });
+                if hot {
+                    under_box(r, theme, c.rect, lean, &theme.chip_hover_paint);
+                }
+                fill_box_paint(r, theme, c.rect, lean, &if hot { theme.chip_hover_paint } else { theme.through(&theme.chip_paint) });
                 color = theme.text_strong;
                 inset = PAD + lean;
             } else if hot {
+                under_box(r, theme, c.rect, lean, &theme.crumb_hover.into());
                 fill_box(r, theme, c.rect, lean, theme.crumb_hover);
                 color = theme.text;
             }
@@ -345,7 +353,12 @@ impl PathBar {
             }
             if i + 1 < self.crumbs.len() {
                 let cx = c.rect.right() + SEP_W / 2.0;
-                chevron_right(r, Point::new(cx, c.rect.y + c.rect.h / 2.0), 3.5, theme.muted.with_alpha(0.8));
+                let ink = theme.muted.with_alpha(0.8);
+                // The skin's path-separator: the drawn chevron, or a slash or backslash.
+                match theme.parts.path_sep() {
+                    None => chevron_right(r, Point::new(cx, c.rect.y + c.rect.h / 2.0), 3.5, ink),
+                    Some(sign) => r.text(sign, Rect::new(c.rect.right(), c.rect.y, SEP_W, c.rect.h), &TextStyle::new(ink).align(Align::Center)),
+                }
             }
         }
         r.pop_clip();
@@ -459,20 +472,125 @@ pub fn bevel(r: &mut Renderer, theme: &Theme, rect: Rect, raised: bool, face: Co
 /// A selected row (or one under the mouse, `hover`) in `paint`: with the skin's `selection-border`
 /// it has round corners and that edge (fainter under the mouse), else it is a plain band.
 pub fn fill_row(r: &mut Renderer, theme: &Theme, rect: Rect, paint: &Paint, hover: bool) {
+    // (Solid over a see-through part: it says what's selected or under the mouse.)
+    let keep = r.fade();
+    r.set_fade(1.0);
+    fill_row_now(r, theme, rect, paint, hover);
+    r.set_fade(keep);
+}
+
+/// A selection's or hover's box: over a see-through part, a faint colour is laid on the part's
+/// own colour first (`Theme::under`), so it looks as it does without the wallpaper.
+pub fn fill_solid(r: &mut Renderer, theme: &Theme, rect: Rect, round: f32, paint: &Paint) {
+    let keep = r.fade();
+    r.set_fade(1.0);
+    if let Some(under) = theme.under() {
+        if paint.first().a < 1.0 || paint.last().a < 1.0 {
+            r.fill_paint(rect, round, &Paint::Flat(under));
+        }
+    }
+    r.fill_paint(rect, round, paint);
+    r.set_fade(keep);
+}
+
+/// `fill_solid`'s underlay for a box in the skin's shape (`fill_box`): call it before filling a
+/// box under the mouse with a faint `paint`.
+pub fn under_box(r: &mut Renderer, theme: &Theme, rect: Rect, lean: f32, paint: &Paint) {
+    if let Some(under) = theme.under() {
+        if paint.first().a < 1.0 || paint.last().a < 1.0 {
+            fill_box(r, theme, rect, lean, under);
+        }
+    }
+}
+
+fn fill_row_now(r: &mut Renderer, theme: &Theme, rect: Rect, paint: &Paint, hover: bool) {
     if theme.selection_border.a <= 0.0 {
-        return r.fill_paint(rect, 0.0, paint);
+        return fill_solid(r, theme, rect, 0.0, paint);
     }
     let rect = rect.inset(1.0, 0.5);
-    r.fill_paint(rect, 3.0, paint);
+    fill_solid(r, theme, rect, 3.0, paint);
     let edge = if hover { theme.selection_border.with_alpha(theme.selection_border.a * 0.55) } else { theme.selection_border };
     r.stroke_round_rect(rect.inset(0.5, 0.5), 2.5, 1.0, edge);
 }
 
+/// A row of the file list, the sidebar or Home: selected (`selected`, in `fill`, with its line in
+/// `edge`, `edge_w` thick) or under the mouse (`fill`), as the skin's `selection-look`,
+/// `selection-line`, `hover-look` and `row-radius` say. `radius`: the row's corners when the skin
+/// sets none of these (the sidebar's panels; those rows have no line).
+#[allow(clippy::too_many_arguments)]
+pub fn paint_row(r: &mut Renderer, theme: &Theme, rect: Rect, selected: bool, fill: &Paint, edge: Color, edge_w: f32, radius: f32) {
+    // Solid over a see-through part: it says what's selected or under the mouse.
+    let keep = r.fade();
+    r.set_fade(1.0);
+    paint_row_now(r, theme, rect, selected, fill, edge, edge_w, radius);
+    r.set_fade(keep);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_row_now(r: &mut Renderer, theme: &Theme, rect: Rect, selected: bool, fill: &Paint, edge: Color, edge_w: f32, radius: f32) {
+    use crate::parts::{HoverLook, LineSide, SelectLook, P};
+    let parts = &theme.parts;
+    let look = parts.select_look();
+    let set = parts.get(P::RowRadius);
+    // Auto (no row-radius): the row's own corners if it has any, else the shape's. A rounded row
+    // is round even in a square skin (that's what the look asks for).
+    let shape = theme.corner(rect.h);
+    let auto = if radius > 0.0 { radius } else { shape };
+    // A band keeps the row's own corners; a rounded or outlined row sits a little in from its edges.
+    let (b, round) = match look {
+        SelectLook::Band => (rect, set.unwrap_or(auto)),
+        SelectLook::Rounded => (rect.inset(2.0, 1.0), set.unwrap_or(if shape > 0.0 { shape } else { 6.0 })),
+        _ => (rect.inset(2.0, 1.0), set.unwrap_or(auto)),
+    };
+    let round = round.min(b.h / 2.0).max(0.0);
+    let plain = look == SelectLook::Band && set.is_none();
+    if !selected {
+        match parts.hover_look() {
+            HoverLook::None => {}
+            HoverLook::Fill if plain && round <= 0.0 => fill_row_now(r, theme, rect, fill, true),
+            HoverLook::Fill => fill_solid(r, theme, b, round, fill),
+            HoverLook::Outline => {
+                let ink = theme.muted.with_alpha(theme.muted.a * 0.6);
+                r.stroke_round_rect(b.inset(0.5, 0.5), (round - 0.5).max(0.0), 1.0, ink);
+            }
+        }
+        return;
+    }
+    match look {
+        // (The sidebar's panels: round ends and no line, as always.)
+        _ if plain && round > 0.0 => return fill_solid(r, theme, rect, round, fill),
+        _ if plain => fill_row_now(r, theme, rect, fill, false),
+        SelectLook::Outline => {
+            fill_solid(r, theme, b, round, &fill.with_strength(0.5));
+            let ink = if edge.a > 0.0 { edge } else { theme.accent };
+            r.stroke_round_rect(b.inset(0.5, 0.5), (round - 0.5).max(0.0), 1.0, ink);
+        }
+        _ => fill_solid(r, theme, b, round, fill),
+    }
+    if edge_w <= 0.0 || edge.a <= 0.0 {
+        return;
+    }
+    // The line: down the left or right side (clear of round corners), or along the bottom.
+    let down = (round * 0.6).min(b.h / 3.0);
+    let line = match parts.select_line() {
+        LineSide::Left => Rect::new(b.x, b.y + down, edge_w, b.h - 2.0 * down),
+        LineSide::Right => Rect::new(b.right() - edge_w, b.y + down, edge_w, b.h - 2.0 * down),
+        LineSide::Under => Rect::new(b.x + round, b.bottom() - edge_w, (b.w - 2.0 * round).max(0.0), edge_w),
+    };
+    if round > 0.0 {
+        r.fill_round_rect(line, (edge_w / 2.0).min(round), edge);
+    } else {
+        r.fill_rect(line, edge);
+    }
+}
+
 /// A text field of the main window (the path, the filter box): the skin's `input` paint, round
-/// corners in a rounded skin, and its `input-border` edge if it has one.
-pub fn fill_field(r: &mut Renderer, theme: &Theme, rect: Rect) {
-    let radius = theme.corner(rect.h);
-    r.fill_paint(rect, radius, &field_paint(&theme.input_paint));
+/// corners in a rounded skin, and its `input-border` edge if it has one. `typing`: Windows' text
+/// box is over it, so it stays solid (that box can't be see-through over the wallpaper).
+pub fn fill_field(r: &mut Renderer, theme: &Theme, rect: Rect, typing: bool) {
+    let radius = theme.box_corner(rect.h);
+    let paint = if typing { theme.input_paint } else { theme.through(&theme.input_paint) };
+    r.fill_paint(rect, radius, &field_paint(&paint));
     if theme.input_border.a > 0.0 {
         // A faint shade along the inside of the top edge: the field sits below the surface.
         r.fill_rect(Rect::new(rect.x + radius * 0.7, rect.y + 1.0, (rect.w - 1.4 * radius).max(0.0), 1.0), Color::rgba(0, 0, 0, 0.07));

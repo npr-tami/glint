@@ -66,7 +66,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, DispatchMessageW, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, PostQuitMessage,
-    SendMessageW, SetForegroundWindow, SetMenuDefaultItem, TrackPopupMenu, TranslateMessage, MF_SEPARATOR, MF_STRING, MSG,
+    SendMessageW, SetMenuDefaultItem, TrackPopupMenu, TranslateMessage, MF_SEPARATOR, MF_STRING, MSG,
     MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WM_APP, WM_NULL, WM_QUIT,
 };
 
@@ -668,7 +668,7 @@ fn drop_menu(hwnd: HWND, at: POINT, plan: &Plan) -> Option<Action> {
         let cancel = wide("Cancel");
         let _ = AppendMenuW(menu, MF_STRING, CANCEL, PCWSTR(cancel.as_ptr()));
         // A menu of a window that isn't in front doesn't close when clicking elsewhere.
-        let _ = SetForegroundWindow(hwnd);
+        let _ = crate::testhide::front(hwnd);
         let picked = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN, at.x, at.y, None, hwnd, None).0 as usize;
         let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
         let _ = DestroyMenu(menu);

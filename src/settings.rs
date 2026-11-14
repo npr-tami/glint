@@ -651,6 +651,16 @@ pub enum NewTab {
 
 /// What "Home" opens ("Home opens"): the sidebar's Home, and "Home folder" when Glint starts or a
 /// tab is opened.
+/// How big Home's Quick access tiles are ("HomeTiles").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HomeTiles {
+    Small,
+    #[default]
+    Normal,
+    Large,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HomePage {
@@ -718,6 +728,34 @@ pub enum SettingsSkins {
     List,
     /// Little tiles in each skin's colours.
     Tiles,
+}
+
+/// How the Skins window is laid out ("Skins window" on the Appearance page).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SkinsWindow {
+    /// One column, 420 wide: the skin in a drop-down at the top with undo, redo and a menu of the
+    /// rest, sections that fold, and one search for every setting.
+    #[default]
+    Compact,
+    /// Two columns, 600 wide: a narrow list of the skins, small icon buttons, smaller rows.
+    Slim,
+    /// Two columns, 780 wide: the list of the skins with its nine buttons, big rows.
+    Wide,
+}
+
+/// How the sort order's editor is laid out ("Sort editor" on the Files and folders page).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortWindow {
+    /// 360 wide: one row at the top (the switch, undo, redo and a menu of the rest), the rules a
+    /// little smaller, the problems folded into one line under them.
+    #[default]
+    Compact,
+    /// 410 wide: as Wide, with small icon buttons (their names show under the mouse).
+    Slim,
+    /// 470 wide: word buttons (DETACH, GUIDE, START FROM…), every problem written out.
+    Wide,
 }
 
 /// Light or dark.
@@ -1048,6 +1086,8 @@ pub struct Settings {
     pub settings_style: SettingsStyle,
     pub settings_show: SettingsShow,
     pub settings_skins: SettingsSkins,
+    /// How the Skins window is laid out.
+    pub skins_window: SkinsWindow,
     pub settings_search: bool,
     pub settings_dots: bool,
     pub settings_reset: bool,
@@ -1077,6 +1117,19 @@ pub struct Settings {
     pub show_details: bool,
     /// Show the status bar.
     pub show_status_bar: bool,
+    /// What the status bar tells: the number of items, the size of what's selected, the drive's
+    /// free space, the folder's total size (its files').
+    pub status_count: bool,
+    pub status_selected: bool,
+    pub status_free: bool,
+    pub status_total: bool,
+    /// The speed figures on the right: how fast the folder opened, how fast Glint started, its memory use.
+    pub status_opened: bool,
+    pub status_started: bool,
+    pub status_memory: bool,
+    /// Home's page: at most this many Quick access tiles in a row (2 to 6), and how big they are.
+    pub home_columns: f32,
+    pub home_tiles: HomeTiles,
     /// Sort by the rules the person wrote (`sort_recipe`) instead of the columns (comes with
     /// custom sort orders).
     pub custom_sort: bool,
@@ -1210,6 +1263,8 @@ pub struct Settings {
     pub sort_guide_shown: bool,
     /// The sort order editor is on its own (DETACH), not docked beside the main window.
     pub sort_detached: bool,
+    /// How the sort order editor is laid out.
+    pub sort_window: SortWindow,
     /// Where the sort order editor was last on its own: left, top, width, height in screen pixels.
     pub sort_bounds: Option<[i32; 4]>,
     /// The skin editor's guide is hidden.
@@ -1246,6 +1301,7 @@ impl Default for Settings {
             settings_style: SettingsStyle::Ticks,
             settings_show: SettingsShow::All,
             settings_skins: SettingsSkins::List,
+            skins_window: SkinsWindow::Compact,
             settings_search: true,
             settings_dots: true,
             settings_reset: true,
@@ -1260,6 +1316,15 @@ impl Default for Settings {
             skin: DEFAULT_SKIN.to_string(),
             show_details: false,
             show_status_bar: true,
+            status_count: true,
+            status_selected: true,
+            status_free: true,
+            status_total: false,
+            status_opened: true,
+            status_started: true,
+            status_memory: true,
+            home_columns: 3.0,
+            home_tiles: HomeTiles::Normal,
             custom_sort: false,
             custom_views: true,
             remember_split: false,
@@ -1308,6 +1373,7 @@ impl Default for Settings {
             upgraded: 0,
             sort_guide_shown: false,
             sort_detached: false,
+            sort_window: SortWindow::Compact,
             sort_bounds: None,
             theme_guide_hidden: false,
             rail_group: RailGroup::Quick,
@@ -1336,6 +1402,8 @@ const CHOICES: &[&str] = &[
     "SettingsStyle",
     "SettingsShow",
     "SettingsSkins",
+    "SkinsWindow",
+    "SortWindow",
     "SettingsSearch",
     "SettingsDots",
     "SettingsReset",
@@ -1582,6 +1650,7 @@ impl Settings {
         if !self.preview_volume.is_finite() {
             self.preview_volume = 0.5;
         }
+        self.home_columns = if self.home_columns.is_finite() { self.home_columns.round().clamp(2.0, 6.0) } else { 3.0 };
         self.preview_volume = self.preview_volume.clamp(0.0, 1.0);
     }
 }

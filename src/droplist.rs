@@ -22,15 +22,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::log;
+use crate::parts::{MenuPick, P};
 use crate::render::{Renderer, TextStyle};
 use crate::theme::{Color, Theme};
 use crate::thumbs::Picture;
 use crate::ui::{MenuItem, Point, Rect};
 
 /// One choice's row, in DIPs.
+#[cfg(test)]
 const ROW_H: f32 = 22.0;
-/// A separator's row.
+/// A separator's row (with the skin's `menu-groups: space`, this much space and no line).
 const LINE_H: f32 = 7.0;
+const SPACE_H: f32 = 10.0;
+/// With `menu-pick: tint-line`, the line on the picked row's left is this thick.
+const PICK_LINE_W: f32 = 3.0;
 /// Room left of a choice's words (and right of them, in the width).
 const PAD: f32 = 8.0;
 /// At most this many rows show; the rest scroll (the wheel, or the arrows).
@@ -50,6 +55,15 @@ pub struct DropLook {
     pub pick: Color,
     pub on_pick: Color,
     pub font: String,
+    /// The skin's menu settings (parts.rs): a choice's row and a group gap's height, a line in
+    /// that gap or only space, how the picked row looks (and its tint), the corners and a shadow.
+    pub row_h: f32,
+    pub line_h: f32,
+    pub gap_line: bool,
+    pub pick_look: MenuPick,
+    pub tint: Color,
+    pub radius: f32,
+    pub shadow: bool,
 }
 
 impl DropLook {
@@ -63,6 +77,13 @@ impl DropLook {
             pick: theme.accent,
             on_pick: theme.on_accent,
             font: theme.font.clone(),
+            row_h: theme.parts.num(P::MenuRowH),
+            line_h: if theme.parts.menu_space() { SPACE_H } else { LINE_H },
+            gap_line: !theme.parts.menu_space(),
+            pick_look: theme.parts.menu_pick(),
+            tint: theme.accent_tint.with_alpha(theme.accent_tint.a.max(0.35)),
+            radius: theme.parts.num(P::MenuRadius),
+            shadow: theme.parts.on(P::MenuShadow),
         }
     }
 }
@@ -95,12 +116,12 @@ const TICK_W: f32 = 22.0;
 const KEYS_GAP: f32 = 28.0;
 
 /// Where each row is, top to bottom, in DIPs from the list's top (inside its frame).
-fn rows(items: &[MenuItem]) -> Vec<(f32, f32)> {
+fn rows(items: &[MenuItem], row_h: f32, line_h: f32) -> Vec<(f32, f32)> {
     let mut y = 0.0;
     items
         .iter()
         .map(|it| {
-            let h = if it.label.is_empty() { LINE_H } else { ROW_H };
+            let h = if it.label.is_empty() { line_h } else { row_h };
             let r = (y, h);
             y += h;
             r
@@ -136,18 +157,23 @@ fn by_letter(items: &[MenuItem], from: Option<usize>, c: char) -> Option<usize> 
 }
 
 fn register_class() {
-    // SAFETY: plain class registration with a static name; Windows' default procedure.
+    use windows::Win32::UI::WindowsAndMessaging::{CS_DROPSHADOW, WNDCLASS_STYLES};
+    // SAFETY: plain class registration with static names; Windows' default procedure. The second
+    // class is the same with Windows' shadow under it (the skin's `menu-shadow`).
     unsafe {
         let Ok(instance) = GetModuleHandleW(None) else { return };
-        let class = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(wndproc),
-            hInstance: instance.into(),
-            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            lpszClassName: w!("GlintDropList"),
-            ..Default::default()
-        };
-        RegisterClassExW(&class);
+        for (name, style) in [(w!("GlintDropList"), WNDCLASS_STYLES(0)), (w!("GlintDropListShadow"), CS_DROPSHADOW)] {
+            let class = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                style,
+                lpfnWndProc: Some(wndproc),
+                hInstance: instance.into(),
+                hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                lpszClassName: name,
+                ..Default::default()
+            };
+            RegisterClassExW(&class);
+        }
     }
 }
 
@@ -211,6 +237,8 @@ impl Open {
         let (w, h) = self.size;
         r.clear(look.back);
         r.push_clip(Rect::new(1.0, 1.0, w - 2.0, h - 2.0));
+        // The skin's menu-pick: the accent behind the words (as always), or a tint (with a line).
+        let accent = look.pick_look == MenuPick::Accent;
         let has_pictures = self.pictures.iter().any(Option::is_some);
         for (i, it) in items.iter().enumerate() {
             let (top, rh) = self.rows[i];
@@ -219,20 +247,27 @@ impl Open {
                 continue;
             }
             if it.label.is_empty() {
-                r.fill_rect(Rect::new(PAD, (y + rh / 2.0).floor(), w - 2.0 * PAD, 1.0), look.line.with_alpha(0.5));
+                if look.gap_line {
+                    r.fill_rect(Rect::new(PAD, (y + rh / 2.0).floor(), w - 2.0 * PAD, 1.0), look.line.with_alpha(0.5));
+                }
                 continue;
             }
             let row = Rect::new(1.0, y, w - 2.0, rh);
             let hot = self.hot == Some(i);
             if hot {
-                r.fill_rect(row, look.pick);
+                r.fill_rect(row, if accent { look.pick } else { look.tint });
+                if look.pick_look == MenuPick::TintLine {
+                    r.fill_rect(Rect::new(row.x, row.y, PICK_LINE_W, row.h), look.pick);
+                }
             }
+            // The words on the picked row: the accent's own colour on the accent.
+            let lit = hot && accent;
             let mut x = PAD + 1.0;
             let (words, keys) = split(&it.label);
             if menu {
                 if it.checked {
                     let c = Point::new(1.0 + TICK_W / 2.0, y + rh / 2.0);
-                    let ink = if hot { look.on_pick } else { look.text };
+                    let ink = if lit { look.on_pick } else { look.text };
                     r.polyline(&[Point::new(c.x - 4.0, c.y), Point::new(c.x - 1.0, c.y + 3.0), Point::new(c.x + 4.5, c.y - 3.5)], 1.6, ink);
                 }
                 x = 1.0 + TICK_W;
@@ -244,7 +279,7 @@ impl Open {
                 }
                 x += self.pictures.iter().flatten().map(|(_, pw, _)| *pw).fold(0.0, f32::max) + PICTURE_GAP;
             }
-            let color = if hot {
+            let color = if lit {
                 look.on_pick
             } else if it.disabled {
                 look.muted
@@ -255,12 +290,17 @@ impl Open {
             let style = if it.disabled || it.bold { style.semibold() } else { style };
             r.text(&words, Rect::new(x, y, (w - x - PAD).max(0.0), rh), &style);
             if let Some(keys) = keys {
-                let keys_color = if hot { look.on_pick } else { look.muted };
+                let keys_color = if lit { look.on_pick } else { look.muted };
                 r.text(&keys, Rect::new(x, y, (w - x - PAD - 4.0).max(0.0), rh), &TextStyle::new(keys_color).align(crate::render::Align::Right));
             }
         }
         r.pop_clip();
-        r.stroke_rect(Rect::new(0.5, 0.5, w - 1.0, h - 1.0), 1.0, look.line);
+        // (Round corners: the window itself is cut round, in `show`.)
+        if look.radius > 0.0 {
+            r.stroke_round_rect(Rect::new(0.5, 0.5, w - 1.0, h - 1.0), look.radius, 1.0, look.line);
+        } else {
+            r.stroke_rect(Rect::new(0.5, 0.5, w - 1.0, h - 1.0), 1.0, look.line);
+        }
         let _ = r.end();
     }
 }
@@ -279,7 +319,8 @@ pub fn show(owner: HWND, list: &DropList) -> u32 {
         let dpi = GetDpiForWindow(owner).max(96);
         let scale = dpi as f32 / 96.0;
         let Ok(instance) = GetModuleHandleW(None) else { return 0 };
-        let Ok(hwnd) = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, w!("GlintDropList"), w!(""), WS_POPUP, 0, 0, 1, 1, Some(owner), None, Some(instance.into()), None) else {
+        let class = if list.look.shadow { w!("GlintDropListShadow") } else { w!("GlintDropList") };
+        let Ok(hwnd) = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, class, w!(""), WS_POPUP, 0, 0, 1, 1, Some(owner), None, Some(instance.into()), None) else {
             return 0;
         };
         let mut renderer = match Renderer::new(hwnd, dpi) {
@@ -313,9 +354,9 @@ pub fn show(owner: HWND, list: &DropList) -> u32 {
         let picture_w = pictures.iter().flatten().map(|(_, pw, _)| *pw).fold(0.0_f32, f32::max);
         let picture_w = if picture_w > 0.0 { picture_w + PICTURE_GAP } else { 0.0 };
         let box_w = (list.under.right - list.under.left) as f32 / scale;
-        let rows = rows(items);
+        let rows = rows(items, list.look.row_h, list.look.line_h);
         let extent = rows.last().map_or(0.0, |(y, h)| y + h);
-        let most = MOST as f32 * ROW_H;
+        let most = MOST as f32 * list.look.row_h;
         let w = box_w.max((words + picture_w + 2.0 * PAD + 2.0 + if extent > most { 12.0 } else { 0.0 }).ceil());
         let h = extent.min(most) + 2.0;
         let (pw, ph) = ((w * scale).round() as i32, (h * scale).round() as i32);
@@ -329,6 +370,12 @@ pub fn show(owner: HWND, list: &DropList) -> u32 {
         let x = x.min(work.right - pw).max(work.left);
         use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
         let _ = SetWindowPos(hwnd, None, x, y, pw, ph, SWP_NOZORDER | SWP_NOACTIVATE);
+        // The skin's menu-radius: the window cut to a rounded shape (Windows keeps the region).
+        if list.look.radius > 0.0 {
+            use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
+            let d = (2.0 * list.look.radius * scale).round() as i32;
+            let _ = SetWindowRgn(hwnd, Some(CreateRoundRectRgn(0, 0, pw + 1, ph + 1, d, d)), false);
+        }
         renderer.resize(pw as u32, ph as u32);
         let current = if list.menu { None } else { items.iter().position(|it| it.checked && pickable(it)) };
         let mut open = Open { hwnd, renderer, size: (w, h), rows, top: 0.0, hot: current, pictures };
@@ -388,7 +435,7 @@ pub fn show(owner: HWND, list: &DropList) -> u32 {
                 WM_NCLBUTTONDOWN | WM_NCRBUTTONDOWN => break,
                 WM_MOUSEWHEEL => {
                     let notches = ((msg.wParam.0 >> 16) & 0xffff) as i16 as f32 / 120.0;
-                    open.scroll_by(-notches * WHEEL_ROWS * ROW_H);
+                    open.scroll_by(-notches * WHEEL_ROWS * list.look.row_h);
                     repaint = true;
                 }
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
@@ -489,7 +536,7 @@ mod tests {
 
     #[test]
     fn rows_stack_with_thin_lines() {
-        let r = rows(&items());
+        let r = rows(&items(), ROW_H, LINE_H);
         assert_eq!(r[3], (3.0 * ROW_H, LINE_H));
         assert_eq!(r[4].0, 3.0 * ROW_H + LINE_H);
     }

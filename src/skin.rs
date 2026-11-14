@@ -85,7 +85,7 @@ use crate::log;
 use crate::settings;
 use crate::shell;
 use crate::sortrecipe;
-use crate::theme::{size, ButtonStyle, CaptionStyle, Color, Era, IconSet, Paint, Shape, SidebarStyle, Stop, TabStyle, Theme, WallpaperFit, MAX_STOPS};
+use crate::theme::{size, ButtonStyle, CaptionStyle, Color, Era, IconSet, Paint, Shape, SidebarStyle, Stop, TabStyle, Theme, WallpaperArea, WallpaperFit, MAX_STOPS};
 
 /// The skin Glint starts with, and its light version.
 pub const DEFAULT: &str = "amd-radeon";
@@ -168,6 +168,7 @@ pub const COLOURS: &[(&str, &str)] = &[
     ("panel-header-text", "sidebar headings"),
     ("sidebar-selection", "the place you're in, in the sidebar"),
     ("sidebar-selection-text", "its name"),
+    ("sidebar-selection-edge", "edge on the left of the place you're in, in the sidebar"),
     ("list-header", "column titles' bar"),
     ("list-header-text", "column titles"),
     ("column-line", "lines between the column titles"),
@@ -248,6 +249,7 @@ pub const DERIVED: &[(&str, &str)] = &[
     ("menu-selection-text", "accent-text"),
     ("menu-border", "line"),
     ("sidebar-text", "text"),
+    ("sidebar-selection-edge", "selection-edge"),
 ];
 
 /// Everything else a skin can set, with what it does.
@@ -266,6 +268,8 @@ pub const OTHERS: &[(&str, &str)] = &[
     ("sidebar-row-height", "sidebar row height, 16 to 48"),
     ("tab-line-width", "current tab's line, 0 to 6"),
     ("toolbar-line-width", "toolbar's line, 0 to 6"),
+    ("selection-edge-width", "selected rows' edge, 0 to 6 (0: none)"),
+    ("sidebar-selection-edge-width", "the sidebar's selected place's edge, 0 to 6 (0: none)"),
     ("font", "fonts to try, best first"),
     ("font-size", "8pt to 14pt (or pixels: 12px)"),
     ("logo-text", "the word in the logo's box, at most 12 letters"),
@@ -287,8 +291,11 @@ pub const OTHERS: &[(&str, &str)] = &[
     ("wallpaper-offset", "moves the wallpaper across, then down: -2000 to 2000 each (20 -10)"),
     ("wallpaper-blur", "blurs the wallpaper: 0 to 50 (0 for none)"),
     ("wallpaper-fade", "fades the wallpaper out at the list's edges: 0 to 50 (0 for none), as a part of the list's size"),
+    ("wallpaper-area", "where the wallpaper lies: middle (the list's room; the preview covers it), middle-shrinks (the preview squeezes it), window-sized (the whole window's size, seen in the list) or window (behind everything)"),
+    ("wallpaper-panels", "with wallpaper-area: window, how much shows through the bars and panels: 0 to 90 (50 if not set)"),
     ("era", "older Windows to look like: none, 98, 2000, xp or 7"),
     ("icons", "icons: windows (today's), classic, xp or aero (follows the era)"),
+    ("logo-style", "what the title bars show at the left: box (logo-text in a box), chrome (the chrome letters), caps (GLiNT) or none"),
     ("title-font", "font of window titles (empty: the skin's font)"),
 ];
 
@@ -302,6 +309,8 @@ const NUMBERS: &[(&str, f32, f32, bool)] = &[
     ("sidebar-row-height", 16.0, 48.0, false),
     ("tab-line-width", 0.0, 6.0, false),
     ("toolbar-line-width", 0.0, 6.0, false),
+    ("selection-edge-width", 0.0, 6.0, false),
+    ("sidebar-selection-edge-width", 0.0, 6.0, false),
     ("font-size", 8.0, 14.0, true),
     ("see-through", 0.0, 90.0, false),
     ("wallpaper-opacity", 0.0, 100.0, false),
@@ -309,23 +318,9 @@ const NUMBERS: &[(&str, f32, f32, bool)] = &[
     ("wallpaper-size", 1.0, 400.0, false),
     ("wallpaper-blur", 0.0, 50.0, false),
     ("wallpaper-fade", 0.0, 50.0, false),
+    ("wallpaper-panels", 0.0, 90.0, false),
     ("scrollbar-width", 4.0, 18.0, false),
 ];
-
-/// What a number setting can be, as a skin writes it ("0 to 20", "8pt to 14pt"); None for a
-/// setting that isn't a number.
-pub fn range_of(key: &str) -> Option<String> {
-    let &(_, min, max, in_pt) = NUMBERS.iter().find(|n| n.0 == key)?;
-    // Two say what their ends mean, or that they're percentages.
-    match key {
-        "see-through" => return Some(format!("{} solid to {} almost clear", show(min, None), show(max, None))),
-        "wallpaper-size" => return Some(format!("{}% to {}%", show(min, None), show(max, None))),
-        _ => {}
-    }
-    let pt = in_pt.then_some(PT);
-    let k = pt.unwrap_or(1.0);
-    Some(format!("{} to {}", show(min * k, pt), show(max * k, pt)))
-}
 
 /// Other names people may write for a setting (CSS habits, the code's names).
 const ALIASES: &[(&str, &str)] = &[
@@ -381,19 +376,31 @@ struct Line {
 
 /// A setting's name as Glint knows it: lower case, words joined with "-", aliases resolved.
 pub fn normalize_key(key: &str) -> String {
+    let k = normalize_word(key);
+    ALIASES.iter().find(|(a, _)| *a == k).map_or(k, |(_, real)| real.to_string())
+}
+
+/// A value's word as `normalize_key` writes a key, but without the keys' old names: "Window" is
+/// "window" here (as a key, it would be "background").
+pub fn normalize_word(word: &str) -> String {
     let mut k = String::new();
-    for word in key.trim().split(|c: char| c.is_whitespace() || c == '_' || c == '-').filter(|w| !w.is_empty()) {
+    for part in word.trim().split(|c: char| c.is_whitespace() || c == '_' || c == '-').filter(|w| !w.is_empty()) {
         if !k.is_empty() {
             k.push('-');
         }
-        k.push_str(&word.to_lowercase());
+        k.push_str(&part.to_lowercase());
     }
-    ALIASES.iter().find(|(a, _)| *a == k).map_or(k, |(_, real)| real.to_string())
+    k
 }
 
 /// Whether Glint knows setting `key` (as [`normalize_key`] makes it).
 pub fn known_key(key: &str) -> bool {
-    COLOURS.iter().any(|(k, _)| *k == key) || OTHERS.iter().any(|(k, _)| *k == key)
+    COLOURS.iter().any(|(k, _)| *k == key) || OTHERS.iter().any(|(k, _)| *k == key) || crate::parts::spec(key).is_some()
+}
+
+/// Every setting's name with what it does: the colours, the others, then the parts' (parts.rs).
+pub fn all_settings() -> impl Iterator<Item = (&'static str, &'static str)> {
+    COLOURS.iter().chain(OTHERS.iter()).copied().chain(crate::parts::SPECS.iter().map(|s| (s.key, s.about)))
 }
 
 /// The text of a line without its note (" // ..."), or None for a line that is only a note.
@@ -469,7 +476,7 @@ fn doesnt_exist<'a>(name: &str, names: impl IntoIterator<Item = &'a str>) -> Str
 
 /// A setting's name Glint doesn't know (or a line it can't read).
 fn unknown(name: &str) -> String {
-    doesnt_exist(name, COLOURS.iter().chain(OTHERS).map(|(k, _)| *k))
+    doesnt_exist(name, all_settings().map(|(k, _)| k))
 }
 
 /// A colour's name Glint doesn't know.
@@ -874,6 +881,7 @@ fn parse_in(text: &str, fallback_name: &str, dir: Option<&Path>) -> Parsed {
         accent: accent_paint.base(),
         accent_tint: accent_tint_paint.base(),
         select_edge: p("selection-edge").base(),
+        sidebar_select_edge: p("sidebar-selection-edge").base(),
         on_accent: p("accent-text").base(),
         hover: hover_paint.base(),
         button_hover: p("tool-hover").base(),
@@ -899,10 +907,13 @@ fn parse_in(text: &str, fallback_name: &str, dir: Option<&Path>) -> Parsed {
         sidebar_row_h: size::ROW_H,
         tab_line_w: 3.0,
         toolbar_line_w: 2.0,
+        select_edge_w: size::SELECT_EDGE,
+        sidebar_select_edge_w: size::SELECT_EDGE,
         font: String::new(),
         font_size: size::FONT,
         logo_text: DEFAULT_LOGO_TEXT.into(),
         logo_style: crate::settings::LogoStyle::Box,
+        logo_own: None,
         window_paint,
         titlebar_paint,
         toolbar_paint,
@@ -970,6 +981,9 @@ fn parse_in(text: &str, fallback_name: &str, dir: Option<&Path>) -> Parsed {
         wallpaper_offset: (0.0, 0.0),
         wallpaper_blur: 0,
         wallpaper_fade: 0.0,
+        wallpaper_area: WallpaperArea::Middle,
+        wallpaper_panels: 0.5,
+        place: Default::default(),
         era: Era::None,
         icons: IconSet::Windows,
         title_text: p("title-text").base(),
@@ -987,6 +1001,7 @@ fn parse_in(text: &str, fallback_name: &str, dir: Option<&Path>) -> Parsed {
         menu_selection_text: p("menu-selection-text").base(),
         menu_border: p("menu-border").base(),
         sidebar_text: p("sidebar-text").base(),
+        parts: crate::parts::Parts::default(),
     };
 
     // The rest: as the skin says, else as the base says.
@@ -1035,6 +1050,12 @@ fn parse_in(text: &str, fallback_name: &str, dir: Option<&Path>) -> Parsed {
     }
     if let Some(x) = number("toolbar-line-width", &mut notes) {
         theme.toolbar_line_w = x;
+    }
+    if let Some(x) = number("selection-edge-width", &mut notes) {
+        theme.select_edge_w = x;
+    }
+    if let Some(x) = number("sidebar-selection-edge-width", &mut notes) {
+        theme.sidebar_select_edge_w = x;
     }
     if let Some(x) = number("font-size", &mut notes) {
         theme.font_size = x;
@@ -1180,6 +1201,18 @@ fn parse_in(text: &str, fallback_name: &str, dir: Option<&Path>) -> Parsed {
     if let Some(x) = number("wallpaper-fade", &mut notes) {
         theme.wallpaper_fade = x / 100.0;
     }
+    let (mine, theirs) = value("wallpaper-area");
+    let standard_area = theirs.as_deref().and_then(wallpaper_area).unwrap_or_default();
+    theme.wallpaper_area = match mine {
+        Some((v, line)) => wallpaper_area(&v).unwrap_or_else(|| {
+            notes.push(Note { line, text: format!("wallpaper-area is middle, middle-shrinks, window-sized or window (not \u{201c}{v}\u{201d}).") });
+            standard_area
+        }),
+        None => standard_area,
+    };
+    if let Some(x) = number("wallpaper-panels", &mut notes) {
+        theme.wallpaper_panels = x / 100.0;
+    }
     // Two numbers, across then down; each past -2000 or 2000 is that end.
     let (mine, theirs) = value("wallpaper-offset");
     let standard_offset = theirs.as_deref().and_then(two_numbers).map_or((0.0, 0.0), |(x, y)| (x.clamp(-MAX_OFFSET, MAX_OFFSET), y.clamp(-MAX_OFFSET, MAX_OFFSET)));
@@ -1240,6 +1273,25 @@ fn parse_in(text: &str, fallback_name: &str, dir: Option<&Path>) -> Parsed {
         }),
         None => theirs.as_deref().and_then(icons_of).unwrap_or(by_era),
     };
+    let logo_of = |v: &str| match v.trim().to_ascii_lowercase().replace([' ', '-', '_'], "").as_str() {
+        "box" | "inabox" => Some(crate::settings::LogoStyle::Box),
+        "chrome" | "chromeletters" => Some(crate::settings::LogoStyle::Chrome),
+        "caps" | "glint" => Some(crate::settings::LogoStyle::Caps),
+        "none" | "no" | "off" => Some(crate::settings::LogoStyle::None),
+        _ => None,
+    };
+    let (mine, theirs) = value("logo-style");
+    theme.logo_own = match mine {
+        Some((v, line)) => logo_of(&v).or_else(|| {
+            notes.push(Note { line, text: format!("logo-style is box, chrome, caps or none (not \u{201c}{v}\u{201d}).") });
+            None
+        }),
+        None => theirs.as_deref().and_then(logo_of),
+    };
+    if let Some(own) = theme.logo_own {
+        theme.logo_style = own;
+    }
+    theme.parts = crate::parts::read(&own, &base, &mut notes);
     let (mine, theirs) = value("title-font");
     theme.title_font = font_list(&mine.map(|(v, _)| v).or(theirs).unwrap_or_default());
 
@@ -1354,6 +1406,17 @@ const WALLPAPER_MISSING: &str = "Can't find the wallpaper";
 
 /// A wallpaper's full path: a bare file name is looked for next to the skin (in `dir`, its file's
 /// folder), then in the skins folder.
+/// A `wallpaper-area` word.
+pub(crate) fn wallpaper_area(v: &str) -> Option<WallpaperArea> {
+    match normalize_word(v).as_str() {
+        "middle" => Some(WallpaperArea::Middle),
+        "middle-shrinks" => Some(WallpaperArea::Shrinks),
+        "window-sized" => Some(WallpaperArea::WindowSized),
+        "window" => Some(WallpaperArea::Window),
+        _ => None,
+    }
+}
+
 fn wallpaper_path(v: &str, dir: Option<&Path>) -> String {
     wallpaper_path_in(v, dir, &folder())
 }
@@ -1899,11 +1962,17 @@ impl Library {
         recycled
     }
 
-    /// Exports a skin's text to `to` (any file the person picked).
+    /// Exports a skin's text to `to` (any file the person picked). To a `.zip` it goes with its
+    /// picture ([`pack_skin`]), wherever that is.
     pub fn export(&mut self, id: &str, to: PathBuf) {
         if let Some(e) = self.find(id) {
             let (text, name) = (e.text.clone(), e.name.clone());
-            self.queue(FileJob::Export { file: to, text, name });
+            if is_zip(&to) {
+                let dir = e.file.as_deref().and_then(Path::parent).map(Path::to_path_buf);
+                self.queue(FileJob::ExportZip { file: to, text, name, dir, skins: folder() });
+            } else {
+                self.queue(FileJob::Export { file: to, text, name });
+            }
         }
     }
 
@@ -2385,7 +2454,8 @@ fn same_place(a: &Path, b: &Path) -> bool {
     real(a) == real(b)
 }
 
-/// Reads the skin file `file` for IMPORT… and brings what it needs into `skins` (the skins folder):
+/// Reads the skin file `file` for IMPORT… and brings what it needs into `skins` (the skins folder).
+/// A `.zip` (what EXPORT… makes of a skin with a wallpaper) is taken apart first.
 /// - the picture its `wallpaper` line names, when that's a file name (or a path from the skin's
 ///   folder) and the picture is next to it: copied in next to where the skin goes. A full path is
 ///   left as it is.
@@ -2399,6 +2469,9 @@ fn same_place(a: &Path, b: &Path) -> bool {
 /// skin's copy goes next to it and uses the pictures there. Touches the disk: call it on a
 /// background thread. Err: the skin itself couldn't be read.
 pub fn prepare_import(file: &Path, skins: &Path) -> Result<Import, String> {
+    if is_zip(file) {
+        return prepare_import_zip(file, skins);
+    }
     let me = Neighbour::read(file)?;
     let from = file.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
     let twin = find_twin(&me, &from);
@@ -2644,6 +2717,9 @@ enum FileJob {
     Delete { file: PathBuf, name: String },
     /// A copy somewhere else (Export…).
     Export { file: PathBuf, text: String, name: String },
+    /// Export as a zip with the skin's picture: `dir` is the skin file's folder, `skins` the skins
+    /// folder (where a bare picture name is looked for).
+    ExportZip { file: PathBuf, text: String, name: String, dir: Option<PathBuf>, skins: PathBuf },
 }
 
 /// The worker's queue, while its thread runs.
@@ -2732,6 +2808,12 @@ fn run_job(job: FileJob) -> Result<String, String> {
         FileJob::Export { file, text, name } => {
             write_atomic(&file, &text).map(|()| format!("Exported {name}")).map_err(|e| format!("Failed to export \u{201c}{name}\u{201d}: {e}"))
         }
+        FileJob::ExportZip { file, text, name, dir, skins } => match pack_skin(&file, &text, &name, dir.as_deref(), &skins) {
+            Ok(None) => Ok(format!("Exported {name}")),
+            Ok(Some(picture)) if picture.is_empty() => Ok(format!("Exported {name} with its wallpaper")),
+            Ok(Some(picture)) => Ok(format!("Exported {name}, without its wallpaper: \u{201c}{picture}\u{201d} wasn't found")),
+            Err(e) => Err(format!("Failed to export \u{201c}{name}\u{201d}: {e}")),
+        },
         FileJob::Rename { from, to, text, name } => {
             // (Any letters: Windows takes "élan" and "Élan" as one file, so that's a change of capitals.)
             let same_file = from.to_string_lossy().to_lowercase() == to.to_string_lossy().to_lowercase();
@@ -2799,6 +2881,144 @@ fn ours_now(file: &Path) {
 }
 
 /// Writes `text` to `file` atomically: a new file next to it, flushed, then renamed over it.
+/// Whether `file` is a .zip.
+pub fn is_zip(file: &Path) -> bool {
+    file.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+}
+
+/// Whether a skin's text names a wallpaper (EXPORT… then makes a zip with the picture in it).
+pub fn has_wallpaper(text: &str) -> bool {
+    !wallpaper_written(text).is_empty()
+}
+
+/// Writes skin `name` (its `text`) to the zip `file`, with its picture: a folder named after the
+/// skin holding the skin's file and the picture, the `wallpaper` line naming the picture by its file
+/// name - so IMPORT… of the zip puts both in a folder of their own in the skins folder, ready. The
+/// picture is found as the skin finds it: next to the skin (in `dir`), in the skins folder, or at
+/// its full path. Ok(None): the skin has no wallpaper; Ok(Some("")): the picture went in;
+/// Ok(Some(name)): it wasn't found, and the zip has just the skin.
+fn pack_skin(file: &Path, text: &str, name: &str, dir: Option<&Path>, skins: &Path) -> std::io::Result<Option<String>> {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    let written = wallpaper_written(text);
+    let picture = Some(PathBuf::from(wallpaper_path_in(&written, dir, skins))).filter(|p| !written.is_empty() && p.is_file());
+    let picture_name = picture.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+    let text = match &picture_name {
+        Some(n) if *n != written => with_value(text, "wallpaper", n),
+        _ => text.to_string(),
+    };
+    let stem = file_stem(name);
+    if let Some(d) = file.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let mut tmp = file.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let zip_err = |e: zip::result::ZipError| match e {
+        zip::result::ZipError::Io(e) => e,
+        e => std::io::Error::other(e.to_string()),
+    };
+    let packed = (|| -> std::io::Result<()> {
+        let mut z = zip::ZipWriter::new(std::io::BufWriter::new(std::fs::File::create(&tmp)?));
+        let squeezed = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        z.start_file(format!("{stem}/{stem}.{EXTENSION}"), squeezed).map_err(zip_err)?;
+        z.write_all(text.as_bytes())?;
+        if let (Some(p), Some(n)) = (&picture, &picture_name) {
+            // (A picture is packed already: stored as it is.)
+            let big = std::fs::metadata(p).is_ok_and(|m| m.len() >= u32::MAX as u64);
+            let kept = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored).large_file(big);
+            z.start_file(format!("{stem}/{n}"), kept).map_err(zip_err)?;
+            std::io::copy(&mut std::fs::File::open(p)?, &mut z)?;
+        }
+        let mut w = z.finish().map_err(zip_err)?;
+        w.flush()?;
+        w.get_ref().sync_all()
+    })();
+    match packed.and_then(|()| std::fs::rename(&tmp, file)) {
+        Ok(()) => Ok((!written.is_empty()).then(|| if picture.is_some() { String::new() } else { written.clone() })),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// At most this many files are taken out of a skin's zip, each picture at most this big.
+const MAX_ZIP_FILES: usize = 64;
+const MAX_ZIP_PICTURE: u64 = 200 * 1024 * 1024;
+
+/// Takes a skin's zip (what EXPORT… makes, or one like it) apart into a new folder in `temp`: its
+/// skins and pictures (and a note), into one folder named after the zip's own folder (or the zip).
+/// Returns that folder and the skin to import (the one named like the folder, else the first).
+fn unpack_skin(file: &Path, temp: &Path) -> Result<PathBuf, String> {
+    use std::io::Read;
+    let bad = |e: &dyn std::fmt::Display| format!("Failed to read {}: {e}", file.display());
+    let mut zip = zip::ZipArchive::new(std::io::BufReader::new(std::fs::File::open(file).map_err(|e| bad(&e))?)).map_err(|e| bad(&e))?;
+    let zip_stem = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Imported skin".into());
+    // The zip's own folder: the first folder its skin is in.
+    let mut folder = None;
+    for i in 0..zip.len() {
+        let Ok(f) = zip.by_index(i) else { continue };
+        if let Some(p) = f.enclosed_name().filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case(EXTENSION))) {
+            folder = p.parent().and_then(|d| d.components().next()).map(|c| c.as_os_str().to_string_lossy().into_owned());
+            break;
+        }
+    }
+    let folder = file_stem(&folder.filter(|f| !f.trim().is_empty()).unwrap_or(zip_stem));
+    let into = temp.join(&folder);
+    std::fs::create_dir_all(&into).map_err(|e| bad(&e))?;
+    let mut skins: Vec<PathBuf> = Vec::new();
+    let mut taken = 0;
+    for i in 0..zip.len() {
+        let Ok(mut f) = zip.by_index(i) else { continue };
+        if f.is_dir() {
+            continue;
+        }
+        let Some(name) = f.enclosed_name().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())) else { continue };
+        let ext = Path::new(&name).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let limit = if ext == EXTENSION {
+            MAX_FILE_BYTES
+        } else if PICTURES.contains(&ext.as_str()) {
+            MAX_ZIP_PICTURE
+        } else if ALSO_IN_A_SKIN_FOLDER.contains(&ext.as_str()) {
+            MAX_FILE_BYTES
+        } else {
+            continue;
+        };
+        let out = into.join(&name);
+        if f.size() > limit || out.exists() {
+            continue;
+        }
+        taken += 1;
+        if taken > MAX_ZIP_FILES {
+            break;
+        }
+        let mut bytes = Vec::new();
+        f.by_ref().take(limit + 1).read_to_end(&mut bytes).map_err(|e| bad(&e))?;
+        if bytes.len() as u64 > limit {
+            continue;
+        }
+        std::fs::write(&out, &bytes).map_err(|e| bad(&e))?;
+        if ext == EXTENSION {
+            skins.push(out);
+        }
+    }
+    let want = format!("{folder}.{EXTENSION}").to_lowercase();
+    let at = skins.iter().position(|s| s.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase() == want)).unwrap_or(0);
+    skins.into_iter().nth(at).ok_or_else(|| format!("{} has no skin in it (a .glint file).", file.display()))
+}
+
+/// [`prepare_import`] for a skin's zip: taken apart in a new folder under the temporary folder,
+/// imported from there (into a folder of its own in the skins folder, with its picture), and the
+/// temporary folder removed.
+fn prepare_import_zip(file: &Path, skins: &Path) -> Result<Import, String> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let temp = std::env::temp_dir().join(format!("glint-skin-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    let result = unpack_skin(file, &temp).and_then(|skin| prepare_import(&skin, skins));
+    let _ = std::fs::remove_dir_all(&temp);
+    result
+}
+
 fn write_atomic(file: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(dir) = file.parent() {
@@ -2986,6 +3206,35 @@ mod tests {
         assert_eq!(nv.tab_line, nv.accent);
     }
 
+    /// Each skin says what its title bars show at the left (`logo-style`); one that doesn't
+    /// leaves it to the "Logo" setting. A word Glint doesn't know is a note.
+    #[test]
+    fn a_skin_has_its_own_logo() {
+        use crate::settings::LogoStyle;
+        for (text, own) in [("logo-style: box
+", LogoStyle::Box), ("logo-style: chrome
+", LogoStyle::Chrome), ("logo style = Caps
+", LogoStyle::Caps), ("logo-style: none
+", LogoStyle::None), ("logo-style: In a box
+", LogoStyle::Box)] {
+            let p = parse(text, "x");
+            assert!(p.notes.is_empty(), "{text:?}: {:?}", p.notes);
+            assert_eq!((p.theme.logo_own, p.theme.logo_style), (Some(own), own), "{text:?}");
+        }
+        assert_eq!(parse("name: Moss
+", "x").theme.logo_own, None);
+        let p = parse("logo-style: sparkly
+", "x");
+        assert_eq!(p.theme.logo_own, None);
+        assert_eq!(p.notes.len(), 1, "{:?}", p.notes);
+        // (`logo` is still the box's colour.)
+        let p = parse("logo: #3a7d44
+logo-style: box
+", "x");
+        assert!(p.notes.is_empty(), "{:?}", p.notes);
+        assert_eq!(p.theme.logo_paint.base(), Color::hex(0x3a7d44));
+    }
+
     #[test]
     fn the_logo_is_the_glint_box_unless_a_skin_names_another_word() {
         // The built-in skins have no word of their own: every one shows GLINT in its box.
@@ -3072,6 +3321,53 @@ mod tests {
         assert_eq!(t.logo_text.chars().count(), MAX_LOGO_TEXT);
         // A circle (background -> line -> background) falls back instead of hanging.
         assert!(t.window.a > 0.0);
+    }
+
+    #[test]
+    fn the_selection_edges_have_their_own_width_and_the_sidebar_its_own_colour() {
+        // Left out: 3 wide, and the sidebar's follows the rows' edge.
+        let t = parse("selection-edge: #112233\n", "x").theme;
+        assert_eq!((t.select_edge_w, t.sidebar_select_edge_w), (3.0, 3.0));
+        assert_eq!(t.sidebar_select_edge, t.select_edge);
+        assert_eq!(t.thin_select_edge(), 2.0, "tiles and pop-ups keep their 2");
+        // Set: each on its own, and 0 takes the line away.
+        let p = parse("selection-edge-width: 0\nsidebar-selection-edge-width: 6\nsidebar-selection-edge: #00ff00\nselection-edge-width: 9\n", "x");
+        assert_eq!(p.notes.len(), 2, "line 4 is the same setting again, and 9 is past 6: {:?}", p.notes);
+        assert_eq!((p.theme.select_edge_w, p.theme.sidebar_select_edge_w), (6.0, 6.0));
+        assert_eq!(p.theme.sidebar_select_edge, Color::hex(0x00ff00));
+        let t = parse("selection-edge-width: 0\n", "x").theme;
+        assert_eq!((t.select_edge_w, t.thin_select_edge()), (0.0, 0.0));
+    }
+
+    #[test]
+    fn the_wallpaper_lies_where_the_skin_says_and_the_bars_show_it_only_behind_everything() {
+        use crate::theme::WallpaperArea;
+        // Left out: the list's room (the preview covers it), and half see-through.
+        let t = parse("wallpaper: x.png\n", "x").theme;
+        assert_eq!((t.wallpaper_area, t.wallpaper_panels), (WallpaperArea::Middle, 0.5));
+        for (word, area) in [("middle", WallpaperArea::Middle), ("middle-shrinks", WallpaperArea::Shrinks), ("Window-Sized", WallpaperArea::WindowSized), ("window", WallpaperArea::Window)] {
+            assert_eq!(parse(&format!("wallpaper-area: {word}\n"), "x").theme.wallpaper_area, area, "{word}");
+        }
+        let p = parse("wallpaper-area: everywhere\nwallpaper-panels: 120\n", "x");
+        assert_eq!(p.notes.len(), 2, "{:?}", p.notes);
+        assert_eq!((p.theme.wallpaper_area, p.theme.wallpaper_panels), (WallpaperArea::Middle, 0.9));
+        // The bars and panels are see-through only with the picture behind the whole window, and
+        // there is one.
+        let solid = Paint::Flat(Color::hex(0x336699));
+        let mut t = parse("wallpaper: x.png\nwallpaper-area: window\nwallpaper-panels: 30\n", "x").theme;
+        assert!(t.wallpaper_behind());
+        assert!((t.through(&solid).base().a - 0.7).abs() < 0.001);
+        assert_eq!(t.bar_fade(), 1.0);
+        // Older Windows: behind the whole window too; their bars fade as a whole instead.
+        t.era = crate::theme::Era::Xp;
+        assert!(t.wallpaper_behind());
+        assert_eq!(t.through(&solid), solid);
+        assert!((t.bar_fade() - 0.7).abs() < 0.001);
+        for text in ["wallpaper-area: window\n", "wallpaper: x.png\nwallpaper-area: window-sized\n", "wallpaper: x.png\nwallpaper-area: window\nwallpaper-opacity: 0\n"] {
+            let t = parse(text, "x").theme;
+            assert!(!t.wallpaper_behind(), "{text}");
+            assert_eq!(t.through(&solid), solid, "{text}");
+        }
     }
 
     #[test]
@@ -3734,11 +4030,6 @@ mod tests {
         let p = parse("wallpaper-blur: 99\naccent: #ff0000\nwallpaper-fade: x\n", "x");
         assert_eq!(noted(&p), [1, 3]);
         assert_eq!(p.theme.accent, Color::hex(0xff0000));
-        // What a number can be, as the hint line says it.
-        assert_eq!(range_of("slant").as_deref(), Some("0 to 20"));
-        assert_eq!(range_of("font-size").as_deref(), Some("8pt to 14pt"));
-        assert_eq!(range_of("wallpaper-zoom").as_deref(), Some("-500 to 500"));
-        assert_eq!(range_of("accent"), None);
         // Every number setting is a setting.
         assert!(NUMBERS.iter().all(|(k, ..)| known_key(k)));
     }
@@ -3843,6 +4134,51 @@ mod tests {
         } else {
             "+"
         }
+    }
+
+    #[test]
+    fn a_skin_with_a_wallpaper_anywhere_exports_as_a_zip_that_imports_ready() {
+        let (base, skins, from) = import_test("zip");
+        // The picture is somewhere else entirely (a full path), not next to the skin.
+        let pics = base.join("Pictures");
+        std::fs::create_dir_all(&pics).unwrap();
+        let beach = pics.join("beach.png");
+        std::fs::write(&beach, b"not really a png").unwrap();
+        let text = format!("name: Moss\ndark: true\nwallpaper: {}\n", beach.display());
+        let zip = from.join("Moss.zip");
+        assert_eq!(pack_skin(&zip, &text, "Moss", None, &skins).unwrap().as_deref(), Some(""));
+        // Inside: a folder named after the skin, with the skin and the picture.
+        let mut z = zip::ZipArchive::new(std::fs::File::open(&zip).unwrap()).unwrap();
+        let mut names: Vec<String> = (0..z.len()).map(|i| z.by_index(i).unwrap().name().unwrap().to_string()).collect();
+        names.sort();
+        assert_eq!(names, ["Moss/Moss.glint", "Moss/beach.png"]);
+        // Imported on another PC (the picture gone from where it was): a folder of its own in the
+        // skins folder, the picture next to the skin, named by its file name.
+        std::fs::remove_file(&beach).unwrap();
+        let mut lib = library_of(&skins);
+        let (id, said, problem) = import(&mut lib, &zip, &skins);
+        assert!(!problem, "{said}");
+        assert_eq!(files_in(&skins.join("Moss")), ["Moss.glint", "beach.png"]);
+        let e = lib.find(&id).unwrap();
+        assert_eq!(value_in(&e.text, "wallpaper").as_deref(), Some("beach.png"));
+        assert_eq!(std::fs::read(skins.join("Moss").join("beach.png")).unwrap(), b"not really a png");
+        // The temporary folder it was taken apart in is gone.
+        let left = std::fs::read_dir(std::env::temp_dir()).unwrap().flatten().any(|i| i.file_name().to_string_lossy().starts_with(&format!("glint-skin-{}-", std::process::id())));
+        assert!(!left);
+        // A wallpaper that isn't there: the zip has just the skin, and says which picture.
+        let zip2 = from.join("Gone.zip");
+        assert_eq!(pack_skin(&zip2, "name: Gone\nwallpaper: nowhere.jpg\n", "Gone", None, &skins).unwrap().as_deref(), Some("nowhere.jpg"));
+        // No wallpaper: None (Export makes a plain .glint for those).
+        assert!(!has_wallpaper("name: Plain\n"));
+        assert!(has_wallpaper(&text));
+        // A zip with no skin in it says so.
+        let empty = from.join("Empty.zip");
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&empty).unwrap());
+        w.start_file("readme.txt", zip::write::SimpleFileOptions::default()).unwrap();
+        std::io::Write::write_all(&mut w, b"hi").unwrap();
+        w.finish().unwrap();
+        assert!(prepare_import(&empty, &skins).is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn files_in(dir: &Path) -> Vec<String> {

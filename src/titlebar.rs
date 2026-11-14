@@ -25,8 +25,14 @@ use std::collections::HashMap;
 use crate::app::AppState;
 use crate::render::{Renderer, TextStyle};
 use crate::retro;
+use crate::parts::{Shown, P};
 use crate::theme::{size, CaptionStyle, Color, Era, Paint, TabStyle, Theme};
 use crate::ui::{Command, Component, Ctx, DropTarget, Effect, Hit, Menu, MenuItem, MouseButton, MouseEvent, Point, Rect};
+
+/// The tabs' text size: the standard one and the skin's tab-text-size.
+fn tab_text(theme: &Theme) -> f32 {
+    size::FONT + theme.parts.num(P::TabText)
+}
 
 /// Tabs start this far below the top of the title bar and reach down to the toolbar.
 const TAB_TOP: f32 = 6.0;
@@ -35,8 +41,6 @@ const TAB_PAD: f32 = 12.0;
 const TAB_ICON_GAP: f32 = 8.0;
 /// The ×'s hover box.
 const TAB_CLOSE: f32 = 18.0;
-const TAB_MIN: f32 = 96.0;
-const TAB_MAX: f32 = 220.0;
 /// Narrowest a tab gets when many share the bar.
 const TAB_SQUEEZED: f32 = 36.0;
 /// Narrowest a pinned tab gets: wide enough for its pin.
@@ -105,6 +109,8 @@ pub struct TitleBar {
     widths: HashMap<String, f32>,
     widths_font: u32,
     widths_bold: bool,
+    /// The tabs' text size the widths were measured at.
+    widths_size: f32,
     /// The tab the open right-click menu is about, by its id: while the menu is open a tab can open
     /// in front of it (a folder from another program), and the pick must not hit its neighbour.
     menu_tab: Option<u64>,
@@ -174,11 +180,12 @@ impl TitleBar {
         None
     }
 
-    fn measure(&mut self, r: &mut Renderer, title: &str, bold: bool) -> f32 {
-        // Another font (the skin changed): measure again.
-        if self.widths_font != r.font_generation() || self.widths_bold != bold {
+    fn measure(&mut self, r: &mut Renderer, title: &str, bold: bool, text: f32) -> f32 {
+        // Another font, or the tabs' text size (the skin changed): measure again.
+        if self.widths_font != r.font_generation() || self.widths_bold != bold || self.widths_size != text {
             self.widths_font = r.font_generation();
             self.widths_bold = bold;
+            self.widths_size = text;
             self.widths.clear();
         }
         if let Some(&w) = self.widths.get(title) {
@@ -187,7 +194,7 @@ impl TitleBar {
         if self.widths.len() > 256 {
             self.widths.clear();
         }
-        let style = TextStyle::new(Color::hex(0));
+        let style = TextStyle::new(Color::hex(0)).size(text);
         let w = r.measure(title, &if bold { style.bold() } else { style }).ceil();
         self.widths.insert(title.to_string(), w);
         w
@@ -198,6 +205,14 @@ impl TitleBar {
         // 98 / 2000: property sheet tabs standing on the toolbar, their names in regular weight.
         let classic = app.theme.era.classic();
         let pills = app.theme.tabs == TabStyle::Pills && !classic;
+        // The skin's tab settings (parts.rs): widths, the gap, the icon, the × and the text size.
+        let parts = &app.theme.parts;
+        let tab_min = parts.num(P::TabMin);
+        let tab_max = parts.num(P::TabMax).max(tab_min);
+        let icon_room = if parts.tab_icon() == Shown::Never { 0.0 } else { size::ICON + TAB_ICON_GAP };
+        let close_room = if parts.tab_close() == Shown::Never { 0.0 } else { TAB_CLOSE };
+        let text = tab_text(&app.theme);
+        let bold = pills || parts.on(P::TabBold);
         let (y, h, gap) = if classic {
             (self.rect.bottom() - CLASSIC_TAB_H, CLASSIC_TAB_H, 0.0)
         } else if pills {
@@ -208,6 +223,7 @@ impl TitleBar {
         } else {
             (self.rect.y + TAB_TOP, self.rect.h - TAB_TOP, 2.0)
         };
+        let gap = if classic { gap } else { parts.get(P::TabGap).unwrap_or(gap) };
         let left = self.rect.x + crate::logo::width(&app.theme) + 4.0;
         let room = (self.button(2).x - DRAG_ROOM - PLUS - 4.0 - left).max(0.0);
         let mut widths: Vec<f32> = app
@@ -215,14 +231,14 @@ impl TitleBar {
             .iter()
             .map(|t| {
                 let title = app.display_name(&t.path);
-                let text = self.measure(r, &title, pills);
-                (TAB_PAD + size::ICON + TAB_ICON_GAP + text + 6.0 + TAB_CLOSE + TAB_PAD * 0.5).clamp(TAB_MIN, TAB_MAX)
+                let words = self.measure(r, &title, bold, text);
+                (TAB_PAD + icon_room + words + 6.0 + close_room + TAB_PAD * 0.5).clamp(tab_min, tab_max)
             })
             .collect();
         // Settings open as a tab: its tab after the folders' (no picture, the same ×).
         if app.settings_tab {
-            let text = self.measure(r, SETTINGS_TAB, pills);
-            widths.push((TAB_PAD + text + 6.0 + TAB_CLOSE + TAB_PAD * 0.5).clamp(TAB_MIN, TAB_MAX));
+            let words = self.measure(r, SETTINGS_TAB, bold, text);
+            widths.push((TAB_PAD + words + 6.0 + close_room + TAB_PAD * 0.5).clamp(tab_min, tab_max));
         }
         let n = widths.len().max(1) as f32;
         let total: f32 = widths.iter().sum::<f32>() + gap * (n - 1.0);
@@ -274,8 +290,15 @@ impl TitleBar {
         };
     }
 
+    /// Where the current tab is (the part in sight in the tab strip), once laid out.
+    fn current_tab(&self, app: &AppState) -> Option<Rect> {
+        let i = if app.settings_tab { app.tabs.len() } else { app.active };
+        let t = self.tabs.get(i)?.rect;
+        let (x0, x1) = (t.x.max(self.strip.x), t.right().min(self.strip.right()));
+        (x1 > x0).then(|| Rect::new(x0, t.y, x1 - x0, t.h))
+    }
+
     fn paint_tabs(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState) {
-        self.layout_tabs(r, app);
         if theme.era.classic() {
             return self.paint_classic_tabs(r, theme, app);
         }
@@ -289,6 +312,13 @@ impl TitleBar {
             let dropping = self.drop_tab == Some(i);
             let hot = matches!(self.hover, Some(Part::Tab(t) | Part::TabClose(t)) if t == i) || dropping;
             let rect = slot.rect;
+            // The current tab and the one under the mouse stay solid over a see-through title bar.
+            let keep = r.fade();
+            if active || hot {
+                r.set_fade(1.0);
+            }
+            // A rounded skin's tabs are round at the top.
+            let round = theme.corner(rect.h);
             if pills {
                 paint_pill(r, theme, rect, active, hot);
             } else if theme.era == Era::Xp {
@@ -296,15 +326,21 @@ impl TitleBar {
             } else if theme.era == Era::Win7 {
                 seven_tab(r, theme, rect, active, hot);
             } else if active {
-                r.fill_paint(rect, 0.0, &theme.tab_active);
-                r.fill_rect(Rect::new(rect.x, rect.y, rect.w, theme.tab_line_w), theme.tab_line);
+                fill_tab(r, rect, round, &theme.tab_active);
+                r.push_clip(rect);
+                r.fill_round_rect(Rect::new(rect.x, rect.y, rect.w, theme.tab_line_w + 2.0 * round), round, theme.tab_line);
+                r.pop_clip();
+                if round > 0.0 {
+                    fill_tab(r, Rect::new(rect.x, rect.y + theme.tab_line_w, rect.w, rect.h - theme.tab_line_w), (round - theme.tab_line_w).max(0.0), &theme.tab_active);
+                }
             } else if hot {
                 // Part of the way to the current tab's look.
-                r.fill_paint(rect, 0.0, &theme.tab);
-                r.fill_paint(rect, 0.0, &theme.tab_active.with_strength(0.7));
+                fill_tab(r, rect, round, &theme.tab);
+                fill_tab(r, rect, round, &theme.tab_active.with_strength(0.7));
             } else {
-                r.fill_paint(rect, 0.0, &theme.tab);
+                fill_tab(r, rect, round, &theme.through(&theme.tab));
             }
+            r.set_fade(keep);
             if dropping && pills {
                 let radius = theme.corner(rect.h);
                 r.stroke_round_rect(rect.inset(0.5, 0.5), (radius - 0.5).max(0.0), 1.0, theme.accent);
@@ -315,7 +351,12 @@ impl TitleBar {
             // The last tab has its × too: closing it closes the window, as in File Explorer. A
             // pinned tab has a pin there instead (it closes from its right-click menu).
             let pinned = tab.is_some_and(|t| t.pinned);
-            let show_close = (active || hot) && rect.w >= 52.0 && !pinned;
+            let show_close = match theme.parts.tab_close() {
+                Shown::Fits => active || hot,
+                Shown::Hover => hot,
+                Shown::Never => false,
+            } && rect.w >= 52.0
+                && !pinned;
             let pin_at = slot.close;
             if !show_close {
                 slot.close = Rect::default();
@@ -324,7 +365,7 @@ impl TitleBar {
             let mid = rect.y + rect.h / 2.0 + if active && !pills { 1.0 } else { 0.0 };
             let mut x = rect.x + TAB_PAD;
             // The folder's icon, when there is room for it and a name.
-            if let Some(tab) = tab.filter(|_| rect.w >= 80.0) {
+            if let Some(tab) = tab.filter(|_| rect.w >= 80.0 && theme.parts.tab_icon() != Shown::Never) {
                 let at = Rect::new(x, (mid - size::ICON / 2.0).round(), size::ICON, size::ICON);
                 tab_icon(r, theme, app, &tab.path, at);
                 x += size::ICON + TAB_ICON_GAP;
@@ -338,8 +379,9 @@ impl TitleBar {
                 theme.tab_text
             };
             let title = tab.map_or_else(|| SETTINGS_TAB.to_string(), |t| app.display_name(&t.path));
-            // The current pill's name is bold.
-            let style = if pills && active { TextStyle::new(color).bold() } else { TextStyle::new(color) };
+            // The current pill's name is bold (any current tab's, with the skin's tab-bold).
+            let style = TextStyle::new(color).size(tab_text(theme));
+            let style = if active && (pills || theme.parts.on(P::TabBold)) { style.bold() } else { style };
             let words = Rect::new(x, mid - 10.0, (right - x).max(0.0), 20.0);
             if theme.era == Era::Xp && !active && theme.title_shadow.a > 0.0 {
                 // XP's taskbar buttons: their words carry the caption's shadow.
@@ -434,7 +476,11 @@ impl TitleBar {
                 retro::State { hot, down: hot && self.pressed.is_some_and(|(p, _)| p == part), active: ctx.active }
             };
             let max = if ctx.maximized { retro::Sign::Restore } else { retro::Sign::Maximize };
+            // (Buttons: solid over a see-through title bar.)
+            let keep = r.fade();
+            r.set_fade(1.0);
             retro::caption_group(r, theme, slots, [retro::Sign::Close, max, retro::Sign::Minimize], [state(Part::Close), state(Part::Maximize), state(Part::Minimize)]);
+            r.set_fade(keep);
             return;
         }
         for (i, part) in [Part::Close, Part::Maximize, Part::Minimize].into_iter().enumerate() {
@@ -501,29 +547,52 @@ impl TitleBar {
 /// window, so the two meet with no seam), round top corners, a grey edge and the orange edge on
 /// top. The others are taskbar buttons: the skin's `tab` paint, a darker edge, standing on the
 /// band a little above it.
+/// A tab's box, round at the top only (`round`): it reaches on below its bottom, out of sight.
+fn fill_tab(r: &mut Renderer, rect: Rect, round: f32, paint: &Paint) {
+    if round <= 0.0 {
+        return r.fill_paint(rect, 0.0, paint);
+    }
+    r.push_clip(rect);
+    r.fill_paint(Rect::new(rect.x, rect.y, rect.w, rect.h + 2.0 * round), round, paint);
+    r.pop_clip();
+}
+
 fn xp_tab(r: &mut Renderer, theme: &Theme, bar: Rect, tab: Rect, active: bool, hot: bool) {
-    const RADIUS: f32 = 3.0;
+    let radius = theme.era_corner(tab.h, 3.0).max(1.0);
     if active {
         r.push_clip(tab);
-        let tall = Rect::new(tab.x, tab.y, tab.w, tab.h + 2.0 * RADIUS);
+        let tall = Rect::new(tab.x, tab.y, tab.w, tab.h + 2.0 * radius);
         let y = tab.y + tab.h / 2.0;
-        r.fill_rect_toward(tall, RADIUS, &theme.toolbar_paint, Point::new(bar.x, y), Point::new(bar.right(), y));
-        r.stroke_round_rect(tall.inset(0.5, 0.5), RADIUS - 0.5, 1.0, theme.tab_border);
+        r.fill_rect_toward(tall, radius, &theme.toolbar_paint, Point::new(bar.x, y), Point::new(bar.right(), y));
+        r.stroke_round_rect(tall.inset(0.5, 0.5), radius - 0.5, 1.0, theme.tab_border);
         // The orange edge: a dark orange line over two light ones, inside the round corners.
         r.push_clip(Rect::new(tab.x, tab.y, tab.w, theme.tab_line_w.max(1.0)));
-        r.fill_round_rect(Rect::new(tab.x, tab.y, tab.w, 2.0 * RADIUS + 2.0), RADIUS, Color::hex(0xe68b2c));
+        r.fill_round_rect(Rect::new(tab.x, tab.y, tab.w, 2.0 * radius + 2.0), radius, Color::hex(0xe68b2c));
         r.pop_clip();
         if theme.tab_line_w > 1.0 {
-            r.fill_rect(Rect::new(tab.x + 1.0, tab.y + 1.0, tab.w - 2.0, theme.tab_line_w - 1.0), theme.tab_line);
+            // (Inside the round corners too.)
+            r.push_clip(Rect::new(tab.x, tab.y + 1.0, tab.w, theme.tab_line_w - 1.0));
+            r.fill_round_rect(Rect::new(tab.x + 1.0, tab.y + 1.0, tab.w - 2.0, 2.0 * radius), (radius - 1.0).max(0.0), theme.tab_line);
+            r.pop_clip();
         }
         r.pop_clip();
         return;
     }
     let button = Rect::new(tab.x, tab.y + 2.0, tab.w, tab.h - 5.0);
-    let paint = if hot { theme.tab.lighter(0.12) } else { theme.tab };
-    r.fill_paint(button, RADIUS, &paint);
+    // Under the mouse: lighter; or, where the other tabs have no box (XP's own look), part of the
+    // way to the current tab's, so it shows.
+    let paint = match hot {
+        true if theme.tab.is_clear() => theme.toolbar_paint.with_strength(0.6),
+        true => theme.tab.lighter(0.12),
+        false => theme.tab,
+    };
+    if hot {
+        crate::pathbar::fill_solid(r, theme, button, radius, &paint);
+    } else {
+        r.fill_paint(button, radius, &paint);
+    }
     r.fill_rect(Rect::new(button.x + 2.0, button.y + 1.0, button.w - 4.0, 1.0), theme.highlight.with_alpha(theme.highlight.a * 0.7));
-    r.stroke_round_rect(button.inset(0.5, 0.5), RADIUS - 0.5, 1.0, paint.last().darker(0.35));
+    r.stroke_round_rect(button.inset(0.5, 0.5), radius - 0.5, 1.0, paint.last().darker(0.35));
 }
 
 /// 7's tabs on its glass, as Internet Explorer's of the time: round-topped. The current one a
@@ -531,7 +600,7 @@ fn xp_tab(r: &mut Renderer, theme: &Theme, bar: Rect, tab: Rect, active: bool, h
 /// line inside it; the others plain glass, a little lower, with fainter edges, brighter under the
 /// mouse.
 fn seven_tab(r: &mut Renderer, theme: &Theme, tab: Rect, active: bool, hot: bool) {
-    const RADIUS: f32 = 4.0;
+    let radius = theme.era_corner(tab.h, 4.0).max(1.5);
     let white = |a: f32| Color::rgba(255, 255, 255, a);
     let (t, shine, edge) = if active {
         (tab, [white(0.92), white(0.62), white(0.0)], theme.tab_border)
@@ -540,10 +609,10 @@ fn seven_tab(r: &mut Renderer, theme: &Theme, tab: Rect, active: bool, hot: bool
         (Rect::new(tab.x, tab.y + 3.0, tab.w, tab.h - 3.0), shine, theme.tab_border.with_alpha(theme.tab_border.a * 0.7))
     };
     r.push_clip(t);
-    let tall = Rect::new(t.x, t.y, t.w, t.h + 2.0 * RADIUS);
-    r.fill_paint_down(tall, RADIUS, &Paint::even(&shine), t.y, t.bottom());
-    r.stroke_round_rect(tall.inset(0.5, 0.5), RADIUS - 0.5, 1.0, edge);
-    r.stroke_round_rect(tall.inset(1.5, 1.5), RADIUS - 1.5, 1.0, white(if active { 0.75 } else { 0.35 }));
+    let tall = Rect::new(t.x, t.y, t.w, t.h + 2.0 * radius);
+    r.fill_paint_down(tall, radius, &Paint::even(&shine), t.y, t.bottom());
+    r.stroke_round_rect(tall.inset(0.5, 0.5), radius - 0.5, 1.0, edge);
+    r.stroke_round_rect(tall.inset(1.5, 1.5), radius - 1.5, 1.0, white(if active { 0.75 } else { 0.35 }));
     r.pop_clip();
 }
 
@@ -603,12 +672,23 @@ impl TitleBar {
             let hot = matches!(self.hover, Some(Part::Tab(t) | Part::TabClose(t)) if t == i) || dropping;
             let rect = slot.rect;
             let shape = classic_tab_shape(rect, active);
+            // The current tab and the one under the mouse stay solid over a see-through title bar.
+            let keep = r.fade();
+            if active || hot {
+                r.set_fade(1.0);
+            }
             classic_tab(r, theme, shape);
+            r.set_fade(keep);
             if dropping {
                 crate::retroctl::dotted(r, shape.inset(3.0, 3.0), theme.text);
             }
             let pinned = tab.is_some_and(|t| t.pinned);
-            let show_close = (active || hot) && rect.w >= 52.0 && !pinned;
+            let show_close = match theme.parts.tab_close() {
+                Shown::Fits => active || hot,
+                Shown::Hover => hot,
+                Shown::Never => false,
+            } && rect.w >= 52.0
+                && !pinned;
             let pin_at = slot.close;
             if !show_close {
                 slot.close = Rect::default();
@@ -617,7 +697,7 @@ impl TitleBar {
             // The words and picture sit in the middle of the part below the top edge.
             let mid = (shape.y + 2.0 + (shape.h - 2.0) / 2.0).round();
             let mut x = rect.x + 8.0;
-            if let Some(tab) = tab.filter(|_| rect.w >= 80.0) {
+            if let Some(tab) = tab.filter(|_| rect.w >= 80.0 && theme.parts.tab_icon() != Shown::Never) {
                 tab_icon(r, theme, app, &tab.path, Rect::new(x, mid - size::ICON / 2.0, size::ICON, size::ICON));
                 x += size::ICON + 6.0;
             }
@@ -725,16 +805,32 @@ fn pixel_cross(r: &mut Renderer, x: f32, y: f32, color: Color) {
     }
 }
 
+/// `rect` but for `hole` (inside it): the parts left, right and above it (all of `rect` without one).
+fn around(rect: Rect, hole: Option<Rect>) -> Vec<Rect> {
+    let Some(h) = hole else { return vec![rect] };
+    let (x0, x1) = (h.x.clamp(rect.x, rect.right()), h.right().clamp(rect.x, rect.right()));
+    let top = h.y.clamp(rect.y, rect.bottom());
+    [
+        Rect::new(rect.x, rect.y, x0 - rect.x, rect.h),
+        Rect::new(x1, rect.y, rect.right() - x1, rect.h),
+        Rect::new(x0, rect.y, x1 - x0, top - rect.y),
+    ]
+    .into_iter()
+    .filter(|p| !p.is_empty())
+    .collect()
+}
+
 /// A tab as a pill (`tabs: pills`): a rounded box of the skin's `tab` paint (`tab-active` for the
 /// current one, lighter under the mouse), a shine along its top and a thin edge.
 fn paint_pill(r: &mut Renderer, theme: &Theme, rect: Rect, active: bool, hot: bool) {
     let radius = theme.corner(rect.h);
+    // (The current one and the one under the mouse solid over a see-through title bar.)
     let paint: Paint = if active {
         theme.tab_active
     } else if hot {
         theme.tab.lighter(if theme.dark { 0.08 } else { 0.45 })
     } else {
-        theme.tab
+        theme.through(&theme.tab)
     };
     r.fill_paint(rect, radius, &paint);
     r.fill_rect(Rect::new(rect.x + radius * 0.7, rect.y + 1.0, (rect.w - 1.4 * radius).max(0.0), 1.0), theme.highlight);
@@ -766,16 +862,31 @@ impl Component for TitleBar {
 
     fn paint(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState, ctx: &Ctx) {
         self.era = theme.era;
+        self.layout_tabs(r, app);
         if theme.era == Era::Win7 {
             // 7's glass runs on down through the toolbar (toolbar.rs draws its part of it).
-            let glass = Rect::new(self.rect.x, self.rect.y, self.rect.w, self.rect.h + size::TOOLBAR_H);
+            let glass = Rect::new(self.rect.x, self.rect.y, self.rect.w, self.rect.h + theme.toolbar_h());
             retro::glass(r, theme, glass, self.rect, ctx.active);
         } else if theme.era.old() {
             retro::title_band(r, theme, self.rect, ctx.active);
-        } else if theme.title_across {
-            r.fill_paint_across(self.rect, &theme.titlebar_paint);
         } else {
-            r.fill_paint(self.rect, 0.0, &theme.titlebar_paint);
+            let paint = theme.through(&theme.titlebar_paint);
+            // See-through over the wallpaper: none under the current tab (it joins the toolbar,
+            // as see-through as that).
+            let hole = (theme.wallpaper_behind() && theme.tabs != TabStyle::Pills).then(|| self.current_tab(app)).flatten();
+            for part in around(self.rect, hole) {
+                if hole.is_some() {
+                    r.push_clip(part);
+                }
+                if theme.title_across {
+                    r.fill_paint_across(self.rect, &paint);
+                } else {
+                    r.fill_paint(self.rect, 0.0, &paint);
+                }
+                if hole.is_some() {
+                    r.pop_clip();
+                }
+            }
         }
         if theme.title_gloss.a > 0.0 && !theme.era.old() {
             let top = Rect::new(self.rect.x, self.rect.y, self.rect.w, (self.rect.h * 0.48).round());

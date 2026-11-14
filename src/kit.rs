@@ -717,16 +717,21 @@ pub fn heading(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str) {
 /// list (the skin's edge and tint) - or, when the skin's sidebar is in panels, like the place
 /// you're in there (a rounded selection inside the list).
 pub fn nav_item(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str, selected: bool, look: Look) {
-    nav_entry(r, theme, rect, text, selected, look, false);
+    nav_entry(r, theme, rect, text, selected, look, false, 18.0);
+}
+
+/// A page list's entry whose name starts `inset` in (a narrow list).
+pub fn nav_item_inset(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str, selected: bool, look: Look, inset: f32) {
+    nav_entry(r, theme, rect, text, selected, look, false, inset);
 }
 
 /// A page's name in a row of tabs along the top (a narrow Settings window): the name sits in the
 /// middle of its tab, so every tab has the same space on both sides.
 pub fn nav_tab(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str, selected: bool, look: Look) {
-    nav_entry(r, theme, rect, text, selected, look, true);
+    nav_entry(r, theme, rect, text, selected, look, true, 18.0);
 }
 
-fn nav_entry(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str, selected: bool, look: Look, middle: bool) {
+fn nav_entry(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str, selected: bool, look: Look, middle: bool, inset: f32) {
     // 98 and 2000: a list box's line, inside the sunken well (`page_list_well`).
     let rect = if theme.era.classic() { Rect::new(rect.x + 9.0, rect.y, (rect.w - 18.0).max(0.0), rect.h) } else { rect };
     if panels(theme) {
@@ -743,7 +748,7 @@ fn nav_entry(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str, selected: 
         if middle {
             r.text(text, pill, &style.align(Align::Center));
         } else {
-            r.text(text, Rect::new(rect.x + 18.0, rect.y, (rect.w - 26.0).max(0.0), rect.h), &style);
+            r.text(text, Rect::new(rect.x + inset, rect.y, (rect.w - inset - 8.0).max(0.0), rect.h), &style);
         }
         if look.focused {
             focus_ring(r, theme, pill, 0.0);
@@ -752,7 +757,7 @@ fn nav_entry(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str, selected: 
     }
     if selected {
         crate::pathbar::fill_row(r, theme, rect, &theme.accent_tint_paint, false);
-        r.fill_rect(Rect::new(rect.x, rect.y, main_size::SELECT_EDGE, rect.h), theme.select_edge);
+        r.fill_rect(Rect::new(rect.x, rect.y, theme.sidebar_select_edge_w, rect.h), theme.sidebar_select_edge);
     } else if look.hover {
         crate::pathbar::fill_row(r, theme, rect, &theme.hover_paint, true);
     }
@@ -762,7 +767,7 @@ fn nav_entry(r: &mut Renderer, theme: &Theme, rect: Rect, text: &str, selected: 
     if middle {
         r.text(text, rect, &style.align(Align::Center));
     } else {
-        r.text(text, Rect::new(rect.x + 18.0, rect.y, (rect.w - 26.0).max(0.0), rect.h), &style);
+        r.text(text, Rect::new(rect.x + inset, rect.y, (rect.w - inset - 8.0).max(0.0), rect.h), &style);
     }
     if look.focused {
         focus_ring(r, theme, rect.inset(2.0, 2.0), 0.0);
@@ -908,6 +913,14 @@ impl Scroller {
             self.anim.stop();
             self.offset = self.offset.min(max);
         }
+    }
+
+    /// The page's last thing ends `end` DIPs down and `view` DIPs of it show. The `margin` under
+    /// that last thing only counts once the page scrolls anyway: a page whose things all fit gets
+    /// no scroll bar just for its empty margin.
+    pub fn set_page(&mut self, end: f32, margin: f32, view: f32) {
+        let content = if end <= view { end } else { end + margin };
+        self.set_extent(content, view);
     }
 
     /// The farthest it can scroll.
@@ -1505,6 +1518,22 @@ mod tests {
         s.set_extent(300.0, 400.0);
         assert_eq!((s.max(), s.offset), (0.0, 0.0));
         assert!(s.thumb(Rect::new(0.0, 0.0, 6.0, 400.0)).is_none(), "no scrollbar when it fits");
+    }
+
+    #[test]
+    fn a_page_that_fits_but_for_its_margin_doesnt_scroll() {
+        let mut s = Scroller::default();
+        // Settings > About: the last box ends 5 DIPs above the bottom; its 16-DIP margin
+        // made it scroll 11 DIPs of nothing.
+        s.set_page(533.0, 16.0, 538.0);
+        assert_eq!(s.max(), 0.0);
+        assert!(s.thumb(Rect::new(0.0, 0.0, 6.0, 538.0)).is_none(), "no scroll bar when the things fit");
+        // Exactly to the bottom still fits.
+        s.set_page(538.0, 16.0, 538.0);
+        assert_eq!(s.max(), 0.0);
+        // Once it scrolls anyway, the margin comes along so the last thing isn't on the edge.
+        s.set_page(600.0, 16.0, 538.0);
+        assert_eq!(s.max(), 78.0);
     }
 
     #[test]

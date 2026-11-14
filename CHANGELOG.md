@@ -2,6 +2,18 @@
 
 The newest version is at the top.
 
+## 26.11.1 · 14/11/2026 18:44
+
+- Added a picture behind the whole window, with see-through panels
+- Added many new skin options: sizes, corners, tabs, sidebar, file list, menus and scroll bars
+- Added three layouts for the Skins window and the sort order window
+- Added foldable sections and one search box in the Skins window
+- Added exporting a skin with its picture as one zip, and importing zips
+- Added more settings: status bar items, details panel width, Home tiles
+- Changed each skin to have its own logo look
+- Changed version numbers to year.month.number
+- Some other improvements and bugfixes
+
 ## 1.0.25-beta.1 · 14/11/2026 03:37
 
 - Added Update automatically in Settings > About

@@ -35,6 +35,7 @@ use crate::shell;
 use crate::textbox::{TextBox, TextEvent, TextEventKind};
 use crate::pathbar::Crumbs;
 use crate::retrotool::{self, Look, Tool};
+use crate::parts::{ToolButtons, P};
 use crate::theme::{size, ButtonStyle, Color, Era, Theme};
 use crate::ui::{Command, Component, Ctx, CursorKind, DropTarget, Effect, Menu, MenuItem, MouseButton, MouseEvent, Point, Rect};
 
@@ -81,6 +82,10 @@ const WORD_LEAN: f32 = 8.0;
 const SORT_W: f32 = 74.0;
 const VIEW_W: f32 = 72.0;
 const SETTINGS_W: f32 = 108.0;
+/// SORT, VIEW and SETTINGS as icons only (`toolbar-buttons: icons`) are this wide (and their
+/// lean); with icons and words, this much wider than with words.
+const ICON_ONLY_W: f32 = 36.0;
+const ICON_ROOM: f32 = 20.0;
 /// The space between two word buttons, measured across (between their parallel sides).
 const WORD_GAP: f32 = 6.0;
 /// Room for the magnifier on the left of the filter box, and for its × on the right.
@@ -176,6 +181,11 @@ pub struct Toolbar {
     /// `layout`; the window lays everything out again when the skin changes).
     lean: f32,
     line_w: f32,
+    /// What SORT, VIEW and SETTINGS show (`toolbar-buttons`), their words in capitals
+    /// (`button-capitals`), and the filter box's width when the skin fixes it (`filter-width`).
+    buttons: ToolButtons,
+    caps: bool,
+    filter_fixed: Option<f32>,
     /// The skin's older Windows, if any (taken in `layout`): its own toolbar (retrotool.rs).
     era: Era,
 }
@@ -210,6 +220,9 @@ impl Toolbar {
             repaint_until: 0.0,
             lean: WORD_LEAN,
             line_w: 2.0,
+            buttons: ToolButtons::Words,
+            caps: true,
+            filter_fixed: None,
             era: Era::None,
         }
     }
@@ -245,9 +258,12 @@ impl Toolbar {
 
     /// Put the cursor in the filter box (Ctrl+F).
     pub fn focus_filter(&mut self, _ctx: &Ctx, _app: &mut AppState) -> Effect {
+        // (Hidden while see-through over a wallpaper: it shows to be typed in.)
+        let was_hidden = !self.filter_box.is_visible();
+        self.filter_box.show();
         self.filter_box.focus();
         self.filter_box.select_all();
-        Effect::None
+        if was_hidden { Effect::Redraw } else { Effect::None }
     }
 
     /// Back from typing to the steps. `focus_back`: give the keyboard back to the window (after
@@ -300,8 +316,21 @@ impl Toolbar {
         }
     }
 
+    /// How wide a word button is whose words take `words` DIPs: narrower with only an icon, wider
+    /// with both.
+    fn word_w(&self, words: f32) -> f32 {
+        match self.buttons {
+            ToolButtons::Words => words,
+            ToolButtons::Icons => ICON_ONLY_W + self.lean,
+            ToolButtons::Both => words + ICON_ROOM,
+        }
+    }
+
     /// The filter box gets narrower when the window does, so the path keeps some room.
     fn filter_w(&self) -> f32 {
+        if let Some(w) = self.filter_fixed {
+            return w;
+        }
         if self.rect.w >= 1100.0 {
             220.0
         } else if self.rect.w >= 860.0 {
@@ -314,11 +343,12 @@ impl Toolbar {
     fn rect_of(&self, part: Part) -> Rect {
         let band = self.band();
         let iy = band.y + (band.h - size::INPUT_H) / 2.0;
-        let settings = Rect::new(band.right() - 8.0 - SETTINGS_W, iy, SETTINGS_W, size::INPUT_H);
+        let (sort_w, view_w, settings_w) = (self.word_w(SORT_W), self.word_w(VIEW_W), self.word_w(SETTINGS_W));
+        let settings = Rect::new(band.right() - 8.0 - settings_w, iy, settings_w, size::INPUT_H);
         // Boxes leaning the same way: across, the gap between two is WORD_GAP when one's right
         // edge sits the lean minus WORD_GAP right of the next one's left edge.
-        let view = Rect::new(settings.x + self.lean - WORD_GAP - VIEW_W, iy, VIEW_W, size::INPUT_H);
-        let sort = Rect::new(view.x + self.lean - WORD_GAP - SORT_W, iy, SORT_W, size::INPUT_H);
+        let view = Rect::new(settings.x + self.lean - WORD_GAP - view_w, iy, view_w, size::INPUT_H);
+        let sort = Rect::new(view.x + self.lean - WORD_GAP - sort_w, iy, sort_w, size::INPUT_H);
         let filter = Rect::new(sort.x - 8.0 - self.filter_w(), iy, self.filter_w(), size::INPUT_H);
         // The address takes what is left between the buttons and the filter. 7 has Refresh at its
         // right end instead of among the buttons; 2000 and XP put "Address" before it and Go after.
@@ -424,17 +454,12 @@ impl Toolbar {
                 r.polyline(&[Point::new(c.x - 5.0, c.y - 1.0), Point::new(c.x, c.y - 6.0), Point::new(c.x + 5.0, c.y - 1.0)], w, color);
             }
             Part::Refresh => {
-                // Three quarters of a circle with an arrow head at its open end.
-                let rad = 5.5;
-                let pts: Vec<Point> = (0..=20)
-                    .map(|i| {
-                        let a = (-60.0 + i as f32 * 13.5).to_radians();
-                        Point::new(c.x + rad * a.cos(), c.y + rad * a.sin())
-                    })
-                    .collect();
+                // Most of a circle going round clockwise from the right, open at the top right,
+                // ending in a solid arrow head that points on along it (as in Windows 11).
+                let (rad, end_deg) = (5.5_f32, 285.0_f32);
+                let pts = refresh_arc(c, rad, end_deg);
                 r.polyline(&pts, w, color);
-                let end = pts[0];
-                r.polyline(&[Point::new(end.x - 4.0, end.y - 1.0), end, Point::new(end.x + 0.5, end.y + 4.0)], w, color);
+                r.fill_polygon(&refresh_head(c, rad, end_deg), color);
             }
             _ => {}
         }
@@ -503,6 +528,47 @@ impl Toolbar {
         let below = Rect::new(b.x, b.y + 1.0, b.w, b.h);
         Self::paint_glyph_w(r, part, below, glass.last().darker(0.45).with_alpha(0.7), 2.2);
         Self::paint_glyph_w(r, part, b, Color::hex(0xffffff), 2.0);
+    }
+
+    /// A word button's face: its word, its icon, or both (`toolbar-buttons`), in `style`.
+    fn paint_face(&self, r: &mut Renderer, b: Rect, part: Part, label: &str, style: &TextStyle) {
+        let mid = Point::new(b.x + b.w / 2.0, b.y + b.h / 2.0);
+        match self.buttons {
+            ToolButtons::Words => r.text(label, b, style),
+            ToolButtons::Icons => Self::word_icon(r, part, mid, style.color),
+            ToolButtons::Both => {
+                let w = r.measure(label, style);
+                let left = (b.x + (b.w - w - ICON_ROOM) / 2.0).round();
+                Self::word_icon(r, part, Point::new(left + 7.0, mid.y), style.color);
+                r.text(label, Rect::new(left + ICON_ROOM, b.y, w + 2.0, b.h), &style.align(Align::Left));
+            }
+        }
+    }
+
+    /// SORT's arrows, VIEW's squares or SETTINGS' cog, about 13 DIPs across, centred on `c`.
+    fn word_icon(r: &mut Renderer, part: Part, c: Point, ink: Color) {
+        let p = |x: f32, y: f32| Point::new(c.x + x, c.y + y);
+        match part {
+            Part::Sort => {
+                r.line(p(-3.0, 5.5), p(-3.0, -5.5), 1.3, ink);
+                r.polyline(&[p(-6.0, -2.5), p(-3.0, -5.5), p(0.0, -2.5)], 1.3, ink);
+                r.line(p(3.0, -5.5), p(3.0, 5.5), 1.3, ink);
+                r.polyline(&[p(0.0, 2.5), p(3.0, 5.5), p(6.0, 2.5)], 1.3, ink);
+            }
+            Part::View => {
+                for (x, y) in [(-5.5, -5.5), (0.5, -5.5), (-5.5, 0.5), (0.5, 0.5)] {
+                    r.fill_rect(Rect::new(c.x + x, c.y + y, 5.0, 5.0), ink);
+                }
+            }
+            _ => {
+                r.stroke_ellipse(c, 3.6, 3.6, 1.5, ink);
+                for k in 0..8 {
+                    let a = k as f32 * std::f32::consts::FRAC_PI_4;
+                    let (s, co) = a.sin_cos();
+                    r.line(p(co * 5.0, s * 5.0), p(co * 6.8, s * 6.8), 2.2, ink);
+                }
+            }
+        }
     }
 
     /// SORT, VIEW or SETTINGS as a glossy capsule (`buttons: liquid`): the skin's `button` glass
@@ -658,10 +724,30 @@ impl Toolbar {
 impl Toolbar {
     /// The toolbar of a skin with an older Windows (retrotool.rs): the era's band, its buttons
     /// and pictures, the Address band or 7's breadcrumb box, and its word buttons.
+    /// Over a wallpaper behind the whole window, Windows' text box (which is solid) only shows
+    /// while typing; otherwise the box is see-through and its words are drawn here
+    /// (`paint_filter_words`). Shows or hides the box to match; true while it shows.
+    fn filter_typing(&mut self, theme: &Theme) -> bool {
+        let typing = !theme.wallpaper_behind() || self.filter_box.has_focus();
+        if typing != self.filter_box.is_visible() {
+            if typing { self.filter_box.show() } else { self.filter_box.hide() }
+        }
+        typing
+    }
+
+    /// The filter's words (or its grey hint) where Windows' box would show them.
+    fn paint_filter_words(&self, r: &mut Renderer, theme: &Theme, app: &AppState) {
+        let words = &app.tab().filter;
+        let (text, color) = if words.is_empty() { (if self.hint_subfolders { "Search subfolders" } else { "Filter" }, theme.muted) } else { (words.as_str(), theme.text) };
+        // (Where Windows' box puts its first letter: its font's edge sits 3 DIPs in.)
+        let at = self.filter_edit_rect();
+        r.text(text, Rect::new(at.x + 3.0, at.y, (at.w - 3.0).max(0.0), at.h), &TextStyle::new(color));
+    }
+
     fn paint_era(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState, active: bool) {
         let era = theme.era;
         let seven = era == Era::Win7;
-        let glass = Rect::new(self.rect.x, self.rect.y - size::TITLE_H, self.rect.w, self.rect.h + size::TITLE_H);
+        let glass = Rect::new(self.rect.x, self.rect.y - theme.title_h(), self.rect.w, self.rect.h + theme.title_h());
         retrotool::band(r, theme, self.rect, glass, active);
 
         if seven {
@@ -747,6 +833,9 @@ impl Toolbar {
         // The filter: the era's box, its magnifier, and × while filtering.
         let f = self.rect_of(Part::Filter);
         retrotool::field(r, theme, f.center(f.w, ERA_FIELD_H), self.hover == Some(Part::Filter));
+        if !self.filter_typing(theme) {
+            self.paint_filter_words(r, theme, app);
+        }
         let filtering = !app.tab().filter.is_empty();
         retrotool::magnifier(r, theme, Point::new(f.x + FILTER_ICON_W / 2.0 + 1.0, f.y + f.h / 2.0), filtering);
         if filtering {
@@ -780,8 +869,14 @@ impl Component for Toolbar {
     fn layout(&mut self, rect: Rect, ctx: &Ctx, app: &AppState) {
         self.rect = rect;
         self.era = app.theme.era;
-        self.lean = app.theme.lean(WORD_LEAN);
+        self.lean = app.theme.button_lean(WORD_LEAN);
         self.line_w = app.theme.toolbar_line_w;
+        // (An older Windows' toolbar keeps its own word buttons.)
+        let parts = &app.theme.parts;
+        let modern = !app.theme.era.old();
+        self.buttons = if modern { parts.tool_buttons() } else { ToolButtons::Words };
+        self.caps = parts.on(P::ButtonCaps) || !modern;
+        self.filter_fixed = parts.filter_w();
         let path = self.rect_of(Part::Path);
         self.path.set_rect(path);
         self.path.set_style(match self.era {
@@ -797,7 +892,10 @@ impl Component for Toolbar {
             self.path_box.place(path, 9.0, ctx.scale);
         }
         self.filter_box.place(self.filter_edit_rect(), 0.0, ctx.scale);
-        self.filter_box.show();
+        // (Shown or hidden as it's painted: see-through over a wallpaper while not typing.)
+        if !self.filter_box.is_visible() && self.filter_box.has_focus() {
+            self.filter_box.show();
+        }
     }
 
     fn rect(&self) -> Rect {
@@ -808,7 +906,7 @@ impl Component for Toolbar {
         if theme.era.old() {
             return self.paint_era(r, theme, app, _ctx.active);
         }
-        r.fill_paint(self.rect, 0.0, &theme.toolbar_paint);
+        r.fill_paint(self.rect, 0.0, &theme.through(&theme.toolbar_paint));
         r.fill_rect(Rect::new(self.rect.x, self.rect.bottom() - self.line_w, self.rect.w, self.line_w), theme.toolbar_line);
 
         let liquid = theme.buttons == ButtonStyle::Liquid;
@@ -827,16 +925,16 @@ impl Component for Toolbar {
             }
             if theme.tool_border.a > 0.0 && hot {
                 let face = b.inset(1.0, 1.0);
-                r.fill_paint(face, 3.0, &crate::theme::Paint::Flat(if pressed { theme.button_pressed } else { theme.button_hover }));
+                crate::pathbar::fill_solid(r, theme, face, theme.corner(face.h).max(3.0), &crate::theme::Paint::Flat(if pressed { theme.button_pressed } else { theme.button_hover }));
                 if !pressed {
                     let shine = Rect::new(face.x, face.y, face.w, face.h / 2.0);
                     r.fill_paint(shine, 3.0, &crate::theme::Paint::even(&[Color::rgba(255, 255, 255, 0.7), Color::rgba(255, 255, 255, 0.0)]));
                 }
                 r.stroke_round_rect(face.inset(0.5, 0.5), 2.5, 1.0, theme.tool_border);
-            } else if pressed {
-                r.fill_rect(b, theme.button_pressed);
-            } else if hot {
-                r.fill_rect(b, theme.button_hover);
+            } else if pressed || hot {
+                // Round in a rounded skin; solid over a see-through toolbar.
+                let fill = if pressed { theme.button_pressed } else { theme.button_hover };
+                crate::pathbar::fill_solid(r, theme, b, theme.corner(b.h), &fill.into());
             }
             if theme.bevels && hot {
                 crate::pathbar::bevel(r, theme, b, !pressed, theme.toolbar);
@@ -860,7 +958,11 @@ impl Component for Toolbar {
 
         // Filter: magnifier, the text box (a child window drawn by Windows), and × while filtering.
         let f = self.rect_of(Part::Filter);
-        fill_field(r, theme, f);
+        let typing = self.filter_typing(theme);
+        fill_field(r, theme, f, typing);
+        if !typing {
+            self.paint_filter_words(r, theme, app);
+        }
         let filtering = !app.tab().filter.is_empty();
         let mag = Point::new(f.x + FILTER_ICON_W / 2.0 + 1.0, f.y + f.h / 2.0);
         Self::paint_magnifier(r, mag, if filtering { theme.accent } else { theme.muted });
@@ -868,6 +970,7 @@ impl Component for Toolbar {
             let x = self.rect_of(Part::FilterClear);
             let hot = self.hover == Some(Part::FilterClear);
             if hot {
+                crate::pathbar::under_box(r, theme, x.center(20.0, 20.0), 0.0, &theme.button_hover.into());
                 fill_box(r, theme, x.center(20.0, 20.0), 0.0, theme.button_hover);
             }
             Self::paint_cross(r, Point::new(x.x + x.w / 2.0, x.y + x.h / 2.0), 3.5, 1.2, if hot { theme.text } else { theme.muted });
@@ -876,6 +979,7 @@ impl Component for Toolbar {
         let sub = self.rect_of(Part::Subfolders);
         let hot = self.hover == Some(Part::Subfolders);
         if hot {
+            crate::pathbar::under_box(r, theme, sub.center(20.0, 20.0), 0.0, &theme.button_hover.into());
             fill_box(r, theme, sub.center(20.0, 20.0), 0.0, theme.button_hover);
         }
         let color = if app.tab().path.is_empty() {
@@ -890,7 +994,8 @@ impl Component for Toolbar {
         Self::paint_subfolders(r, Point::new(sub.x + sub.w / 2.0, sub.y + sub.h / 2.0), color);
 
         // SORT, VIEW and SETTINGS: word buttons in the skin's shape, or glossy capsules.
-        for (part, label) in [(Part::Sort, "SORT"), (Part::View, "VIEW"), (Part::Settings, "SETTINGS")] {
+        for (part, caps, word) in [(Part::Sort, "SORT", "Sort"), (Part::View, "VIEW", "View"), (Part::Settings, "SETTINGS", "Settings")] {
+            let label = if self.caps { caps } else { word };
             let b = self.rect_of(part);
             let hot = self.hover == Some(part);
             // (Their menus open as the button goes down, so there is no "pressed" look to show.)
@@ -902,8 +1007,16 @@ impl Component for Toolbar {
                     crate::kit::push_button(r, theme, b.inset(1.0, 1.0), label, look, false);
                     continue;
                 }
-                fill_box_paint(r, theme, b, self.lean, if hot { &theme.chip_hover_paint } else { &theme.chip_paint });
-                r.text(label, b, &TextStyle::new(theme.button_text).semibold().align(Align::Center));
+                let paint = &if hot { theme.chip_hover_paint } else { theme.through(&theme.chip_paint) };
+                if hot {
+                    crate::pathbar::under_box(r, theme, b, self.lean, paint);
+                }
+                if self.lean > 0.0 {
+                    fill_box_paint(r, theme, b, self.lean, paint);
+                } else {
+                    r.fill_paint(b, theme.button_corner(b.h), paint);
+                }
+                self.paint_face(r, b, part, label, &TextStyle::new(theme.button_text).semibold().align(Align::Center));
             }
         }
     }
@@ -1108,7 +1221,8 @@ impl Component for Toolbar {
                         Effect::Redraw
                     }
                 }
-                TextEventKind::LostFocus | TextEventKind::Tab => Effect::None,
+                // (A redraw: see-through over a wallpaper, the box hides again.)
+                TextEventKind::LostFocus | TextEventKind::Tab => Effect::Redraw,
             };
         }
         Effect::None
@@ -1201,9 +1315,54 @@ fn go_command(typed: Option<String>) -> Command {
     }
 }
 
+/// The refresh sign's circle round `c`: clockwise on screen from the right (0 degrees) to
+/// `end_deg` (angles grow downwards, as y does).
+fn refresh_arc(c: Point, rad: f32, end_deg: f32) -> Vec<Point> {
+    (0..=20)
+        .map(|i| {
+            let a = (end_deg * i as f32 / 20.0).to_radians();
+            Point::new(c.x + rad * a.cos(), c.y + rad * a.sin())
+        })
+        .collect()
+}
+
+/// The refresh sign's solid arrow head: its base across the circle's end, its tip on along the
+/// way the circle goes (clockwise).
+fn refresh_head(c: Point, rad: f32, end_deg: f32) -> [Point; 3] {
+    let a = end_deg.to_radians();
+    let end = Point::new(c.x + rad * a.cos(), c.y + rad * a.sin());
+    // The way round (the circle's direction at its end), and across it.
+    let (dx, dy) = (-a.sin(), a.cos());
+    let (nx, ny) = (-dy, dx);
+    let (tip, half) = (3.4, 2.8);
+    [
+        Point::new(end.x + dx * tip, end.y + dy * tip),
+        Point::new(end.x + nx * half, end.y + ny * half),
+        Point::new(end.x - nx * half, end.y - ny * half),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_refresh_arrow_points_on_along_its_circle() {
+        let c = Point::new(12.0, 12.0);
+        let arc = refresh_arc(c, 5.5, 285.0);
+        let end = *arc.last().unwrap();
+        let before = arc[arc.len() - 2];
+        let [tip, b1, b2] = refresh_head(c, 5.5, 285.0);
+        // The head's base sits across the circle's end: its middle is the end.
+        assert!(((b1.x + b2.x) / 2.0 - end.x).abs() < 0.01 && ((b1.y + b2.y) / 2.0 - end.y).abs() < 0.01);
+        // The tip goes the same way the circle was going (it once pointed sideways off it).
+        let (gx, gy) = (end.x - before.x, end.y - before.y);
+        let (hx, hy) = (tip.x - end.x, tip.y - end.y);
+        let cos = (gx * hx + gy * hy) / ((gx * gx + gy * gy).sqrt() * (hx * hx + hy * hy).sqrt());
+        assert!(cos > 0.95, "the head points along the circle, not across it ({cos})");
+        // The opening is at the top right: the circle starts at the right and ends above it.
+        assert!(arc[0].x > c.x && end.y < c.y && end.x > c.x);
+    }
 
     #[test]
     fn go_goes_to_what_was_typed() {

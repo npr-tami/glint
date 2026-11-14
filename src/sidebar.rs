@@ -36,6 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETWHEE
 use crate::app::{can_pin, AppState};
 use crate::folder::Drive;
 use crate::icons::{self, IconId, Icons, LoadedIcon};
+use crate::parts::{DriveBars, Headings, P};
 use crate::recent;
 use crate::settings::HomePage;
 use crate::recycle;
@@ -63,6 +64,8 @@ const PAD_RIGHT: f32 = 12.0;
 /// The usage bar under a drive's name: its thickness and its distance from the row's bottom.
 const BAR_H: f32 = 3.0;
 const BAR_BOTTOM: f32 = 4.0;
+/// With `drive-bars: full`, a drive shows its usage bar once it is this full.
+const FULL_AT: f32 = 0.9;
 /// 98 / 2000: the usage bar is a sunken progress bar this tall.
 const CLASSIC_BAR_H: f32 = 9.0;
 /// How much of a drive row the name gets (the rest holds the bar).
@@ -200,6 +203,16 @@ pub struct Sidebar {
     repeat: crate::retroctl::Repeat,
     /// How tall a line is, from the skin (`sidebar-row-height`).
     row_h: f32,
+    /// The skin's sidebar settings (parts.rs): the icons' size, the space before them, the
+    /// headings, the drives' usage bars (thickness, when shown) and the text size (added).
+    icon: f32,
+    indent: f32,
+    headings: Headings,
+    drive_bar_h: f32,
+    drive_bars: DriveBars,
+    text: f32,
+    /// The skin's `scrollbar-show: using` (see `list::bar_in_use`).
+    bars_while_used: bool,
 }
 
 impl Default for Sidebar {
@@ -247,6 +260,13 @@ impl Sidebar {
             arrows: 0.0,
             repeat: crate::retroctl::Repeat::default(),
             row_h: size::ROW_H,
+            icon: size::ICON,
+            indent: PAD_LEFT,
+            headings: Headings::Shown,
+            drive_bar_h: BAR_H,
+            drive_bars: DriveBars::Always,
+            text: 0.0,
+            bars_while_used: false,
         }
     }
 
@@ -265,19 +285,29 @@ impl Sidebar {
         self.bar_margin = app.theme.scrollbar_margin();
         self.arrows = crate::retroctl::arrows(&app.theme);
         self.row_h = app.theme.sidebar_row_h;
+        let parts = &app.theme.parts;
+        self.icon = parts.num(P::SidebarIcon);
+        self.indent = parts.num(P::SidebarIndent);
+        self.headings = parts.sidebar_headings();
+        self.drive_bar_h = parts.num(P::DriveBarH);
+        self.drive_bars = parts.drive_bars();
+        self.text = parts.num(P::SidebarText);
+        self.bars_while_used = parts.scrollbars_while_used();
         // Above the first heading, after a heading, between the groups, and after the last line.
         let (top, heading_h, first, between, end) = if self.panels {
             (PANEL_MARGIN, PANEL_HEADER_H, PANEL_PAD, PANEL_PAD + PANEL_MARGIN, PANEL_PAD + PANEL_MARGIN)
         } else {
             (0.0, HEADING_H, 0.0, GROUP_GAP, BOTTOM_PAD)
         };
+        // Hidden headings take no room (they stay in the list, so dropping and the groups work).
+        let heading_h = if self.headings == Headings::Hidden { 0.0 } else { heading_h };
         // 98 / 2000: a little taller, for the progress bar under the name (`classic_usage`).
         let drive_h = if self.panels {
             self.row_h + PANEL_DRIVE_EXTRA
         } else if app.theme.era.classic() {
             self.drive_text_h() + CLASSIC_BAR_GAP + CLASSIC_BAR_H + BAR_BOTTOM
         } else {
-            self.row_h.max(self.drive_text_h() + 1.0 + BAR_H + BAR_BOTTOM)
+            self.row_h.max(self.drive_text_h() + 1.0 + self.drive_bar_h + BAR_BOTTOM)
         };
         let row_h = self.row_h;
         self.items.clear();
@@ -357,12 +387,21 @@ impl Sidebar {
         Rect::new(x + inset, y, (w - 2.0 * inset).max(0.0), h)
     }
 
+    /// A heading's title as the skin's sidebar-headings writes it (in capitals or as it is).
+    fn heading(&self, title: &str) -> String {
+        if self.headings == Headings::Capitals {
+            title.to_uppercase()
+        } else {
+            title.to_string()
+        }
+    }
+
     /// Where icons (and hints) start in a row, from its left edge.
     fn pad_left(&self) -> f32 {
         if self.panels {
             PANEL_ROW_PAD
         } else {
-            PAD_LEFT
+            self.indent
         }
     }
 
@@ -549,7 +588,7 @@ impl Sidebar {
 
     /// Where a line's name starts, and how wide it may be.
     fn name_span(&self, row: Rect) -> (f32, f32) {
-        let text_x = row.x + self.pad_left() + size::ICON + ICON_GAP;
+        let text_x = row.x + self.pad_left() + self.icon + ICON_GAP;
         // (A panel's rows already keep clear of the scrollbar.)
         let right = if self.panels {
             row.right() - PANEL_ROW_PAD
@@ -574,22 +613,17 @@ impl Sidebar {
             RowState::Selected if seven => crate::pathbar::fill_row(r, theme, row, &theme.sidebar_selection, false),
             RowState::Hover if seven => crate::pathbar::fill_row(r, theme, row, &theme.hover_paint, true),
             RowState::Selected if label_only => {}
-            RowState::Selected => {
-                r.fill_paint(row, radius, &theme.sidebar_selection);
-                if radius <= 0.0 {
-                    r.fill_rect(Rect::new(row.x, row.y, size::SELECT_EDGE, row.h), theme.select_edge);
-                }
-            }
-            RowState::Hover => r.fill_paint(row, radius, &theme.hover_paint),
+            RowState::Selected => crate::pathbar::paint_row(r, theme, row, true, &theme.sidebar_selection, theme.sidebar_select_edge, theme.sidebar_select_edge_w, radius),
+            RowState::Hover => crate::pathbar::paint_row(r, theme, row, false, &theme.hover_paint, theme.sidebar_select_edge, theme.sidebar_select_edge_w, radius.max(0.01)),
             RowState::Normal => {}
         }
         let (top_h, bar_h, bar_bottom) = match item {
             Item::Drive(_) if self.panels => (row.h - PANEL_BAR_H - 8.0, PANEL_BAR_H, 6.0),
-            _ => (self.drive_text_h(), BAR_H, BAR_BOTTOM),
+            _ => (self.drive_text_h(), self.drive_bar_h, BAR_BOTTOM),
         };
         // A drive's icon sits beside its name, above the bar.
         let icon_mid = if matches!(item, Item::Drive(_)) && self.panels { top_h / 2.0 + 1.0 } else { row.h / 2.0 };
-        let icon = Rect::new(row.x + self.pad_left(), row.y + icon_mid - size::ICON / 2.0, size::ICON, size::ICON);
+        let icon = Rect::new(row.x + self.pad_left(), row.y + icon_mid - self.icon / 2.0, self.icon, self.icon);
         let (text_x, text_w) = self.name_span(row);
         let selected = state == RowState::Selected;
         let color = if links && state == RowState::Hover {
@@ -600,7 +634,9 @@ impl Sidebar {
             theme.sidebar_text
         };
         // With panels, the place you're in is in bold.
-        let style = if selected && self.panels { TextStyle::new(color).bold() } else { TextStyle::new(color) };
+        // (Or the skin's selection-bold says so.)
+        let style = TextStyle::new(color).size(size::FONT + self.text);
+        let style = if selected && (self.panels || theme.parts.on(P::SelectBold)) { style.bold() } else { style };
         // The selection behind a name only (98 / 2000), in `line`'s middle.
         let mark = |r: &mut Renderer, name: &str, line: Rect| {
             if label_only && selected {
@@ -671,7 +707,13 @@ impl Sidebar {
                     Some(id) => r.icon(&app.icons, id, icon),
                     None => draw_drive_glyph(r, icon, theme.muted, theme.text),
                 }
-                match usage(drive) {
+                // The skin's drive-bars: always, only when nearly full, or never.
+                let shown = |used: f32| match self.drive_bars {
+                    DriveBars::Always => true,
+                    DriveBars::Full => used >= FULL_AT,
+                    DriveBars::Never => false,
+                };
+                match usage(drive).filter(|&used| shown(used)) {
                     Some(used) if theme.era.classic() && !self.panels => {
                         mark(r, &drive.name, Rect::new(text_x, row.y, text_w, top_h));
                         r.text(&drive.name, Rect::new(text_x, row.y, text_w, top_h), &style);
@@ -716,7 +758,7 @@ impl Sidebar {
             }
             let radius = theme.corner(panel.h);
             r.fill_round_rect(Rect::new(panel.x, panel.y + 1.0, panel.w, panel.h), radius, shadow);
-            r.fill_paint(panel, radius, &theme.sidebar_panel);
+            r.fill_paint(panel, radius, &theme.through(&theme.sidebar_panel));
         }
     }
 
@@ -954,7 +996,7 @@ impl Component for Sidebar {
         }
 
         // (A gradient runs down the whole sidebar, as on the bars.)
-        r.fill_paint_down(self.rect, 0.0, &theme.sidebar_paint, self.rect.y, self.rect.bottom());
+        r.fill_paint_down(self.rect, 0.0, &theme.through(&theme.sidebar_paint), self.rect.y, self.rect.bottom());
         if theme.bevels {
             crate::pathbar::bevel(r, theme, self.rect, false, theme.window);
         }
@@ -970,6 +1012,9 @@ impl Component for Sidebar {
             if y + placed.h <= self.rect.y || y >= self.rect.bottom() {
                 continue;
             }
+            if Self::is_heading(placed.item) && self.headings == Headings::Hidden {
+                continue;
+            }
             let row = self.line_rect(placed.item, y, placed.h);
             let hovered = hover == Some(index);
             if self.panels && Self::is_heading(placed.item) {
@@ -981,7 +1026,7 @@ impl Component for Sidebar {
                 // "This PC" lights up under the mouse (it shows all drives); a heading something
                 // dragged would go into is outlined.
                 let lit = hovered && placed.item == Item::PcHeading;
-                paint_panel_header(r, theme, row, title, lit, self.is_drop_target(placed.item, app));
+                paint_panel_header(r, theme, row, &self.heading(title), lit, self.is_drop_target(placed.item, app));
                 continue;
             }
             match placed.item {
@@ -989,15 +1034,15 @@ impl Component for Sidebar {
                     // Folders dragged onto "Pinned" are pinned: it lights up and is outlined.
                     let dropping = self.is_drop_target(placed.item, app);
                     if dropping {
-                        r.fill_paint(row, 0.0, &theme.hover_paint);
+                        crate::pathbar::fill_solid(r, theme, row, 0.0, &theme.hover_paint);
                         r.stroke_rect(row, 1.0, theme.accent);
                     }
                     let title = if placed.item == Item::QuickHeading { "Quick access" } else { "Pinned" };
-                    r.text(title, Rect::new(row.x + PAD_LEFT, y, heading_w, row.h), &TextStyle::new(if dropping { theme.text } else { theme.panel_header_text }));
+                    r.text(&self.heading(title), Rect::new(row.x + self.indent, y, heading_w, row.h), &TextStyle::new(if dropping { theme.text } else { theme.panel_header_text }));
                 }
                 Item::QuickHint | Item::PinHint => {
                     if self.is_drop_target(placed.item, app) {
-                        r.fill_paint(row, 0.0, &theme.hover_paint);
+                        crate::pathbar::fill_solid(r, theme, row, 0.0, &theme.hover_paint);
                         r.stroke_rect(row, 1.0, theme.accent);
                     }
                     // Where the icons start (a hint has none), so it fits the narrow sidebar.
@@ -1009,10 +1054,10 @@ impl Component for Sidebar {
                 Item::PcHeading => {
                     // A title you can click (it shows all drives): it lights up like a place.
                     if hovered {
-                        r.fill_paint(row, 0.0, &theme.hover_paint);
+                        crate::pathbar::fill_solid(r, theme, row, 0.0, &theme.hover_paint);
                     }
                     let color = if hovered { theme.text } else { theme.panel_header_text };
-                    r.text("This PC", Rect::new(row.x + PAD_LEFT, y, heading_w, row.h), &TextStyle::new(color));
+                    r.text(&self.heading("This PC"), Rect::new(row.x + self.indent, y, heading_w, row.h), &TextStyle::new(color));
                 }
                 item => {
                     // The place something dragged would go into: outlined in red.
@@ -1041,7 +1086,7 @@ impl Component for Sidebar {
         }
         r.pop_clip();
 
-        if let Some(thumb) = self.thumb() {
+        if let Some(thumb) = self.thumb().filter(|_| crate::list::bar_in_use(self.bars_while_used, self.mouse.is_some(), self.drag.is_some())) {
             let state = if self.drag.is_some() {
                 ThumbState::Dragged
             } else if self.repeat.hold != crate::retroctl::Hold::None {
@@ -1057,6 +1102,8 @@ impl Component for Sidebar {
     }
 
     fn mouse_move(&mut self, _ctx: &Ctx, e: &MouseEvent, app: &mut AppState) -> Effect {
+        // (The mouse coming in shows a scroll bar that only shows while it's in use.)
+        let entered = self.mouse.is_none() && self.bars_while_used;
         self.mouse = Some(e.pos);
         if let Some(grab) = self.drag {
             self.rebuild(app);
@@ -1068,12 +1115,22 @@ impl Component for Sidebar {
             }
             return Effect::Redraw;
         }
-        self.update_hover()
+        let effect = self.update_hover();
+        if entered {
+            Effect::Redraw
+        } else {
+            effect
+        }
     }
 
     fn mouse_leave(&mut self, _ctx: &Ctx, _app: &mut AppState) -> Effect {
         self.mouse = None;
-        self.update_hover()
+        let effect = self.update_hover();
+        if self.bars_while_used {
+            Effect::Redraw
+        } else {
+            effect
+        }
     }
 
     fn mouse_down(&mut self, ctx: &Ctx, e: &MouseEvent, app: &mut AppState) -> Effect {
@@ -1278,7 +1335,7 @@ impl Component for Sidebar {
 /// bold with a slight shadow. Outlined in the accent while something dragged would go into it.
 fn paint_panel_header(r: &mut Renderer, theme: &Theme, row: Rect, title: &str, lit: bool, dropping: bool) {
     let radius = theme.corner(row.h);
-    let paint = if lit { theme.panel_header.lighter(if theme.dark { 0.1 } else { 0.3 }) } else { theme.panel_header };
+    let paint = if lit { theme.panel_header.lighter(if theme.dark { 0.1 } else { 0.3 }) } else { theme.through(&theme.panel_header) };
     // The bar reaches on below its bottom, out of sight, so only its top corners are round.
     r.push_clip(row);
     if theme.era == crate::theme::Era::Xp {

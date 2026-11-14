@@ -24,6 +24,9 @@ const TILE_GAP: f32 = 4.0;
 /// Narrower than this, a tile goes to the next line (at most three to a line).
 const TILE_MIN_W: f32 = 230.0;
 const MAX_COLUMNS: usize = 3;
+/// Small and large tiles (Settings' HomeTiles).
+const SMALL_TILE_H: f32 = 46.0;
+const LARGE_TILE_H: f32 = 86.0;
 const SECTION_GAP: f32 = 18.0;
 /// The column titles over the list ("Name", "Date accessed").
 const COLUMNS_H: f32 = 30.0;
@@ -75,6 +78,9 @@ impl Layout {
 /// What Home remembers between frames.
 #[derive(Clone, Debug)]
 pub struct Home {
+    /// Settings' HomeColumns and HomeTiles: at most this many tiles in a row, and their size.
+    pub columns: usize,
+    pub tiles: crate::settings::HomeTiles,
     pub quick_open: bool,
     pub lists_open: bool,
     /// Favorites on show instead of Recent.
@@ -85,7 +91,17 @@ pub struct Home {
 
 impl Default for Home {
     fn default() -> Self {
-        Home { quick_open: true, lists_open: true, favorites: false, layout: Layout::default() }
+        Home { columns: MAX_COLUMNS, tiles: crate::settings::HomeTiles::Normal, quick_open: true, lists_open: true, favorites: false, layout: Layout::default() }
+    }
+}
+
+/// A tile's height and the narrowest it gets (more go to the next line), by Settings' HomeTiles.
+fn tile_size(tiles: crate::settings::HomeTiles) -> (f32, f32) {
+    use crate::settings::HomeTiles;
+    match tiles {
+        HomeTiles::Small => (SMALL_TILE_H, 170.0),
+        HomeTiles::Normal => (TILE_H, TILE_MIN_W),
+        HomeTiles::Large => (LARGE_TILE_H, 290.0),
     }
 }
 
@@ -98,16 +114,17 @@ pub fn layout(width: f32, parts: Parts, count: usize, home: &Home, shown: impl F
     l.spots.push((Spot::Quick, Rect::new(PAD - 6.0, y + 4.0, 150.0, HEAD_H - 8.0)));
     y += HEAD_H;
     if home.quick_open {
-        let columns = ((inner / TILE_MIN_W) as usize).clamp(1, MAX_COLUMNS);
+        let (tile_h, min_w) = tile_size(home.tiles);
+        let columns = ((inner / min_w) as usize).clamp(1, home.columns.max(1));
         let tile_w = (inner - TILE_GAP * (columns - 1) as f32) / columns as f32;
         let tiles: Vec<usize> = (0..parts.recent.min(count)).filter(|&i| shown(i)).collect();
         for (n, &i) in tiles.iter().enumerate() {
             let (c, row) = (n % columns, n / columns);
-            let r = Rect::new(PAD + c as f32 * (tile_w + TILE_GAP), y + row as f32 * (TILE_H + TILE_GAP), tile_w, TILE_H);
+            let r = Rect::new(PAD + c as f32 * (tile_w + TILE_GAP), y + row as f32 * (tile_h + TILE_GAP), tile_w, tile_h);
             l.spots.push((Spot::Item(i), r));
         }
         let lines = tiles.len().div_ceil(columns);
-        y += lines as f32 * (TILE_H + TILE_GAP);
+        y += lines as f32 * (tile_h + TILE_GAP);
     }
     y += SECTION_GAP;
     let pill_y = y + (HEAD_H - PILL_H) / 2.0;
@@ -179,6 +196,8 @@ fn under_name(e: &Entry, index: usize, parts: Parts, user: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 pub fn paint(r: &mut Renderer, theme: &Theme, app: &AppState, tab: &Tab, home: &mut Home, area: Rect, scroll: f32, mouse: Option<Point>, scale: f32) {
     let parts = tab.folder.home.as_deref().copied().unwrap_or_default();
+    home.columns = app.settings.home_columns as usize;
+    home.tiles = app.settings.home_tiles;
     home.layout = layout(area.w - 8.0, parts, tab.folder.entries.len(), home, |i| tab.row_of(i).is_some());
     let l = &home.layout;
     let at = |rc: Rect| Rect::new(area.x + rc.x, area.y + rc.y - scroll, rc.w, rc.h);
@@ -204,14 +223,14 @@ pub fn paint(r: &mut Renderer, theme: &Theme, app: &AppState, tab: &Tab, home: &
         match spot {
             Spot::Quick => {
                 if hovered {
-                    r.fill_paint(b, theme.radius.min(4.0), &theme.hover_paint);
+                    solid_hover(r, theme, b);
                 }
                 chevron(r, Point::new(b.x + 12.0, b.y + b.h / 2.0), home.quick_open, theme.text);
                 r.text("Quick access", Rect::new(b.x + 24.0, b.y, b.w - 24.0, b.h), &TextStyle::new(theme.text_strong).size(font + 2.0).semibold());
             }
             Spot::Lists => {
                 if hovered {
-                    r.fill_paint(b, theme.radius.min(4.0), &theme.hover_paint);
+                    solid_hover(r, theme, b);
                 }
                 chevron(r, Point::new(b.x + 12.0, b.y + b.h / 2.0), home.lists_open, theme.text);
             }
@@ -240,13 +259,14 @@ pub fn paint(r: &mut Renderer, theme: &Theme, app: &AppState, tab: &Tab, home: &
                 let selected = tab.is_selected(i);
                 let is_tile = i < parts.recent;
                 let faded = cut.is_some_and(|c| c.contains(&e.lower));
-                if selected {
-                    r.fill_paint(b, if is_tile { theme.radius.min(6.0) } else { 0.0 }, &theme.accent_tint_paint);
-                    if !is_tile {
-                        r.fill_rect(Rect::new(b.x, b.y, size::SELECT_EDGE, b.h), theme.select_edge);
-                    }
+                if selected && is_tile {
+                    r.fill_paint(b, theme.radius.min(6.0), &theme.accent_tint_paint);
+                } else if selected {
+                    crate::pathbar::paint_row(r, theme, b, true, &theme.accent_tint_paint, theme.select_edge, theme.select_edge_w, 0.0);
+                } else if hovered && is_tile {
+                    crate::pathbar::fill_solid(r, theme, b, theme.radius.min(6.0), &theme.hover_paint);
                 } else if hovered {
-                    r.fill_paint(b, if is_tile { theme.radius.min(6.0) } else { 0.0 }, &theme.hover_paint);
+                    crate::pathbar::paint_row(r, theme, b, false, &theme.hover_paint, theme.select_edge, theme.select_edge_w, 0.01);
                 }
                 // (An older Windows' selection is dark: faded names on it take its own colour.)
                 let name_color = if (faded || e.is_hidden()) && !(selected && theme.era.old()) {
@@ -259,15 +279,23 @@ pub fn paint(r: &mut Renderer, theme: &Theme, app: &AppState, tab: &Tab, home: &
                 let muted = if selected { theme.selection_details } else { theme.muted };
                 let sub = under_name(e, i, parts, &user);
                 if is_tile {
-                    let pic = Rect::new(b.x + 10.0, b.y + (b.h - 48.0) / 2.0, 48.0, 48.0);
+                    // The picture's size, where the name starts, and whether the pin fits, by size.
+                    let (side, top, pinned) = match home.tiles {
+                        crate::settings::HomeTiles::Small => (32.0, 4.0, false),
+                        crate::settings::HomeTiles::Normal => (48.0, 8.0, true),
+                        crate::settings::HomeTiles::Large => (64.0, 18.0, true),
+                    };
+                    let pic = Rect::new(b.x + 10.0, b.y + (b.h - side) / 2.0, side, side);
                     crate::list::picture(r, theme, app, &tab.folder.path, e, pic, scale);
                     let x = pic.right() + 12.0;
                     let w = b.right() - x - 8.0;
                     // (Older Windows wrote the names plainly, in the list's font.)
                     let name_style = if theme.era.old() { TextStyle::new(name_color).size(font) } else { TextStyle::new(name_color).size(font + 1.0).semibold() };
-                    r.text(&e.name, Rect::new(x, b.y + 8.0, w, 20.0), &name_style);
-                    r.text(&sub, Rect::new(x, b.y + 27.0, w, 16.0), &TextStyle::new(muted).size(small));
-                    pin(r, Point::new(x + 5.0, b.y + 51.0), muted);
+                    r.text(&e.name, Rect::new(x, b.y + top, w, 20.0), &name_style);
+                    r.text(&sub, Rect::new(x, b.y + top + 19.0, w, 16.0), &TextStyle::new(muted).size(small));
+                    if pinned {
+                        pin(r, Point::new(x + 5.0, b.y + top + 43.0), muted);
+                    }
                 } else {
                     let ir = Rect::new(b.x + 12.0, b.y + (b.h - size::ICON_LARGE) / 2.0, size::ICON_LARGE, size::ICON_LARGE);
                     if !crate::eraicons::draw_entry(r, theme.icons, &tab.folder.path, e, ir) {
@@ -425,6 +453,25 @@ mod tests {
         assert_eq!(short_folder("D:\\文档\\报告", user), "D:\\文档\\报告");
     }
 
+    /// Settings' HomeColumns and HomeTiles: four small tiles to a line when there's room, and
+    /// large ones go to fewer lines' worth of width (at most as many as fit).
+    #[test]
+    fn tiles_follow_the_settings() {
+        let parts = Parts { pinned: 6, recent: 8, favorites: 0 };
+        let home = Home { columns: 4, tiles: crate::settings::HomeTiles::Small, ..Home::default() };
+        let l = layout(900.0, parts, 8, &home, |_| true);
+        let tiles: Vec<Rect> = l.items().filter(|(i, _)| *i < 8).map(|(_, r)| r).collect();
+        assert_eq!(tiles[0].y, tiles[3].y, "four to a line");
+        assert!(tiles[4].y > tiles[3].y);
+        assert_eq!(tiles[0].h, SMALL_TILE_H);
+        let home = Home { columns: 6, tiles: crate::settings::HomeTiles::Large, ..Home::default() };
+        let l = layout(900.0, parts, 8, &home, |_| true);
+        let tiles: Vec<Rect> = l.items().filter(|(i, _)| *i < 8).map(|(_, r)| r).collect();
+        assert_eq!(tiles[0].h, LARGE_TILE_H);
+        assert_eq!(tiles[0].y, tiles[1].y);
+        assert!(tiles[2].y > tiles[1].y, "only two large tiles fit 900 wide");
+    }
+
     /// Six tiles in three columns, then the pills and the Recent rows; Favorites swaps the rows; a
     /// folded section leaves its items out.
     #[test]
@@ -452,4 +499,12 @@ mod tests {
         assert_eq!(l.items().count(), 0);
         assert!(l.spot_at(Point::new(PAD + 30.0, l.spots[2].1.y + 5.0)) == Some(Spot::Recent));
     }
+}
+
+/// A heading's box under the mouse: solid even over a see-through file list.
+fn solid_hover(r: &mut Renderer, theme: &Theme, b: Rect) {
+    let keep = r.fade();
+    r.set_fade(1.0);
+    crate::pathbar::fill_solid(r, theme, b, theme.radius.min(4.0), &theme.hover_paint);
+    r.set_fade(keep);
 }

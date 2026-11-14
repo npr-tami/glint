@@ -143,6 +143,14 @@ pub fn nav_button(r: &mut Renderer, theme: &Theme, b: Rect, tool: Tool, look: Lo
 /// sunken one while pressed, and switched on, sunken over the light checker (plain face while the
 /// mouse is over it).
 fn classic_frame(r: &mut Renderer, theme: &Theme, frame: Rect, look: Look, face: Color) {
+    // (Solid over a see-through toolbar: it's under the mouse, pressed or on.)
+    let keep = r.fade();
+    r.set_fade(1.0);
+    classic_frame_now(r, theme, frame, look, face);
+    r.set_fade(keep);
+}
+
+fn classic_frame_now(r: &mut Renderer, theme: &Theme, frame: Rect, look: Look, face: Color) {
     if look.checked {
         if !look.hot {
             retro::dither(r, theme, frame.inset(1.0, 1.0), face);
@@ -158,6 +166,11 @@ fn classic_frame(r: &mut Renderer, theme: &Theme, frame: Rect, look: Look, face:
 /// XP's toolbar button frame: round cornered, a light gradient with a darker foot under the mouse,
 /// pressed in when pressed, white when switched on.
 pub fn xp_frame(r: &mut Renderer, theme: &Theme, rect: Rect, look: Look) {
+    xp_frame_round(r, theme, rect, look, theme.era_corner(rect.h, 3.0));
+}
+
+/// `xp_frame` with corners this round (SORT, VIEW and SETTINGS: the skin's button-radius).
+pub fn xp_frame_round(r: &mut Renderer, theme: &Theme, rect: Rect, look: Look, radius: f32) {
     let s = scheme(theme);
     let (fill_paint, border) = if look.pressed {
         (g(&[(0.0, 0xdcdad1), (0.15, 0xe7e5e0), (0.5, 0xe2e1d9), (0.8, 0xdeddd4), (1.0, 0xebeae5)]), match s {
@@ -179,12 +192,25 @@ pub fn xp_frame(r: &mut Renderer, theme: &Theme, rect: Rect, look: Look) {
     } else {
         return;
     };
-    r.fill_paint(rect, 3.0, &fill_paint);
-    r.stroke_round_rect(rect.inset(0.5, 0.5), 2.5, 1.0, c(border));
+    // (Solid over a see-through toolbar: it's under the mouse, pressed or on.)
+    let keep = r.fade();
+    r.set_fade(1.0);
+    let radius = radius.min(rect.h / 2.0).max(0.0);
+    r.fill_paint(rect, radius, &fill_paint);
+    r.stroke_round_rect(rect.inset(0.5, 0.5), (radius - 0.5).max(0.0), 1.0, c(border));
+    r.set_fade(keep);
 }
 
 /// Windows 7's command bar button under the mouse: a pale blue box with a step at its middle.
 pub fn seven_box(r: &mut Renderer, rect: Rect, pressed: bool) {
+    // (Solid over a see-through toolbar: it's under the mouse or pressed.)
+    let keep = r.fade();
+    r.set_fade(1.0);
+    seven_box_now(r, rect, pressed);
+    r.set_fade(keep);
+}
+
+fn seven_box_now(r: &mut Renderer, rect: Rect, pressed: bool) {
     let paint = if pressed {
         g(&[(0.0, 0xc9d4e4), (0.12, 0xdde8f1), (0.15, 0xe1ebf5), (0.49, 0xd8e4f1), (0.5, 0xcfdbec), (1.0, 0xcfdbec)])
     } else {
@@ -496,8 +522,9 @@ pub fn field(r: &mut Renderer, theme: &Theme, rect: Rect, hot: bool) {
             retro::edge(r, theme, rect, Edge::Sunken, theme.toolbar);
         }
         Era::Xp => {
-            r.fill_paint(rect, 0.0, &paint);
-            r.stroke_rect(rect.inset(0.5, 0.5), 1.0, c(0x7f9db9));
+            let round = theme.parts.get(crate::parts::P::BoxRadius).unwrap_or_else(|| theme.era_corner(rect.h, 0.0)).min(rect.h / 2.0);
+            r.fill_paint(rect, round, &paint);
+            r.stroke_round_rect(rect.inset(0.5, 0.5), (round - 0.5).max(0.0), 1.0, c(0x7f9db9));
         }
         Era::Win7 => {
             r.fill_paint(rect, 1.0, &paint);
@@ -518,6 +545,15 @@ pub fn field(r: &mut Renderer, theme: &Theme, rect: Rect, hot: bool) {
 /// The drop arrow at the right end of a box (`rect` is the box; the arrow's own rectangle comes
 /// back): 98 / 2000's raised grey button, XP's pale blue tile, 7's plain arrow behind a divider.
 pub fn drop_arrow(r: &mut Renderer, theme: &Theme, rect: Rect, hot: bool) -> Rect {
+    // (A button: solid over a see-through toolbar.)
+    let keep = r.fade();
+    r.set_fade(1.0);
+    let b = drop_arrow_now(r, theme, rect, hot);
+    r.set_fade(keep);
+    b
+}
+
+fn drop_arrow_now(r: &mut Renderer, theme: &Theme, rect: Rect, hot: bool) -> Rect {
     match theme.era {
         Era::Win98 | Era::Win2000 => {
             let b = Rect::new(rect.right() - 2.0 - 16.0, rect.y + 2.0, 16.0, rect.h - 4.0);
@@ -619,7 +655,8 @@ pub fn word_button(r: &mut Renderer, theme: &Theme, b: Rect, word: &str, hot: bo
         }
         Era::Xp => {
             let b = b.inset(1.0, 1.0);
-            xp_frame(r, theme, b, Look { enabled: true, hot, ..Look::default() });
+            let radius = theme.parts.get(crate::parts::P::ButtonRadius).unwrap_or_else(|| theme.era_corner(b.h, 3.0));
+            xp_frame_round(r, theme, b, Look { enabled: true, hot, ..Look::default() }, radius);
             let pic = Rect::new(b.x + 6.0, b.y + (b.h - 16.0) / 2.0, 16.0, 16.0);
             xp_word_picture(r, word, pic);
             let rest = Rect::new(pic.right(), b.y, b.right() - pic.right(), b.h);

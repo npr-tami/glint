@@ -318,6 +318,24 @@ pub enum WallpaperFit {
     Actual,
 }
 
+/// Where a skin's wallpaper lies: the skin's `wallpaper-area`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WallpaperArea {
+    /// The file list's room, laid out as if no details panel or preview were open: opening one
+    /// covers the picture's side instead of squeezing it (`middle`). Only the window's size (and
+    /// the sidebar) changes it.
+    #[default]
+    Middle,
+    /// The file list itself: opening the details panel or the preview squeezes the picture into
+    /// what's left (`middle-shrinks`; how Glint always did it).
+    Shrinks,
+    /// Laid out over the whole window but seen only in the file list (`window-sized`).
+    WindowSized,
+    /// Behind the whole window: the bars, sidebar, list and panels lie over it, see-through by
+    /// `wallpaper-panels` (`window`). Older-Windows skins (era) keep it in the file list.
+    Window,
+}
+
 /// How the tabs sit in the title bar: the skin's `tabs`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TabStyle {
@@ -398,9 +416,63 @@ pub enum IconSet {
     Aero,
 }
 
+use crate::parts::P;
+
 /// The active skin as plain values: every colour the window uses, by role, and the shapes and text.
 /// Pick the role, not the hex value, so every skin works. It is made from a skin's text once, when
 /// the skin is chosen or changed (skin.rs).
+/// The parts of the main window that can each be see-through by their own amount (`Theme::see`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Place {
+    /// Anything else: `wallpaper-panels`.
+    #[default]
+    Other,
+    Title,
+    Toolbar,
+    Sidebar,
+    List,
+    Details,
+    Status,
+}
+
+/// Which `Place` is being drawn now. (Shared safely, as skins are; never part of a skin's
+/// look, so any two are equal.)
+#[derive(Debug, Default)]
+pub struct PlaceNow(std::sync::atomic::AtomicU8);
+
+impl PlaceNow {
+    pub fn get(&self) -> Place {
+        match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => Place::Title,
+            2 => Place::Toolbar,
+            3 => Place::Sidebar,
+            4 => Place::List,
+            5 => Place::Details,
+            6 => Place::Status,
+            _ => Place::Other,
+        }
+    }
+
+    pub fn set(&self, p: Place) {
+        self.0.store(p as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Clone for PlaceNow {
+    fn clone(&self) -> Self {
+        let c = PlaceNow::default();
+        c.set(self.get());
+        c
+    }
+}
+
+impl PartialEq for PlaceNow {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Theme {
     pub dark: bool,
@@ -434,6 +506,9 @@ pub struct Theme {
     pub accent_tint: Color,
     /// The edge on the left of a selected row.
     pub select_edge: Color,
+    /// The edge on the left of the sidebar's selected place (and of the page lists in Glint's own
+    /// windows, which look like it): follows select_edge when a skin leaves it out.
+    pub sidebar_select_edge: Color,
     /// Text and signs on the accent (close button hover, a switch's knob, the yes button).
     pub on_accent: Color,
     /// A row under the mouse (list and sidebar).
@@ -474,14 +549,22 @@ pub struct Theme {
     /// How thick the active tab's line and the toolbar's line are (0: none).
     pub tab_line_w: f32,
     pub toolbar_line_w: f32,
+    /// How wide the selected rows' edge is (selection-edge-width; 0: none). Bars under a tile and
+    /// in pop-up lists are two thirds of it.
+    pub select_edge_w: f32,
+    /// How wide the sidebar's selected place's edge is (sidebar-selection-edge-width; 0: none).
+    pub sidebar_select_edge_w: f32,
     /// The fonts to try, best first ("Segoe UI Variable Text, Segoe UI"), and the main window's
     /// text size in DIPs (12 = 9 pt).
     pub font: String,
     pub font_size: f32,
     /// The word in the logo's box; empty for the chrome wordmark (logo.rs), which is what a skin
     /// without a `logo-text` gets.
-    /// What the title bars show at the left (the "Logo" setting; not part of a skin).
+    /// What the title bars show at the left: the skin's `logo-style` (`logo_own`), or for a skin
+    /// that doesn't say, the "Logo" setting as it was before skins had their own.
     pub logo_style: crate::settings::LogoStyle,
+    /// The skin's own `logo-style`, if it has one.
+    pub logo_own: Option<crate::settings::LogoStyle>,
     pub logo_text: String,
 
     // ---- Paints. What the surfaces above are filled with: a flat colour in most skins, a gradient
@@ -613,6 +696,13 @@ pub struct Theme {
     /// How much of the list's width and height it fades out over at the list's edges, 0 (none) to
     /// 0.5 (`wallpaper-fade`: 0 to 50).
     pub wallpaper_fade: f32,
+    /// Where the wallpaper lies (`wallpaper-area`).
+    pub wallpaper_area: WallpaperArea,
+    /// With the wallpaper behind the whole window: how much of it shows through the bars, sidebar,
+    /// list and panels, 0 (they're solid) to 0.9 (`wallpaper-panels`: 0 to 90; 50 if not set).
+    pub wallpaper_panels: f32,
+    /// The part of the main window being drawn (`set_place`, `see`).
+    pub place: PlaceNow,
 
     // ---- Older Windows. Each is off (or follows an older colour) unless the skin sets it.
     /// Which older Windows the skin dresses Glint as (`era`), and whose icons it shows (`icons`).
@@ -642,6 +732,9 @@ pub struct Theme {
     pub menu_border: Color,
     /// The names of the places in the sidebar.
     pub sidebar_text: Color,
+    /// The parts' own settings: sizes, the selected row, corners, tabs, text, the toolbar, the
+    /// sidebar, the file list, scroll bars and menus (parts.rs).
+    pub parts: crate::parts::Parts,
 }
 
 impl Theme {
@@ -669,6 +762,10 @@ impl Theme {
         };
         if standard > 0.0 {
             return ((standard - self.scrollbar_w) / 2.0).max(0.0);
+        }
+        // The skin's scrollbar-gap: the space on both sides of the thumb.
+        if let Some(gap) = self.parts.get(P::ScrollGap) {
+            return gap;
         }
         if self.scrollbar_track.is_clear() {
             size::SCROLLBAR_MARGIN
@@ -701,22 +798,160 @@ impl Theme {
         }
     }
 
-    /// The corner radius of a box `h` DIPs high (0 unless the shape is rounded).
+    /// The selected rows' edge as a thinner bar (under a tile, in pop-up lists): two thirds of
+    /// selection-edge-width, so the standard 3 gives the 2 these always had.
+    pub fn thin_select_edge(&self) -> f32 {
+        self.select_edge_w * 2.0 / 3.0
+    }
+
+    /// The wallpaper lies behind the whole window (`wallpaper-area: window`), and there is one.
+    pub fn wallpaper_behind(&self) -> bool {
+        self.wallpaper_area == WallpaperArea::Window && !self.wallpaper.is_empty() && self.wallpaper_opacity > 0.0
+    }
+
+    /// Which part of the main window is being drawn (window.rs says, part by part): each can be
+    /// see-through by its own amount (`see`).
+    pub fn set_place(&self, place: Place) {
+        self.place.set(place);
+    }
+
+    /// How see-through the part being drawn is, 0 (solid) to 1 (only the wallpaper): its own
+    /// setting (`see-through-title-bar` and the rest), else `wallpaper-panels`.
+    pub fn see(&self) -> f32 {
+        let own = match self.place.get() {
+            Place::Title => Some(P::SeeTitle),
+            Place::Toolbar => Some(P::SeeToolbar),
+            Place::Sidebar => Some(P::SeeSidebar),
+            Place::List => Some(P::SeeList),
+            Place::Details => Some(P::SeeDetails),
+            Place::Status => Some(P::SeeStatus),
+            Place::Other => None,
+        };
+        own.and_then(|p| self.parts.get(p)).map_or(self.wallpaper_panels, |v| v / 100.0).clamp(0.0, 1.0)
+    }
+
+    /// How strong an older-Windows skin's boxes are drawn (Renderer::set_fade) while the wallpaper
+    /// lies behind the whole window: its bars are drawn from many pieces, so all of them go
+    /// see-through together, as `see` says for the part. 1 otherwise. (What's under the mouse,
+    /// selected or pressed stays solid: those set the fade to 1 while they draw.)
+    pub fn bar_fade(&self) -> f32 {
+        if self.era.old() && self.wallpaper_behind() {
+            1.0 - self.see()
+        } else {
+            1.0
+        }
+    }
+
+    /// A bar's or panel's background: see-through as `see` says for the part while the wallpaper
+    /// lies behind the whole window, as the skin says otherwise. (Older-Windows skins: `bar_fade`.)
+    pub fn through(&self, p: &Paint) -> Paint {
+        if self.wallpaper_behind() && !self.era.old() {
+            p.with_strength(1.0 - self.see())
+        } else {
+            *p
+        }
+    }
+
+    /// What a see-through selection or hover is laid on while the part being drawn is
+    /// see-through, so it shows as solid as it would without the wallpaper: the part's own colour.
+    /// None when the part isn't see-through.
+    pub fn under(&self) -> Option<Color> {
+        if !self.wallpaper_behind() || self.see() <= 0.0 {
+            return None;
+        }
+        let c = match self.place.get() {
+            Place::Title => self.titlebar,
+            Place::Toolbar => self.toolbar,
+            Place::Sidebar => self.sidebar,
+            Place::Status => self.statusbar,
+            _ => self.panel,
+        };
+        Some(c.with_alpha(1.0))
+    }
+
+    /// An older-Windows skin's own small corners (`own`: XP's 3 on its buttons and tabs), unless
+    /// the skin's shape is rounded: then the shape's corners, as everywhere else.
+    pub fn era_corner(&self, h: f32, own: f32) -> f32 {
+        if self.shape == Shape::Rounded {
+            self.corner(h)
+        } else {
+            own.min(h / 2.0)
+        }
+    }
+
     /// The gap between the window's panels (and below the toolbar): Windows 7 parts its panes
     /// with a thin pale line instead (window.rs draws 7's line colour where the gaps are).
     pub fn gap(&self) -> f32 {
-        if self.era == Era::Win7 {
+        if let Some(g) = self.parts.get(P::Gap) {
+            g
+        } else if self.era == Era::Win7 {
             1.0
         } else {
             size::GAP
         }
     }
 
+    /// The main window's title bar, toolbar, status bar and column titles: how tall each is, and
+    /// how wide the sidebar is (`title-bar-height` and the rest; `size::TITLE_H` and the rest when
+    /// the skin doesn't say).
+    pub fn title_h(&self) -> f32 {
+        self.parts.num(P::TitleH)
+    }
+    pub fn toolbar_h(&self) -> f32 {
+        self.parts.num(P::ToolbarH)
+    }
+    pub fn status_h(&self) -> f32 {
+        self.parts.num(P::StatusH)
+    }
+    pub fn header_h(&self) -> f32 {
+        self.parts.num(P::HeaderH)
+    }
+    pub fn sidebar_w(&self) -> f32 {
+        self.parts.num(P::SidebarW)
+    }
+
+    /// The corner radius of a box `h` DIPs high (0 unless the shape is rounded).
     pub fn corner(&self, h: f32) -> f32 {
         if self.shape == Shape::Rounded {
             self.radius.min(h / 2.0).max(0.0)
         } else {
             0.0
+        }
+    }
+
+    /// The corners of the toolbar's buttons (SORT, VIEW, SETTINGS), `h` high: the skin's
+    /// `button-radius`, else the shape's.
+    pub fn button_corner(&self, h: f32) -> f32 {
+        match self.parts.get(P::ButtonRadius) {
+            Some(r) => r.min(h / 2.0),
+            None => self.corner(h),
+        }
+    }
+
+    /// How far those buttons lean: not at all once the skin gives them corners of their own.
+    pub fn button_lean(&self, standard: f32) -> f32 {
+        if self.parts.get(P::ButtonRadius).is_some() {
+            0.0
+        } else {
+            self.lean(standard)
+        }
+    }
+
+    /// The corners of the path and filter boxes, `h` high: the skin's `box-radius`, else the
+    /// shape's.
+    pub fn box_corner(&self, h: f32) -> f32 {
+        match self.parts.get(P::BoxRadius) {
+            Some(r) => r.min(h / 2.0),
+            None => self.corner(h),
+        }
+    }
+
+    /// The corners of the sidebar, the file list and the details panel: the skin's
+    /// `panel-radius`, else the shape's (square unless the shape is rounded).
+    pub fn panel_corner(&self) -> f32 {
+        match self.parts.get(P::PanelRadius) {
+            Some(r) => r,
+            None => self.corner(f32::MAX),
         }
     }
 
@@ -755,7 +990,6 @@ pub mod size {
 
     /// The gap between floating panels.
     pub const GAP: f32 = 6.0;
-    pub const SIDEBAR_W: f32 = 210.0;
     /// The sidebar's rows (the file list's come from the skin, `Theme::row_h`).
     pub const ROW_H: f32 = 28.0;
     pub const HEADER_H: f32 = 32.0;

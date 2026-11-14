@@ -239,10 +239,15 @@ pub struct Renderer {
     /// Reused buffer for converting text to UTF-16, so drawing text doesn't allocate.
     wide: Vec<u16>,
     clip_depth: u32,
+    /// Round clips pushed (`push_round_clip`): their layers, popped newest first.
+    round_clips: Vec<(windows::Win32::Graphics::Direct2D::ID2D1Layer, windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS)>,
     in_frame: bool,
     /// While set (`set_tint`), every colour drawn goes this far toward this colour, and a
     /// picture gets a veil of it over its shape: 98 / 2000's selected icon.
     tint: Option<(Color, f32)>,
+    /// While below 1 (`set_fade`), filled boxes (not text, lines, shapes or pictures) are drawn
+    /// that see-through: an older-Windows skin's bars over a wallpaper behind the whole window.
+    fade: f32,
     /// The skin's text size as a part of the standard one (1.0 = 9 pt): every text is drawn that
     /// much bigger or smaller (`set_font`).
     text_scale: f32,
@@ -325,8 +330,10 @@ impl Renderer {
             dpi: dpi as f32,
             wide: Vec::with_capacity(256),
             clip_depth: 0,
+            round_clips: Vec::new(),
             in_frame: false,
             tint: None,
+            fade: 1.0,
             text_scale: 1.0,
             font_asked: (String::new(), 1.0),
             font_generation: 0,
@@ -482,6 +489,7 @@ impl Renderer {
         self.drop_unused_pictures();
         self.in_frame = true;
         self.clip_depth = 0;
+        // (None are left: `end` popped them.)
         true
     }
 
@@ -497,6 +505,9 @@ impl Renderer {
     pub fn end(&mut self) -> FrameResult {
         if !self.in_frame {
             return FrameResult::Shown;
+        }
+        while !self.round_clips.is_empty() {
+            self.pop_round_clip();
         }
         self.in_frame = false;
         while self.clip_depth > 0 {
@@ -613,6 +624,29 @@ impl Renderer {
         self.tint = tint;
     }
 
+    /// Until `set_fade(1.0)`, filled boxes are drawn `opacity` strong (see `fade`).
+    pub fn set_fade(&mut self, opacity: f32) {
+        self.fade = opacity.clamp(0.0, 1.0);
+    }
+
+    /// How strong filled boxes are drawn now (`set_fade`): what's under the mouse, selected or
+    /// pressed is drawn solid (`set_fade(1.0)`) and this put back after.
+    pub fn fade(&self) -> f32 {
+        self.fade
+    }
+
+    /// How strong box `r` is drawn as `fade` has it: a face fades, but a thin piece (an edge, a
+    /// glyph's stroke, 3 DIPs or less across) stays, so edges and signs still show.
+    fn fade_of(&self, r: Rect) -> f32 {
+        if self.fade < 1.0 && r.w.min(r.h) > 3.0 { self.fade } else { 1.0 }
+    }
+
+    /// A box's colour as `fade` has it (`fade_of`).
+    fn faded(&self, r: Rect, color: Color) -> Color {
+        let f = self.fade_of(r);
+        if f < 1.0 { color.with_alpha(color.a * f) } else { color }
+    }
+
     /// `c` as drawn now (see `set_tint`).
     fn tinted(&self, c: Color) -> Color {
         match self.tint {
@@ -644,6 +678,7 @@ impl Renderer {
 
     /// A filled rectangle with pixel-sharp edges.
     pub fn fill_rect(&mut self, r: Rect, color: Color) {
+        let color = self.faded(r, color);
         if r.is_empty() || color.a <= 0.0 {
             return;
         }
@@ -656,6 +691,7 @@ impl Renderer {
 
     /// A filled rectangle with rounded corners (e.g. the scrollbar thumb).
     pub fn fill_round_rect(&mut self, r: Rect, radius: f32, color: Color) {
+        let color = self.faded(r, color);
         if r.is_empty() || color.a <= 0.0 {
             return;
         }
@@ -910,6 +946,44 @@ impl Renderer {
         }
     }
 
+    /// Only draw inside `r` with round corners `radius` until the matching
+    /// [`Renderer::pop_round_clip`] (a skin's `panel-radius`: the panels' corners). A radius of 0 is
+    /// a plain clip; every push needs its pop either way.
+    pub fn push_round_clip(&mut self, r: Rect, radius: f32) {
+        use windows::Win32::Graphics::Direct2D::{ID2D1Geometry, D2D1_LAYER_OPTIONS_NONE, D2D1_LAYER_PARAMETERS};
+        let Some(t) = self.target.as_ref().filter(|_| self.in_frame) else { return };
+        let rr = D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: r.x, top: r.y, right: r.right(), bottom: r.bottom() }, radiusX: radius.max(0.0), radiusY: radius.max(0.0) };
+        // SAFETY: plain creation calls on our own factory and target; the layer is popped by
+        // pop_round_clip (or `end`).
+        let made = unsafe {
+            self.d2d.CreateRoundedRectangleGeometry(&rr).and_then(|g| g.cast::<ID2D1Geometry>()).and_then(|g| t.rt.CreateLayer(None).map(|layer| (g, layer)))
+        };
+        let Ok((geometry, layer)) = made else { return };
+        let params = D2D1_LAYER_PARAMETERS {
+            contentBounds: rr.rect,
+            geometricMask: std::mem::ManuallyDrop::new(Some(geometry)),
+            maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            maskTransform: windows_numerics::Matrix3x2::identity(),
+            opacity: 1.0,
+            opacityBrush: std::mem::ManuallyDrop::new(None),
+            layerOptions: D2D1_LAYER_OPTIONS_NONE,
+        };
+        // SAFETY: the layer belongs to this target; the mask is kept (in round_clips) until the
+        // layer is popped.
+        unsafe { t.rt.PushLayer(&params, &layer) };
+        self.round_clips.push((layer, params));
+    }
+
+    pub fn pop_round_clip(&mut self) {
+        let Some((_layer, mut params)) = self.round_clips.pop() else { return };
+        if let Some(t) = &self.target {
+            // SAFETY: there is a matching PushLayer (round_clips held its layer).
+            unsafe { t.rt.PopLayer() };
+        }
+        // SAFETY: lets go of the mask the parameters held, once, after its layer is popped.
+        unsafe { std::mem::ManuallyDrop::drop(&mut params.geometricMask) };
+    }
+
     /// Only draw inside `r` until the matching [`Renderer::pop_clip`].
     pub fn push_clip(&mut self, r: Rect) {
         let rect = self.snapped(r);
@@ -1017,6 +1091,8 @@ impl Renderer {
         let rect = self.snapped(r);
         let (a, b) = across(rect);
         let Some(brush) = self.linear_brush(g, a, b) else { return };
+        // SAFETY: plain setter on a live brush.
+        unsafe { brush.SetOpacity(self.fade_of(r)) };
         let Some(t) = &self.target else { return };
         // SAFETY: the rectangle lives across the calls; the brush belongs to this target.
         unsafe {
@@ -1045,6 +1121,8 @@ impl Renderer {
         let (a, b) = across(D2D_RECT_F { left: lo.x, top: lo.y, right: hi.x, bottom: hi.y });
         let Some(geo) = self.path(points, true) else { return };
         let Some(brush) = self.linear_brush(g, a, b) else { return };
+        // SAFETY: plain setter on a live brush.
+        unsafe { brush.SetOpacity(self.fade_of(Rect::new(lo.x, lo.y, hi.x - lo.x, hi.y - lo.y))) };
         let Some(t) = &self.target else { return };
         // SAFETY: the geometry and brush are live; no opacity brush.
         unsafe { t.rt.FillGeometry(&geo, &brush, None) };
@@ -1115,6 +1193,8 @@ impl Renderer {
         let rect = self.snapped(r);
         let (a, b) = (Vector2 { X: rect.left, Y: self.snap(top) }, Vector2 { X: rect.left, Y: self.snap(bottom) });
         let Some(brush) = self.linear_brush(g, a, b) else { return };
+        // SAFETY: plain setter on a live brush.
+        unsafe { brush.SetOpacity(self.fade_of(r)) };
         let Some(t) = &self.target else { return };
         // SAFETY: the rectangle lives across the calls; the brush belongs to this target.
         unsafe {
@@ -1139,6 +1219,8 @@ impl Renderer {
         let rect = self.snapped(r);
         let (a, b) = (Vector2 { X: rect.left, Y: rect.top }, Vector2 { X: rect.right, Y: rect.top });
         let Some(brush) = self.linear_brush(g, a, b) else { return };
+        // SAFETY: plain setter on a live brush.
+        unsafe { brush.SetOpacity(self.fade_of(r)) };
         let Some(t) = &self.target else { return };
         // SAFETY: the rectangle lives across the calls; the brush belongs to this target.
         unsafe { t.rt.FillRectangle(&rect, &brush) };
@@ -1159,6 +1241,7 @@ impl Renderer {
         unsafe {
             brush.SetStartPoint(a);
             brush.SetEndPoint(b);
+            brush.SetOpacity(1.0);
         }
         Some(brush)
     }
@@ -1277,6 +1360,8 @@ impl Renderer {
         }
         let rect = self.snapped(r);
         let Some(brush) = self.linear_brush(g, vec2(a), vec2(b)) else { return };
+        // SAFETY: plain setter on a live brush.
+        unsafe { brush.SetOpacity(self.fade_of(r)) };
         let Some(t) = &self.target else { return };
         // SAFETY: the rectangle lives across the calls; the brush belongs to this target.
         unsafe {
@@ -1807,6 +1892,38 @@ fn pick_font_family(dwrite: &IDWriteFactory) -> &'static str {
     }
     let Some(collection) = collection else { return FONT_FAMILIES[1] };
     FONT_FAMILIES.iter().find(|name| family_in(&collection, name)).copied().unwrap_or(FONT_FAMILIES[1])
+}
+
+/// Every font family installed, by its English name (or its first), A to Z: the Skins window's
+/// font drop-down.
+pub fn system_fonts() -> Vec<String> {
+    // SAFETY: DirectWrite's shared factory and its system collection; every out-pointer is valid,
+    // and each name is read into a buffer of the length DirectWrite gave.
+    unsafe {
+        let Ok(dwrite) = DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED) else { return Vec::new() };
+        let mut collection: Option<IDWriteFontCollection> = None;
+        if dwrite.GetSystemFontCollection(&mut collection, false).is_err() {
+            return Vec::new();
+        }
+        let Some(collection) = collection else { return Vec::new() };
+        let english = HSTRING::from("en-us");
+        let mut fonts = Vec::new();
+        for i in 0..collection.GetFontFamilyCount() {
+            let Ok(names) = collection.GetFontFamily(i).and_then(|f| f.GetFamilyNames()) else { continue };
+            let (mut at, mut exists) = (0u32, BOOL(0));
+            if names.FindLocaleName(PCWSTR(english.as_ptr()), &mut at, &mut exists).is_err() || !exists.as_bool() {
+                at = 0;
+            }
+            let Ok(len) = names.GetStringLength(at) else { continue };
+            let mut name = vec![0u16; len as usize + 1];
+            if names.GetString(at, &mut name).is_ok() {
+                fonts.push(String::from_utf16_lossy(&name[..len as usize]));
+            }
+        }
+        fonts.sort_by_key(|f| f.to_lowercase());
+        fonts.dedup();
+        fonts
+    }
 }
 
 /// Whether the font family `name` is installed (a skin's font).

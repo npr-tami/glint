@@ -389,7 +389,7 @@ impl PreviewPane {
             self.volume = Some(app.settings.preview_volume);
         }
         self.take_answers();
-        r.fill_paint(rect, 0.0, &theme.panel_paint);
+        r.fill_paint(rect, 0.0, &theme.through(&theme.panel_paint));
         r.push_clip(rect);
         let one = details::focused(app);
         if let Some(o) = &one {
@@ -650,7 +650,7 @@ impl PreviewPane {
         if let Some(sh) = self.shown.as_mut() {
             sh.controls = Some(c);
         }
-        r.fill_paint(bar, 0.0, &theme.list_header);
+        r.fill_paint(bar, 0.0, &theme.through(&theme.list_header));
         r.fill_rect(Rect::new(bar.x, bar.y, bar.w, 1.0), theme.line);
         let v = self.video.as_ref().filter(|_| self.video_key == self.view_key);
         let playing = v.is_some_and(|v| v.is_playing());
@@ -825,7 +825,7 @@ impl PreviewPane {
     fn paint_bar(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState, one: Option<&One>) {
         let bar = self.bar();
         // The bar takes the look of the file list's column titles.
-        r.fill_paint(Rect::new(self.rect.x, self.rect.y, self.rect.w, TOP_H), 0.0, &theme.list_header);
+        r.fill_paint(Rect::new(self.rect.x, self.rect.y, self.rect.w, TOP_H), 0.0, &theme.through(&theme.list_header));
         r.fill_rect(Rect::new(self.rect.x, self.rect.y + TOP_H, self.rect.w, 1.0), theme.line);
         let picture = self.shown.and_then(|s| s.picture);
         let button_bg = |r: &mut Renderer, rect: Rect, hit: Hit, on: bool, enabled: bool| {

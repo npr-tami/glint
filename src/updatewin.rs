@@ -46,7 +46,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetAncestor, GetClientRect, GetForegroundWindow, GetWindowRect, IsWindow, KillTimer,
-    LoadCursorW, LoadIconW, PostMessageW, RegisterClassExW, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, GA_ROOTOWNER,
+    LoadCursorW, LoadIconW, PostMessageW, RegisterClassExW, SetTimer, SetWindowPos, ShowWindow, GA_ROOTOWNER,
     HTCAPTION, HTCLIENT, IDC_ARROW, MINMAXINFO, SIZE_MINIMIZED, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SW_SHOW, SW_SHOWNOACTIVATE, WA_INACTIVE,
     WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO,
@@ -561,7 +561,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
                     frame::cloak(hwnd, false);
                     if !quiet {
-                        let _ = SetForegroundWindow(hwnd);
+                        let _ = crate::testhide::front(hwnd);
                     }
                     if frame::is_wine() {
                         // Wine shows a frame only once the next one is drawn.

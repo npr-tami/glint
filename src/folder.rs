@@ -1128,7 +1128,7 @@ fn is_absolute(path: &str) -> bool {
     path.starts_with("\\\\") || (b.get(1) == Some(&b':') && b.get(2) == Some(&b'\\'))
 }
 
-/// `path` as the disk spells it ("x:\GLINTBREAK\FILES" typed: "X:\GlintBreak\files"), so the path
+/// `path` as the disk spells it ("c:\USERS\ME\FILES" typed: "C:\Users\Me\files"), so the path
 /// bar and the tab show the real names. Only on this PC's own drives and USB sticks (a network
 /// drive that's away would hold things up); the path as it is when a part of it isn't found.
 pub fn real_case(path: &str) -> String {

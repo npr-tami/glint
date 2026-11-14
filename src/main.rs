@@ -45,6 +45,7 @@
 mod anim;
 mod bugreport;
 mod catcher;
+mod testhide;
 mod archive;
 mod app;
 mod codebox;
@@ -75,6 +76,7 @@ mod logo;
 mod media;
 mod menu;
 mod palette;
+mod parts;
 mod pathbar;
 mod peek;
 mod popup;
@@ -93,7 +95,6 @@ mod settingswin;
 mod shell;
 mod shellmenu;
 mod skin;
-mod skincode;
 mod skinwin;
 mod sortrecipe;
 mod sortwin;
@@ -271,6 +272,8 @@ fn main() {
         app.say(format!("Glint is updated to {v}."));
         log::line(&format!("first start after updating to {v} automatically"));
     }
+    // (Test copies only: every window stays off the screen and leaves the focus alone.)
+    testhide::start();
     let hwnd = match window::create(app, window::Options { bench, started, main, hidden }) {
         Ok(h) => h,
         Err(e) => {

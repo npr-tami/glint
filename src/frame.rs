@@ -156,7 +156,10 @@ pub fn apply_theme(hwnd: HWND, theme: &Theme) {
     let dark = BOOL::from(theme.dark);
     // 98 / 2000 draw their own frame (`paint_classic_border`): no line of Windows 11's round it
     // (DWMWA_COLOR_NONE).
-    let border = if theme.era.classic() { 0xFFFF_FFFE } else { theme.line.to_colorref() };
+    // With the logo in a box, no line either: the box fills the window's top left corner, and
+    // the line would cut across its top and left edges.
+    let boxed = theme.logo_style != crate::settings::LogoStyle::None && !theme.chrome_logo();
+    let border = if theme.era.classic() || boxed { 0xFFFF_FFFE } else { theme.line.to_colorref() };
     let corners = if theme.era.classic() { DWMWCP_DONOTROUND } else { DWMWCP_ROUND };
     // SAFETY: as in `init`.
     unsafe {
@@ -240,7 +243,8 @@ pub fn zoomed(hwnd: HWND) -> bool {
 
 /// Hides the window from the screen until its first frame is ready (no white flash at start).
 pub fn cloak(hwnd: HWND, on: bool) {
-    let v = BOOL::from(on);
+    // (A test copy run hidden keeps every window cloaked: testhide.rs.)
+    let v = BOOL::from(on || crate::testhide::on());
     // SAFETY: as in `init`.
     unsafe {
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &v as *const _ as *const _, 4);

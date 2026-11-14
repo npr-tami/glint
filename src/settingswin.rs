@@ -69,7 +69,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetParent, GetWindow, GetWindowRect, IsIconic, IsZoomed,
     KillTimer, LoadCursorW,
-    LoadIconW, PostMessageW, RegisterClassExW, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, GW_OWNER, HTCLIENT,
+    LoadIconW, PostMessageW, RegisterClassExW, SetTimer, SetWindowPos, ShowWindow, GW_OWNER, HTCLIENT,
     IDC_ARROW, MINMAXINFO, SIZE_MINIMIZED, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SW_RESTORE, SW_SHOW, WA_INACTIVE, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_COMMAND,
     WM_CTLCOLOREDIT, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
@@ -398,6 +398,14 @@ enum Block {
     Note(Rect, String),
     /// "More settings" / "Fewer settings".
     More(Rect, String),
+}
+
+impl Block {
+    fn rect(&self) -> Rect {
+        match self {
+            Block::Group(r, _) | Block::Heading(r, _) | Block::Note(r, _) | Block::More(r, _) => *r,
+        }
+    }
 }
 
 /// The window's own choices (Appearance > Settings window), as read from the settings.
@@ -818,13 +826,13 @@ pub fn run_job(hwnd: HWND, scale: f32, job: Job) -> JobDone {
                 follow(hwnd, false);
                 let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
                 frame::cloak(hwnd, false);
-                let _ = SetForegroundWindow(hwnd);
+                let _ = crate::testhide::front(hwnd);
             }
             Job::Activate => {
                 if IsIconic(hwnd).as_bool() {
                     let _ = ShowWindow(hwnd, SW_RESTORE);
                 }
-                let _ = SetForegroundWindow(hwnd);
+                let _ = crate::testhide::front(hwnd);
             }
             Job::Drop(mut list, at) => {
                 let mut corners = [POINT { x: (at.x * scale).round() as i32, y: (at.y * scale).round() as i32 }, POINT { x: (at.right() * scale).round() as i32, y: (at.bottom() * scale).round() as i32 }];
@@ -853,7 +861,7 @@ pub fn run_job(hwnd: HWND, scale: f32, job: Job) -> JobDone {
             Job::Close => {
                 // The main window gets the focus back (not whatever Windows would pick).
                 if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
-                    let _ = SetForegroundWindow(owner);
+                    let _ = crate::testhide::front(owner);
                 }
                 let _ = DestroyWindow(hwnd);
             }
@@ -1015,12 +1023,25 @@ fn beside(owner: HWND, w: i32) -> (i32, i32, i32, i32) {
     (x, top, w, bottom - top)
 }
 
+thread_local! {
+    /// How tall the main window's title bar and toolbar are together, and its status bar (the
+    /// skin's sizes, as the main window last laid itself out).
+    static MAIN_BARS: Cell<(f32, f32)> = const { Cell::new((size::TITLE_H + size::TOOLBAR_H, size::STATUS_H)) };
+}
+
+/// The main window's bars are this tall now: above the panels (title bar and toolbar) and below
+/// them (the status bar; 0 when it's hidden).
+pub fn main_bars(top: f32, bottom: f32) {
+    MAIN_BARS.with(|c| c.set((top, bottom)));
+}
+
 /// Over the main window's right edge, where the details panel goes: below its tabs and toolbar,
 /// above its status bar, `w` wide.
 fn in_panel(owner: HWND, scale: f32, w: i32) -> (i32, i32, i32, i32) {
     let main = visible_rect(owner);
-    let top = main.top + ((size::TITLE_H + size::TOOLBAR_H) * scale) as i32;
-    let bottom = (main.bottom - (size::STATUS_H * scale) as i32).max(top + 100);
+    let (above, below) = MAIN_BARS.with(Cell::get);
+    let top = main.top + (above * scale) as i32;
+    let bottom = (main.bottom - (below * scale) as i32).max(top + 100);
     let w = w.min(((main.right - main.left) / 2).max(200));
     (main.right - w, top, w, bottom - top)
 }
@@ -1526,11 +1547,13 @@ impl SettingsWindow {
         }
         if let Some((text, w)) = more_button {
             blocks.push(Block::More(Rect::new(x0 - 4.0, y - 4.0, w, ROW_H), text));
-            y += ROW_H;
         }
+        // Scrolls only when its boxes and rows don't fit: `y` has room for a next group's title
+        // in it, and an empty margin alone shouldn't bring a scroll bar.
+        let end = blocks.iter().map(Block::rect).chain(rows.iter().map(|p| p.rect)).map(|r| r.bottom()).fold(0.0, f32::max);
         self.blocks = blocks;
         self.rows = rows;
-        self.scroller.set_extent(y + PAD_BOTTOM, content.h);
+        self.scroller.set_page(end, PAD_BOTTOM, content.h);
         self.layout_foot();
         // The keyboard can't stay on something that's gone or greyed now.
         let gone = match self.focus {
@@ -1680,7 +1703,8 @@ impl SettingsWindow {
             flat::title(r, theme, bar, self.active);
         } else {
             kit::title_bar(r, theme, bar, self.active);
-            let x = kit::logo(r, theme, bar);
+            // (No logo in Settings, whatever the skin.)
+            let x = bar.x;
             crate::retro::title(r, theme, Rect::new(x + 10.0, 0.0, (self.size.0 - x - 10.0 - ksize::CLOSE_W).max(0.0), size::TITLE_H), "Settings", self.active);
         }
         let hot = self.hover == Some(Hot::Close);
@@ -1881,7 +1905,7 @@ impl SettingsWindow {
                     let Some(o) = p.options.get(n).map(|o| shift(*o)) else { break };
                     let colours = match v {
                         pages::Val::S(id) => self.swatches.iter().find(|(s, _)| s == id).map(|(_, c)| *c),
-                        pages::Val::B(_) => None,
+                        pages::Val::B(_) | pages::Val::N(_) => None,
                     };
                     skin_tile(r, theme, o, label, colours, Some(&v.json()) == current, look_at(Part::Option(n), &parts));
                 }
@@ -1891,6 +1915,8 @@ impl SettingsWindow {
                     let current = self.values.get(*key);
                     let label = choices.iter().find(|(v, _)| Some(&v.json()) == current).map(|(_, l)| l.clone()).unwrap_or_else(|| match current {
                         Some(Value::String(s)) => s.clone(),
+                        // (A width dragged by hand, not one of the choices.)
+                        Some(Value::Number(n)) => n.as_f64().map_or_else(String::new, |n| format!("{}", n.round())),
                         _ => String::new(),
                     });
                     draw_dropdown(r, theme, m, &label, look_at(Part::Main, &parts));

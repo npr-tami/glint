@@ -45,7 +45,7 @@ pub const LIVE: &[&str] = &[
     // General
     "Startup",
     "StartupFolder",
-    "NewTab", "HomeOpens",
+    "NewTab", "HomeOpens", "HomeColumns", "HomeTiles",
     "SettingsOpens",
     "SettingsPages",
     "SettingsStyle",
@@ -69,10 +69,12 @@ pub const LIVE: &[&str] = &[
     "Theme",
     "ZipIcon",
     "@SkinEditor",
+    "SkinsWindow",
     "Size",
     "ShowSidebar",
     "ShowDetails",
     "ShowStatusBar",
+    "StatusCount", "StatusSelected", "StatusFree", "StatusTotal", "StatusOpened", "StatusStarted", "StatusMemory", "DetailsWidth",
     "View",
     // Files and folders
     "ShowHidden",
@@ -84,6 +86,7 @@ pub const LIVE: &[&str] = &[
     "FoldersFirst",
     "CustomSort",
     "CustomViews",
+    "SortWindow",
     "ConfirmDelete",
     // Mouse and keyboard
     "SingleClick",
@@ -366,6 +369,8 @@ pub fn set_outside(key: &str, on: bool) -> Result<(), String> {
 pub enum Val {
     S(&'static str),
     B(bool),
+    /// A number (a width, how many in a row), saved as settings.json writes an f32.
+    N(f32),
 }
 
 impl Val {
@@ -373,6 +378,7 @@ impl Val {
         match self {
             Val::S(s) => Value::String(s.to_string()),
             Val::B(b) => Value::Bool(b),
+            Val::N(n) => Value::from(n as f64),
         }
     }
 }
@@ -584,6 +590,8 @@ fn general(f: &Facts) -> Vec<Item> {
             choice("Startup", "Open Glint to", None, &[(S("restore"), "Tabs from last time"), (S("home"), "Home folder"), (S("thispc"), "This PC"), (S("folder"), "A specific folder")]).long(),
             Row::new("StartupFolder", "", None, Ctl::Folder).only_if("Startup", S("folder")),
             choice("HomeOpens", "Home opens", None, &[(S("page"), "Home page (like File Explorer)"), (S("folder"), "Your user folder")]).long().more(),
+            choice("HomeColumns", "Tiles in a row", None, &[(Val::N(2.0), "Up to 2"), (Val::N(3.0), "Up to 3"), (Val::N(4.0), "Up to 4"), (Val::N(5.0), "Up to 5"), (Val::N(6.0), "Up to 6")]).only_if("HomeOpens", S("page")).more(),
+            choice("HomeTiles", "Tile size", None, &[(S("small"), "Small"), (S("normal"), "Normal"), (S("large"), "Large")]).only_if("HomeOpens", S("page")).more(),
             toggle("RememberSplit", "Reopen split view", None).more(),
         ]),
         Item::Heading("New tabs"),
@@ -639,9 +647,9 @@ fn look(f: &Facts) -> Vec<Item> {
         Item::Card(vec![
             Row::new("Skin", "", None, Ctl::Choice("Skin", skin_choices(f))).long(),
             choice("Theme", "Light or dark", None, &[(S("system"), "Same as Windows"), (S("light"), "Light"), (S("dark"), "Dark")]).radios(),
-            choice("Logo", "Logo", None, &[(S("box"), "Box"), (S("chrome"), "Chrome"), (S("caps"), "GLiNT"), (S("none"), "None")]).long().more(),
             choice("ZipIcon", "Zip icon", None, &[(S("label"), "Red label"), (S("folder"), "Folder"), (S("page"), "Page"), (S("glint"), "Glint icon")]).long().more(),
             Row::new("@SkinEditor", "Skins", None, Ctl::Button("EDIT\u{2026}".into(), Act::SkinEditor)),
+            choice("SkinsWindow", "Skins window", None, &[(S("compact"), "One column"), (S("slim"), "Slim"), (S("wide"), "Wide")]).long(),
         ]),
         Item::Heading("Layout"),
         Item::Card(vec![
@@ -656,6 +664,24 @@ fn look(f: &Facts) -> Vec<Item> {
             toggle("ShowSidebar", "Sidebar", None),
             toggle("ShowDetails", "Details panel", None),
             toggle("ShowStatusBar", "Status bar", None),
+        ]),
+        Item::Heading("Status bar and details"),
+        Item::Card(vec![
+            toggle("StatusCount", "Number of items", None).needs("ShowStatusBar").more(),
+            toggle("StatusSelected", "Size of what\u{2019}s selected", None).needs("ShowStatusBar").more(),
+            toggle("StatusFree", "Free space", None).needs("ShowStatusBar").more(),
+            toggle("StatusTotal", "Folder\u{2019}s total size", None).needs("ShowStatusBar").more(),
+            toggle("StatusOpened", "How fast the folder opened", None).needs("ShowStatusBar").more(),
+            toggle("StatusStarted", "How fast Glint started", None).needs("ShowStatusBar").more(),
+            toggle("StatusMemory", "Memory use", None).needs("ShowStatusBar").more(),
+            choice(
+                "DetailsWidth",
+                "Details panel width",
+                None,
+                &[(Val::N(0.0), "Standard (280)"), (Val::N(240.0), "240"), (Val::N(300.0), "300"), (Val::N(340.0), "340"), (Val::N(400.0), "400"), (Val::N(480.0), "480")],
+            )
+            .long()
+            .more(),
         ]),
         // The window's own choices, together and last, so they never get in the way.
         Item::Heading("Settings window"),
@@ -695,6 +721,7 @@ fn files() -> Vec<Item> {
             toggle("FoldersFirst", "Folders first", None),
             Row::new("CustomSort", "Custom sort order", None, Ctl::ButtonToggle("EDIT\u{2026}".into(), Act::SortEditor, "CustomSort")),
             Row::new("CustomViews", "Custom views", None, Ctl::ButtonToggle("EDIT\u{2026}".into(), Act::SortEditor, "CustomViews")).more(),
+            choice("SortWindow", "Sort editor", None, &[(S("compact"), "Compact"), (S("slim"), "Slim"), (S("wide"), "Wide")]).long(),
         ]),
         Item::Heading("Ask before deleting"),
         Item::Card(vec![choice("ConfirmDelete", "", None, &[(S("permanent"), "Only when deleting permanently"), (S("always"), "Always"), (S("never"), "Never")]).radios()]),
