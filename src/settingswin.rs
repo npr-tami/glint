@@ -3016,6 +3016,14 @@ fn place_row(r: &mut Renderer, row: Row, shape: Shape, left: f32, y: f32, w: f32
         placed.title = if placed.row.title.is_empty() { Vec::new() } else { kit::wrap(r, &placed.row.title, &title_style, placed.text_w) };
         if let Some(note) = &placed.row.note {
             placed.note = kit::wrap(r, note, &note_style, placed.text_w);
+            // What About says about updates changes while you look ("Looking for a new version…",
+            // then what was found): room for two lines from the start, so the rows under it don't
+            // jump down under the mouse.
+            if placed.row.key == "@Update" {
+                while placed.note.len() < 2 {
+                    placed.note.push(String::new());
+                }
+            }
         }
         placed.title.len() as f32 * TITLE_LINE + placed.note.len() as f32 * NOTE_LINE + later
     };

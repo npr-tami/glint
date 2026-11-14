@@ -302,6 +302,8 @@ pub struct Window {
     updates: update::Schedule,
     /// The new version the update prompt shows (updatewin.rs), for its answer.
     prompted: Option<Release>,
+    /// The install under way is "Update automatically"'s (no update window; Glint keeps running).
+    quiet_install: bool,
     /// The details panel or the Space preview on the right of the list (side.rs).
     side: Side,
 }
@@ -441,6 +443,7 @@ pub fn create(app: AppState, options: Options) -> Result<HWND> {
             theme_generation: 0,
             updates: update::Schedule::default(),
             prompted: None,
+            quiet_install: false,
             side: Side::new(),
         });
         if options.main && !options.bench {
@@ -1735,6 +1738,32 @@ impl Window {
                     }
                     return;
                 }
+                // "Update automatically": an automatic check puts a new version in place without asking
+                // (once: a version already put in place isn't fetched again).
+                // A version already put in place isn't asked about either: it opens next start (About
+                // and the status bar say so).
+                let placed = update::status().put_in_place;
+                if let (update::Found::Newer(release), Some(v)) = (&found, &placed) {
+                    if release.version == *v {
+                        if asked && self.settings_win.is_none() {
+                            let (said, _) = update::about(true, self.app.settings.check_for_updates);
+                            self.app.say(said);
+                            self.invalidate();
+                        }
+                        return;
+                    }
+                }
+                // (Not while the update window is open from before: that one waits for its answer.)
+                if !asked && self.app.settings.update_automatically && !updatewin::is_open() {
+                    if let update::Found::Newer(release) = found {
+                        {
+                            log::line(&format!("update: putting {} in place automatically", release.version));
+                            self.quiet_install = update::start_install(shell::Owner::new(self.hwnd), release, true);
+                            self.refresh_settings();
+                        }
+                    }
+                    return;
+                }
                 if update::should_prompt(&found, &self.app.settings, asked, update::now_seconds()) {
                     if let update::Found::Newer(release) = found {
                         if updatewin::open(self.hwnd, &self.app.theme, &release, &update::ours().to_string()) {
@@ -1750,9 +1779,15 @@ impl Window {
             }
             update::ANSWERED => {
                 let Some(release) = self.prompted.clone() else { return };
+                if detail == update::ANSWER_STOP {
+                    log::line(&format!("update: installing {} stopped (the update window was closed)", release.version));
+                    update::stop_install_now();
+                    self.prompted = None;
+                    return;
+                }
                 if detail == update::ANSWER_UPDATE {
                     log::line(&format!("update: installing {} (asked in the prompt)", release.version));
-                    if !update::start_install(shell::Owner::new(self.hwnd), release) {
+                    if !update::start_install(shell::Owner::new(self.hwnd), release, false) {
                         updatewin::problem("Glint is busy looking for updates right now. Try again in a moment.");
                     }
                     self.refresh_settings();
@@ -1780,6 +1815,18 @@ impl Window {
             }
             update::INSTALLED => {
                 self.refresh_settings();
+                if std::mem::take(&mut self.quiet_install) {
+                    // Glint keeps running; the new version opens next time. A failure is in the log,
+                    // and the next check tries again.
+                    match (update::take_installed(), update::status().put_in_place) {
+                        (Some(Ok(_)), Some(v)) => self.app.say(format!("Glint {v} is ready. It opens the next time Glint starts.")),
+                        // (Why is too long for the status bar: Settings > About shows it.)
+                        (Some(Err(_)), _) => self.app.say("Failed to update Glint automatically. Settings > About says why."),
+                        _ => {}
+                    }
+                    self.invalidate();
+                    return;
+                }
                 match update::take_installed() {
                     Some(Ok(exe)) => {
                         // The new Glint opens the tabs open now: written now, even when nothing
@@ -1795,11 +1842,15 @@ impl Window {
                         update::restart_after_quit(exe, self.app.in_background());
                         self.quit();
                     }
+                    Some(Err(why)) if why == update::STOPPED => {
+                        self.app.say(update::STOPPED);
+                        self.invalidate();
+                    }
                     Some(Err(why)) => {
                         if updatewin::is_open() {
                             updatewin::problem(&why);
                         } else {
-                            self.app.say(format!("Failed to update Glint: {why}."));
+                            self.app.say(format!("Failed to update Glint: {}", sentence(&why)));
                             self.invalidate();
                         }
                     }
@@ -3170,6 +3221,14 @@ impl Drop for Window {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_update_error_reads_as_one_sentence() {
+        assert_eq!(super::sentence("The download doesn't match the one on GitHub, so it was deleted. Nothing was changed."), "the download doesn't match the one on GitHub, so it was deleted. Nothing was changed.");
+        assert_eq!(super::sentence("Glint can't write to its own folder."), "Glint can't write to its own folder.");
+        assert_eq!(super::sentence("it took longer than 600 seconds"), "it took longer than 600 seconds.");
+        assert_eq!(super::sentence(""), ".");
+    }
+
     use super::*;
 
     const WORK: RECT = RECT { left: 0, top: 0, right: 1920, bottom: 1040 };
@@ -3222,4 +3281,16 @@ mod tests {
         assert_eq!((r.right - r.left, r.bottom - r.top), (size::MIN_W as i32, size::MIN_H as i32));
         assert!(fit_rect([0, 0, 800, 600], 96, 96, RECT::default()).is_none(), "no work area");
     }
+}
+
+/// What went wrong, as the end of "Failed to update Glint: ...": lowercase after the colon (unless
+/// it starts with Glint's name), and exactly one full stop at the end.
+fn sentence(why: &str) -> String {
+    let why = why.trim().trim_end_matches('.');
+    let mut out = match why.chars().next() {
+        Some(c) if !why.starts_with("Glint") => c.to_lowercase().chain(why.chars().skip(1)).collect(),
+        _ => why.to_string(),
+    };
+    out.push('.');
+    out
 }

@@ -17,7 +17,7 @@
 //!   now, and nothing else nags.
 //!
 //! **When** (`Schedule`, the main window's UPDATE_TIMER): about 30 seconds after start and then every
-//! 12 hours while Glint runs ("CheckForUpdates", on) - never while it's hidden in the background
+//! 12 hours while Glint runs (after a failed check sooner: 30 minutes, then 1, 2, 4, 8 hours) ("CheckForUpdates", on) - never while it's hidden in the background
 //! (the timer stops; when the window is back a check that's due runs 30 seconds later). Settings >
 //! About > CHECK FOR UPDATES checks at once and shows the result there. Only the main Glint checks
 //! (an extra window says so in About).
@@ -52,7 +52,8 @@
 //! finishing).
 //!
 //! `glint.exe --version` prints the version and ends (no window). `GLINT_TEST_VERSION=0.2.9` makes Glint
-//! take itself for that version (for testing; never passed on to the exe it starts).
+//! take itself for that version, and `GLINT_TEST_FINGERPRINT=sha256:<hex>` (or `none`) takes GitHub's
+//! fingerprint for that one (for testing; neither is passed on to the exe it starts).
 
 use std::ffi::{c_void, OsStr, OsString};
 use std::io::{Read, Write};
@@ -60,6 +61,7 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -103,6 +105,8 @@ pub const ANSWER_LATER: isize = 2;
 pub const ANSWER_SKIP: isize = 3;
 /// "Stop checking for updates".
 pub const ANSWER_OFF: isize = 4;
+/// The window was closed (Esc, ×, Alt+F4) while the update downloads: stop it.
+pub const ANSWER_STOP: isize = 5;
 /// The main window's timer for the next check.
 pub const UPDATE_TIMER: usize = 70;
 
@@ -293,6 +297,10 @@ pub struct Release {
     pub size: u64,
     /// A hotfix of the version Glint has (Version::hotfixed_by): the prompt can't be put off.
     pub required: bool,
+    /// The fingerprint GitHub lists for that Glint.exe (SHA-256, 64 lowercase hex digits): the
+    /// download must have exactly this one. None when GitHub lists none (older releases): then only
+    /// the size and the version are checked.
+    pub sha256: Option<String>,
 }
 
 /// Everything the windows show about updates.
@@ -305,13 +313,23 @@ pub struct Status {
     /// What the last check found, and when ("14:02").
     pub last: Option<(Found, String)>,
     /// How many checks in a row have failed (Found::Failed), the last one too; 0 after any other
-    /// result. About words GitHub being out of reach differently the longer it goes on.
+    /// result. About words GitHub being out of reach differently the longer it goes on, and the next
+    /// automatic check comes sooner (`next_check_in`).
     pub failed_in_row: u32,
+    /// While the new Glint.exe downloads: how many bytes have arrived, of how many (the update
+    /// window's bar). None before and after.
+    pub downloading: Option<(u64, u64)>,
+    /// "Update automatically" put this version in place already (`start_install` with `quiet`): it
+    /// starts the next time Glint starts, and later checks don't fetch it again.
+    pub put_in_place: Option<String>,
+    /// "Update automatically" failed: the version, and why (About shows it; the status bar only points
+    /// there, the reason being too long for it). Cleared when the next install starts.
+    pub failed_by_itself: Option<(String, String)>,
     /// What the last install brought (taken by the window).
     installed: Option<Result<PathBuf, String>>,
 }
 
-static STATUS: Mutex<Status> = Mutex::new(Status { checking: false, installing: false, last: None, failed_in_row: 0, installed: None });
+static STATUS: Mutex<Status> = Mutex::new(Status { checking: false, installing: false, last: None, failed_in_row: 0, downloading: None, put_in_place: None, failed_by_itself: None, installed: None });
 
 fn status_lock() -> std::sync::MutexGuard<'static, Status> {
     STATUS.lock().unwrap_or_else(PoisonError::into_inner)
@@ -348,7 +366,14 @@ pub fn about(main: bool, _auto: bool) -> (String, bool) {
     }
     let st = status_lock();
     let ours = ours();
-    let said = if st.installing {
+    let said = if let (Some(v), false) = (&st.put_in_place, st.installing || st.checking) {
+        format!("Current version: {ours}. Glint {v} is in place and opens the next time Glint starts.")
+    } else if let (Some((v, why)), false) = (&st.failed_by_itself, st.installing || st.checking) {
+        let why = why.trim().trim_end_matches('.');
+        let mut chars = why.chars();
+        let why: String = chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default();
+        format!("Current version: {ours}. Failed to update to Glint {v} automatically. {why}.")
+    } else if st.installing {
         "Installing the new Glint…".to_string()
     } else if st.checking {
         "Looking for a new version…".to_string()
@@ -451,12 +476,33 @@ impl Schedule {
         true
     }
 
-    /// A check is done (automatic or asked for): the next one is due in 12 hours.
+    /// A check is done (automatic or asked for): the next one is due in 12 hours - sooner when it
+    /// failed (`next_check_in`).
     pub fn checked(&mut self, hwnd: HWND) {
         if self.due.is_some() {
-            self.due = Some(Instant::now() + EVERY);
+            let wait = {
+                let st = status_lock();
+                next_check_in(st.last.as_ref().map(|(f, _)| f), st.failed_in_row)
+            };
+            if wait < EVERY {
+                log::line(&format!("update: the check failed; the next one is in {} minutes", wait.as_secs() / 60));
+            }
+            self.due = Some(Instant::now() + wait);
             self.arm(hwnd);
         }
+    }
+}
+
+/// After a failed check (offline, most likely), the next one comes this soon...
+const RETRY_FIRST: Duration = Duration::from_secs(30 * 60);
+
+/// How long until the next automatic check, after one that found `found`: 12 hours, unless it
+/// failed - then 30 minutes, doubling with each failure in a row (1 hour, 2, 4, 8), up to 12 hours.
+/// So a hotfix out while the PC was offline comes soon after it's back online.
+pub fn next_check_in(found: Option<&Found>, failed_in_row: u32) -> Duration {
+    match found {
+        Some(Found::Failed(_)) if failed_in_row > 0 => RETRY_FIRST.saturating_mul(1u32 << (failed_in_row - 1).min(8)).min(EVERY),
+        _ => EVERY,
     }
 }
 
@@ -666,6 +712,16 @@ struct AssetJson {
     size: u64,
     /// "uploaded" once it's all there.
     state: Option<String>,
+    /// Its fingerprint, "sha256:<64 hex digits>" (GitHub lists one for files uploaded since mid 2025).
+    digest: Option<String>,
+}
+
+/// The SHA-256 fingerprint in GitHub's `digest` ("sha256:AB12..."), as 64 lowercase hex digits.
+/// None for no digest, another kind, or one that isn't 64 hex digits.
+fn sha256_of_digest(digest: Option<&str>) -> Option<String> {
+    let d = digest?.trim();
+    let (kind, hex) = d.split_once(':')?;
+    (kind.eq_ignore_ascii_case("sha256") && hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| hex.to_ascii_lowercase())
 }
 
 /// `text`, cut to at most `max` bytes (at a character's edge, with "…" after it).
@@ -729,7 +785,12 @@ fn read_release(release: ReleaseJson, ours: &Version) -> Found {
     }
     let text = release.body.as_deref().unwrap_or("").trim();
     let required = ours.hotfixed_by(&theirs);
-    Found::Newer(Release { version: theirs.to_string(), changelog: shorten(text, MAX_CHANGELOG), tag: tag.to_string(), url: exe.browser_download_url.clone(), size: exe.size, required })
+    let sha256 = match std::env::var("GLINT_TEST_FINGERPRINT") {
+        // Testing: GitHub's fingerprint taken for another one ("sha256:..."), or for none ("none").
+        Ok(test) if !test.is_empty() => sha256_of_digest(Some(&test)),
+        _ => sha256_of_digest(exe.digest.as_deref()),
+    };
+    Found::Newer(Release { version: theirs.to_string(), changelog: shorten(text, MAX_CHANGELOG), tag: tag.to_string(), url: exe.browser_download_url.clone(), size: exe.size, required, sha256 })
 }
 
 /// What's new in a release (version `theirs`) for Glint at `ours`: the sections of `changelog`
@@ -841,26 +902,48 @@ pub(crate) fn exe_version(exe: &Path) -> Option<[u64; 3]> {
 
 /// Starts putting `release` in place, on a thread of its own. `owner` gets WM_APP_UPDATE /
 /// INSTALLED when it's done (`take_installed`). False if a check or another install is under way.
-pub fn start_install(owner: shell::Owner, release: Release) -> bool {
+/// `quiet` ("Update automatically"): no window asked; the new Glint.exe is put in place all the same,
+/// but this Glint keeps running - the new version opens the next time Glint starts, and its status
+/// bar says so then (`quietly_updated`).
+pub fn start_install(owner: shell::Owner, release: Release, quiet: bool) -> bool {
     {
         let mut st = status_lock();
         if st.checking || st.installing {
             return false;
         }
         st.installing = true;
+        st.failed_by_itself = None;
     }
+    STOP.store(false, Ordering::SeqCst);
+    STOPPED_BY_PERSON.store(false, Ordering::SeqCst);
     let started = shell::background("update: install", move || {
         let result = install(&release);
+        // Put in place (by the window's answer or by itself): the Glint from before stays as
+        // Glint.old.exe until the new one has been closed normally once, and the new one's first
+        // start says it's new - also when Glint was closed before it could restart (`stop_install`).
+        if let Ok(exe) = &result {
+            note_quiet_update(exe, &release.version);
+        }
         match &result {
+            Ok(exe) if quiet => {
+                log::line(&format!("update: Glint {} is in place automatically ({}); it opens the next time Glint starts", release.version, exe.display()));
+                status_lock().put_in_place = Some(release.version.clone());
+            }
             Ok(exe) => log::line(&format!("update: Glint {} is in place ({})", release.version, exe.display())),
             Err(why) => {
                 log::line(&format!("update: Glint {} couldn't be installed: {why}", release.version));
-                log::error(&format!("Updating to Glint {} didn't work: {why}", release.version));
+                // (Stopped by the person, or by closing Glint, isn't an error.)
+                if !STOP.load(Ordering::SeqCst) {
+                    log::error(&format!("Updating to Glint {} didn't work: {why}", release.version));
+                }
             }
         }
         {
             let mut st = status_lock();
             st.installing = false;
+            if let (true, Err(why)) = (quiet, &result) {
+                st.failed_by_itself = Some((release.version.clone(), why.clone()));
+            }
             st.installed = Some(result);
         }
         // SAFETY: posting to a window handle is safe even if the window is gone.
@@ -872,6 +955,51 @@ pub fn start_install(owner: shell::Owner, release: Release) -> bool {
         status_lock().installing = false;
     }
     started
+}
+
+/// Set when Glint is closing: an install that hasn't put the new Glint.exe in place yet stops, and
+/// nothing changes (`stop_install`).
+static STOP: AtomicBool = AtomicBool::new(false);
+/// Set with STOP when the person stopped the update (Esc or × on the update window while it
+/// downloads), not Glint closing: it says so instead of "Glint was closed".
+static STOPPED_BY_PERSON: AtomicBool = AtomicBool::new(false);
+/// What an install says when the person stopped it (`stop_install_now`).
+pub const STOPPED: &str = "The update was stopped. Nothing was changed.";
+
+/// Why an install stopped: the person stopped it, or Glint was closing.
+fn stopped_why() -> String {
+    format!("{} Nothing was changed.", stopped_short())
+}
+
+fn stopped_short() -> &'static str {
+    if STOPPED_BY_PERSON.load(Ordering::SeqCst) {
+        "The update was stopped."
+    } else {
+        "Glint was closed before the update was done."
+    }
+}
+
+/// The person closed the update window while it downloads (Esc, ×, Alt+F4): the install stops
+/// before it changes anything, and nothing is changed (a new Glint.exe already being put in place
+/// - a few renames - finishes). Doesn't wait.
+pub fn stop_install_now() {
+    STOPPED_BY_PERSON.store(true, Ordering::SeqCst);
+    STOP.store(true, Ordering::SeqCst);
+}
+
+/// Glint is closing (its window is gone): an install under way stops before it changes anything - or,
+/// when it's already putting the new Glint.exe in place, finishes that (a few renames). Waits for it
+/// at most `limit`. Then nothing is half done: no download left behind, and the Glint from before
+/// kept as after any update.
+pub fn stop_install(limit: Duration) {
+    STOP.store(true, Ordering::SeqCst);
+    let until = Instant::now() + limit;
+    while status_lock().installing && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if status_lock().installing {
+        log::line("update: Glint closed while an install was still under way");
+    }
 }
 
 /// Whether glint.exe is a build of its own (in a cargo `target` folder): it's built again from the
@@ -889,8 +1017,19 @@ fn install(release: &Release) -> Result<PathBuf, String> {
     }
     let expected = Version::parse(&release.version).ok_or("the new version number can't be read")?;
     let downloaded = download(release, &settings::folders().cache)?;
-    let done = install_into(&downloaded, &ours, |exe| verify(exe, &expected));
-    if done.is_ok() {
+    if STOP.load(Ordering::SeqCst) {
+        let _ = std::fs::remove_file(&downloaded);
+        return Err(stopped_why());
+    }
+    // (Stopped while the new exe was checked: still nothing changed.)
+    let done = install_into(&downloaded, &ours, |exe| {
+        verify(exe, &expected)?;
+        if STOP.load(Ordering::SeqCst) {
+            return Err(stopped_short().into());
+        }
+        Ok(())
+    });
+    if done.is_ok() || STOP.load(Ordering::SeqCst) {
         let _ = std::fs::remove_file(&downloaded);
     }
     done
@@ -906,7 +1045,11 @@ fn download(release: &Release, cache: &Path) -> Result<PathBuf, String> {
     }
     std::fs::create_dir_all(cache).map_err(|e| format!("The cache folder ({}) couldn't be made ({e}). Nothing was changed.", cache.display()))?;
     remove_downloads(cache);
-    let file = cache.join(format!("Glint-{}.exe", release.version));
+    // Written as "Glint-<version>.exe.part" and named "Glint-<version>.exe" only once it's whole and
+    // checked: a download cut off (Glint closed, the PC turned off) never looks like a whole one, and
+    // the next start clears it away (`remove_old_exes`).
+    let done = cache.join(format!("Glint-{}.exe", release.version));
+    let file = cache.join(format!("Glint-{}.exe.part", release.version));
     // Nothing else may open it while it's written (another Glint using the same cache folder).
     let mut out = std::fs::OpenOptions::new()
         .write(true)
@@ -916,13 +1059,22 @@ fn download(release: &Release, cache: &Path) -> Result<PathBuf, String> {
         .open(&file)
         .map_err(|e| format!("The new Glint.exe couldn't be saved in {} ({e}). Nothing was changed.", cache.display()))?;
     let mut written = 0u64;
+    let mut fingerprint = Sha256::new();
+    status_lock().downloading = Some((0, release.size));
     let got = get(&release.url, "", DOWNLOAD_LIMIT, |piece| {
+        if STOP.load(Ordering::SeqCst) {
+            return Err("Glint was closed before it was done".into());
+        }
         written += piece.len() as u64;
         if written > release.size {
             return Err(format!("it's bigger than GitHub said ({} bytes)", release.size));
         }
-        out.write_all(piece).map_err(|e| format!("it couldn't be saved ({e})"))
+        fingerprint.update(piece);
+        out.write_all(piece).map_err(|e| format!("it couldn't be saved ({e})"))?;
+        status_lock().downloading = Some((written, release.size));
+        Ok(())
     });
+    status_lock().downloading = None;
     let saved = out.sync_all();
     drop(out);
     let size = std::fs::metadata(&file).map_or(0, |m| m.len());
@@ -932,22 +1084,144 @@ fn download(release: &Release, cache: &Path) -> Result<PathBuf, String> {
         Ok(()) if saved.is_err() || size != release.size => Some(format!("only {size} of its {} bytes arrived", release.size)),
         Ok(()) => None,
     };
-    match problem {
-        None => Ok(file),
-        Some(why) => {
+    if let Some(why) = problem {
+        let _ = std::fs::remove_file(&file);
+        if STOP.load(Ordering::SeqCst) {
+            return Err(stopped_why());
+        }
+        return Err(format!("The new Glint.exe couldn't be downloaded: {why}. Nothing was changed."));
+    }
+    // The fingerprint GitHub lists for it: anything else is not the file that was released (changed
+    // on the way, or swapped). Without one, the size above and the version check later are all.
+    match &release.sha256 {
+        Some(want) if fingerprint.hex() != *want => {
             let _ = std::fs::remove_file(&file);
-            Err(format!("The new Glint.exe couldn't be downloaded: {why}. Nothing was changed."))
+            log::line(&format!("update: the download's fingerprint is {}, GitHub lists {want}", fingerprint.hex()));
+            Err("The download doesn't match the one on GitHub, so it was deleted. Nothing was changed.".into())
+        }
+        Some(_) => finish_download(&file, &done),
+        None => {
+            log::line(&format!("update: GitHub lists no fingerprint for Glint {}; checked by size and version only", release.version));
+            finish_download(&file, &done)
         }
     }
 }
 
-/// Deletes the downloads earlier updates left in `cache` (`Glint-<version>.exe`). One that another
-/// Glint is writing right now can't be deleted and stays.
+/// A whole, checked download gets its real name ("...exe.part" to "...exe").
+fn finish_download(part: &Path, done: &Path) -> Result<PathBuf, String> {
+    rename_patiently(part, done).map(|_| done.to_path_buf()).map_err(|e| {
+        let _ = std::fs::remove_file(part);
+        format!("The new Glint.exe couldn't be saved in {} ({e}). Nothing was changed.", done.parent().map_or(String::new(), |p| p.display().to_string()))
+    })
+}
+
+/// SHA-256 (FIPS 180-4), fed piece by piece: the fingerprint of a download, compared with the one
+/// GitHub lists for the file.
+struct Sha256 {
+    state: [u32; 8],
+    /// Bytes not yet making up a whole 64-byte block.
+    pending: Vec<u8>,
+    /// All bytes fed so far.
+    length: u64,
+}
+
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+impl Sha256 {
+    fn new() -> Sha256 {
+        Sha256 { state: [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19], pending: Vec::with_capacity(64), length: 0 }
+    }
+
+    fn update(&mut self, mut data: &[u8]) {
+        self.length += data.len() as u64;
+        if !self.pending.is_empty() {
+            let take = (64 - self.pending.len()).min(data.len());
+            self.pending.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.pending.len() < 64 {
+                return;
+            }
+            let block: [u8; 64] = self.pending[..].try_into().expect("64 bytes");
+            self.block(&block);
+            self.pending.clear();
+        }
+        let mut chunks = data.chunks_exact(64);
+        for block in &mut chunks {
+            self.block(block.try_into().expect("64 bytes"));
+        }
+        self.pending.extend_from_slice(chunks.remainder());
+    }
+
+    fn block(&mut self, block: &[u8; 64]) {
+        let mut w = [0u32; 64];
+        for (i, word) in block.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = h.wrapping_add(s1).wrapping_add(ch).wrapping_add(SHA256_K[i]).wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (s, v) in self.state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *s = s.wrapping_add(v);
+        }
+    }
+
+    /// The fingerprint of everything fed so far, as 64 lowercase hex digits.
+    fn hex(&self) -> String {
+        let mut last = Sha256 { state: self.state, pending: self.pending.clone(), length: 0 };
+        let bits = self.length.wrapping_mul(8);
+        let mut tail = vec![0x80u8];
+        while (self.pending.len() + tail.len()) % 64 != 56 {
+            tail.push(0);
+        }
+        tail.extend_from_slice(&bits.to_be_bytes());
+        last.update(&tail);
+        last.state.iter().map(|v| format!("{v:08x}")).collect()
+    }
+}
+
+/// Deletes the downloads earlier updates left in `cache` (`Glint-<version>.exe`, and cut-off ones,
+/// `...exe.part`). One that another Glint is writing right now can't be deleted and stays.
 pub(crate) fn remove_downloads(cache: &Path) {
+    remove_downloads_where(cache, |name| name.ends_with(".exe") || name.ends_with(".exe.part"));
+}
+
+/// Deletes only cut-off downloads (`Glint-<version>.exe.part`) in `cache`: a whole one stays (an
+/// update that couldn't put it in place says where it is, to copy by hand).
+fn remove_cut_off_downloads(cache: &Path) {
+    remove_downloads_where(cache, |name| name.ends_with(".exe.part"));
+}
+
+fn remove_downloads_where(cache: &Path, wanted: impl Fn(&str) -> bool) {
     let Ok(entries) = std::fs::read_dir(cache) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_lowercase();
-        if name.starts_with("glint-") && name.ends_with(".exe") && entry.file_type().is_ok_and(|t| t.is_file()) {
+        if name.starts_with("glint-") && wanted(&name) && entry.file_type().is_ok_and(|t| t.is_file()) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -1105,7 +1379,7 @@ impl Drop for Job {
 /// it wrote on its standard output, or why it failed.
 fn run(exe: &Path, args: &[&OsStr], limit: Duration) -> Result<String, String> {
     let mut cmd = Command::new(exe);
-    cmd.args(args).creation_flags(CREATE_NO_WINDOW).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).env_remove("GLINT_TEST_VERSION");
+    cmd.args(args).creation_flags(CREATE_NO_WINDOW).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).env_remove("GLINT_TEST_VERSION").env_remove("GLINT_TEST_FINGERPRINT");
     if let Some(dir) = exe.parent() {
         cmd.current_dir(dir);
     }
@@ -1167,7 +1441,7 @@ pub fn restart_after_quit(exe: PathBuf, hidden: bool) {
 pub fn restart_if_installed() {
     let Some((exe, hidden)) = RESTART.lock().unwrap_or_else(PoisonError::into_inner).take() else { return };
     let mut cmd = Command::new(&exe);
-    cmd.arg(AFTER_UPDATE).env_remove("GLINT_TEST_VERSION");
+    cmd.arg(AFTER_UPDATE).env_remove("GLINT_TEST_VERSION").env_remove("GLINT_TEST_FINGERPRINT");
     if hidden {
         cmd.arg(crate::registry::BACKGROUND_SWITCH);
     }
@@ -1192,7 +1466,11 @@ pub const AFTER_UPDATE: &str = "--after-update";
 /// `just_updated` (started with --after-update) starts that wait (KEEP_NOTE).
 pub fn remove_old_exes(just_updated: bool) {
     let Ok(ours) = std::env::current_exe() else { return };
-    shell::background("update: remove old exe", move || remove_old_exes_of(&ours, just_updated, Duration::from_secs(5)));
+    let cache = settings::folders().cache;
+    shell::background("update: remove old exe", move || {
+        remove_cut_off_downloads(&cache);
+        remove_old_exes_of(&ours, just_updated, Duration::from_secs(5))
+    });
 }
 
 /// `remove_old_exes` for the Glint at `ours`, waiting `pause` between tries.
@@ -1235,9 +1513,45 @@ fn proven(ours: &Path) {
     }
 }
 
+/// The keep note's line after an automatic update: the new version hasn't said yet that it's new.
+const ANNOUNCE: &str = "Not yet said in the status bar.";
+
+/// "Update automatically" put `version` in place as `exe`: the keep note (written now, not at the new
+/// one's first start: that start isn't --after-update) keeps the Glint from before until the new one
+/// has been closed normally once, and has the new one say at its first start that it's new.
+fn note_quiet_update(exe: &Path, version: &str) {
+    let text = format!("{version}\r\nThe Glint from before the update ({}.old.exe) is kept until Glint {version} has been closed normally once.\r\n{ANNOUNCE}\r\n", plain_stem(exe));
+    if let Err(e) = std::fs::write(keep_note(exe), text) {
+        log::line(&format!("update: couldn't write {} ({e})", keep_note(exe).display()));
+    }
+}
+
+/// At the main Glint's start: when "Update automatically" put this version in place and it hasn't said
+/// so yet, its version ("1.0.25-beta.1") - once: the note forgets it. None otherwise.
+pub fn quietly_updated() -> Option<String> {
+    let ours = std::env::current_exe().ok()?;
+    quietly_updated_at(&ours)
+}
+
+fn quietly_updated_at(ours: &Path) -> Option<String> {
+    let note = keep_note(ours);
+    let text = std::fs::read_to_string(&note).ok()?;
+    let is_ours = text.lines().next().map(str::trim) == Some(ours_version().as_str());
+    if !is_ours || is_old_exe(ours) || !text.lines().any(|l| l.trim() == ANNOUNCE) {
+        return None;
+    }
+    let kept: String = text.lines().filter(|l| l.trim() != ANNOUNCE).map(|l| format!("{l}\r\n")).collect();
+    if let Err(e) = std::fs::write(&note, kept) {
+        log::line(&format!("update: couldn't write {} ({e})", note.display()));
+    }
+    Some(ours_version())
+}
+
 /// The version this Glint is, as the keep note has it.
 fn ours_version() -> String {
-    log::VERSION.to_string()
+    // (GLINT_TEST_VERSION counts here too, so a test Glint that takes itself for an older version
+    // is told apart from the new one it put in place.)
+    ours().to_string()
 }
 
 /// "<name>.old.keep" next to `ours`: while it is there, the Glint from before the update stays.
@@ -1693,6 +2007,15 @@ mod tests {
         let mut names: Vec<String> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         names.sort();
         assert_eq!(names, vec!["Glint-folder.exe", "Glint.exe.txt", "thumbs.db"]);
+        // A cut-off download goes at the next start; a whole one stays (a failed update says where it is).
+        for name in ["Glint-0.8.0.exe.part", "Glint-0.8.0.exe", "Glint.exe.part.txt"] {
+            std::fs::write(d.join(name), b"x").unwrap();
+        }
+        remove_cut_off_downloads(&d);
+        assert!(!d.join("Glint-0.8.0.exe.part").exists() && d.join("Glint-0.8.0.exe").exists() && d.join("Glint.exe.part.txt").exists());
+        remove_downloads(&d);
+        assert!(!d.join("Glint-0.8.0.exe").exists() && d.join("Glint.exe.part.txt").exists());
+        let _ = std::fs::remove_file(d.join("Glint.exe.part.txt"));
         // An address that isn't GitHub's, or a size that makes no sense, is refused before anything
         // is asked or written.
         let release = |url: &str, size: u64| Release { version: "0.8.0".into(), url: url.into(), size, ..Default::default() };
@@ -1763,5 +2086,87 @@ mod tests {
         assert_eq!(offline(2), "Failed to reach GitHub at 18:48. Is the PC online?");
         assert_eq!(offline(3), "Failed to reach GitHub at 18:48. Try again later.");
         assert_eq!(offline(7), "Failed to reach GitHub at 18:48. Try again later.");
+        // Update automatically: what it put in place, or why it failed (whole sentences, one full stop).
+        status_lock().put_in_place = Some("99.0.0".into());
+        assert_eq!(about(true, true).0, format!("Current version: {ours}. Glint 99.0.0 is in place and opens the next time Glint starts."));
+        status_lock().put_in_place = None;
+        status_lock().failed_by_itself = Some(("99.0.0".into(), "the new Glint.exe isn't there any more. Try again.".into()));
+        assert_eq!(about(true, true).0, format!("Current version: {ours}. Failed to update to Glint 99.0.0 automatically. The new Glint.exe isn't there any more. Try again."));
+        status_lock().failed_by_itself = None;
+    }
+
+    #[test]
+    fn fingerprints_are_worked_out_right() {
+        let hex = |pieces: &[&[u8]]| {
+            let mut h = Sha256::new();
+            for p in pieces {
+                h.update(p);
+            }
+            h.hex()
+        };
+        assert_eq!(hex(&[]), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(hex(&[b"abc"]), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        let long = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+        assert_eq!(hex(&[long]), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+        // However the download arrives in pieces, the fingerprint is the same.
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i * 7 + i / 255) as u8).collect();
+        let whole = hex(&[&data]);
+        for size in [1, 63, 64, 65, 4096, 65_536] {
+            let pieces: Vec<&[u8]> = data.chunks(size).collect();
+            assert_eq!(hex(&pieces), whole, "pieces of {size}");
+        }
+    }
+
+    #[test]
+    fn githubs_fingerprint_is_read() {
+        let good = "sha256:BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD";
+        assert_eq!(sha256_of_digest(Some(good)).as_deref(), Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+        assert_eq!(sha256_of_digest(None), None);
+        assert_eq!(sha256_of_digest(Some("")), None);
+        assert_eq!(sha256_of_digest(Some("md5:900150983cd24fb0d6963f7d28e17f72")), None);
+        assert_eq!(sha256_of_digest(Some("sha256:abc")), None, "too short");
+        assert_eq!(sha256_of_digest(Some(&good.replace('A', "z"))), None, "not hex");
+        // In a release: read with the file, absent in older releases.
+        let ours = v("0.7.0");
+        let exe = asset("Glint.exe", 3_000_000, "uploaded");
+        let with = exe.replacen('{', &format!("{{\"digest\": \"{good}\", "), 1);
+        assert!(matches!(read_latest(latest_json("v0.8.0", &with).as_bytes(), &ours), Found::Newer(r) if r.sha256.as_deref() == Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")));
+        assert!(matches!(read_latest(latest_json("v0.8.0", &exe).as_bytes(), &ours), Found::Newer(r) if r.sha256.is_none()));
+    }
+
+    #[test]
+    fn a_failed_check_tries_again_sooner() {
+        let failed = Found::Failed(UNREACHABLE.into());
+        let mins = |n| next_check_in(Some(&failed), n).as_secs() / 60;
+        assert_eq!([mins(1), mins(2), mins(3), mins(4), mins(5), mins(6), mins(40)], [30, 60, 120, 240, 480, 720, 720]);
+        assert_eq!(next_check_in(Some(&Found::UpToDate("1.0.0".into())), 0), EVERY);
+        assert_eq!(next_check_in(Some(&Found::Unavailable("GitHub's limit on checks was reached".into())), 0), EVERY);
+        assert_eq!(next_check_in(None, 0), EVERY);
+    }
+
+    #[test]
+    fn an_update_automatically_says_so_once_and_keeps_the_glint_from_before() {
+        let d = test_dir("quiet");
+        let ours = d.join("Glint.exe");
+        let old = d.join("Glint.old.exe");
+        std::fs::write(&ours, b"new").unwrap();
+        std::fs::write(&old, b"old").unwrap();
+        note_quiet_update(&ours, &ours_version());
+        // The first start of the new one says it's new - once.
+        assert_eq!(quietly_updated_at(&ours), Some(ours_version()));
+        assert_eq!(quietly_updated_at(&ours), None);
+        // The Glint from before stays until the new one is closed normally.
+        let quick = Duration::from_millis(1);
+        remove_old_exes_of(&ours, false, quick);
+        assert!(old.exists());
+        proven(&ours);
+        remove_old_exes_of(&ours, false, quick);
+        assert!(!old.exists());
+        // A note for another version says nothing, and Glint.old.exe itself never says it.
+        note_quiet_update(&ours, "0.0.1");
+        assert_eq!(quietly_updated_at(&ours), None);
+        note_quiet_update(&ours, &ours_version());
+        assert_eq!(quietly_updated_at(&old), None);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

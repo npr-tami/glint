@@ -60,7 +60,7 @@ use crate::log;
 use crate::render::{FrameResult, Renderer, TextStyle};
 use crate::theme::{size, Color, Theme};
 use crate::ui::{Point, Rect};
-use crate::update::{self, Release, ANSWERED, ANSWER_LATER, ANSWER_OFF, ANSWER_SKIP, ANSWER_UPDATE, WM_APP_UPDATE};
+use crate::update::{self, Release, ANSWERED, ANSWER_LATER, ANSWER_OFF, ANSWER_SKIP, ANSWER_STOP, ANSWER_UPDATE, WM_APP_UPDATE};
 
 /// The window's title (Alt+Tab, the taskbar's thumbnails).
 const TITLE: &str = "Glint update";
@@ -90,6 +90,12 @@ const WM_APP_PROMPT_SHOW: u32 = WM_APP + 71;
 const WM_APP_PROMPT_QUIT: u32 = WM_APP + 72;
 /// Trying to draw again after the graphics card refused a frame.
 const RETRY_TIMER: usize = 1;
+/// While installing: drawing again now and then, so the download's bar moves.
+const PROGRESS_TIMER: usize = 2;
+const PROGRESS_EVERY_MS: u32 = 100;
+/// The download's bar: its height, and the room under it.
+const BAR_H: f32 = 6.0;
+const BAR_GAP: f32 = 6.0;
 /// The words of the choices (buttons in capitals, like every button of Glint's).
 const UPDATE: &str = "UPDATE";
 /// UPDATE on a required fix.
@@ -677,7 +683,10 @@ impl Prompt {
     fn status_lines(&mut self) -> Vec<String> {
         let text = match (&self.problem, self.installing) {
             (Some(p), _) => p.clone(),
-            (None, true) => "Installing… Glint restarts by itself when it's done.".to_string(),
+            (None, true) => match update::status().downloading {
+                Some((got, all)) => format!("Downloading {} of {} MB.", megabytes(got), megabytes(all)),
+                None => "Installing… Glint restarts by itself when it's done.".to_string(),
+            },
             (None, false) => return Vec::new(),
         };
         let w = self.inner_w();
@@ -686,10 +695,20 @@ impl Prompt {
         lines
     }
 
+    /// While the new Glint.exe downloads: how much has arrived, of how much (the bar).
+    fn downloading(&self) -> Option<(u64, u64)> {
+        if self.installing && self.problem.is_none() {
+            update::status().downloading
+        } else {
+            None
+        }
+    }
+
     /// The box with what's new: under the heading, above the status and the buttons.
     fn changelog_rect(&mut self) -> Rect {
         let top = size::TITLE_H + 18.0 + 28.0 + 22.0;
-        let status = self.status_lines().len() as f32 * STATUS_LINE;
+        let bar = if self.downloading().is_some() { BAR_H + BAR_GAP } else { 0.0 };
+        let status = self.status_lines().len() as f32 * STATUS_LINE + bar;
         // (A required fix has only its button; otherwise "Stop checking for updates" may sit
         // above the buttons.)
         let above = if self.required { self.buttons().1.y } else { self.off_rect().y } - 6.0;
@@ -822,6 +841,7 @@ impl Prompt {
         let required = self.required;
         let b = self.changelog_rect();
         let status = self.status_lines();
+        let downloading = self.downloading();
         let (update, later) = self.buttons();
         let skip = self.skip_rect();
         let off = self.off_rect();
@@ -858,8 +878,19 @@ impl Prompt {
         r.pop_clip();
         kit::scrollbar(r, theme, track, &self.scroller, thumb_hot, hold);
 
-        // Installing, or what went wrong.
+        // Installing (with the download's bar while it downloads), or what went wrong.
         let mut y = b.bottom() + 10.0;
+        if let Some((got, all)) = downloading {
+            let bar = Rect::new(PAD, y, w, BAR_H);
+            let radius = theme.corner(BAR_H);
+            r.fill_paint(bar, radius, &theme.bar_track_paint);
+            let part = if all > 0 { (got as f32 / all as f32).clamp(0.0, 1.0) } else { 0.0 };
+            if part > 0.0 {
+                let fill = (bar.w * part).clamp(1.0_f32.max(2.0 * radius), bar.w);
+                r.fill_round_rect(Rect::new(bar.x, bar.y, fill, bar.h), radius, theme.accent);
+            }
+            y += BAR_H + BAR_GAP;
+        }
         let status_color = if self.problem.is_some() { theme.accent } else { theme.muted };
         for line in &status {
             r.text(line, Rect::new(PAD, y, w, STATUS_LINE), &TextStyle::new(status_color).size(ksize::NOTE_FONT + 0.5));
@@ -1025,10 +1056,15 @@ impl Prompt {
                 acts.push(Act::Destroy);
             }
             Ctl::Update => {
-                // The window stays open while installing: it says how it went.
+                // The window stays open while installing: it says how it went, and shows the
+                // download's bar meanwhile.
                 self.installing = true;
                 self.problem = None;
                 self.invalidate();
+                // SAFETY: a timer on our own window.
+                unsafe {
+                    SetTimer(Some(self.hwnd), PROGRESS_TIMER, PROGRESS_EVERY_MS, None);
+                }
                 acts.push(Act::Answer(ANSWER_UPDATE));
             }
             Ctl::Later => self.dismiss(acts),
@@ -1049,6 +1085,9 @@ impl Prompt {
         }
         if self.required || !self.installing {
             acts.push(Act::Answer(ANSWER_LATER));
+        } else {
+            // Closed while it downloads: the person wants it stopped.
+            acts.push(Act::Answer(ANSWER_STOP));
         }
         acts.push(Act::Destroy);
     }
@@ -1192,6 +1231,16 @@ impl Prompt {
                 self.dismiss(&mut acts);
                 Some(LRESULT(0))
             }
+            WM_TIMER if wparam.0 == PROGRESS_TIMER => {
+                if !self.installing {
+                    // SAFETY: stops our own timer.
+                    unsafe {
+                        let _ = KillTimer(Some(self.hwnd), PROGRESS_TIMER);
+                    }
+                }
+                self.invalidate();
+                Some(LRESULT(0))
+            }
             WM_TIMER if wparam.0 == RETRY_TIMER => {
                 // SAFETY: stops our own one-off timer.
                 unsafe {
@@ -1232,6 +1281,11 @@ impl Prompt {
         };
         (result, acts)
     }
+}
+
+/// Bytes as megabytes with one decimal ("3.6").
+fn megabytes(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / (1024.0 * 1024.0))
 }
 
 /// A quiet button ("Stop checking for updates"): only its words, muted, lit and underlined under

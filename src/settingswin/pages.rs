@@ -36,6 +36,8 @@ pub const SETUP_INFO: &str = "Copies your Glint and Windows versions and the set
 
 pub const TEMP_WIN_E_FIX: &str = "On newer Windows 11, Win+E can open File Explorer instead of Glint. This keeps a tiny part of Glint running in the background (no window, no tray icon), so Win+E always opens Glint. It's temporary, until there's a proper fix.";
 
+pub const UPDATE_AUTOMATICALLY: &str = "Downloads new versions and puts them in place without the update window. The new version opens the next time Glint starts, and the status bar says so.";
+
 /// What works in this version: settings by their name in settings.json, and "@" names for the
 /// rest (buttons, things Windows keeps). Rows about anything else are hidden.
 pub const LIVE: &[&str] = &[
@@ -97,6 +99,7 @@ pub const LIVE: &[&str] = &[
     "@About",
     "@Update",
     "CheckForUpdates",
+    "UpdateAutomatically",
     "@ReportBug",
     "@BugInfo",
     "@SettingsFolder",
@@ -762,6 +765,7 @@ fn about(f: &Facts) -> Vec<Item> {
             Row::new("@About", &format!("Glint {}", crate::log::VERSION), Some("A light file explorer for Windows. This is a beta: some things may not work yet."), Ctl::None),
             Row::new("@Update", ABOUT_ROW, Some(&f.update_said), Ctl::Button(if f.update_busy { "CHECKING\u{2026}".into() } else { "CHECK NOW".into() }, Act::Update)).needs("@UpdateReady"),
             toggle("CheckForUpdates", "Check for updates automatically", None).indent(),
+            toggle("UpdateAutomatically", "Update automatically", f.info_open.filter(|k| *k == "UpdateAutomatically").map(|_| UPDATE_AUTOMATICALLY)).indent().needs("CheckForUpdates").info(),
         ]),
         Item::Heading("Help"),
         Item::Card(vec![

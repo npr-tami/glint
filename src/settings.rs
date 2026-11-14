@@ -271,6 +271,15 @@ fn settle_in(exe_dir: &Path, home: &Path, local: &Path) -> Vec<String> {
         }
     }
     let found = find_in(Some(exe_dir), home);
+    // An empty `Glint data` made by hand makes Glint portable - but only while it's empty: the first
+    // thing written into it that isn't settings (a cache folder: thumbnails, an update's download)
+    // would make the next look at it find Glint not portable, and Glint would move to %APPDATA%.
+    // Its config folder, made now, keeps it portable.
+    if found.portable && !found.config.exists() && found.config.starts_with(&portable) {
+        if let Err(e) = std::fs::create_dir_all(&found.config) {
+            problems.push(format!("Failed to make Glint's settings folder in {} ({e}).", portable.display()));
+        }
+    }
     let _ = std::fs::remove_file(found.config.join(format!("{FILE_NAME}.old")));
     // The Glint that moved the files while it ran has quit: this one goes by where they are.
     let _ = std::fs::remove_file(found.config.join(STARTED_NOTE));
@@ -1149,6 +1158,10 @@ pub struct Settings {
     /// version and says so when there is one. The update window's "Turn off automatic updates"
     /// turns it off.
     pub check_for_updates: bool,
+    /// "Update automatically": a new version an automatic check finds is downloaded and put in place
+    /// without the update window; it opens the next time Glint starts. Off unless the person turns
+    /// it on: nothing is downloaded without their say.
+    pub update_automatically: bool,
     /// Where new versions come from: a GitHub repository, as owner/name. Its newest release is
     /// tagged with the version ("v0.8.0") and has a ready-built Glint.exe attached.
     pub update_repo: String,
@@ -1280,6 +1293,7 @@ impl Default for Settings {
             update_repo: UPDATE_REPO.to_string(),
             skipped_update: None,
             remind_update_after: 0,
+            update_automatically: false,
             tabs: Vec::new(),
             active_tab: 0,
             bounds: None,
@@ -1376,6 +1390,7 @@ const CHOICES: &[&str] = &[
     "ZipIcon",
     // Updates (update.rs).
     "CheckForUpdates",
+    "UpdateAutomatically",
     "UpdateRepo",
     "SkippedUpdate",
     "RemindUpdateAfter",
@@ -2489,6 +2504,13 @@ mod tests {
         assert!(find_in(Some(&exe), &home).portable);
         std::fs::write(exe.join(PORTABLE_FOLDER).join("notes.txt"), "x").unwrap();
         assert!(!find_in(Some(&exe), &home).portable);
+        // Settled at start, an empty "Glint data" stays portable after Glint writes its cache there.
+        let _ = std::fs::remove_dir_all(exe.join(PORTABLE_FOLDER));
+        std::fs::create_dir_all(exe.join(PORTABLE_FOLDER)).unwrap();
+        let _ = settle_in(&exe, &home, &home);
+        assert!(exe.join(PORTABLE_FOLDER).join("config").is_dir());
+        std::fs::create_dir_all(exe.join(PORTABLE_FOLDER).join("cache")).unwrap();
+        assert!(find_in(Some(&exe), &home).portable, "a cache folder written into it later");
         let _ = std::fs::remove_dir_all(&base);
     }
 

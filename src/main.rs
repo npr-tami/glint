@@ -262,8 +262,14 @@ fn main() {
         app.select_when_loaded(name);
     }
     if after_update {
+        // (The note that it's new is used up here, so the next start doesn't say it again.)
+        let _ = main.then(update::quietly_updated);
         app.say(format!("Glint is updated to {}.", update::ours()));
         log::line(&format!("started after updating to {}", update::ours()));
+    } else if let Some(v) = main.then(update::quietly_updated).flatten() {
+        // "Update automatically" put this version in place while the one before was running.
+        app.say(format!("Glint is updated to {v}."));
+        log::line(&format!("first start after updating to {v} automatically"));
     }
     let hwnd = match window::create(app, window::Options { bench, started, main, hidden }) {
         Ok(h) => h,
@@ -329,6 +335,8 @@ fn main() {
     // The window is gone: the tray icon and Win+E go, and the next glint.exe becomes the main one -
     // even while this process still waits for copies to finish (`_finish_file_jobs`).
     life::shutdown();
+    // An update under way stops (or finishes putting the new Glint.exe in place): nothing half done.
+    update::stop_install(Duration::from_secs(10));
     // A normal quit: a version an update just put in place has proven itself (update.rs).
     if main {
         update::session_ended_cleanly();

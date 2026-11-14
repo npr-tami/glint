@@ -2,6 +2,17 @@
 
 The newest version is at the top.
 
+## 1.0.25-beta.1 · 14/11/2026 03:37
+
+- Added Update automatically in Settings > About
+- Added a download bar to the update window
+- Changed Esc and × in the update window to stop a download
+- Fixed a portable Glint losing its settings after an update
+- Fixed closing Glint during an update
+- Improved update safety
+- Improved update checks
+- Some other improvements and bugfixes
+
 ## 1.0.24-beta.5 · 12/11/2026 20:05
 
 - Added searching inside files: type words in quotes in the search bar, like "hello world"
