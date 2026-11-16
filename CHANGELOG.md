@@ -2,6 +2,10 @@
 
 The newest version is at the top.
 
+## 26.11.3 · 16/11/2026 09:31
+
+- Renamed some settings to be more consistent
+
 ## 26.11.2 · 14/11/2026 23:12
 
 - Changed the Skins window: every setting is now in the section of the part it changes, with clearer names

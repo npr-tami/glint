@@ -3,16 +3,44 @@
 //! so a test driver can work Glint through window messages and take pictures of it (PrintWindow)
 //! while the person keeps working. Off unless the variable is set; a normal start never sees it.
 
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::OnceLock;
+
+use windows::core::w;
+use windows::Win32::Graphics::Gdi::InvalidateRect;
 
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, SetWindowsHookExW, CBT_CREATEWNDW, CWPRETSTRUCT, HCBT_CREATEWND, SetForegroundWindow, WH_CALLWNDPROC, WH_CALLWNDPROCRET, WH_CBT, CWPSTRUCT, WINDOWPOS, WM_WINDOWPOSCHANGING, SWP_NOACTIVATE, WM_CREATE,
+    CallNextHookEx, RegisterWindowMessageW, SetWindowsHookExW, CBT_CREATEWNDW, CWPRETSTRUCT, HCBT_CREATEWND, SetForegroundWindow, WH_CALLWNDPROC, WH_CALLWNDPROCRET, WH_CBT, CWPSTRUCT, WINDOWPOS, WM_WINDOWPOSCHANGING, SWP_NOACTIVATE, WM_CREATE,
     WM_SHOWWINDOW, WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, GetWindowLongW, GWL_STYLE,
 };
+
+/// A window a test driver asked a picture of (0: none). See `take`.
+static WANTED: AtomicIsize = AtomicIsize::new(0);
+
+/// The message a test driver sends a window for a picture of it ("GlintTestShot"). Since a Windows
+/// update (15 Nov 2026) PrintWindow of a hidden window comes back white, so Glint saves the picture
+/// itself: the window's next frame is copied to `shot_path` (a .bmp, only Glint's own drawing; the
+/// driver adds the text boxes).
+fn shot_message() -> u32 {
+    static M: OnceLock<u32> = OnceLock::new();
+    // SAFETY: a constant, NUL-terminated name.
+    *M.get_or_init(|| unsafe { RegisterWindowMessageW(w!("GlintTestShot")) })
+}
+
+/// Where the picture goes: glint-shot.bmp in %TEMP% (the test copy's own temp folder).
+pub fn shot_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("TEMP").map(|t| std::path::Path::new(&t).join("glint-shot.bmp"))
+}
+
+/// Whether the frame being drawn for `hwnd` should be saved as the asked-for picture (asked once,
+/// answered once).
+pub fn take(hwnd: HWND) -> bool {
+    on() && WANTED.compare_exchange(hwnd.0 as isize, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+}
 
 /// Whether this Glint runs hidden for a test driver.
 pub fn on() -> bool {
@@ -101,6 +129,10 @@ unsafe extern "system" fn placing(code: i32, wparam: WPARAM, lparam: LPARAM) -> 
     unsafe {
         if code >= 0 && lparam.0 != 0 {
             let m = &*(lparam.0 as *const CWPSTRUCT);
+            if m.message == shot_message() && m.message != 0 {
+                WANTED.store(m.hwnd.0 as isize, Ordering::SeqCst);
+                let _ = InvalidateRect(Some(m.hwnd), None, false);
+            }
             if m.message == WM_WINDOWPOSCHANGING && m.lParam.0 != 0 && top_level(m.hwnd) {
                 let wp = &mut *(m.lParam.0 as *mut WINDOWPOS);
                 wp.flags |= SWP_NOACTIVATE;

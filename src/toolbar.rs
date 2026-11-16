@@ -196,7 +196,7 @@ impl Toolbar {
     /// Creates the toolbar and its (hidden) text boxes as children of the main window.
     pub fn new(hwnd: HWND) -> Toolbar {
         let filter_box = TextBox::new(hwnd, FILTER_BOX);
-        filter_box.set_hint("Filter");
+        filter_box.set_hint("Search bar");
         // Window shortcuts (Ctrl+Shift+F, Ctrl+T...) work while typing in these boxes too.
         filter_box.pass_shortcuts();
         let path_box = TextBox::new(hwnd, PATH_BOX);
@@ -678,7 +678,7 @@ impl Toolbar {
                 MenuItem::new(SET_WINDOW, "Settings\u{2026}\tCtrl+,"),
                 MenuItem::new(SET_ABOUT, "About Glint\u{2026}"),
                 MenuItem::separator(),
-                MenuItem::new(SET_QUIT, "Quit Glint\tCtrl+Q"),
+                MenuItem::new(SET_QUIT, "Exit Glint\tCtrl+Q"),
             ],
         })
     }
@@ -751,7 +751,7 @@ impl Toolbar {
     /// The filter's words (or its grey hint) where Windows' box would show them.
     fn paint_filter_words(&self, r: &mut Renderer, theme: &Theme, app: &AppState) {
         let words = &app.tab().filter;
-        let (text, color) = if words.is_empty() { (if self.hint_subfolders { "Search subfolders" } else { "Filter" }, theme.muted) } else { (words.as_str(), theme.text) };
+        let (text, color) = if words.is_empty() { (if self.hint_subfolders { "Search subfolders" } else { "Search bar" }, theme.muted) } else { (words.as_str(), theme.text) };
         // (Where Windows' box puts its first letter: its font's edge sits 3 DIPs in.)
         let at = self.filter_edit_rect();
         r.text(text, Rect::new(at.x + 3.0, at.y, (at.w - 3.0).max(0.0), at.h), &TextStyle::new(color));
@@ -1315,7 +1315,7 @@ impl Component for Toolbar {
         let subfolders = app.subfolders && !tab.path.is_empty();
         if subfolders != self.hint_subfolders {
             self.hint_subfolders = subfolders;
-            self.filter_box.set_hint(if subfolders { "Search subfolders" } else { "Filter" });
+            self.filter_box.set_hint(if subfolders { "Search subfolders" } else { "Search bar" });
         }
         now < self.repaint_until
     }

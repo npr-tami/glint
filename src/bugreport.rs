@@ -63,7 +63,7 @@ pub fn text(values: &Map<String, Value>, skins: &[(String, String, String)], m: 
         "restore" => "Tabs from last time",
         "thispc" => "This PC",
         "folder" => "A specific folder",
-        _ => "Home folder",
+        _ => "User folder",
     };
     let errors = match &m.errors {
         (0, _) => "none".to_string(),

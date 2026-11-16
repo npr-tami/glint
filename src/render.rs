@@ -514,6 +514,9 @@ impl Renderer {
             self.pop_clip();
         }
         let Some(t) = &self.target else { return FrameResult::DeviceLost };
+        if crate::testhide::take(self.hwnd) {
+            let _ = save_test_shot(&t.rt);
+        }
         // SAFETY: matches the BeginDraw in `begin`.
         match unsafe { t.rt.EndDraw(None, None) } {
             Ok(()) => {
@@ -1961,4 +1964,53 @@ mod tests {
         warm_up_done();
         warm_up_done(); // twice is fine
     }
+}
+
+/// A test copy run hidden (testhide.rs): the frame drawn so far, saved as a 32-bit .bmp for the
+/// test driver (PrintWindow can't see a hidden window's drawing).
+fn save_test_shot(rt: &ID2D1HwndRenderTarget) -> Result<()> {
+    use windows::Win32::Graphics::Direct2D::{D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_CPU_READ, D2D1_BITMAP_PROPERTIES1, D2D1_MAP_OPTIONS_READ};
+    let Some(path) = crate::testhide::shot_path() else { return Ok(()) };
+    // SAFETY: the bitmap is made, filled, read and let go here; the mapped bits are read only
+    // between Map and Unmap, within the pitch and size Direct2D gives.
+    unsafe {
+        let dc: ID2D1DeviceContext = rt.cast()?;
+        let size = rt.GetPixelSize();
+        let props = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: rt.GetPixelFormat(),
+            dpiX: 96.0,
+            dpiY: 96.0,
+            bitmapOptions: D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            colorContext: std::mem::ManuallyDrop::new(None),
+        };
+        let bmp = dc.CreateBitmap(size, None, 0, &props)?;
+        rt.Flush(None, None)?;
+        bmp.CopyFromRenderTarget(None, rt, None)?;
+        let m = bmp.Map(D2D1_MAP_OPTIONS_READ)?;
+        let (w, h) = (size.width as usize, size.height as usize);
+        let mut out = Vec::with_capacity(54 + w * h * 4);
+        let le32 = |v: &mut Vec<u8>, x: u32| v.extend_from_slice(&x.to_le_bytes());
+        out.extend_from_slice(b"BM");
+        le32(&mut out, (54 + w * h * 4) as u32);
+        le32(&mut out, 0);
+        le32(&mut out, 54);
+        le32(&mut out, 40);
+        le32(&mut out, w as u32);
+        le32(&mut out, (-(h as i32)) as u32); // top-down rows
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&32u16.to_le_bytes());
+        for _ in 0..6 {
+            le32(&mut out, 0);
+        }
+        for y in 0..h {
+            let row = std::slice::from_raw_parts(m.bits.add(y * m.pitch as usize), w * 4);
+            out.extend_from_slice(row);
+        }
+        let _ = bmp.Unmap();
+        let tmp = path.with_extension("part");
+        if std::fs::write(&tmp, &out).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+    Ok(())
 }

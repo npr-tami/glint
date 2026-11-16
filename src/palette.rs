@@ -160,7 +160,7 @@ pub fn actions(app: &AppState) -> Vec<Item> {
         Item::new("Select by pattern\u{2026}", "", Action::Fill("*.")),
         Item::new("Copy path", "Ctrl+Shift+C", Run(Command::CopyPath)).guide(G::Files, "Copies where the selected items are, as text"),
         Item::new("Type a path", "Ctrl+L", Run(Command::EditPath)).guide(G::Places, "Puts the cursor in the address bar"),
-        Item::new("Filter", "Ctrl+F", Run(Command::FocusFilter)).guide(G::Select, "Shows only the items with what you type in their name"),
+        Item::new("Search bar", "Ctrl+F", Run(Command::FocusFilter)).guide(G::Select, "Shows only the items with what you type in their name"),
         Item::new(if s.show_hidden { "Stop showing hidden files" } else { "Show hidden files" }, "Ctrl+H", Run(Command::ToggleHidden)).guide(G::View, "The files Windows keeps out of sight"),
         Item::new(&show_hide(s.show_sidebar, "sidebar"), "Ctrl+B", Run(Command::ToggleSidebar)).guide(G::View, "The list of places on the left"),
         Item::new(&show_hide(s.show_status_bar, "status bar"), "", Run(Command::ShowStatusBar(!s.show_status_bar))).guide(G::View, "The line at the bottom that counts the items"),
@@ -219,8 +219,8 @@ pub fn actions(app: &AppState) -> Vec<Item> {
     v.push(Item::new(&on_off(s.folder_sizes, "folder sizes"), "", Action::FolderSizes(!s.folder_sizes)).guide(G::View, about));
     v.push(Item::new("Find duplicates", "", Run(Command::FindDuplicates)).guide(G::Files, "Finds files that are exact copies of each other"));
     v.push(match app.subfolders {
-        true => Item::new("Stop searching subfolders", "Ctrl+Shift+F", Run(Command::ToggleSubfolders)).guide(G::Select, "The filter looks only in this folder"),
-        false => Item::new("Search subfolders", "Ctrl+Shift+F", Run(Command::ToggleSubfolders)).guide(G::Select, "The filter also looks inside the folders here"),
+        true => Item::new("Stop searching subfolders", "Ctrl+Shift+F", Run(Command::ToggleSubfolders)).guide(G::Select, "The search bar looks only in this folder"),
+        false => Item::new("Search subfolders", "Ctrl+Shift+F", Run(Command::ToggleSubfolders)).guide(G::Select, "The search bar also looks inside the folders here"),
     });
     v.push(Item::new("Rename all\u{2026}", "F2", Action::RenameMany).guide(G::Files, "Renames all the selected items at once"));
     v.push(Item::new("Properties", "Alt+Enter", Run(Command::Properties)).guide(G::Files, "Opens Windows' Properties window"));
@@ -237,7 +237,7 @@ pub fn actions(app: &AppState) -> Vec<Item> {
     }
     v.push(Item::new("Light or dark", "Ctrl+Shift+L", Run(Command::ToggleTheme)).guide(G::View, "Switches between the light and dark look"));
     v.push(Item::new("Settings", "Ctrl+,", Run(Command::OpenSettings(None))).guide(G::Glint, "Opens Glint's settings"));
-    v.push(Item::new("Quit Glint", "Ctrl+Q", Run(Command::Quit)).guide(G::Glint, "Closes Glint completely"));
+    v.push(Item::new("Exit Glint", "Ctrl+Q", Run(Command::Quit)).guide(G::Glint, "Closes Glint completely"));
     v.push(Item::new("Help", "", Action::Fill("?")));
     // Every setting, by its title: Settings opens at it. (The guide has one line for them all.)
     for (title, page) in crate::settingswin::findable(&app.settings) {

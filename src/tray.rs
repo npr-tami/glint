@@ -175,7 +175,7 @@ fn menu(door: HWND) -> Option<Request> {
         if let Ok(h) = CreatePopupMenu() {
             let _ = AppendMenuW(h, MF_STRING, PICK_OPEN, w!("Open Glint"));
             let _ = AppendMenuW(h, MF_SEPARATOR, 0, PCWSTR::null());
-            let _ = AppendMenuW(h, MF_STRING, PICK_QUIT, w!("Quit Glint"));
+            let _ = AppendMenuW(h, MF_STRING, PICK_QUIT, w!("Exit Glint"));
             let _ = SetMenuDefaultItem(h, PICK_OPEN as u32, 0);
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);

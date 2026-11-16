@@ -30,7 +30,7 @@ pub const PAGES: [&str; 5] = ["General", "Appearance", "Files", "Keys", "About"]
 pub const ABOUT: usize = 4;
 pub const ABOUT_ROW: &str = "Updates";
 
-/// Why "Temp Win+E Fix" is there, behind its (i).
+/// Why "Temp Win+E fix" is there, behind its (i).
 /// The (i) next to "Setup info" in About.
 pub const SETUP_INFO: &str = "Copies your Glint and Windows versions and the settings that change how Glint works. Paste it into a bug report: then whoever looks at the bug can set up Glint the same way and see it happen. No file, folder, user or PC names are included.";
 
@@ -269,7 +269,7 @@ pub fn after_change(key: &str, before: &Settings, app: &mut AppState) -> Option<
         "StayRunning" => {
             let on = app.settings.stay_running;
             life::apply_stay_running(&mut app.settings, on);
-            app.say(if on { "Closing now hides Glint (Ctrl+Q quits)." } else { "Closing now quits Glint." });
+            app.say(if on { "Closing now hides Glint (Ctrl+Q exits)." } else { "Closing now exits Glint." });
             None
         }
         "TrayIcon" => {
@@ -585,17 +585,20 @@ fn general(f: &Facts) -> Vec<Item> {
         .collect();
     // As File Explorer's Folder Options: a group's title asks, its round buttons and ticks answer.
     vec![
-        Item::Heading(""),
+        Item::Heading("Startup"),
         Item::Card(vec![
-            choice("Startup", "Open Glint to", None, &[(S("restore"), "Tabs from last time"), (S("home"), "Home folder"), (S("thispc"), "This PC"), (S("folder"), "A specific folder")]).long(),
+            choice("Startup", "Open Glint to", None, &[(S("restore"), "Tabs from last time"), (S("home"), "User folder"), (S("thispc"), "This PC"), (S("folder"), "A specific folder")]).long(),
             Row::new("StartupFolder", "", None, Ctl::Folder).only_if("Startup", S("folder")),
-            choice("HomeOpens", "Home opens", None, &[(S("page"), "Home page (like File Explorer)"), (S("folder"), "Your user folder")]).long().more(),
-            choice("HomeColumns", "Tiles in a row", None, &[(Val::N(2.0), "Up to 2"), (Val::N(3.0), "Up to 3"), (Val::N(4.0), "Up to 4"), (Val::N(5.0), "Up to 5"), (Val::N(6.0), "Up to 6")]).only_if("HomeOpens", S("page")).more(),
-            choice("HomeTiles", "Tile size", None, &[(S("small"), "Small"), (S("normal"), "Normal"), (S("large"), "Large")]).only_if("HomeOpens", S("page")).more(),
             toggle("RememberSplit", "Reopen split view", None).more(),
         ]),
+        Item::Heading("Home page"),
+        Item::Card(vec![
+            choice("HomeOpens", "Home opens", None, &[(S("page"), "Home page"), (S("folder"), "User folder")]).long().more(),
+            choice("HomeColumns", "Home columns", None, &[(Val::N(2.0), "Up to 2"), (Val::N(3.0), "Up to 3"), (Val::N(4.0), "Up to 4"), (Val::N(5.0), "Up to 5"), (Val::N(6.0), "Up to 6")]).only_if("HomeOpens", S("page")).more(),
+            choice("HomeTiles", "Home icon size", None, &[(S("small"), "Small"), (S("normal"), "Medium"), (S("large"), "Large")]).only_if("HomeOpens", S("page")).more(),
+        ]),
         Item::Heading("New tabs"),
-        Item::Card(vec![choice("NewTab", "", None, &[(S("same"), "Open the current folder"), (S("home"), "Open Home"), (S("thispc"), "Open This PC")]).radios()]),
+        Item::Card(vec![choice("NewTab", "", None, &[(S("same"), "Current folder"), (S("home"), "Home"), (S("thispc"), "This PC")]).radios()]),
         Item::Heading("Opening items"),
         Item::Card(vec![
             choice("SingleClick", "", None, &[(B(true), "Single-click to open"), (B(false), "Double-click to open")]).radios(),
@@ -606,14 +609,14 @@ fn general(f: &Facts) -> Vec<Item> {
         Item::Heading("Background"),
         Item::Card(vec![
             toggle("StayRunning", "Keep running when closed", None),
-            toggle("TrayIcon", "Show tray icon", None).indent().needs("StayRunning"),
+            toggle("TrayIcon", "Tray icon", None).indent().needs("StayRunning"),
             toggle("StartWithWindows", "Start with Windows", None),
         ]),
         Item::Heading("Default file explorer"),
         Item::Card(vec![
             toggle("@Folders", "Open folders and drives in Glint", None),
             toggle("@WinE", "Win+E opens Glint", None),
-            toggle("WinEAfterQuit", "Temp Win+E Fix", f.info_open.filter(|k| *k == "WinEAfterQuit").map(|_| TEMP_WIN_E_FIX)).indent().needs("@WinE").info(),
+            toggle("WinEAfterQuit", "Temp Win+E fix", f.info_open.filter(|k| *k == "WinEAfterQuit").map(|_| TEMP_WIN_E_FIX)).indent().needs("@WinE").info(),
         ]),
         Item::Heading("Right-click menu"),
         Item::Card(vec![
@@ -646,10 +649,10 @@ fn look(f: &Facts) -> Vec<Item> {
         Item::Heading("Skin"),
         Item::Card(vec![
             Row::new("Skin", "", None, Ctl::Choice("Skin", skin_choices(f))).long(),
-            choice("Theme", "Light or dark", None, &[(S("system"), "Same as Windows"), (S("light"), "Light"), (S("dark"), "Dark")]).radios(),
+            choice("Theme", "Light or dark", None, &[(S("system"), "System"), (S("light"), "Light"), (S("dark"), "Dark")]).radios(),
             choice("ZipIcon", "Zip icon", None, &[(S("label"), "Red label"), (S("folder"), "Folder"), (S("page"), "Page"), (S("glint"), "Glint icon")]).long().more(),
             Row::new("@SkinEditor", "Skins", None, Ctl::Button("EDIT\u{2026}".into(), Act::SkinEditor)),
-            choice("SkinsWindow", "Skins window", None, &[(S("compact"), "One column"), (S("slim"), "Slim"), (S("wide"), "Wide")]).long(),
+            choice("SkinsWindow", "Skin editor", None, &[(S("compact"), "Compact"), (S("slim"), "Slim"), (S("wide"), "Wide")]).long(),
         ]),
         Item::Heading("Layout"),
         Item::Card(vec![
@@ -663,9 +666,17 @@ fn look(f: &Facts) -> Vec<Item> {
             choice("Size", "Row size", None, &[(S("small"), "Small"), (S("medium"), "Medium"), (S("large"), "Large")]).radios(),
             toggle("ShowSidebar", "Sidebar", None),
             toggle("ShowDetails", "Details panel", None),
+            choice(
+                "DetailsWidth",
+                "Details panel width",
+                None,
+                &[(Val::N(0.0), "Default (280)"), (Val::N(240.0), "240"), (Val::N(300.0), "300"), (Val::N(340.0), "340"), (Val::N(400.0), "400"), (Val::N(480.0), "480")],
+            )
+            .long()
+            .more(),
             toggle("ShowStatusBar", "Status bar", None),
         ]),
-        Item::Heading("Status bar and details"),
+        Item::Heading("Status bar"),
         Item::Card(vec![
             toggle("StatusCount", "Number of items", None).needs("ShowStatusBar").more(),
             toggle("StatusSelected", "Size of what\u{2019}s selected", None).needs("ShowStatusBar").more(),
@@ -674,14 +685,6 @@ fn look(f: &Facts) -> Vec<Item> {
             toggle("StatusOpened", "How fast the folder opened", None).needs("ShowStatusBar").more(),
             toggle("StatusStarted", "How fast Glint started", None).needs("ShowStatusBar").more(),
             toggle("StatusMemory", "Memory use", None).needs("ShowStatusBar").more(),
-            choice(
-                "DetailsWidth",
-                "Details panel width",
-                None,
-                &[(Val::N(0.0), "Standard (280)"), (Val::N(240.0), "240"), (Val::N(300.0), "300"), (Val::N(340.0), "340"), (Val::N(400.0), "400"), (Val::N(480.0), "480")],
-            )
-            .long()
-            .more(),
         ]),
         // The window's own choices, together and last, so they never get in the way.
         Item::Heading("Settings window"),
@@ -691,7 +694,7 @@ fn look(f: &Facts) -> Vec<Item> {
             choice("SettingsStyle", "Choices look like", None, &[(S("ticks"), "Ticks and dots"), (S("sentences"), "Sentences")]).long(),
             choice("SettingsShow", "Show", None, &[(S("all"), "All settings"), (S("basic"), "Basic first")]).long(),
             choice("SettingsSkins", "Skins as", None, &[(S("list"), "Drop-down"), (S("tiles"), "Tiles")]).long(),
-            toggle("SettingsSearch", "Search box", None),
+            toggle("SettingsSearch", "Search bar", None),
             toggle("SettingsDots", "Dot on changed settings", None),
             toggle("SettingsReset", "Reset page button", None),
             toggle("SettingsLastPage", "Reopen on the last page", None),
@@ -713,7 +716,7 @@ fn files() -> Vec<Item> {
         Item::Card(vec![column("modified", "Date modified"), column("created", "Date created"), column("type", "Type"), column("size", "Size"), column("dimensions", "Picture size"), column("length", "Length")]),
         Item::Heading("Dates and sizes"),
         Item::Card(vec![
-            choice("DateFormat", "Dates", None, &[(S("default"), "Windows default"), (S("relative"), "Relative (Today, Yesterday…)"), (S("iso"), "Year first (2026-10-06 14:32)")]).more(),
+            choice("DateFormat", "Dates", None, &[(S("default"), "System"), (S("relative"), "Relative (Today, Yesterday…)"), (S("iso"), "Year first (2026-10-06 14:32)")]).more(),
             choice("SizeFormat", "Sizes", None, &[(S("auto"), "Automatic (KB, MB, GB)"), (S("kb"), "Always in KB")]).more(),
         ]),
         Item::Heading("Sorting and views"),
@@ -738,7 +741,7 @@ fn keys_page() -> Vec<Item> {
             keys("@Keys", "Ctrl+T / Ctrl+W", "New tab / close tab"),
             keys("@Keys", "Ctrl+Shift+T", "Reopen closed tab"),
             keys("@Keys", "Ctrl+L or F4", "Type a path"),
-            keys("@Keys", "Ctrl+F", "Filter"),
+            keys("@Keys", "Ctrl+F", "Search bar"),
             keys("@Search", "Ctrl+Shift+F", "Search subfolders"),
             keys("@Keys", "Ctrl+Z / Ctrl+Y", "Undo / redo"),
             keys("@Keys", "F2", "Rename"),
@@ -756,7 +759,7 @@ fn keys_page() -> Vec<Item> {
             keys("@DiskUsage", "Ctrl+Shift+U", "Disk space"),
             keys("@Keys", "Ctrl+,", "Settings"),
             keys("@Keys", "Ctrl+U", "Command box"),
-            keys("@Keys", "Ctrl+Q", "Quit Glint"),
+            keys("@Keys", "Ctrl+Q", "Exit Glint"),
         ]),
     ]
 }
@@ -942,7 +945,7 @@ mod tests {
         assert_eq!(choices[6].0, Val::S("file:Moss"));
         let theme = rows(&items).find(|r| r.key == "Theme").unwrap();
         let Ctl::Choice(_, modes) = &theme.ctl else { panic!() };
-        assert_eq!(modes[0], (Val::S("system"), "Same as Windows".to_string()));
+        assert_eq!(modes[0], (Val::S("system"), "System".to_string()));
         let editor = rows(&items).find(|r| r.key == "@SkinEditor").unwrap();
         assert_eq!(editor.ctl, Ctl::Button("EDIT\u{2026}".into(), Act::SkinEditor));
     }
@@ -957,7 +960,7 @@ mod tests {
         }
         let keys = page(3, &facts(&values));
         assert!(rows(&keys).any(|r| r.key == "@DiskUsage" && r.title == "Ctrl+Shift+U"));
-        assert!(rows(&keys).any(|r| r.title == "Ctrl+Q" && r.ctl == Ctl::Text("Quit Glint")));
+        assert!(rows(&keys).any(|r| r.title == "Ctrl+Q" && r.ctl == Ctl::Text("Exit Glint")));
         assert!(!rows(&page(ABOUT, &facts(&values))).any(|r| r.key == "@Discord"));
         assert_eq!(title_of("StayRunning").as_deref(), Some("Keep running when closed"));
         assert_eq!(title_of("NewTab").as_deref(), Some("New tabs"), "round buttons go by their group");

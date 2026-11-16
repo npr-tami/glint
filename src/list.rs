@@ -1280,7 +1280,7 @@ impl ListView {
             MenuItem::submenu(
                 "Dates",
                 vec![
-                    MenuItem::new(HEAD_DATE_DEFAULT, &format!("Windows default ({})", folder::format_date(now)).replace('&', "&&"))
+                    MenuItem::new(HEAD_DATE_DEFAULT, &format!("System ({})", folder::format_date(now)).replace('&', "&&"))
                         .checked(s.date_format == DateFormat::Default),
                     date(HEAD_DATE_RELATIVE, "Relative", DateFormat::Relative, earlier),
                     date(HEAD_DATE_ISO, "Year first", DateFormat::Iso, now),
