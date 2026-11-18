@@ -582,6 +582,10 @@ pub fn main_started(zip_icon: ZipIcon, win_e_after_quit: bool) {
     let Some(door) = door() else { return };
     if registry::win_e_on(&Places::current(), &exe) {
         winekey::start(door);
+        // Newer Windows 11: Win+E goes to Glint's registry key again (directlaunch.rs).
+        if !testing_without_registry() {
+            crate::directlaunch::keep_released(win_e_on);
+        }
     }
     // Looking at the old place may wait on a network drive, so not on this thread. Win+E is looked
     // at again afterwards: a repaired registry may point at this glint.exe now. Zip and 7z files that
@@ -716,6 +720,9 @@ pub fn apply_win_e(on: bool) -> Result<(), String> {
     registry::set_win_e(&Places::current(), on, &exe)?;
     // The catcher follows ("Temp Win+E Fix" only works with Win+E on).
     crate::catcher::sync(on && crate::catcher::setting_on());
+    if on && !testing_without_registry() {
+        crate::directlaunch::keep_released(win_e_on);
+    }
     match door() {
         Some(door) if on => winekey::start(door),
         Some(_) => winekey::stop(),

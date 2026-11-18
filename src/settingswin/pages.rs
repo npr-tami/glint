@@ -34,7 +34,7 @@ pub const ABOUT_ROW: &str = "Updates";
 /// The (i) next to "Setup info" in About.
 pub const SETUP_INFO: &str = "Copies your Glint and Windows versions and the settings that change how Glint works. Paste it into a bug report: then whoever looks at the bug can set up Glint the same way and see it happen. No file, folder, user or PC names are included.";
 
-pub const TEMP_WIN_E_FIX: &str = "On newer Windows 11, Win+E can open File Explorer instead of Glint. This keeps a tiny part of Glint running in the background (no window, no tray icon), so Win+E always opens Glint. It's temporary, until there's a proper fix.";
+pub const TEMP_WIN_E_FIX: &str = "Windows 11 sometimes takes Win+E back for File Explorer, like after a restart. This keeps a small part of Glint running in the background so Win+E keeps opening Glint, even when Glint is closed.";
 
 pub const UPDATE_AUTOMATICALLY: &str = "Downloads new versions and puts them in place without the update window. The new version opens the next time Glint starts, and the status bar says so.";
 

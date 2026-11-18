@@ -58,6 +58,7 @@ mod dragdrop;
 mod droplist;
 mod diskpage;
 mod diskspace;
+mod directlaunch;
 mod dupes;
 mod fileops;
 mod folder;

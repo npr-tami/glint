@@ -2,6 +2,10 @@
 
 The newest version is at the top.
 
+## 26.11.4 · 18/11/2026 12:19
+
+- Changed how Temp Win+E fix works
+
 ## 26.11.3 · 16/11/2026 09:31
 
 - Renamed some settings to be more consistent

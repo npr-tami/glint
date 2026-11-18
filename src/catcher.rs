@@ -1,14 +1,17 @@
-//! "Win+E after quitting" (Settings > General, under "Win+E opens Glint"): a tiny glint.exe that
-//! only catches Win+E, so Win+E opens Glint even after Ctrl+Q.
+//! "Temp Win+E fix" (Settings > General, under "Win+E opens Glint"): a tiny glint.exe that keeps
+//! Win+E pointed at Glint even after Ctrl+Q.
 //!
-//! Why: newer Windows 11 (seen on 25H2, build 26200) no longer reads the registry key that "Win+E
-//! opens Glint" sets (registry.rs): Win+E goes straight to File Explorer's own start place. The
-//! running Glint still catches Win+E itself (winekey.rs), so this keeps a catcher running when
-//! Glint doesn't: `glint.exe --win-e-catcher`, no window on screen, no tray icon, a few MB.
+//! Why: newer Windows 11 (seen on 25H2, build 26200) hands Win+E to File Explorer's own "direct
+//! launch" window before the registry key that "Win+E opens Glint" sets (registry.rs). Taking that
+//! away gives Win+E back to the key (directlaunch.rs), but Explorer puts it back each time it starts
+//! (sign-in, an Explorer restart). So this keeps running when Glint doesn't and takes it away again
+//! each time: `glint.exe --win-e-catcher`, no window on screen, no tray icon, no keyboard hook, no
+//! admin, a few MB. (Until 17 Nov 2026 it caught Win+E with a keyboard hook, which Windows blinds
+//! while an admin app is in front.)
 //!
 //! - It starts with Windows (its own Run value, "Glint Win+E"), and the main Glint starts it too when
 //!   it isn't running (at start, and when the setting is switched on). Ctrl+Q leaves it running.
-//! - On Win+E: the main Glint (if one runs) is asked to open a window; otherwise glint.exe starts.
+//! - On Win+E: Explorer runs Glint's registry key (glint.exe starts, and hands over to a running Glint).
 //! - Every half minute it checks the setting and Win+E are still on (switched off in any way, it
 //!   ends) and that its glint.exe wasn't replaced by an update (then the new one takes over).
 //! - Switching the setting (or Win+E) off ends it and removes its Run value.
@@ -230,7 +233,10 @@ pub fn run() {
             return;
         };
         WINDOW.store(window.0 as isize, Ordering::SeqCst);
-        winekey::start(window);
+        // No keyboard hook: Explorer itself gets Win+E (also in admin apps) and runs Glint's registry
+        // key, once File Explorer's direct launch is taken away - here, each time Explorer puts it
+        // back (directlaunch.rs).
+        crate::directlaunch::keep_released(life::win_e_on);
         SetTimer(Some(window), CHECK_TIMER, CHECK_EVERY, None);
         life::trim_memory();
         let born = exe_time(&exe);
@@ -269,7 +275,6 @@ pub fn run() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        winekey::stop();
         let _ = KillTimer(Some(window), CHECK_TIMER);
         replaced
     };
