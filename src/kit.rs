@@ -1,14 +1,16 @@
 //! A small kit of controls drawn by Glint, for Glint's own windows: the Settings window, the skin
 //! customiser, the sort order editor, the update window and the question box. Everything is in the
-//! skin's look (theme.rs): switches and buttons have the shape of SORT and SETTINGS (slanted in AMD
-//! Radeon, square in NVIDIA, or rounded), and there is one accent colour.
+//! skin's look (theme.rs): buttons have the shape of SORT and SETTINGS (in AMD Radeon slanted on a
+//! side with another button beside it and straight on a side with nothing beside it, square in
+//! NVIDIA, or rounded), switches and checkboxes are straight (or rounded), and there is one accent
+//! colour.
 //!
 //! A skin with glass buttons (`buttons: liquid`, see [`glass`]) gets glass here too: glossy
 //! capsules for buttons, switches with a silver knob, drop-downs like text boxes. A skin whose
 //! sidebar is in panels (`sidebar-style: panels`) gets rounded selections in the page lists and
 //! cards with a soft shadow. Every other skin looks exactly as it always did.
 //!
-//! - [`toggle`]: an on/off switch (a track with a knob, in the skin's shape).
+//! - [`toggle`]: an on/off switch (a track with a knob, straight, or rounded in a rounded skin).
 //! - [`checkbox`]: a small box with a tick.
 //! - [`Flips`]: switches and checkboxes the person flips glide between off and on (the knob slides,
 //!   the colours fade), unless Windows' "Show animations" is off.
@@ -35,7 +37,7 @@ use windows::core::BOOL;
 use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS};
 
 use crate::details::blend;
-use crate::pathbar::{fill_box, outline_box};
+use crate::pathbar::{face, fill_box, fill_box_beside, outline_box, Beside};
 use crate::render::{Align, Renderer, TextStyle};
 use crate::theme::{size as main_size, ButtonStyle, CaptionStyle, Color, Paint, SidebarStyle, Stop, Theme};
 use crate::retroctl::{Held, Hold, Repeat};
@@ -47,15 +49,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::SetCapture;
 pub mod size {
     pub const TOGGLE_W: f32 = 40.0;
     pub const TOGGLE_H: f32 = 20.0;
-    /// How far a switch leans (its top edge sits this far right of its bottom edge).
-    pub const TOGGLE_LEAN: f32 = 6.0;
-    /// A checkbox, and how far it leans (like the switches, in a slanted skin).
+    /// A checkbox.
     pub const CHECK: f32 = 16.0;
-    pub const CHECK_LEAN: f32 = 4.0;
     /// Drop-downs and text boxes.
     pub const FIELD_H: f32 = 30.0;
     pub const BUTTON_H: f32 = 28.0;
-    /// Buttons lean like SORT and SETTINGS.
+    /// Buttons lean like SORT and SETTINGS (on a side with another button beside it).
     pub const BUTTON_LEAN: f32 = 8.0;
     /// Text inside a drop-down starts this far in; the arrow takes this much on the right.
     pub const FIELD_PAD: f32 = 10.0;
@@ -175,15 +174,12 @@ const SILVER: [Stop; 3] = [
 
 // ---------------------------------------------------------------- switch
 
-/// Where a switch's knob sits: inside a track that leans `lean`, with an even margin all round,
-/// the same slant.
-fn knob(track: Rect, on: bool, lean: f32) -> (Rect, f32) {
-    let h = track.h - 8.0;
-    let k_lean = lean * h / track.h;
-    let w = 14.0;
-    // The track's slanted sides at the knob's top and bottom, 3 DIPs inside them.
-    let x = if on { track.right() - lean * 4.0 / track.h - 3.0 - w } else { track.x + lean * 4.0 / track.h + 3.0 };
-    (Rect::new(x, track.y + 4.0, w, h), k_lean)
+/// Where a switch's knob sits: inside the track, 4 DIPs from its top and bottom and 3 from its
+/// ends.
+fn knob(track: Rect, on: bool) -> Rect {
+    let (w, h) = (14.0, track.h - 8.0);
+    let x = if on { track.right() - 3.0 - w } else { track.x + 3.0 };
+    Rect::new(x, track.y + 4.0, w, h)
 }
 
 /// An on/off switch in `rect` (TOGGLE_W x TOGGLE_H). On: filled with the accent, the knob on the
@@ -203,9 +199,9 @@ pub fn toggle(r: &mut Renderer, theme: &Theme, rect: Rect, on: f32, look: Look) 
         return bevel_toggle(r, theme, rect, t, look);
     }
     let lit = look.enabled && (look.hover || look.pressed);
-    let lean = theme.lean(size::TOGGLE_LEAN);
-    let (off_knob, k_lean) = knob(rect, false, lean);
-    let (on_knob, _) = knob(rect, true, lean);
+    // Straight in every skin (rounded in a rounded one): a switch stands on its own.
+    let lean = 0.0;
+    let (off_knob, on_knob) = (knob(rect, false), knob(rect, true));
     let k = Rect::new(off_knob.x + (on_knob.x - off_knob.x) * t, off_knob.y, off_knob.w, off_knob.h);
     let fill = if look.pressed && look.enabled { theme.accent.with_alpha(0.75) } else if lit { theme.accent.with_alpha(0.88) } else { theme.accent };
     let line = if lit { theme.text } else { theme.muted };
@@ -217,7 +213,7 @@ pub fn toggle(r: &mut Renderer, theme: &Theme, rect: Rect, on: f32, look: Look) 
     if t > 0.0 {
         fill_box(r, theme, rect, lean, faded(fill.with_alpha(fill.a * t), look));
     }
-    fill_box(r, theme, k, k_lean, faded(blend(line, theme.on_accent, t), look));
+    fill_box(r, theme, k, lean, faded(blend(line, theme.on_accent, t), look));
     if look.focused {
         focus_ring(r, theme, rect, lean);
     }
@@ -262,15 +258,15 @@ fn glass_toggle(r: &mut Renderer, theme: &Theme, rect: Rect, t: f32, look: Look)
     }
 }
 
-/// Whether `p` is on the switch (the slanted shape, a little bigger so it's easy to hit).
+/// Whether `p` is on the switch (a little bigger than it, so it's easy to hit).
 pub fn toggle_contains(rect: Rect, p: Point) -> bool {
     rect.inset(-4.0, -4.0).contains(p)
 }
 
 // ---------------------------------------------------------------- checkbox
 
-/// A checkbox in `rect` (CHECK x CHECK): a small box leaning like the switches (straight or rounded
-/// in skins without slants), in the accent with a tick when on. `on` is how far it is from off
+/// A checkbox in `rect` (CHECK x CHECK): a small straight box (rounded in a rounded skin), in the
+/// accent with a tick when on. `on` is how far it is from off
 /// (0.0) to on (1.0): while it's flipping ([`Flips`]) the fill and the tick fade in or out.
 pub fn checkbox(r: &mut Renderer, theme: &Theme, rect: Rect, on: f32, look: Look) {
     let t = on.clamp(0.0, 1.0);
@@ -284,7 +280,8 @@ pub fn checkbox(r: &mut Renderer, theme: &Theme, rect: Rect, on: f32, look: Look
         return box_checkbox(r, theme, rect, t, look);
     }
     let lit = look.enabled && (look.hover || look.pressed);
-    let lean = theme.lean(size::CHECK_LEAN);
+    // Straight in every skin, like the switches.
+    let lean = 0.0;
     let fill = if lit { theme.accent.with_alpha(0.88) } else { theme.accent };
     let line = if lit { theme.text } else { theme.muted };
     if t < 1.0 {
@@ -502,8 +499,14 @@ fn button_style(color: Color) -> TextStyle {
     TextStyle::new(color).semibold().align(Align::Center)
 }
 
-/// A word button in the skin's shape (write the label in capitals, like SORT and CANCEL).
+/// A word button in the skin's shape (write the label in capitals, like SORT and CANCEL), on its
+/// own: straight on both sides.
 pub fn button(r: &mut Renderer, theme: &Theme, rect: Rect, label: &str, look: Look) {
+    button_beside(r, theme, rect, label, look, Beside::NONE);
+}
+
+/// A word button with other buttons `beside` it: in a slanted skin it leans on those sides only.
+pub fn button_beside(r: &mut Renderer, theme: &Theme, rect: Rect, label: &str, look: Look, beside: Beside) {
     if theme.era.old() {
         return crate::retroctl::push_button(r, theme, rect, &sentence_case(label), look, false);
     }
@@ -519,17 +522,22 @@ pub fn button(r: &mut Renderer, theme: &Theme, rect: Rect, label: &str, look: Lo
         _ => theme.chip,
     };
     let lean = theme.lean(size::BUTTON_LEAN);
-    fill_box(r, theme, rect, lean, faded(fill, look));
-    r.text(label, rect, &button_style(faded(theme.text, look)));
+    fill_box_beside(r, theme, rect, lean, beside, faded(fill, look));
+    r.text(label, face(rect, lean, beside), &button_style(faded(theme.text, look)));
     if look.focused {
-        focus_ring(r, theme, rect, lean);
+        focus_ring_beside(r, theme, rect, lean, beside);
     }
 }
 
 /// A window's main button (UPDATE, the question box's yes): filled with the accent, its words in
 /// the colour that goes on it, in the skin's shape - in a glass skin a capsule in the selection's
-/// colour.
+/// colour. On its own: straight on both sides.
 pub fn primary_button(r: &mut Renderer, theme: &Theme, rect: Rect, label: &str, look: Look) {
+    primary_button_beside(r, theme, rect, label, look, Beside::NONE);
+}
+
+/// The main button with other buttons `beside` it: in a slanted skin it leans on those sides only.
+pub fn primary_button_beside(r: &mut Renderer, theme: &Theme, rect: Rect, label: &str, look: Look, beside: Beside) {
     if theme.era.old() {
         return crate::retroctl::push_button(r, theme, rect, &sentence_case(label), look, true);
     }
@@ -546,11 +554,11 @@ pub fn primary_button(r: &mut Renderer, theme: &Theme, rect: Rect, label: &str, 
         _ => theme.accent,
     };
     let lean = theme.lean(size::BUTTON_LEAN);
-    fill_box(r, theme, rect, lean, fill);
+    fill_box_beside(r, theme, rect, lean, beside, fill);
     let text = if look.enabled { theme.on_accent } else { theme.on_accent.with_alpha(0.7) };
-    r.text(label, rect, &button_style(text));
+    r.text(label, face(rect, lean, beside), &button_style(text));
     if look.focused {
-        focus_ring(r, theme, rect, lean);
+        focus_ring_beside(r, theme, rect, lean, beside);
     }
 }
 
@@ -806,14 +814,29 @@ pub fn page_list_well(r: &mut Renderer, theme: &Theme, column: Rect) {
 }
 
 /// "CANCEL" -> "Cancel" (an older Windows never wrote its buttons in capitals); a label already in
-/// mixed case stays as it is.
+/// mixed case stays as it is. What a label says in brackets keeps its letters: a size's unit is
+/// "MB", never "mb" ("CLEAR CACHE (2 MB)" -> "Clear cache (2 MB)"). Words after the brackets are
+/// made small like the ones before them.
 pub fn sentence_case(label: &str) -> String {
     if label.chars().any(|ch| ch.is_lowercase()) {
         return label.to_string();
     }
-    let lower = label.to_lowercase();
-    let mut chars = lower.chars();
-    chars.next().map_or_else(String::new, |f| f.to_uppercase().chain(chars).collect())
+    let mut out = String::with_capacity(label.len());
+    let mut inside = 0usize;
+    for ch in label.chars() {
+        match ch {
+            '(' => inside += 1,
+            ')' => inside = inside.saturating_sub(1),
+            _ if inside == 0 => {
+                // The label's first letter stays a capital.
+                if out.is_empty() { out.extend(ch.to_uppercase()) } else { out.extend(ch.to_lowercase()) }
+                continue;
+            }
+            _ => {}
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// How thick the outline round the control that has the keyboard is.
@@ -828,6 +851,12 @@ pub fn focus_ring(r: &mut Renderer, theme: &Theme, rect: Rect, lean: f32) {
 /// The same round a control with its own corners (`radius`).
 pub fn focus_ring_round(r: &mut Renderer, theme: &Theme, rect: Rect, radius: f32, lean: f32) {
     crate::pathbar::ring_around(r, rect, lean, radius, FOCUS_W, theme.text.with_alpha(0.65));
+}
+
+/// The outline round a button that leans only on the sides with a button `beside` it.
+pub fn focus_ring_beside(r: &mut Renderer, theme: &Theme, rect: Rect, lean: f32, beside: Beside) {
+    let radius = if lean > 0.0 && beside != Beside::NONE { 0.0 } else { theme.corner(rect.h) };
+    crate::pathbar::ring_around_beside(r, rect, lean, beside, radius, FOCUS_W, theme.text.with_alpha(0.65));
 }
 
 // ---------------------------------------------------------------- text
@@ -1495,6 +1524,26 @@ pub fn close_button(r: &mut Renderer, theme: &Theme, rect: Rect, hover: bool, pr
 mod tests {
     use super::*;
 
+    /// Buttons in sentence case: capitals become small letters but for the first, mixed case stays,
+    /// and what's in brackets keeps its letters (a size's unit).
+    #[test]
+    fn sentence_case_keeps_units_in_brackets() {
+        assert_eq!(sentence_case("CANCEL"), "Cancel");
+        assert_eq!(sentence_case("RESET THIS PAGE"), "Reset this page");
+        assert_eq!(sentence_case("EDIT SKINS\u{2026}"), "Edit skins\u{2026}");
+        assert_eq!(sentence_case("CLEAR CACHE (0 B)"), "Clear cache (0 B)");
+        assert_eq!(sentence_case("CLEAR CACHE (1.2 GB)"), "Clear cache (1.2 GB)");
+        assert_eq!(sentence_case("Already Mixed (KB)"), "Already Mixed (KB)");
+        assert_eq!(sentence_case(""), "");
+        assert_eq!(sentence_case("("), "(");
+        assert_eq!(sentence_case("\u{c9}COLE (\u{c9})"), "\u{c9}cole (\u{c9})");
+        // Words after the brackets are made small too; brackets that never close keep the rest.
+        assert_eq!(sentence_case("SAVE (2 MB) AND CLOSE"), "Save (2 MB) and close");
+        assert_eq!(sentence_case("A (B (C) D) E"), "A (B (C) D) e");
+        assert_eq!(sentence_case("FREE (2 GB"), "Free (2 GB");
+        assert_eq!(sentence_case(") ODD"), ") odd");
+    }
+
     #[test]
     fn the_scroller_stays_in_range_and_reveals() {
         let mut s = Scroller::default();
@@ -1552,10 +1601,11 @@ mod tests {
     #[test]
     fn knobs_sit_inside_the_switch() {
         let track = Rect::new(10.0, 10.0, size::TOGGLE_W, size::TOGGLE_H);
-        let (off, _) = knob(track, false, size::TOGGLE_LEAN);
-        let (on, _) = knob(track, true, size::TOGGLE_LEAN);
+        let (off, on) = (knob(track, false), knob(track, true));
         assert!(off.x > track.x && on.right() < track.right() && on.x > off.right());
         assert_eq!((off.y, off.h), (14.0, 12.0));
+        // The same margin at both ends: 3 DIPs.
+        assert_eq!((off.x - track.x, track.right() - on.right()), (3.0, 3.0));
     }
 
     #[test]

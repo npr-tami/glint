@@ -56,6 +56,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::frame;
 use crate::kit::{self, size as ksize, Look, Scroller};
+use crate::pathbar::Beside;
 use crate::log;
 use crate::render::{FrameResult, Renderer, TextStyle};
 use crate::theme::{size, Color, Theme};
@@ -336,7 +337,7 @@ pub fn open(owner: HWND, theme: &Theme, release: &Release, ours: &str) -> bool {
             r
         }
         Err(e) => {
-            log::error(&format!("The update window couldn't draw: {e}"));
+            log::error(&format!("Failed to draw the update window: {e}"));
             // SAFETY: our own window, which has no state yet.
             unsafe {
                 let _ = DestroyWindow(hwnd);
@@ -897,16 +898,17 @@ impl Prompt {
             y += STATUS_LINE;
         }
 
-        // A required fix has only UPDATE (where LATER would be).
+        // A required fix has only UPDATE (where LATER would be): on its own, so straight.
         if required {
             kit::primary_button(r, theme, later_or_update(update, later), UPDATE_NOW, update_look);
             return;
         }
 
         quiet_button(r, theme, off, OFF, off_look);
-        kit::button(r, theme, skip, SKIP, skip_look);
-        kit::primary_button(r, theme, update, UPDATE, update_look);
-        kit::button(r, theme, later, LATER, later_look);
+        // Three in a row: they lean only where they meet.
+        kit::button_beside(r, theme, skip, SKIP, skip_look, Beside::RIGHT);
+        kit::primary_button_beside(r, theme, update, UPDATE, update_look, Beside::BOTH);
+        kit::button_beside(r, theme, later, LATER, later_look, Beside::LEFT);
     }
 
     // ------------------------------------------------------------ the mouse
@@ -925,13 +927,15 @@ impl Prompt {
         if self.required {
             return kit::button_contains(later_or_update(update, later), p).then_some(Hot::Ctl(Ctl::Update));
         }
-        if kit::button_contains(update, p) {
+        // Their exact shapes: they lean toward each other, so their rects overlap a little.
+        let lean = self.theme.lean(ksize::BUTTON_LEAN);
+        if crate::pathbar::box_contains_beside(update, lean, Beside::BOTH, p) {
             return Some(Hot::Ctl(Ctl::Update));
         }
-        if kit::button_contains(later, p) {
+        if crate::pathbar::box_contains_beside(later, lean, Beside::LEFT, p) {
             return Some(Hot::Ctl(Ctl::Later));
         }
-        if kit::button_contains(self.skip_rect(), p) {
+        if crate::pathbar::box_contains_beside(self.skip_rect(), lean, Beside::RIGHT, p) {
             return Some(Hot::Ctl(Ctl::Skip));
         }
         if self.off_rect().contains(p) {

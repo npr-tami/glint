@@ -18,9 +18,9 @@
 //!
 //! The list's options (settings.json; right-click a column title for most of
 //! them):
-//! - which columns show next to Name ("Columns": Date modified, Date created, Type, Size, and Picture
-//!   size and Length, which media.rs reads in the background), plus a Folder column while subfolders
-//!   are searched (search.rs);
+//! - which columns show next to Name ("Columns": Date modified, Date created, Type, Size, and Image
+//!   dimensions and Duration, which media.rs reads in the background), plus a Folder column while
+//!   subfolders are searched (search.rs);
 //! - folders above files or mixed with them ("FoldersFirst");
 //! - how dates and sizes look ("DateFormat", "SizeFormat"; folder.rs formats them);
 //! - the row and text size ("Size": small, medium with more room, large with bigger text and
@@ -53,8 +53,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetDoubleClickTime, GetFocus, VK_A, VK_C, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F2, VK_HOME, VK_INSERT, VK_LEFT, VK_N, VK_NEXT, VK_PRIOR,
-    VK_RETURN, VK_RIGHT, VK_SPACE, VK_UP, VK_V, VK_X, VK_Y, VK_Z,
+    GetDoubleClickTime, GetFocus, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer, SystemParametersInfoW, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS};
 // Dragging items out, and things dragged in (dragdrop.rs).
@@ -91,10 +90,18 @@ const ROW_PAD: f32 = 12.0;
 /// With the skin's `list-rows: stripes`, every other row gets this much of the text colour over it.
 const STRIPE_ALPHA: f32 = 0.04;
 const MIN_COL: f32 = 48.0;
+/// Image dimensions' width until it's dragged: room for its title.
+const DIMENSIONS_W: f32 = 135.0;
+/// Inside a .zip or .7z the Size column is at least this wide, for "Unpacked size".
+const UNPACKED_W: f32 = 115.0;
 /// The tree view: how far each level is pulled in, and the room for the ▸ arrow before the icon.
 const TREE_INDENT: f32 = 16.0;
 const TREE_ARROW: f32 = 16.0;
 const MIN_NAME: f32 = 120.0;
+/// The width Name keeps (at the normal text size) for as long as there are columns to leave out
+/// for it (`place_columns`): as wide as the List view makes a name. MIN_NAME is only the least it
+/// gets once there are none left to leave out.
+const READABLE_NAME: f32 = LIST_COLUMN_W;
 /// How close (DIPs) to a column edge the mouse must be to resize it.
 const EDGE_GRAB: f32 = 4.0;
 /// With one-click opening: a click whose button comes up further than this from where it went
@@ -139,7 +146,7 @@ enum Col {
     Created,
     Type,
     Size,
-    /// Picture size: a picture's or a video's width and height (media.rs).
+    /// Image dimensions: a picture's or a video's width and height (media.rs).
     Dimensions,
     /// How long a video or a song plays (media.rs).
     Length,
@@ -171,7 +178,7 @@ impl Col {
     fn default_width(self) -> f32 {
         match self {
             Col::Size => 90.0,
-            Col::Dimensions => 110.0,
+            Col::Dimensions => DIMENSIONS_W,
             Col::Length => 80.0,
             Col::Free => 110.0,
             Col::Folder => 220.0,
@@ -181,8 +188,9 @@ impl Col {
     }
 
     /// Its title; `bin`: in the Recycle Bin, whose dates are when items were deleted; `recent`: in
-    /// Recent, whose dates are when files were opened.
-    fn title(self, this_pc: bool, bin: bool, recent: bool) -> &'static str {
+    /// Recent, whose dates are when files were opened; `archive`: inside a .zip or .7z, whose
+    /// sizes are the files' own, not what they take packed.
+    fn title(self, this_pc: bool, bin: bool, recent: bool, archive: bool) -> &'static str {
         match self {
             Col::Name => "Name",
             Col::Modified if bin => "Date deleted",
@@ -191,9 +199,10 @@ impl Col {
             Col::Created => "Date created",
             Col::Type => "Type",
             Col::Size if this_pc => "Total size",
+            Col::Size if archive => "Unpacked size",
             Col::Size => "Size",
-            Col::Dimensions => "Picture size",
-            Col::Length => "Length",
+            Col::Dimensions => "Image dimensions",
+            Col::Length => "Duration",
             Col::Folder => "Folder",
             Col::Free => "Free space",
             Col::Location => "Original location",
@@ -223,6 +232,26 @@ impl Col {
 
 /// The columns next to Name that settings.json can switch on, in the list's order.
 const OPTIONAL: [Col; 6] = [Col::Modified, Col::Created, Col::Type, Col::Size, Col::Dimensions, Col::Length];
+
+/// The columns a list too narrow for all of them leaves out (`place_columns`), the least useful
+/// first. Name never goes, nor does a column that isn't one of these (the Folder of a search
+/// result, the Recycle Bin's Original location, This PC's Free space).
+const DROP_ORDER: [Col; 6] = [Col::Created, Col::Dimensions, Col::Length, Col::Type, Col::Size, Col::Modified];
+
+/// The columns next to Name (each with its width) that show when `room` is all the width they
+/// can have: while they're wider than that together, one more is left out, in `DROP_ORDER`.
+fn columns_that_fit(cols: &[(Col, f32)], room: f32) -> Vec<Col> {
+    let mut left = cols.to_vec();
+    for out in DROP_ORDER {
+        // (Half a pixel over still fits: widths remembered at the normal text size and shown
+        // bigger for large rows can come out a hair wider than the room they were dragged to.)
+        if left.iter().map(|(_, w)| w).sum::<f32>() <= room + 0.5 {
+            break;
+        }
+        left.retain(|(c, _)| *c != out);
+    }
+    left.into_iter().map(|(c, _)| c).collect()
+}
 
 /// A column where it sits now.
 #[derive(Clone, Copy, Debug)]
@@ -341,8 +370,8 @@ pub struct ListView {
     rect: Rect,
     /// Widths of the columns next to Name as last set (by default or by dragging an edge), by key.
     wanted: BTreeMap<&'static str, f32>,
-    /// The columns as they sit now (from the last `place_columns`): Name first, then the others,
-    /// squeezed when the window is too narrow for them. Name takes the rest.
+    /// The columns as they sit now (from the last `place_columns`): Name first, then the others
+    /// (not the ones left out because the list is too narrow for them). Name takes the rest.
     cols: Vec<Placed>,
     /// Row height, icon and text size, from the "Size" setting at the last frame.
     row_h: f32,
@@ -387,7 +416,8 @@ pub struct ListView {
     name_box_at: Option<Rect>,
     slow: Option<SlowClick>,
     click_open: Option<ClickOpen>,
-    /// When one click last opened something (the second click of a double-click is then ignored).
+    /// When one click last opened something, or Home's "Clear search" was clicked (the second
+    /// click of a double-click is then ignored).
     opened_at: Option<f64>,
     /// Whether the window was active at the last mouse move (a click that brings the window to the
     /// front doesn't start renaming).
@@ -428,9 +458,12 @@ pub struct ListView {
     /// SHOW THEM after "Only protected system files are here." (at the last frame), when it shows.
     show_system_at: Option<Rect>,
     /// How media.rs tells this list's asks from the other half's (split view), and what this list
-    /// last asked it for (Picture size and Length).
+    /// last asked it for (Image dimensions and Duration).
     media_id: u32,
     media: MediaRead,
+    /// The listing whose column titles were last drawn, and whether it's inside a .zip or .7z
+    /// (its Size column then says the sizes are unpacked ones).
+    archived: (String, bool),
 }
 
 /// What the list says when everything left to show is a protected system file, and its button.
@@ -444,7 +477,7 @@ static NEXT_LIST: AtomicU32 = AtomicU32::new(1);
 /// often (seconds), so its rows don't jump about with every value.
 const RESORT_EVERY: f64 = 0.25;
 
-/// What a list last asked media.rs for (the Picture size and Length columns), and how far through
+/// What a list last asked media.rs for (the Image dimensions and Duration columns), and how far through
 /// its listing handing over the rest has got.
 #[derive(Default)]
 struct MediaRead {
@@ -539,6 +572,7 @@ impl ListView {
             show_system_at: None,
             media_id: NEXT_LIST.fetch_add(1, Ordering::Relaxed),
             media: MediaRead::default(),
+            archived: (String::new(), false),
         }
     }
 
@@ -649,7 +683,7 @@ impl ListView {
         if crate::recent::is_recent(&t.folder.path) {
             return vec![Col::Name, Col::Folder, Col::Modified, Col::Size, Col::Type];
         }
-        // Picture size and Length only where something can have them (pictures, videos, songs).
+        // Image dimensions and Duration only where something can have them (pictures, videos, songs).
         let here = |c: &Col| match c {
             Col::Dimensions => t.media_here.dims,
             Col::Length => t.media_here.length,
@@ -663,19 +697,52 @@ impl ListView {
         cols
     }
 
+    /// Whether the tab's folder is inside a .zip or .7z (found out once for each listing: it may
+    /// ask the disk).
+    fn in_archive(&mut self, tab: &Tab) -> bool {
+        if self.archived.0 != tab.folder.path {
+            self.archived = (tab.folder.path.clone(), !tab.folder.path.is_empty() && crate::archive::split(&tab.folder.path).is_some());
+        }
+        self.archived.1
+    }
+
     fn is_this_pc(t: &Tab) -> bool {
         // (A search of every drive from This PC shows files, with the search results' columns.)
         t.folder.path.is_empty() && !t.folder.entries.is_empty() && !t.is_searching()
     }
 
-    /// Works out where every column sits: the ones next to Name keep the widths last set, squeezed
-    /// on narrow windows (so they come back when the window is made wide again); Name takes the rest.
+    /// Works out where every column sits: the ones next to Name keep the widths last set, and Name
+    /// takes the rest.
+    ///
+    /// Names come first: a list too narrow to show every column and still leave Name a width a
+    /// name can be read in (`READABLE_NAME`) leaves columns out, the least useful first
+    /// (`DROP_ORDER`). That is this list's own doing, by its own width (each half of split view
+    /// for itself), and only for as long as it is that narrow: the Columns setting, the widths and
+    /// the sort stay as they are, and the columns are back as soon as there is room. Columns that
+    /// can't be left out are squeezed as a last resort (from the widths last set, so they come
+    /// back too).
     fn place_columns(&mut self, app: &AppState) {
         let wanted_cols = Self::wanted_columns(app);
-        let others: Vec<Col> = wanted_cols.iter().copied().filter(|&c| c != Col::Name).collect();
         // Large rows have bigger text: the columns grow with it, so dates still fit.
         let grow = self.text_growth();
-        let mut widths: Vec<f32> = others.iter().map(|c| self.wanted.get(c.key()).copied().unwrap_or(c.default_width()) * grow).collect();
+        // Inside a .zip or .7z the Size column says "Unpacked size": room for those words.
+        let size_at_least = if self.in_archive(app.tab()) { UNPACKED_W } else { 0.0 };
+        let all: Vec<(Col, f32)> = wanted_cols
+            .iter()
+            .filter(|&&c| c != Col::Name)
+            .map(|&c| {
+                let w = self.wanted.get(c.key()).copied().unwrap_or(c.default_width());
+                (c, if c == Col::Size { w.max(size_at_least) } else { w } * grow)
+            })
+            .collect();
+        let others: Vec<Col> = if matches!(self.drag, Drag::Column { .. }) {
+            // While a column's edge is dragged the columns stay the ones they were: one coming
+            // back would move the edge away from under the mouse.
+            all.iter().map(|&(c, _)| c).filter(|c| self.cols.iter().any(|p| p.col == *c)).collect()
+        } else {
+            columns_that_fit(&all, self.rect.w - SCROLL_GUTTER - READABLE_NAME * grow)
+        };
+        let mut widths: Vec<f32> = all.iter().filter(|(c, _)| others.contains(c)).map(|&(_, w)| w).collect();
         let avail = self.rect.w - SCROLL_GUTTER - MIN_NAME;
         let total: f32 = widths.iter().sum();
         if total > avail && avail > 0.0 {
@@ -1012,6 +1079,13 @@ impl ListView {
         if tab.waiting_long() {
             return Effect::None;
         }
+        // Inside an archive Glint can't change (one in another, or with locked items): why,
+        // instead of a name box (app/files.rs).
+        if let Some(why) = app.archive_cant_change() {
+            app.say(why);
+            return Effect::Redraw;
+        }
+        let tab = app.tab();
         let chosen = tab.selected_entries();
         // Several selected: they're renamed all at once, with a form saying how (app/forms.rs).
         if chosen.len() > 1 && !crate::recent::is_recent(&tab.folder.path) {
@@ -1215,6 +1289,10 @@ impl ListView {
     /// The slow-click timer ran out (window.rs): rename, if the item is still the lone selected one.
     pub fn slow_click_due(&mut self, ctx: &Ctx, app: &mut AppState) -> Effect {
         let Some(s) = self.slow.take().filter(|s| s.armed && app.question.is_none()) else { return Effect::None };
+        // (Not where nothing can be renamed: an archive inside another, or with locked items.)
+        if app.archive_cant_change().is_some() {
+            return Effect::None;
+        }
         let hide_ext = app.settings.hide_known_extensions;
         let tab = app.tab_mut();
         let alone = tab.focus == Some(s.index) && tab.is_selected(s.index) && tab.selection_summary().0 == 1;
@@ -1270,8 +1348,8 @@ impl ListView {
             col(HEAD_CREATED, "Date created", "created"),
             col(HEAD_TYPE, "Type", "type"),
             col(HEAD_SIZE, "Size", "size"),
-            col(HEAD_DIMENSIONS, "Picture size", "dimensions"),
-            col(HEAD_LENGTH, "Length", "length"),
+            col(HEAD_DIMENSIONS, "Image dimensions", "dimensions"),
+            col(HEAD_LENGTH, "Duration", "length"),
             MenuItem::separator(),
             MenuItem::new(HEAD_FOLDERS_FIRST, "Folders first").checked(s.folders_first),
             MenuItem::new(HEAD_EXTENSIONS, "File extensions").checked(!s.hide_known_extensions),
@@ -1310,8 +1388,8 @@ impl ListView {
                 // Turned on where it can't show: say where it does.
                 let here = app.tab().media_here;
                 match item {
-                    HEAD_DIMENSIONS if on && !here.dims => app.say("Picture size shows in folders with pictures or videos."),
-                    HEAD_LENGTH if on && !here.length => app.say("Length shows in folders with videos or songs."),
+                    HEAD_DIMENSIONS if on && !here.dims => app.say("Image dimensions show in folders with pictures or videos."),
+                    HEAD_LENGTH if on && !here.length => app.say("Duration shows in folders with videos or songs."),
                     _ => {}
                 }
             }
@@ -1343,14 +1421,14 @@ impl ListView {
         Effect::Redraw
     }
 
-    // ------------------------------------------------------------ Picture size and Length (media.rs)
+    // ------------------------------------------------------------ Image dimensions and Duration (media.rs)
 
-    /// What media.rs knows about the rows on screen for the Picture size and Length columns, by
+    /// What media.rs knows about the rows on screen for the Image dimensions and Duration columns, by
     /// row; what it doesn't is asked for. The rows on screen first, then, while it has little of it
     /// left, more of the rest of the listing (on the PC's own drives, or anywhere while the tab is
     /// sorted by one of the columns). Nothing is asked while neither column shows.
     fn media_rows(&mut self, tab: &Tab, geo: &Geometry, scroll: f32) -> Vec<(usize, media::Facts)> {
-        // (A tab sorted by Picture size or Length needs those values even with the column hidden.)
+        // (A tab sorted by Image dimensions or Duration needs those values even with the column hidden.)
         let cols = media::Columns {
             dims: tab.sort == SortKey::Dimensions || self.cols.iter().any(|p| p.col == Col::Dimensions),
             length: tab.sort == SortKey::Length || self.cols.iter().any(|p| p.col == Col::Length),
@@ -1361,7 +1439,7 @@ impl ListView {
         self.media_ask(tab, cols, geo.visible(scroll))
     }
 
-    /// A view without columns (List, the icons) of a tab sorted by Picture size or Length: the
+    /// A view without columns (List, the icons) of a tab sorted by Image dimensions or Duration: the
     /// listing is still read (the rest, as no value shows), so the sort gets them all.
     fn media_for_sort(&mut self, tab: &Tab) {
         let cols = media::Columns {
@@ -1419,7 +1497,7 @@ impl ListView {
     }
 
     /// Every frame, before painting: media.rs is told what this list no longer needs and which
-    /// folders' values to keep, and a tab sorted by Picture size or Length sorts again as values
+    /// folders' values to keep, and a tab sorted by Image dimensions or Duration sorts again as values
     /// come in (at most every RESORT_EVERY; as folder sizes do in app.rs). True while a sort is due.
     fn tick_media(&mut self, now: f64, app: &mut AppState) -> bool {
         // Both columns off: nothing is read, and what was is forgotten.
@@ -1468,6 +1546,7 @@ impl ListView {
         };
         let this_pc = Self::is_this_pc(tab);
         let bin = recycle::is_bin(&tab.folder.path);
+        let archive = self.in_archive(tab);
         // Home and Duplicates keep an order of their own until a column is clicked: till then no
         // column is the sorted one.
         let own_order = !tab.column_now && (crate::recent::is_recent(&tab.folder.path) || tab.search.as_ref().is_some_and(|s| s.is_dupes()));
@@ -1482,7 +1561,7 @@ impl ListView {
                 if cell.w <= 0.0 {
                     continue;
                 }
-                let label = p.col.title(this_pc, bin, crate::recent::is_recent(&tab.folder.path));
+                let label = p.col.title(this_pc, bin, crate::recent::is_recent(&tab.folder.path), archive);
                 let right = p.col.right_aligned();
                 let text_rect = if i == 0 { Rect::new(cell.x + ROW_PAD + 4.0, cell.y, cell.w - ROW_PAD - 16.0, cell.h) } else { cell.inset(10.0, 0.0) };
                 let sorted = p.col.sort_key() == Some(tab.sort) && tab.custom_here().is_none() && !own_order && !(this_pc && p.col == Col::Free && tab.sort != SortKey::Date);
@@ -1507,7 +1586,7 @@ impl ListView {
                 // The line between two column titles (none in most skins).
                 r.fill_rect(Rect::new(cell.x, cell.y, 1.0, cell.h), theme.column_line);
             }
-            let label = p.col.title(this_pc, bin, crate::recent::is_recent(&tab.folder.path));
+            let label = p.col.title(this_pc, bin, crate::recent::is_recent(&tab.folder.path), archive);
             let right = p.col.right_aligned();
             let text_rect = if i == 0 { Rect::new(cell.x + ROW_PAD + 4.0, cell.y, cell.w - ROW_PAD - 16.0, cell.h) } else { cell.inset(10.0, 0.0) };
             let mut style = TextStyle::new(theme.list_header_text).align(if right { Align::Right } else { Align::Left });
@@ -1569,7 +1648,7 @@ impl ListView {
                 Flow::Columns => self.paint_names(r, theme, app, tab, &geo, scroll),
                 Flow::Grid => self.paint_tiles(r, theme, app, tab, &geo, scroll),
             }
-            // (Rows ask media.rs for their Picture size and Length as they're drawn.)
+            // (Rows ask media.rs for their Image dimensions and Duration as they're drawn.)
             if self.flow != Flow::Rows {
                 self.media_for_sort(tab);
             }
@@ -1588,41 +1667,8 @@ impl ListView {
         r.pop_clip();
 
         // A message instead of items: errors, empty folders, no filter matches.
-        let message = if waiting {
-            Some("Loading\u{2026}".to_string())
-        } else if let Some(err) = &tab.folder.error {
-            Some(err.clone())
-        } else if let Some(s) = tab.search.as_ref().filter(|_| tab.view.is_empty()) {
-            Some(if !s.done {
-                "Searching\u{2026}".to_string()
-            } else if let Some(err) = s.listing.error.as_ref().filter(|_| s.listing.path == tab.path) {
-                err.clone() // the folder itself can't be read (gone, no permission)
-            } else if s.query.contains('"') {
-                // Words in quotes (looked for inside files): shown as typed, quotes and all.
-                format!("Nothing found for {} here{}.", s.query.trim(), if s.deep { " or in the folders inside" } else { "" })
-            } else {
-                format!("Nothing called \u{201c}{}\u{201d} here or in the folders inside.", s.query)
-            })
-        } else if tab.folder.entries.is_empty() && tab.loading.is_some() {
-            Some("Loading\u{2026}".to_string())
-        } else if tab.folder.entries.is_empty() && tab.folder.path == tab.path {
-            Some(if recycle::is_bin(&tab.path) {
-                "The Recycle Bin is empty."
-            } else if crate::recent::is_recent(&tab.path) {
-                "Files you open show up here."
-            } else {
-                "This folder is empty."
-            }.to_string())
-        } else if tab.view.is_empty() && !tab.filter.is_empty() {
-            Some(format!("No items match \u{201c}{}\u{201d}.", tab.filter))
-        } else if tab.view.is_empty() && tab.folder.path == tab.path {
-            // Everything here is hidden (see Tab::rebuild_view).
-            Some(if tab.show_hidden { SYSTEM_ONLY } else { "Only hidden items are here. Ctrl+H shows them." }.to_string())
-        } else {
-            None
-        };
         self.show_system_at = None;
-        if let Some(m) = message {
+        if let Some(m) = Self::message(tab, waiting) {
             let line = Rect::new(area.x + ROW_PAD + size::ICON + 8.0, area.y + 6.0, area.w - 60.0, size::ROW_H);
             let style = TextStyle::new(theme.muted);
             r.text(&m, line, &style);
@@ -1645,6 +1691,55 @@ impl ListView {
             };
             let room = crate::retroctl::Room::of(tab.scroll, self.max_scroll(tab));
             paint_scrollbar(r, theme, self.lane(), thumb, state, room);
+        }
+    }
+
+    /// What the list says instead of items: a folder on its way (`waiting`: a slow one, whose
+    /// rows aren't drawn), errors, empty folders, a search or the search bar matching nothing.
+    fn message(tab: &Tab, waiting: bool) -> Option<String> {
+        if waiting {
+            Some("Loading\u{2026}".to_string())
+        } else if let Some(err) = &tab.folder.error {
+            Some(err.clone())
+        } else if let Some(s) = tab.search.as_ref().filter(|_| tab.view.is_empty()) {
+            // Find duplicates with nothing to show says what the status bar says (dupes.rs).
+            let dupes = s.is_dupes();
+            Some(if !s.done {
+                if dupes { crate::dupes::CHECKING } else { "Searching\u{2026}" }.to_string()
+            } else if let Some(err) = s.listing.error.as_ref().filter(|_| s.listing.path == tab.path) {
+                err.clone() // the folder itself can't be read (gone, no permission)
+            } else if dupes && !tab.folder.entries.is_empty() {
+                // It found some, and the search bar hides them all: said as in any folder.
+                format!("No items match \u{201c}{}\u{201d}.", tab.filter)
+            } else if dupes {
+                crate::dupes::NONE_FOUND.to_string()
+            } else if s.query.contains('"') {
+                // Words in quotes (looked for inside files): shown as typed, quotes and all.
+                format!("Nothing found for {} here{}.", s.query.trim(), if s.deep { " or in the folders inside" } else { "" })
+            } else {
+                format!("Nothing called \u{201c}{}\u{201d} here or in the folders inside.", s.query)
+            })
+        } else if tab.folder.entries.is_empty() && tab.loading.is_some() {
+            Some("Loading\u{2026}".to_string())
+        } else if tab.folder.entries.is_empty() && tab.folder.path == tab.path {
+            Some(if recycle::is_bin(&tab.path) {
+                "The Recycle Bin is empty."
+            } else if crate::recent::is_recent(&tab.path) {
+                "Files you open show up here."
+            } else {
+                "This folder is empty."
+            }.to_string())
+        } else if tab.view.is_empty() && !tab.filter.is_empty() {
+            Some(format!("No items match \u{201c}{}\u{201d}.", tab.filter))
+        } else if tab.view.is_empty() && tab.folder.path == tab.path {
+            // Everything here is hidden (see Tab::rebuild_view).
+            Some(if tab.show_hidden {
+                SYSTEM_ONLY.to_string()
+            } else {
+                crate::keymap::say_with(&crate::keymap::keys_now(crate::keymap::Action::HiddenFiles), "Only hidden items are here. {keys} shows them.", "Only hidden items are here.")
+            })
+        } else {
+            None
         }
     }
 
@@ -1743,7 +1838,7 @@ impl ListView {
         let bin = tab.folder.bin.as_ref().filter(|b| b.items.len() == tab.folder.entries.len());
         // The tree view: arrows on folders, items of open folders pulled in by their level.
         let tree = tab.view_mode == ViewMode::Tree && tab.tree_here();
-        // Picture size and Length: what media.rs knows about the rows on screen (the rest is asked for).
+        // Image dimensions and Duration: what media.rs knows about the rows on screen (the rest is asked for).
         let media = self.media_rows(tab, geo, scroll);
         // Duplicates: a line above each new set, so the sets stand apart (not once a column sorts
         // them: a set's files are then apart anyway).
@@ -2428,8 +2523,8 @@ impl Component for ListView {
             self.scale = ctx.scale;
             self.name_box_at = None; // the name box needs placing (and its font making) again
         }
-        // Keep the name column usable on narrow windows by shrinking the others - from the widths
-        // last set, so they come back when the window is made wide again.
+        // Keep the name column usable on narrow windows by leaving the others out, or shrinking
+        // them - from the widths last set, so they come back when the window is made wide again.
         self.take_size(app);
         self.place_columns(app);
         if self.rename.is_some() {
@@ -2500,6 +2595,9 @@ impl Component for ListView {
         } else if app.settings.single_click && self.row_at(app.tab(), p).is_some() && self.on_arrow(app.tab(), p).is_none() {
             // One click opens: the pointer says so, as in Explorer's single-click mode.
             CursorKind::Hand
+        } else if self.home_on && self.home.layout.spot_at(self.home_point(app.tab(), p)) == Some(home::Spot::ClearSearch) {
+            // Home's "Clear search" is a link.
+            CursorKind::Hand
         } else {
             CursorKind::Arrow
         }
@@ -2557,10 +2655,13 @@ impl Component for ListView {
                 }
             }
             Drag::Column { col, start_x, start_w } => {
-                // Dragging an edge left makes the column right of it wider; the name column gives way.
+                // Dragging an edge left makes the column right of it wider; the name column gives
+                // way - no further than `place_columns` lets it before leaving a column out, so
+                // making one column wider never hides another.
                 let w = (start_w + (start_x - e.pos.x)).max(MIN_COL);
                 let others: f32 = self.cols.iter().skip(1).filter(|p| p.col != col).map(|p| p.w).sum();
-                let max_w = (self.rect.w - SCROLL_GUTTER - MIN_NAME - others).max(MIN_COL);
+                let name = if self.cols.iter().any(|p| DROP_ORDER.contains(&p.col)) { READABLE_NAME * self.text_growth() } else { MIN_NAME };
+                let max_w = (self.rect.w - SCROLL_GUTTER - name - others).max(MIN_COL);
                 // Kept at the normal text size (see `text_growth`).
                 self.wanted.insert(col.key(), w.min(max_w) / self.text_growth());
                 self.place_columns(app);
@@ -2629,6 +2730,14 @@ impl Component for ListView {
                     true
                 }
                 Some(home::Spot::Recent | home::Spot::Favorites) => return Effect::None,
+                // "Clear search", after the words saying nothing on Home matches: the search bar
+                // is emptied (as Esc does).
+                Some(home::Spot::ClearSearch) => {
+                    // (Everything comes back, with a tile where the link was: the second click of
+                    // a double-click must not open it.)
+                    self.opened_at = Some(ctx.now);
+                    return Effect::Command(Command::SetFilter(String::new()));
+                }
                 _ => false,
             };
             if changed {
@@ -2881,24 +2990,51 @@ impl Component for ListView {
             return Effect::None; // the items on screen aren't this folder's (see paint_rows)
         }
         let key = windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(vk);
-        // (Ctrl+arrows and Shift+arrows: moving the cursor without selecting, selecting a range.)
-        if let Some(row) = self.cursor_key(key, app) {
-            let tab = app.tab_mut();
-            self.move_cursor(tab, row, mods.shift, mods.ctrl);
-            return Effect::Redraw;
+        // The file shortcuts, as the person has them (keymap.rs), before the keys that move the
+        // cursor: a shortcut may be on Alt with an arrow, which is no cursor key. (Alt only comes
+        // here for one of them.)
+        let found = crate::keymap::KeyMap::of_settings(&app.settings).find(crate::keymap::Chord::of(vk, mods)).filter(|a| a.in_list());
+        if found.is_none() && !mods.alt {
+            // (Ctrl+arrows and Shift+arrows: moving the cursor without selecting, selecting a range.)
+            if let Some(row) = self.cursor_key(key, app) {
+                let tab = app.tab_mut();
+                self.move_cursor(tab, row, mods.shift, mods.ctrl);
+                return Effect::Redraw;
+            }
+        }
+        if let Some(a) = found {
+            use crate::keymap::Action as A;
+            return match a {
+                A::OpenInNewTab => Effect::Command(Command::OpenInNewTabs),
+                A::SelectAll => {
+                    app.tab_mut().select_all();
+                    Effect::Redraw
+                }
+                // Working with files (app/files.rs).
+                A::CopyPath => Effect::Command(Command::CopyPath),
+                A::Copy => Effect::Command(Command::CopyFiles),
+                A::Cut => Effect::Command(Command::CutFiles),
+                A::Paste => Effect::Command(Command::Paste),
+                A::Delete => Effect::Command(Command::Delete { permanent: false }),
+                A::DeletePermanently => Effect::Command(Command::Delete { permanent: true }),
+                A::Rename => self.begin_rename_selected(ctx, app),
+                A::NewFolder => Effect::Command(Command::NewFolder),
+                // Undo and redo the last file actions (undo.rs).
+                A::Undo => Effect::Command(Command::Undo),
+                A::Redo => Effect::Command(Command::Redo),
+                _ => Effect::None,
+            };
+        }
+        if mods.alt {
+            return Effect::None;
         }
         let tab = app.tab_mut();
         let cur = tab.focus_row();
         match key {
-            VK_RETURN if mods.ctrl => Effect::Command(Command::OpenInNewTabs),
             // The right-click menu from the keyboard; Shift+F10 (and Shift+Apps) Windows' whole menu.
             VK_APPS => self.keyboard_menu(app, mods.shift),
             VK_F10 if mods.shift => self.keyboard_menu(app, true),
             VK_RETURN => Effect::Command(Command::OpenSelected),
-            VK_A if mods.ctrl => {
-                tab.select_all();
-                Effect::Redraw
-            }
             VK_SPACE if mods.ctrl => {
                 if let Some(r) = cur {
                     tab.toggle_row(r);
@@ -2913,20 +3049,6 @@ impl Component for ListView {
                 tab.clear_selection();
                 Effect::Redraw
             }
-            // Working with files (app/files.rs). Ctrl+Insert and Shift+Insert are the old copy and
-            // paste keys, which Explorer still knows.
-            VK_C if mods.ctrl && mods.shift => Effect::Command(Command::CopyPath),
-            VK_C | VK_INSERT if mods.ctrl && !mods.shift => Effect::Command(Command::CopyFiles),
-            VK_X if mods.ctrl && !mods.shift => Effect::Command(Command::CutFiles),
-            VK_V if mods.ctrl && !mods.shift => Effect::Command(Command::Paste),
-            VK_INSERT if mods.shift && !mods.ctrl => Effect::Command(Command::Paste),
-            VK_DELETE if !mods.ctrl => Effect::Command(Command::Delete { permanent: mods.shift }),
-            VK_F2 if !mods.ctrl && !mods.shift => self.begin_rename_selected(ctx, app),
-            VK_N if mods.ctrl && mods.shift => Effect::Command(Command::NewFolder),
-            // Undo and redo the last file actions (undo.rs).
-            VK_Z if mods.ctrl && !mods.shift => Effect::Command(Command::Undo),
-            VK_Y if mods.ctrl && !mods.shift => Effect::Command(Command::Redo),
-            VK_Z if mods.ctrl && mods.shift => Effect::Command(Command::Redo),
             _ => Effect::None,
         }
     }
@@ -3063,7 +3185,7 @@ impl Component for ListView {
             self.repaint_until = self.repaint_until.max(now + 0.3);
         }
         self.was_loading = loading;
-        // Picture size and Length (media.rs): sorted again as values come in.
+        // Image dimensions and Duration (media.rs): sorted again as values come in.
         let resort = self.tick_media(now, app);
         // The name box follows its item; a new folder's box opens once the folder is read again.
         self.keep_name_box(now, app);
@@ -3177,6 +3299,63 @@ mod tests {
         }
     }
 
+    /// In an archive inside another one, F2 says why it can't rename and opens no name box; a
+    /// slow click does nothing. In the outer archive F2 renames.
+    #[test]
+    fn f2_inside_an_archive_glint_cant_change_says_why() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("glint-list-test-nested-rename-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zip_of = |entries: &[(&str, &[u8])]| {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            for (name, data) in entries {
+                w.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+                w.write_all(data).unwrap();
+            }
+            w.finish().unwrap().into_inner()
+        };
+        let zip = format!("{}\\Photos.zip", dir.display());
+        std::fs::write(&zip, zip_of(&[("a.txt", b"a"), ("inner.zip", &zip_of(&[("c.txt", b"c")]))])).unwrap();
+        let mut app = AppState::for_tests(crate::settings::Settings::default());
+        let open = |app: &mut AppState, inner: &str| {
+            let full = if inner.is_empty() { zip.clone() } else { format!("{zip}\\{inner}") };
+            let listed = crate::archive::read(&zip, inner, &full);
+            let t = &mut app.tabs[0];
+            t.path = full;
+            crate::app::apply_listing(t, listed);
+            t.selected = vec![false; t.folder.entries.len()];
+            t.selected[0] = true;
+            t.focus = Some(0);
+        };
+        let ctx = Ctx { hwnd: HWND::default(), scale: 1.0, now: 0.0, maximized: false, active: true };
+        let f2 = 0x71;
+        let mut list = ListView::new();
+        list.layout(Rect::new(0.0, 0.0, 600.0, 300.0), &ctx, &app);
+        open(&mut app, "inner.zip");
+        let _ = list.key_down(&ctx, f2, crate::ui::Mods::default(), &mut app);
+        assert!(list.rename.is_none(), "no name box");
+        assert_eq!(app.note(), Some(crate::archive::NESTED_NOTE));
+        list.slow = Some(SlowClick { tab_id: app.tab().id, index: 0, armed: true });
+        let _ = list.slow_click_due(&ctx, &mut app);
+        assert!(list.rename.is_none(), "a slow click doesn't rename there either");
+        // In the archive itself F2 goes on to the name box (which needs a window, so a test sees
+        // only that nothing is said).
+        open(&mut app, "");
+        app.say("before");
+        let _ = list.key_down(&ctx, f2, crate::ui::Mods::default(), &mut app);
+        assert_eq!(app.note(), Some("before"), "renaming goes on in the outer archive");
+        // Its Size column says "Unpacked size": it has room for those words, while an ordinary
+        // folder's keeps its own width.
+        list.layout(Rect::new(0.0, 0.0, 1000.0, 300.0), &ctx, &app);
+        let size_w = |list: &ListView| list.cols.iter().find(|p| p.col == Col::Size).map(|p| p.w);
+        assert_eq!(size_w(&list), Some(UNPACKED_W));
+        app.tabs[0].path = dir.display().to_string();
+        app.tabs[0].folder.path = dir.display().to_string();
+        list.layout(Rect::new(0.0, 0.0, 1000.0, 300.0), &ctx, &app);
+        assert_eq!(size_w(&list), Some(Col::Size.default_width()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn names_keep_their_extension_unless_asked() {
         let e = file("report.pdf");
@@ -3201,6 +3380,117 @@ mod tests {
         assert_eq!(relative_folder(&e, "C:\\"), "");
         e.target = Some("C:\\x\\a.txt".into());
         assert_eq!(relative_folder(&e, "C:\\"), "x");
+    }
+
+    /// A tab on a search of C:\\t (`dupes`: for duplicate files) that has found `found` so far.
+    fn searching(dupes: bool, done: bool, found: &[&str]) -> Tab {
+        let mut tab = Tab::new(1, "C:\\t".into());
+        tab.folder.path = "C:\\t".into();
+        let mut search = crate::search::test_search("C:\\t");
+        search.query = "report".into();
+        search.done = done;
+        search.dupes = dupes.then(Default::default);
+        tab.search = Some(search);
+        tab.folder.entries = found.iter().map(|n| Entry { target: Some(format!("C:\\t\\{n}")), ..file(n) }).collect();
+        tab.selected = vec![false; found.len()];
+        tab.rebuild_view();
+        tab
+    }
+
+    /// Find duplicates with nothing to show: "Checking for duplicate files…" while it runs, "No
+    /// duplicate files found." when it ended with none - not the name search's words.
+    #[test]
+    fn a_duplicate_search_with_nothing_to_show_says_so_in_its_own_words() {
+        let said = |tab: &Tab| ListView::message(tab, false);
+        assert_eq!(said(&searching(true, false, &[])).as_deref(), Some("Checking for duplicate files\u{2026}"));
+        assert_eq!(said(&searching(true, true, &[])).as_deref(), Some("No duplicate files found."));
+        // The words are the status bar's (dupes.rs keeps them for both).
+        assert_eq!(said(&searching(true, false, &[])).as_deref(), Some(crate::dupes::CHECKING));
+        assert_eq!(said(&searching(true, true, &[])).as_deref(), Some(crate::dupes::NONE_FOUND));
+        // A search for names keeps its own.
+        assert_eq!(said(&searching(false, false, &[])).as_deref(), Some("Searching\u{2026}"));
+        assert_eq!(said(&searching(false, true, &[])).as_deref(), Some("Nothing called \u{201c}report\u{201d} here or in the folders inside."));
+        // Sets on screen: nothing to say, running or done.
+        let sets = ["a #1.txt", "b \u{130}\u{f1} \u{1F600}.txt"];
+        assert_eq!(said(&searching(true, false, &sets)), None);
+        assert_eq!(said(&searching(true, true, &sets)), None);
+        // Found some, and the search bar hides them all: while it runs it is still checking; once
+        // done it didn't end with none, so it reads as in any folder.
+        for (done, expected) in [(false, "Checking for duplicate files\u{2026}"), (true, "No items match \u{201c}zzz\u{201d}.")] {
+            let mut tab = searching(true, done, &sets);
+            tab.filter = "zzz".into();
+            tab.rebuild_view();
+            assert_eq!(said(&tab).as_deref(), Some(expected));
+            // The search bar emptied again: the sets are back.
+            tab.filter.clear();
+            tab.rebuild_view();
+            assert_eq!(said(&tab), None);
+        }
+        // The folder itself couldn't be read: that is said, as for any search.
+        let mut gone = searching(true, true, &[]);
+        if let Some(s) = gone.search.as_mut() {
+            s.listing = crate::folder::Folder { path: "C:\\t".into(), error: Some("This folder is gone.".into()), ..Default::default() };
+        }
+        assert_eq!(said(&gone).as_deref(), Some("This folder is gone."));
+        // A slow folder on its way comes first, and a scan given up (Esc) leaves the folder's own words.
+        assert_eq!(ListView::message(&searching(true, false, &[]), true).as_deref(), Some("Loading\u{2026}"));
+        let mut back = searching(true, false, &[]);
+        back.search = None;
+        back.path = "C:\\t".into();
+        assert_eq!(said(&back).as_deref(), Some("This folder is empty."));
+    }
+
+    /// Find duplicates for real, in a folder without any: the list says it is checking, then that
+    /// none were found. Asked twice in a row, or given up half way (Esc), it
+    /// never says so wrongly.
+    #[test]
+    fn find_duplicates_says_it_is_checking_then_that_it_found_none() {
+        let dir = std::env::temp_dir().join(format!("glint-list-test-no-dupes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for (name, content) in [("a.txt", "one"), ("b.txt", "three"), ("sub\\c.txt", "a longer one")] {
+            std::fs::write(dir.join(name), content).unwrap();
+        }
+        let mut app = AppState::for_tests(crate::settings::Settings::default());
+        // The folder on screen, read as it is when the menu is used.
+        let path = dir.to_string_lossy().replace('/', "\\");
+        app.tabs[0].path = path.clone();
+        crate::app::apply_listing(&mut app.tabs[0], folder::read(&path));
+        app.tabs[0].load_ms = Some(1.0);
+        assert_eq!((app.tab().view.len(), ListView::message(app.tab(), false)), (3, None));
+        // Takes in what the background threads send until `until` holds (or 20 seconds pass).
+        let wait = |app: &mut AppState, until: &dyn Fn(&AppState) -> bool| {
+            let start = std::time::Instant::now();
+            while !until(app) && start.elapsed().as_secs() < 20 {
+                app.receive();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            until(app)
+        };
+        let done = |app: &AppState| app.tab().search.as_ref().is_some_and(|s| s.done);
+        // Asked twice in a row: the second search is the one that counts.
+        for _ in 0..2 {
+            app.run(Command::FindDuplicates);
+            // (No passing note: it would still say "Checking…" after a quick scan had ended.)
+            assert_eq!(app.note(), None);
+            assert!(done(&app) || ListView::message(app.tab(), false).as_deref() == Some("Checking for duplicate files\u{2026}"));
+        }
+        assert!(wait(&mut app, &done), "the search ends");
+        assert_eq!(ListView::message(app.tab(), false).as_deref(), Some("No duplicate files found."));
+        // Esc: back to the folder and its items.
+        app.run(Command::EndDuplicates);
+        assert!(app.tab().search.is_none());
+        assert_eq!((app.tab().view.len(), ListView::message(app.tab(), false)), (3, None));
+        // Given up half way: nothing is said about duplicates, then or once its results would have come.
+        app.run(Command::FindDuplicates);
+        app.run(Command::EndDuplicates);
+        assert_eq!((app.tab().view.len(), ListView::message(app.tab(), false)), (3, None));
+        let settled = std::time::Instant::now();
+        wait(&mut app, &|_| settled.elapsed().as_millis() > 300);
+        assert!(app.tab().search.is_none());
+        assert_eq!((app.tab().view.len(), ListView::message(app.tab(), false)), (3, None));
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Letters typed together jump to a name starting with them; when none does, the last letter
@@ -3399,6 +3689,83 @@ mod tests {
         assert!(lit >= 2, "spots lit up: {lit}");
     }
 
+    /// Home with the search bar matching nothing: a click on "Clear search" empties the search bar
+    /// and everything shows again; the link has a hand and lights up; nothing else there clears it.
+    #[test]
+    fn home_clear_search_empties_the_search_bar() {
+        let _turn = media::test_turn();
+        let mut app = AppState::for_tests(crate::settings::Settings::default());
+        let names: Vec<String> = (0..12).map(|i| format!("f{i} \u{1F600}.txt")).collect();
+        let entries = names.iter().map(|n| Entry { target: Some(format!("C:\\x\\{n}")), ..file(n) }).collect();
+        let parts = crate::recent::Parts { pinned: 6, recent: 6, favorites: 10 };
+        let folder = crate::folder::Folder { path: crate::recent::LOCATION.into(), entries, home: Some(Box::new(parts)), ..Default::default() };
+        app.tabs[0].path = crate::recent::LOCATION.into();
+        crate::app::apply_listing(&mut app.tabs[0], folder);
+        let mut list = ListView::new();
+        let ctx = Ctx { hwnd: HWND::default(), scale: 1.0, now: 0.0, maximized: false, active: true };
+        list.layout(Rect::new(10.0, 40.0, 600.0, 300.0), &ctx, &app);
+        list.tick(0.0, &mut app);
+        assert!(list.home_on);
+        // The page as the last frame drew it: the words, and the link after them when they show.
+        let frame = |list: &mut ListView, app: &AppState| {
+            let tab = app.tab();
+            list.home.layout = home::layout(592.0, parts, tab.folder.entries.len(), &list.home, |i| tab.row_of(i).is_some());
+            let said = home::note(tab, parts, list.home.favorites);
+            if matches!(said, Some(home::Note::NoMatch(_))) {
+                home::place_clear_search(&mut list.home.layout, 180.0, 70.0);
+            }
+            list.painted_hover = list.hover_key(tab);
+            said
+        };
+        let link = |list: &ListView| list.home.layout.spots.iter().find(|(s, _)| *s == home::Spot::ClearSearch).map(|&(_, rc)| Point::new(10.0 + rc.x + rc.w / 2.0, 40.0 + rc.y + rc.h / 2.0));
+        let ev = |pos: Point, button: MouseButton| MouseEvent { pos, button, mods: crate::ui::Mods::default(), wheel: 0.0 };
+        assert_eq!((frame(&mut list, &app), link(&list)), (None, None), "nothing typed: no words, no link");
+        // Twice over: typed, cleared by the link, typed again.
+        for typed in ["test", "#\u{130}\u{f1} \u{1F600}\u{1F600}"] {
+            assert!(app.run(Command::SetFilter(typed.into())));
+            assert!(app.tab().view.is_empty() && app.tab().search.is_none(), "Home is searched as it is");
+            assert_eq!(frame(&mut list, &app), Some(home::Note::NoMatch(format!("No items on Home match \u{201c}{typed}\u{201d}."))));
+            let at = link(&list).expect("the link shows");
+            // The words before it, and the empty page under it, are not the link.
+            let words = Point::new(at.x - 100.0, at.y);
+            assert_eq!((list.cursor(at, &app), list.cursor(words, &app)), (CursorKind::Hand, CursorKind::Arrow));
+            assert!(!matches!(list.mouse_down(&ctx, &ev(words, MouseButton::Left), &mut app), Effect::Command(_)));
+            let _ = list.mouse_up(&ctx, &ev(words, MouseButton::Left), &mut app);
+            assert!(!matches!(list.mouse_down(&ctx, &ev(at, MouseButton::Right), &mut app), Effect::Command(Command::SetFilter(_))), "only the left button");
+            let _ = list.mouse_up(&ctx, &ev(at, MouseButton::Right), &mut app);
+            assert_eq!(app.tab().filter, typed);
+            // Moving onto it lights it up (one new frame), moving along it doesn't ask again.
+            list.painted_hover = HoverKey::default();
+            assert!(matches!(list.mouse_move(&ctx, &ev(at, MouseButton::Left), &mut app), Effect::Redraw));
+            list.painted_hover = list.hover_key(app.tab());
+            assert_eq!(list.painted_hover.spot, Some(home::Spot::ClearSearch));
+            assert!(matches!(list.mouse_move(&ctx, &ev(Point::new(at.x + 2.0, at.y), MouseButton::Left), &mut app), Effect::None));
+            // The click: the search bar's own command, with nothing in it.
+            let effect = list.mouse_down(&ctx, &ev(at, MouseButton::Left), &mut app);
+            let Effect::Command(Command::SetFilter(text)) = effect else { panic!("the link clears the search bar") };
+            assert_eq!(text, "");
+            assert!(app.run(Command::SetFilter(text)));
+            assert_eq!((app.tab().filter.as_str(), app.tab().view.len()), ("", 12));
+            assert_eq!((frame(&mut list, &app), link(&list)), (None, None), "everything is back, the link is gone");
+            // Where the link was is the page again: a tile, here.
+            assert_eq!(list.cursor(at, &app), CursorKind::Arrow);
+            let under = list.row_at(app.tab(), at).and_then(|row| app.tab().index_at(row)).expect("a tile is back where the link was");
+            // The link clicked twice in a row (a double-click) opens nothing: only later clicks do.
+            assert!(matches!(list.mouse_up(&ctx, &ev(at, MouseButton::Left), &mut app), Effect::None));
+            assert!(matches!(list.double_click(&ctx, &ev(at, MouseButton::Left), &mut app), Effect::None), "the link's second click opens nothing");
+            let later = Ctx { hwnd: HWND::default(), scale: 1.0, now: 60.0, maximized: false, active: true };
+            assert!(matches!(list.double_click(&later, &ev(at, MouseButton::Left), &mut app), Effect::Command(Command::OpenEntry(i)) if i == under));
+        }
+        // Scrolled, the link is where it was drawn.
+        assert!(app.run(Command::SetFilter("test".into())));
+        frame(&mut list, &app);
+        list.home.layout.height = 900.0;
+        app.tabs[0].scroll = 30.0;
+        let at = link(&list).expect("the link shows");
+        assert_eq!(list.cursor(Point::new(at.x, at.y - 30.0), &app), CursorKind::Hand);
+        assert!(matches!(list.mouse_down(&ctx, &ev(Point::new(at.x, at.y - 30.0), MouseButton::Left), &mut app), Effect::Command(Command::SetFilter(t)) if t.is_empty()));
+    }
+
     /// The Apps key on Home opens the menu at the chosen tile or line, scrolled or not.
     #[test]
     fn home_keyboard_menu_opens_at_the_item() {
@@ -3528,5 +3895,179 @@ mod tests {
         assert_eq!(fade_stops(0.9), fade_stops(0.5));
         assert_eq!(fade_stops(-1.0), fade_stops(0.0));
         assert!(fade_stops(0.3).windows(2).all(|p| p[0].0 <= p[1].0), "stops in order");
+    }
+
+    /// A folder of files (odd names among them, each created at another time) with every column
+    /// switched on, Image dimensions and Duration too; `size` is the "Size" setting.
+    fn every_column(size: ListSize) -> AppState {
+        let mut settings = crate::settings::Settings::default();
+        settings.columns = OPTIONAL.iter().map(|c| c.key().to_string()).collect();
+        settings.size = size;
+        let mut app = AppState::for_tests(settings);
+        let long = format!("{}.txt", "n".repeat(300));
+        let names = ["a #1.txt", "\u{130}\u{f1} \u{1F600}.jpg", long.as_str(), "b.mp4"];
+        let entries = names.iter().enumerate().map(|(i, n)| Entry { created: (10 - i) as u64, ..file(n) }).collect();
+        crate::app::apply_listing(&mut app.tabs[0], crate::folder::Folder { path: "C:\\t".into(), entries, ..Default::default() });
+        app.tabs[0].media_here.dims = true;
+        app.tabs[0].media_here.length = true;
+        app
+    }
+
+    /// The columns `list` shows once laid out `w` wide (Name first).
+    fn shown_at(list: &mut ListView, app: &AppState, w: f32) -> Vec<Col> {
+        let ctx = Ctx { hwnd: HWND::default(), scale: 1.0, now: 0.0, maximized: false, active: true };
+        list.layout(Rect::new(0.0, 0.0, w, 400.0), &ctx, app);
+        list.cols.iter().map(|p| p.col).collect()
+    }
+
+    const EVERY: [Col; 7] = [Col::Name, Col::Modified, Col::Created, Col::Type, Col::Size, Col::Dimensions, Col::Length];
+
+    /// A list too narrow for every column leaves them out one by one - Date created, Image dimensions,
+    /// Duration, Type, Size and Date modified last - so Name stays readable, never Name itself; made
+    /// wide again it has them all back, at every width the same ones as on the way down.
+    #[test]
+    fn a_narrow_list_leaves_the_least_useful_columns_out_and_brings_them_back() {
+        let app = every_column(ListSize::Medium);
+        let mut list = ListView::new();
+        assert_eq!(shown_at(&mut list, &app, 1200.0), EVERY.to_vec(), "wide: all of them");
+        assert_eq!(list.text_growth(), 1.0);
+        // Widths: 150 each for the dates and Type, 90 Size, 135 Image dimensions, 80 Duration; Name
+        // keeps 250 and the scroll bar 14. Where each one first goes, narrowing a pixel at a time:
+        let mut down = Vec::new();
+        let mut went = Vec::new();
+        for w in (0..=1200).rev() {
+            let cols = shown_at(&mut list, &app, w as f32);
+            assert_eq!(cols[0], Col::Name, "at {w}");
+            let hidden: Vec<Col> = EVERY.iter().copied().filter(|c| !cols.contains(c)).collect();
+            // Always the first few of the order, and the shown ones in their usual order.
+            assert!(DROP_ORDER[..hidden.len()].iter().all(|c| hidden.contains(c)), "at {w}: {hidden:?}");
+            assert_eq!(cols, EVERY.iter().copied().filter(|c| cols.contains(c)).collect::<Vec<_>>());
+            if hidden.len() > went.len() {
+                assert_eq!(hidden.len(), went.len() + 1, "one at a time");
+                went.push(w);
+            }
+            if cols.len() > 1 {
+                assert!(list.cols[0].w >= READABLE_NAME, "at {w}: Name is {}", list.cols[0].w);
+            }
+            down.push(cols);
+        }
+        assert_eq!(went, vec![1018, 868, 733, 653, 503, 413]);
+        // Wider again: the same columns at each width, all of them back at the end.
+        for w in 0..=1200 {
+            assert_eq!(shown_at(&mut list, &app, w as f32), down[1200 - w], "at {w}");
+        }
+        assert_eq!(shown_at(&mut list, &app, 1019.0), EVERY.to_vec());
+        // Odd widths: nothing breaks, and Name is always there.
+        for w in [0.0, 0.5, 13.0, 1e6, 1e9] {
+            let cols = shown_at(&mut list, &app, w);
+            assert_eq!(cols[0], Col::Name, "at {w}");
+            assert!(list.cols.iter().all(|p| p.w.is_finite() && p.w >= 0.0), "at {w}");
+        }
+        assert_eq!(shown_at(&mut list, &app, 0.0), vec![Col::Name]);
+        assert_eq!(shown_at(&mut list, &app, 1e9), EVERY.to_vec());
+    }
+
+    /// Each half of split view decides by its own width, and the Columns setting and the widths
+    /// saved in settings.json stay as they were.
+    #[test]
+    fn each_half_of_split_view_leaves_columns_out_by_its_own_width() {
+        let app = every_column(ListSize::Medium);
+        let before = app.settings.clone();
+        let (mut wide, mut narrow) = (ListView::new(), ListView::new());
+        let widths = wide.column_widths();
+        // Both halves laid out, again and again, as the window is drawn.
+        for _ in 0..2 {
+            assert_eq!(shown_at(&mut wide, &app, 1100.0), EVERY.to_vec());
+            assert_eq!(shown_at(&mut narrow, &app, 600.0), vec![Col::Name, Col::Modified, Col::Size]);
+        }
+        assert_eq!(app.settings, before, "nothing written to the settings");
+        assert_eq!(app.settings.columns.len(), 6);
+        assert_eq!((wide.column_widths(), narrow.column_widths()), (widths.clone(), widths));
+    }
+
+    /// Large rows have bigger text and wider columns: Name keeps a readable width at that size too.
+    #[test]
+    fn large_rows_leave_columns_out_sooner() {
+        let app = every_column(ListSize::Large);
+        let mut list = ListView::new();
+        let _ = shown_at(&mut list, &app, 1200.0);
+        let grow = list.text_growth();
+        assert!(grow > 1.0, "bigger text: {grow}");
+        assert!(shown_at(&mut list, &app, 1019.0).len() < EVERY.len(), "too narrow at this size");
+        // All of them need 1005 (Name 250 and the rest 755) that much wider, and the scroll bar.
+        let all = (SCROLL_GUTTER + 1005.0 * grow).ceil() + 1.0;
+        assert_eq!(shown_at(&mut list, &app, all), EVERY.to_vec());
+        for w in (0..=all as i32).rev().step_by(7) {
+            let cols = shown_at(&mut list, &app, w as f32);
+            if cols.len() > 1 {
+                assert!(list.cols[0].w >= READABLE_NAME * grow - 0.01, "at {w}: Name is {}", list.cols[0].w);
+            }
+        }
+    }
+
+    /// Dragging a column's edge: the columns stay the ones they were while the mouse is down (the
+    /// edge stays under it, even if the window changes size), and making a column wider stops
+    /// where it would push another out.
+    #[test]
+    fn widening_a_column_never_pushes_another_out() {
+        let mut app = every_column(ListSize::Medium);
+        let ctx = Ctx { hwnd: HWND::default(), scale: 1.0, now: 0.0, maximized: false, active: true };
+        let mut list = ListView::new();
+        let at_900 = shown_at(&mut list, &app, 900.0);
+        assert_eq!(at_900, vec![Col::Name, Col::Modified, Col::Type, Col::Size, Col::Dimensions, Col::Length]);
+        let ty = list.cols.iter().find(|p| p.col == Col::Type).copied().unwrap();
+        list.drag = Drag::Column { col: Col::Type, start_x: ty.x, start_w: ty.w };
+        let ev = MouseEvent { pos: Point::new(ty.x - 500.0, 10.0), button: MouseButton::Left, mods: crate::ui::Mods::default(), wheel: 0.0 };
+        let _ = list.mouse_move(&ctx, &ev, &mut app);
+        let ty_now = list.cols.iter().find(|p| p.col == Col::Type).unwrap().w;
+        assert_eq!(ty_now, 900.0 - SCROLL_GUTTER - READABLE_NAME - (150.0 + 90.0 + DIMENSIONS_W + 80.0), "as wide as there is room for");
+        assert_eq!(list.cols.iter().map(|p| p.col).collect::<Vec<_>>(), at_900);
+        // The window narrowed while the mouse is still down: no column goes yet.
+        assert_eq!(shown_at(&mut list, &app, 700.0), at_900);
+        // Let go, at the same width: still all there; narrower, they go as before.
+        list.drag = Drag::None;
+        assert_eq!(shown_at(&mut list, &app, 900.0), at_900);
+        assert!(list.cols[0].w >= READABLE_NAME);
+        assert!(shown_at(&mut list, &app, 700.0).len() < at_900.len());
+    }
+
+    /// The same with large rows, whose columns are shown wider than they're remembered: a column
+    /// dragged as wide as it goes and let go leaves the list showing the columns it showed, at
+    /// every width (the widths are multiplied back up, which must not come out a hair too wide).
+    #[test]
+    fn widening_a_column_of_large_rows_never_pushes_another_out() {
+        let ctx = Ctx { hwnd: HWND::default(), scale: 1.0, now: 0.0, maximized: false, active: true };
+        for size in [ListSize::Large, ListSize::Medium, ListSize::Small] {
+            let mut app = every_column(size);
+            for step in 0..1200 {
+                let w = 520.0 + step as f32 * 0.61;
+                let before = shown_at(&mut ListView::new(), &app, w);
+                for col in before.iter().copied().filter(|c| *c != Col::Name) {
+                    let mut list = ListView::new();
+                    let _ = shown_at(&mut list, &app, w);
+                    let at = list.cols.iter().find(|p| p.col == col).copied().unwrap();
+                    list.drag = Drag::Column { col, start_x: at.x, start_w: at.w };
+                    let ev = MouseEvent { pos: Point::new(at.x - 2000.0, 10.0), button: MouseButton::Left, mods: crate::ui::Mods::default(), wheel: 0.0 };
+                    let _ = list.mouse_move(&ctx, &ev, &mut app);
+                    list.drag = Drag::None;
+                    assert_eq!(shown_at(&mut list, &app, w), before, "{size:?} rows, {w} wide, {col:?} dragged");
+                }
+            }
+        }
+    }
+
+    /// Sorted by a column the list has left out: the sort stays (and so does the order), and the
+    /// column is back once there is room.
+    #[test]
+    fn a_sorted_column_left_out_keeps_its_sort() {
+        let mut app = every_column(ListSize::Medium);
+        app.tabs[0].sort = SortKey::Created;
+        app.tabs[0].rebuild_view();
+        let order = app.tab().view.clone();
+        let mut list = ListView::new();
+        assert!(!shown_at(&mut list, &app, 600.0).contains(&Col::Created));
+        assert_eq!((app.tab().sort, &app.tab().view), (SortKey::Created, &order));
+        assert!(shown_at(&mut list, &app, 1200.0).contains(&Col::Created));
+        assert_eq!((app.tab().sort, &app.tab().view), (SortKey::Created, &order));
     }
 }

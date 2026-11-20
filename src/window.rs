@@ -36,7 +36,7 @@ use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, GetKeyboardLayout, VkKeyScanExW, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT,
-    VK_BACK, VK_OEM_5, VK_CONTROL, VK_F3, VK_F4, VK_F5, VK_F6, VK_LEFT, VK_MENU, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
+    VK_BACK, VK_OEM_5, VK_CONTROL, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos,
@@ -64,6 +64,7 @@ use windows::Win32::UI::WindowsAndMessaging::WM_CLIPBOARDUPDATE;
 use crate::app::{AppState, WM_APP_LOADED};
 use crate::ask::{Answer, AskBox};
 use crate::frame;
+use crate::keymap::{Action, Chord, KeyMap};
 use crate::list::{ListView, BAR_REPEAT_TIMER, SLOW_CLICK_TIMER};
 use crate::log;
 use crate::render::{FrameResult, Renderer, TextStyle};
@@ -76,9 +77,8 @@ use crate::popup::{self, Pick};
 use crate::shell::{self, WM_APP_NOTE};
 use crate::shellmenu::{self, Built, WM_APP_SHELL_MENU};
 use crate::ui::{FilesMenu, ShellTarget, MORE_OPTIONS};
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_OEM_3, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU;
-use crate::textbox::{self, TextEvent, TextEventKind, WM_APP_TEXT};
+use crate::textbox::{self, TextEvent, TextEventKind, WM_APP_TEXT, WM_APP_WANTS_KEY};
 // How Glint runs (life.rs): background mode, requests from other glint.exe's, Ctrl+N and Ctrl+Q.
 use crate::life::{self, Request, WM_APP_LIFE};
 use windows::Win32::UI::WindowsAndMessaging::{SC_CLOSE, SW_HIDE, WM_CLOSE};
@@ -96,7 +96,6 @@ pub mod sorting;
 use crate::settingswin::{self, SettingsWindow};
 use crate::skin::WM_APP_SKINS;
 use crate::skinwin::{self, SkinWindow};
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_OEM_COMMA;
 // Updates (update.rs) and their prompt (updatewin.rs).
 use crate::update::{self, Release, WM_APP_UPDATE};
 use crate::updatewin;
@@ -576,6 +575,28 @@ fn mods() -> Mods {
     }
 }
 
+/// "Sidebar shown (Ctrl+B hides it).": what was shown or hidden, and the shortcut that undoes it
+/// (none when it has no shortcut).
+fn shown_or_hidden(what: &str, show: bool, keys: &str) -> String {
+    let done = if show { "shown" } else { "hidden" };
+    if keys.is_empty() {
+        format!("{what} {done}.")
+    } else {
+        format!("{what} {done} ({keys} {} it).", if show { "hides" } else { "shows" })
+    }
+}
+
+/// The keys pressed, as the key map knows them: Ctrl with the key that types "\" on this keyboard
+/// is Ctrl+\ while Split view has its default, so that shortcut is Ctrl+\ on every keyboard.
+/// (The Settings window reads a new shortcut's keys the same way, so that key can't be given to
+/// something else and then never reach it.)
+pub(crate) fn pressed_chord(vk: u16, m: Mods, map: &KeyMap) -> Chord {
+    if m.ctrl && !m.alt && !map.changed(Action::SplitView) && is_ctrl_backslash(vk, m.shift) {
+        return Chord::new(VK_OEM_5.0, true, false, false);
+    }
+    Chord::of(vk, m)
+}
+
 /// Whether `vk` (with `shift`, Ctrl held and Alt not) is Ctrl+\: the \ key of US and UK keyboards
 /// (VK_OEM_5), or the key that types "\" on the keyboard layout in use.
 fn is_ctrl_backslash(vk: u16, shift: bool) -> bool {
@@ -903,7 +924,7 @@ fn open_settings(hwnd: HWND, ptr: *mut Window, page: Option<usize>) {
         let list = (*ptr).app.settings.settings_pages == settings::SettingsPages::List;
         let Some(win) = settingswin::create(hwnd, &theme, place, opens, list, page) else {
             BUSY.with(|b| b.set(true));
-            (*ptr).app.say("Windows couldn't open Settings right now. Try again.");
+            (*ptr).app.say("Failed to open Settings. Try again.");
             (*ptr).invalidate();
             BUSY.with(|b| b.set(false));
             return;
@@ -956,7 +977,7 @@ fn open_skins(hwnd: HWND, ptr: *mut Window) {
         let layout = (*ptr).app.settings.skins_window;
         let Some(win) = skinwin::create(hwnd, &theme, layout) else {
             BUSY.with(|b| b.set(true));
-            (*ptr).app.say("Windows couldn't open Skins right now. Try again.");
+            (*ptr).app.say("Failed to open Skins. Try again.");
             (*ptr).invalidate();
             BUSY.with(|b| b.set(false));
             return;
@@ -1359,8 +1380,15 @@ impl Window {
                 self.invalidate();
                 self.keyboard_to_question();
             }
-            Effect::Menu(menu) => self.deferred.push(Deferred::Menu(part, menu)),
-            Effect::FilesMenu(menu) => self.open_files_menu(part, menu),
+            // (Glint's menus show each shortcut as it is now: it may have been changed.)
+            Effect::Menu(mut menu) => {
+                crate::keymap::swap_menu(&mut menu.items, &KeyMap::of_settings(&self.app.settings));
+                self.deferred.push(Deferred::Menu(part, menu))
+            }
+            Effect::FilesMenu(mut menu) => {
+                crate::keymap::swap_menu(&mut menu.menu.items, &KeyMap::of_settings(&self.app.settings));
+                self.open_files_menu(part, menu)
+            }
             Effect::DragOut(d) => self.start_drag_out(d),
         }
     }
@@ -1461,7 +1489,9 @@ impl Window {
         if self.list.wine_nudge(now) {
             ANIMATING.with(|a| a.set(true));
         }
-        self.app.say(if show { "Sidebar shown (Ctrl+B hides it)" } else { "Sidebar hidden (Ctrl+B shows it)" });
+        // (With the shortcut as it is now: it may have been changed.)
+        let keys = KeyMap::of_settings(&self.app.settings).text(Action::Sidebar);
+        self.app.say(&shown_or_hidden("Sidebar", show, &keys));
     }
 
     /// Shows or hides the details panel (Alt+P, the Settings window).
@@ -1470,12 +1500,13 @@ impl Window {
         self.side_changed(now);
         if self.side.preview_open() {
             // The preview is in its place; the panel comes back when the preview closes.
-            self.app.say(if show { "The details panel comes back when the preview closes." } else { "Details panel hidden" });
+            self.app.say(if show { "The details panel comes back when the preview closes." } else { "Details panel hidden." });
         } else if show && self.side.rect().is_empty() {
             // No room for it next to the list (side.rs): it shows once the window is wider.
             self.app.say("Make the window wider to show the details panel.");
         } else {
-            self.app.say(if show { "Details panel shown (Alt+P hides it)" } else { "Details panel hidden (Alt+P shows it)" });
+            let keys = KeyMap::of_settings(&self.app.settings).text(Action::DetailsPanel);
+            self.app.say(&shown_or_hidden("Details panel", show, &keys));
         }
     }
 
@@ -1536,7 +1567,7 @@ impl Window {
                 if !self.set_dark(dark) {
                     // Nothing changed on screen, so "Light or dark" stays as it was too.
                     self.app.settings.theme = before;
-                    self.app.say(if dark { "This skin has no dark version" } else { "This skin has no light version. Make one called \u{201c}\u{2026} (Light)\u{201d}." });
+                    self.app.say(if dark { "This skin has no dark version." } else { "This skin has no light version. Make one called \u{201c}\u{2026} (Light)\u{201d}." });
                 }
             }
             Command::SetTheme(mode) => {
@@ -1574,6 +1605,7 @@ impl Window {
                 }
             }
             Command::BeginRename => {
+                // (Inside an archive Glint can't change it says why instead: list.rs.)
                 let e = self.list.begin_rename_selected(&ctx, &mut self.app);
                 self.apply(Part::List, e);
             }
@@ -1761,7 +1793,8 @@ impl Window {
                     if release.version == *v {
                         if asked && self.settings_win.is_none() {
                             let (said, _) = update::about(true, self.app.settings.check_for_updates);
-                            self.app.say(said);
+                            // (One line on the status bar: "Last checked at" follows with a space.)
+                            self.app.say(said.replace('\n', " "));
                             self.invalidate();
                         }
                         return;
@@ -1787,7 +1820,7 @@ impl Window {
                 } else if asked && self.settings_win.is_none() {
                     // Asked for, and the Settings window that asked is gone: the status bar says it.
                     let (said, _) = update::about(true, self.app.settings.check_for_updates);
-                    self.app.say(said);
+                    self.app.say(said.replace('\n', " "));
                     self.invalidate();
                 }
             }
@@ -2390,6 +2423,14 @@ impl Window {
         if self.app.form.is_some() {
             let a = if button == MouseButton::Left && self.form_shown() { self.form.mouse_down(p) } else { Answer::Nothing };
             self.form_answered(a);
+            if self.form.dragging() {
+                // Its list's scroll bar is held: the mouse stays ours until the button comes up,
+                // wherever that is.
+                // SAFETY: capturing the mouse for our own window.
+                unsafe {
+                    SetCapture(self.hwnd);
+                }
+            }
             return;
         }
         if self.palette.is_open() {
@@ -2472,8 +2513,15 @@ impl Window {
             return;
         }
         if self.app.form.is_some() && self.capture.is_none() {
+            let held = self.form.dragging();
             let a = if button == MouseButton::Left && self.form_shown() { self.form.mouse_up(p) } else { Answer::Nothing };
             self.form_answered(a);
+            if held && !self.form.dragging() {
+                // SAFETY: releasing our own capture.
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+            }
             return;
         }
         if self.palette.is_open() && self.capture.is_none() {
@@ -2502,6 +2550,11 @@ impl Window {
         if self.palette.is_open() {
             let c = self.palette.wheel(p, notches);
             return self.palette_chose(c);
+        }
+        // A form's preview list scrolls (renaming many); nothing behind a form or question does.
+        if self.app.form.is_some() && self.form_shown() {
+            let a = self.form.wheel(p, notches);
+            return self.form_answered(a);
         }
         if self.app.question.is_some() || self.app.form.is_some() {
             return;
@@ -2563,93 +2616,85 @@ impl Window {
             return true;
         }
         if self.palette.is_open() {
-            if m.alt {
+            // Its own shortcut, as the person has it, closes it again.
+            let map = KeyMap::of_settings(&self.app.settings);
+            let closes = map.find(pressed_chord(vk, m, &map)) == Some(Action::CommandBox);
+            if m.alt && !closes {
                 return false;
             }
-            let c = self.palette.key(vk, m);
+            let c = if closes { crate::palette::Choice::Close } else { self.palette.key(vk, m) };
             self.palette_chose(c);
             return true;
         }
         let key = |k: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| vk == k.0;
-        let letter = |c: char| vk == c as u16;
         // Shift, Ctrl or Alt on its own does nothing, so it leaves a right-click menu that waits for
         // Windows' items alone (Shift held for Shift+right-click keeps coming, repeated by Windows).
         if !(key(VK_SHIFT) || key(VK_CONTROL) || key(VK_MENU)) {
             self.drop_pending_menu();
         }
         // AltGr (the right Alt on German, Polish... keyboards) comes as Ctrl+Alt: AltGr+Q is @, not
-        // Ctrl+Q. So the Ctrl shortcuts want Ctrl without Alt, and the Alt+letter ones Alt without Ctrl.
+        // Ctrl+Q. So the Ctrl shortcuts want Ctrl without Alt, and the Alt+letter ones Alt without Ctrl
+        // (the key map only takes a shortcut's exact keys).
         let ctrl = m.ctrl && !m.alt;
-        if ctrl && !m.shift && letter('U') {
+        // The shortcuts, as the person has them (keymap.rs, Settings > Keyboard shortcuts).
+        let map = KeyMap::of_settings(&self.app.settings);
+        // (Ctrl+\ is whichever key types "\" on this keyboard, while Split view has its default.)
+        let pressed = pressed_chord(vk, m, &map);
+        let found = map.find(pressed);
+        if found == Some(Action::CommandBox) {
             // The command box (palette.rs).
             self.palette.open(self.hwnd, &self.app);
             self.invalidate();
             return true;
         }
-        let cmd = if ctrl && m.shift && letter('L') {
-            Some(Command::ToggleTheme)
-        } else if ctrl && m.shift && letter('U') {
+        let path = || self.app.tab().path.clone();
+        // The file list's shortcuts are its own (below).
+        let cmd = match found.filter(|a| !a.in_list()) {
+            Some(Action::LightDarkMode) => Some(Command::ToggleTheme),
             // Disk space for the drive on screen (diskpage.rs).
-            Some(Command::DiskSpace(None))
-        } else if ctrl && m.shift && letter('T') {
-            Some(Command::ReopenClosedTab)
-        } else if ctrl && !m.shift && letter('H') {
-            Some(Command::ToggleHidden)
-        } else if ctrl && !m.shift && letter('D') {
+            Some(Action::DiskSpace) => Some(Command::DiskSpace(None)),
+            Some(Action::ReopenClosedTab) => Some(Command::ReopenClosedTab),
+            Some(Action::HiddenFiles) => Some(Command::ToggleHidden),
             // Pin the folder on screen to the sidebar, or unpin it.
-            Some(Command::TogglePin(self.app.tab().path.clone()))
-        } else if ctrl && letter('T') {
-            Some(Command::NewTab)
-        } else if ctrl && letter('W') {
-            Some(Command::CloseTab(self.app.active))
-        } else if ctrl && !m.shift && letter('N') {
-            Some(Command::NewWindow) // (Ctrl+Shift+N is New folder, in the list)
-        } else if ctrl && !m.shift && letter('Q') {
-            Some(Command::Quit)
-        } else if ctrl && key(VK_TAB) {
-            Some(if m.shift { Command::PrevTab } else { Command::NextTab })
+            Some(Action::PinToSidebar) => Some(Command::TogglePin(path())),
+            Some(Action::NewTab) => Some(Command::NewTab),
+            Some(Action::CloseTab) => Some(Command::CloseTab(self.app.active)),
+            Some(Action::NewWindow) => Some(Command::NewWindow),
+            Some(Action::ExitGlint) => Some(Command::Quit),
+            Some(Action::NextTab) => Some(Command::NextTab),
+            Some(Action::PreviousTab) => Some(Command::PrevTab),
+            Some(Action::TypePath) => Some(Command::EditPath),
+            Some(Action::SplitView) => Some(Command::ToggleSplit),
+            Some(Action::SwitchPane) if self.app.split.is_some() => Some(Command::OtherPane),
+            // The filter searches subfolders too (or not any more).
+            Some(Action::SearchSubfolders) => Some(Command::ToggleSubfolders),
+            Some(Action::SearchBar) => Some(Command::FocusFilter),
+            Some(Action::Sidebar) => Some(Command::ToggleSidebar),
+            Some(Action::Refresh) => Some(Command::Refresh),
+            Some(Action::Up) => Some(Command::Up),
+            Some(Action::Back) => Some(Command::Back),
+            Some(Action::Forward) => Some(Command::Forward),
+            Some(Action::Properties) => Some(Command::Properties),
+            Some(Action::Settings) => Some(Command::OpenSettings(None)),
+            // A terminal in the folder on screen.
+            Some(Action::OpenInTerminal) => Some(Command::OpenTerminal(path())),
+            // The details panel on the right of the list (side.rs).
+            Some(Action::DetailsPanel) => Some(Command::ToggleDetails),
+            // The preview, unless its key is Space and Space is part of a name being typed to jump to it.
+            Some(Action::Preview) if !(key(VK_SPACE) && !m.ctrl && !m.alt && self.list.typing(self.now())) => Some(Command::TogglePreview),
+            _ => None,
+        };
+        // The keys that can't be changed.
+        let cmd = if cmd.is_some() {
+            cmd
         } else if let Some(view) = (ctrl && m.shift && (b'1'..=b'6').contains(&(vk as u8)) && vk < 0x100).then(|| ViewMode::for_key((vk as u8 - b'0') as u32)).flatten() {
             // Ctrl+Shift+1 to 6: the views, with Explorer's numbers (extra large icons ... details).
             Some(Command::SetView(view))
         } else if ctrl && (b'1'..=b'9').contains(&(vk as u8)) && vk < 0x100 {
             Some(Command::SwitchTab((vk as u8 - b'1') as usize))
-        } else if (ctrl && letter('L')) || (m.alt && !m.ctrl && letter('D')) || key(VK_F4) && !m.alt {
-            Some(Command::EditPath)
-        } else if ctrl && is_ctrl_backslash(vk, m.shift) {
-            Some(Command::ToggleSplit)
-        } else if key(VK_F6) && !m.ctrl && !m.alt && self.app.split.is_some() {
-            Some(Command::OtherPane)
-        } else if ctrl && m.shift && letter('F') {
-            // The filter searches subfolders too (or not any more).
-            Some(Command::ToggleSubfolders)
-        } else if (ctrl && letter('F')) || (key(VK_F3) && !m.ctrl && !m.alt) {
-            Some(Command::FocusFilter)
-        } else if ctrl && !m.shift && letter('B') {
-            Some(Command::ToggleSidebar)
-        } else if key(VK_F5) || (ctrl && letter('R')) {
-            Some(Command::Refresh)
         } else if key(VK_BACK) && !m.alt && !m.ctrl {
             // Up, or back like a web browser ("Backspace" setting).
             Some(if self.app.settings.backspace == Backspace::Back { Command::Back } else { Command::Up })
-        } else if m.alt && key(VK_UP) {
-            Some(Command::Up)
-        } else if m.alt && key(VK_LEFT) {
-            Some(Command::Back)
-        } else if m.alt && key(VK_RIGHT) {
-            Some(Command::Forward)
-        } else if m.alt && key(VK_RETURN) {
-            Some(Command::Properties)
-        } else if ctrl && !m.shift && key(VK_OEM_COMMA) {
-            Some(Command::OpenSettings(None))
-        } else if ctrl && key(VK_OEM_3) {
-            // Ctrl+` (the key left of 1): a terminal in the folder on screen.
-            Some(Command::OpenTerminal(self.app.tab().path.clone()))
-        } else if m.alt && !m.ctrl && !m.shift && letter('P') {
-            // The details panel on the right of the list (side.rs).
-            Some(Command::ToggleDetails)
-        } else if key(VK_SPACE) && !m.ctrl && !m.alt && !m.shift && !self.list.typing(self.now()) {
-            // The Space preview, unless Space is part of a name being typed to jump to it.
-            Some(Command::TogglePreview)
         } else {
             None
         };
@@ -2658,14 +2703,17 @@ impl Window {
             return true;
         }
         // While the preview is open, Esc closes it and Left / Right step through the files; the
-        // other keys (Up, Down...) go on to the list, and the preview follows its selection.
-        let effect = self.side.preview_key(vk, m, &mut self.app);
-        if !matches!(effect, Effect::None) {
-            self.apply(Part::Side, effect);
-            return true;
-        }
-        if m.alt {
-            return false; // leave Alt+F4, Alt+Space etc. to Windows
+        // other keys (Up, Down...) go on to the list, and the preview follows its selection. (A
+        // file shortcut's keys are the list's, also with an arrow in them.)
+        if !found.is_some_and(Action::in_list) {
+            let effect = self.side.preview_key(vk, m, &mut self.app);
+            if !matches!(effect, Effect::None) {
+                self.apply(Part::Side, effect);
+                return true;
+            }
+            if m.alt {
+                return false; // leave Alt+F4, Alt+Space etc. to Windows
+            }
         }
         let ctx = self.ctx();
         let effect = self.list.key_down(&ctx, vk, m, &mut self.app);
@@ -2829,6 +2877,10 @@ impl Window {
                 if self.capture.is_some() || self.split_drag {
                     let p = self.last_mouse;
                     self.mouse_up(p, MouseButton::Left);
+                }
+                if self.form.dragging() {
+                    self.form.let_go();
+                    self.invalidate();
                 }
                 Some(LRESULT(0))
             }
@@ -3021,6 +3073,18 @@ impl Window {
                 // Windows' items are late: the menu opens without them.
                 self.open_pending_menu(None, None);
                 Some(LRESULT(0))
+            }
+            WM_APP_WANTS_KEY => {
+                // The path box or the search bar asks about a key pressed in it: the window takes
+                // it when it is a shortcut the person moved, whose own keys the box hands on too
+                // (New tab moved from Ctrl+T to F7 opens a tab from there as Ctrl+T did). Never a
+                // file shortcut: those keys stay the box's.
+                let map = KeyMap::of_settings(&self.app.settings);
+                let wants = map.find(pressed_chord(wparam.0 as u16, mods(), &map)).is_some_and(|a| {
+                    let was = Chord::parse(a.spec().default);
+                    !a.in_list() && map.changed(a) && was.is_some_and(|c| textbox::is_window_shortcut(c.vk, c.ctrl, c.alt))
+                });
+                Some(LRESULT(isize::from(wants)))
             }
             WM_APP_NOTE => {
                 // A background job (terminal, Open with, Properties) has something to say.
@@ -3263,7 +3327,7 @@ impl Window {
             let _ = KillTimer(Some(self.hwnd), SHELL_MENU_TIMER);
         }
         if built.is_none() && p.menu.windows.as_ref().is_some_and(|w| w.full) {
-            self.app.say(if session.is_some() { "Windows has no menu of its own here" } else { "Windows' menu took too long; here is Glint's" });
+            self.app.say(if session.is_some() { "Windows has no menu of its own here." } else { "Windows' menu took too long; here is Glint's." });
             self.invalidate();
         }
         self.deferred.push(Deferred::FilesMenu(p.part, p.menu, built));

@@ -43,7 +43,8 @@ impl AppState {
         self.split_last = self.tab().id;
         self.ensure_loaded(other);
         self.sync_split_watch();
-        self.say("Split view: click a side to work in it (F6 switches).");
+        let keys = self.keys(crate::keymap::Action::SwitchPane);
+        self.say(crate::keymap::say_with(&keys, "Split view: click a side to work in it ({keys} switches).", "Split view: click a side to work in it."));
     }
 
     /// F6, or a click in the other half: Glint works in that half now.

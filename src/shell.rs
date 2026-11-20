@@ -207,13 +207,13 @@ pub fn open_with(owner: Owner, path: &str) {
                     ShellExecuteW(Some(owner.hwnd()), PCWSTR(verb.as_ptr()), PCWSTR(file.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL)
                 };
                 if r.0 as isize <= 32 {
-                    tell(owner.hwnd(), "Windows couldn't show the \u{201c}Open with\u{201d} window.".to_string());
+                    tell(owner.hwnd(), "Failed to show the \u{201c}Open with\u{201d} window.".to_string());
                 }
             }
         }
     });
     if !started {
-        tell(owner.hwnd(), "Windows couldn't start \u{201c}Open with\u{201d} right now.".to_string());
+        tell(owner.hwnd(), "Failed to start \u{201c}Open with\u{201d}. Try again.".to_string());
     }
 }
 
@@ -291,7 +291,7 @@ pub fn open_terminal(owner: Owner, dir: &str, choice: Terminal) {
         }
     });
     if !started {
-        tell(owner.hwnd(), "Windows couldn't open a terminal right now.".to_string());
+        tell(owner.hwnd(), "Failed to open a terminal. Try again.".to_string());
     }
 }
 

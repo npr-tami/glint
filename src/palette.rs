@@ -11,14 +11,16 @@
 //!
 //! While the box is open the window hands it the mouse and the keys (window.rs):
 //! - Up / Down pick a row, Enter or a click runs it;
-//! - Esc, Ctrl+U or a click outside closes it.
+//! - Esc, its own shortcut (Ctrl+U, or the keys it was given) or a click outside closes it.
+
+use std::cell::Cell;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_NEXT, VK_PRIOR, VK_RETURN, VK_UP,
+    GetKeyState, SetFocus, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
-use windows::Win32::UI::WindowsAndMessaging::{GetParent, SendMessageW, WM_CHAR, WM_KEYDOWN};
+use windows::Win32::UI::WindowsAndMessaging::{GetParent, SendMessageW, WM_CHAR, WM_KEYDOWN, WM_SYSCHAR, WM_SYSKEYDOWN};
 
 use crate::app::{AppState, SortKey, Tab};
 use crate::folder::NameFilter;
@@ -171,7 +173,7 @@ pub fn actions(app: &AppState) -> Vec<Item> {
         },
     ];
     if app.split.is_some() {
-        v.push(Item::new("Switch side", "F6", Run(Command::OtherPane)).guide(G::Tabs, "Moves to the other side of split view"));
+        v.push(Item::new("Switch pane", "F6", Run(Command::OtherPane)).guide(G::Tabs, "Moves to the other side of split view"));
     }
     // Tab sets, as in a tab's right-click menu: save these tabs, open or remove a saved set.
     v.push(Item::new("Save tabs as a set\u{2026}", "", Run(Command::SaveTabSet)).guide(G::Tabs, "Keeps these tabs, to open them all again later"));
@@ -201,20 +203,20 @@ pub fn actions(app: &AppState) -> Vec<Item> {
         (SortKey::Created, "date created", "Newest first"),
         (SortKey::Type, "type", "The same kinds of files together"),
         (SortKey::Size, "size", "Biggest first"),
-        (SortKey::Dimensions, "picture size", "Biggest pictures and videos first"),
-        (SortKey::Length, "length", "Longest videos and songs first"),
+        (SortKey::Dimensions, "image dimensions", "Biggest pictures and videos first"),
+        (SortKey::Length, "duration", "Longest videos and songs first"),
     ];
     for (key, name, about) in keys {
         let desc = matches!(key, SortKey::Date | SortKey::Created | SortKey::Size | SortKey::Dimensions | SortKey::Length);
         v.push(Item::new(&format!("Sort by {name}"), "", Run(Command::SetSort(key, desc))).guide(G::Sort, about));
     }
-    // (As SORT > Custom order: on while a column decides here turns it back on.)
+    // (As SORT > Sort rules: on while a column decides here turns it back on.)
     let custom_on = s.custom_sort && !tab.column_now;
     let about = if custom_on { "Sorts by the columns again" } else { "Sorts with your own rules" };
-    v.push(Item::new(&on_off(custom_on, "custom order"), "", Run(Command::SetCustomSort(!custom_on))).guide(G::Sort, about));
-    v.push(Item::new("Edit custom order\u{2026}", "", Run(Command::OpenSortEditor)).guide(G::Sort, "Opens the editor for your own sort rules"));
+    v.push(Item::new(&on_off(custom_on, "sort rules"), "", Run(Command::SetCustomSort(!custom_on))).guide(G::Sort, about));
+    v.push(Item::new("Edit folder rules\u{2026}", "", Run(Command::OpenSortEditor)).guide(G::Sort, "Opens the editor for your own sort rules"));
     let about = if s.custom_views { "Every folder uses the same view" } else { "Folders keep the view you gave them" };
-    v.push(Item::new(&on_off(s.custom_views, "custom views"), "", Run(Command::SetCustomViews(!s.custom_views))).guide(G::View, about));
+    v.push(Item::new(&on_off(s.custom_views, "view rules"), "", Run(Command::SetCustomViews(!s.custom_views))).guide(G::View, about));
     let about = if s.folder_sizes { "Stops adding up how big folders are" } else { "Shows how big each folder is" };
     v.push(Item::new(&on_off(s.folder_sizes, "folder sizes"), "", Action::FolderSizes(!s.folder_sizes)).guide(G::View, about));
     v.push(Item::new("Find duplicates", "", Run(Command::FindDuplicates)).guide(G::Files, "Finds files that are exact copies of each other"));
@@ -235,7 +237,7 @@ pub fn actions(app: &AppState) -> Vec<Item> {
             false => Item::new("Pin to sidebar", "Ctrl+D", Run(Command::TogglePin(here))).guide(G::Places, "Adds this folder to the sidebar"),
         });
     }
-    v.push(Item::new("Light or dark", "Ctrl+Shift+L", Run(Command::ToggleTheme)).guide(G::View, "Switches between the light and dark look"));
+    v.push(Item::new("Light/dark mode", "Ctrl+Shift+L", Run(Command::ToggleTheme)).guide(G::View, "Switches between the light and dark look"));
     v.push(Item::new("Settings", "Ctrl+,", Run(Command::OpenSettings(None))).guide(G::Glint, "Opens Glint's settings"));
     v.push(Item::new("Exit Glint", "Ctrl+Q", Run(Command::Quit)).guide(G::Glint, "Closes Glint completely"));
     v.push(Item::new("Help", "", Action::Fill("?")));
@@ -247,6 +249,11 @@ pub fn actions(app: &AppState) -> Vec<Item> {
     // (The guide has one line for them all.)
     for e in app.skins.entries() {
         v.push(Item::new(&format!("Skin: {}", e.name), "", Action::Skin(e.id.clone())));
+    }
+    // Each shortcut as it is now (the items above name the defaults; Settings can change them).
+    let keys = crate::keymap::KeyMap::of_settings(&app.settings);
+    for item in &mut v {
+        item.keys = crate::keymap::swap_keys(item.keys, &keys);
     }
     v
 }
@@ -265,6 +272,10 @@ pub fn guide(all: &[Item]) -> Vec<Item> {
         ("*.pdf", "Selects every PDF here", "*."),
         ("tag:red", "Selects everything with a red tag", "tag:"),
         ("holiday", "Any other word searches for it here", ""),
+        ("size:>10mb", "Finds files over 10 MB (or <500kb, 1gb..5gb)", "size:"),
+        ("date:today", "Finds what changed today (or yesterday, 2026-01, <2026)", "date:"),
+        ("-draft", "Leaves out names with draft in them", "-"),
+        ("regex:^img_\\d+", "Finds names that match a regular expression", "regex:"),
     ];
     let mut v: Vec<Item> = typed.iter().map(|&(name, about, start)| Item::new(name, "", Action::Fill(start)).guide(Group::Typing, about)).collect();
     v.extend(all.iter().filter(|it| !it.about.is_empty()).cloned());
@@ -333,6 +344,41 @@ pub fn score(name: &str, query: &str) -> Option<u32> {
     }
 }
 
+/// Other words a row answers to besides its name: what people call the thing it does, and what
+/// it was called before. "Edit folder rules…" is what sorts folders your own way, so "sort" has
+/// to find it.
+fn other_words(action: &Action) -> &'static [&'static str] {
+    match action {
+        Action::Run(Command::OpenSortEditor) => &["sort", "order", "views", "custom"],
+        _ => &[],
+    }
+}
+
+/// How a row's other words ([`other_words`]) match what was typed. Some(true): every typed word
+/// is one of them, whole ("sort", "custom order"), which finds the row as well as the start of
+/// its name does. Some(false): each typed word starts one of them or a word of the name ("cust",
+/// "sort rules"), which still finds it, after the rows whose own names match. None: no match.
+fn by_other_words(item: &Item, query: &str) -> Option<bool> {
+    let others = other_words(&item.action);
+    let q = query.trim().to_lowercase();
+    if others.is_empty() || q.is_empty() {
+        return None;
+    }
+    let name = item.name.to_lowercase();
+    let mut whole = true;
+    for part in q.split_whitespace() {
+        if others.contains(&part) {
+            continue;
+        }
+        whole = false;
+        let mut words = others.iter().copied().chain(name.split(|c: char| !c.is_alphanumeric()));
+        if !words.any(|w| w.starts_with(part)) {
+            return None;
+        }
+    }
+    Some(whole)
+}
+
 /// Whether typed text is a pattern for "Select": a `*` or `?` in it, or a colour tag (`tag:red`,
 /// tags.rs), and not a path.
 pub fn is_pattern(text: &str) -> bool {
@@ -343,13 +389,22 @@ pub fn is_pattern(text: &str) -> bool {
 
 /// The rows to show for `text`: the best matches first (ties keep the list's order), a "Go to"
 /// row first for a path, a "Select" row first for a pattern, and a "Search for" row last for
-/// anything but a path. At most MAX_ROWS.
+/// anything but a path. At most MAX_ROWS. A row found by its other words, typed whole, goes
+/// first among the rows that match as well ("sort" lists "Edit folder rules…" above the sorts).
 pub fn rows_for(all: &[Item], text: &str) -> Vec<Item> {
     let t = text.trim();
     if t.is_empty() {
         return all.iter().take(MAX_ROWS).cloned().collect();
     }
-    let mut found: Vec<(u32, bool, usize)> = all.iter().enumerate().filter_map(|(i, it)| score(&it.name, t).map(|s| (s, !FIRST_AMONG_EQUALS.contains(&it.name.as_str()), i))).collect();
+    let rank = |it: &Item| {
+        let by_name = score(&it.name, t).map(|s| (s, !FIRST_AMONG_EQUALS.contains(&it.name.as_str())));
+        let by_others = by_other_words(it, t).map(|whole| if whole { (0, false) } else { (2, true) });
+        match (by_name, by_others) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    };
+    let mut found: Vec<(u32, bool, usize)> = all.iter().enumerate().filter_map(|(i, it)| rank(it).map(|(s, later)| (s, later, i))).collect();
     found.sort();
     let found: Vec<(u32, usize)> = found.into_iter().map(|(s, _, i)| (s, i)).collect();
     if looks_like_path(t) {
@@ -379,7 +434,7 @@ pub fn select_matching(tab: &mut Tab, pattern: &str) -> usize {
     for &i in &tab.view {
         let i = i as usize;
         let e = &tab.folder.entries[i];
-        if filter.keeps(&e.lower, || e.path_in(&tab.folder.path)) {
+        if filter.keeps_item(e, || e.path_in(&tab.folder.path)) {
             tab.selected[i] = true;
             first.get_or_insert(i);
             n += 1;
@@ -433,6 +488,11 @@ impl CommandBox {
             b
         });
         edit.set_text("");
+        // Its own shortcut closes it again, from the text box too (see `keys_proc`).
+        TOGGLE.with(|t| t.set(crate::keymap::KeyMap::of_settings(&app.settings).chord(crate::keymap::Action::CommandBox)));
+        // If a shortcut that types nothing (F7) closed it last time, no character came to be
+        // dropped, so the first one typed now must not be.
+        SKIP_CHAR.with(|s| s.set(false));
         self.all = actions(app);
         self.show("");
         self.open = true;
@@ -617,13 +677,14 @@ impl CommandBox {
         }
     }
 
-    /// A key, from the text box (Up, Down, Page Up, Page Down, Ctrl+U) or the window itself.
+    /// A key, from the text box (Up, Down, Page Up, Page Down) or the window itself. (Its own
+    /// shortcut, which closes it, the window finds in the key map.)
     pub fn key(&mut self, vk: u16, m: Mods) -> Choice {
+        let _ = m;
         let n = self.rows.len();
         let to = match vk {
             v if v == VK_RETURN.0 => return self.run(self.pick),
             v if v == VK_ESCAPE.0 => return Choice::Close,
-            v if v == u16::from(b'U') && m.ctrl => return Choice::Close,
             _ if n == 0 => return Choice::Nothing,
             v if v == VK_UP.0 => (self.pick + n - 1) % n,
             v if v == VK_DOWN.0 => (self.pick + 1) % n,
@@ -702,26 +763,37 @@ impl CommandBox {
     }
 }
 
-/// On the box's EDIT: the keys that move through the rows (and Ctrl+U) go to the window, which
-/// hands them to the box (`CommandBox::key`).
+thread_local! {
+    /// The command box's own shortcut as it was when it opened (None: it has none).
+    static TOGGLE: Cell<Option<crate::keymap::Chord>> = const { Cell::new(None) };
+    /// Its shortcut was just pressed in the text box: the character that comes with it isn't typed.
+    static SKIP_CHAR: Cell<bool> = const { Cell::new(false) };
+}
+
+/// On the box's EDIT: the keys that move through the rows, and the box's own shortcut, go to the
+/// window, which hands them to the box (`CommandBox::key`) or closes it.
 unsafe extern "system" fn keys_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _uid: usize, _data: usize) -> LRESULT {
-    if msg == WM_KEYDOWN {
+    if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
         let vk = wparam.0 as u16;
-        // SAFETY: plain key-state query.
-        let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
-        if [VK_UP.0, VK_DOWN.0, VK_PRIOR.0, VK_NEXT.0].contains(&vk) || (ctrl && vk == u16::from(b'U')) {
+        // SAFETY: plain key-state queries.
+        let held = |k: u16| unsafe { GetKeyState(i32::from(k)) } < 0;
+        let pressed = crate::keymap::Chord::new(vk, held(VK_CONTROL.0), held(VK_SHIFT.0), msg == WM_SYSKEYDOWN || held(VK_MENU.0));
+        let toggle = TOGGLE.with(Cell::get) == Some(pressed);
+        // (Each key's own character comes right after it: only the shortcut's is dropped.)
+        SKIP_CHAR.with(|s| s.set(toggle));
+        if toggle || (msg == WM_KEYDOWN && [VK_UP.0, VK_DOWN.0, VK_PRIOR.0, VK_NEXT.0].contains(&vk)) {
             // Sent, not posted, so the window sees Ctrl as it is now.
             // SAFETY: a message to our own parent window, on this same thread.
             unsafe {
                 if let Ok(parent) = GetParent(hwnd) {
-                    SendMessageW(parent, WM_KEYDOWN, Some(wparam), Some(lparam));
+                    SendMessageW(parent, msg, Some(wparam), Some(lparam));
                 }
             }
             return LRESULT(0);
         }
     }
-    // Ctrl+U's character isn't typed.
-    if msg == WM_CHAR && wparam.0 == 0x15 {
+    // The shortcut's character isn't typed (nor Ctrl+U's, which the box never types).
+    if (msg == WM_CHAR || msg == WM_SYSCHAR) && (SKIP_CHAR.with(|s| s.replace(false)) || (msg == WM_CHAR && wparam.0 == 0x15)) {
         return LRESULT(0);
     }
     // SAFETY: everything else goes on to textbox.rs's handling and the EDIT's own.
@@ -894,14 +966,14 @@ mod tests {
         assert_eq!(found.action, Action::Run(Command::OpenSetting(2, "Hidden files".into())));
         // Any setting on any page, once each; the shortcut list isn't one.
         let settings: Vec<&Item> = all.iter().filter(|i| matches!(i.action, Action::Run(Command::OpenSetting(..)))).collect();
-        for t in ["Setting: Skin", "Setting: Zip icon", "Setting: Open Glint to", "Setting: Check for updates automatically"] {
+        for t in ["Setting: Skin", "Setting: ZIP icon style", "Setting: On startup, open", "Setting: Check for updates automatically"] {
             assert_eq!(settings.iter().filter(|i| i.name == t).count(), 1, "{t}");
         }
         // (A setting may name a key, like "Ctrl+scroll wheel changes view"; a shortcut row is just its keys.)
         for t in ["Setting: Ctrl+Q", "Setting: Ctrl+Shift+U", "Setting: F2"] {
             assert!(!settings.iter().any(|i| i.name == t), "no shortcuts: {t}");
         }
-        assert!(rows_for(&all, "setting zip").iter().any(|r| r.name == "Setting: Zip icon"));
+        assert!(rows_for(&all, "setting zip").iter().any(|r| r.name == "Setting: ZIP icon style"));
     }
 
     /// Saving the tabs as a set, and each saved set (to open or remove), are found by "tab set",
@@ -933,7 +1005,7 @@ mod tests {
         assert_eq!(rows_for(&all, "remove work")[0].action, Action::Run(Command::DeleteTabSet(0)));
         // Settings still come first for what starts their name.
         assert_eq!(rows_for(&all, "settings")[0].name, "Settings");
-        assert_eq!(rows_for(&all, "setting zip")[0].name, "Setting: Zip icon");
+        assert_eq!(rows_for(&all, "setting zip")[0].name, "Setting: ZIP icon style");
         // The guide tells how to find them.
         assert!(guide(&all).iter().any(|r| r.name == "Tab sets" && r.group == Group::Tabs && r.action == Action::Fill("tab set ")));
         assert!(guide(&all).iter().any(|r| r.action == Action::Run(Command::SaveTabSet)));
@@ -948,10 +1020,124 @@ mod tests {
         assert!(all.iter().any(|i| i.name == "Show hidden files" && i.keys == "Ctrl+H"));
         assert!(all.iter().any(|i| i.name == "View: Details" && i.keys == "Ctrl+Shift+6"));
         assert!(all.iter().any(|i| i.name == "View: Extra large icons" && i.keys == "Ctrl+Shift+1"));
-        assert!(!all.iter().any(|i| i.name == "Switch side"), "only in split view");
+        assert!(!all.iter().any(|i| i.name == "Switch pane"), "only in split view");
         let skins = all.iter().filter(|i| matches!(i.action, Action::Skin(_))).count();
         assert_eq!(skins, app.skins.entries().len());
         assert!(skins > 0);
+    }
+
+    /// The folder rules go by one name: the editor, and the two switches (sorting, views).
+    #[test]
+    fn the_folder_rules_have_one_name() {
+        use crate::settings::Settings;
+        let named = |app: &AppState, action: Action| actions(app).into_iter().find(|i| i.action == action).map(|i| i.name).expect("listed");
+        let off = AppState::for_tests(Settings { custom_sort: false, custom_views: false, ..Default::default() });
+        assert_eq!(named(&off, Action::Run(Command::OpenSortEditor)), "Edit folder rules\u{2026}");
+        assert_eq!(named(&off, Action::Run(Command::SetCustomSort(true))), "Turn on sort rules");
+        assert_eq!(named(&off, Action::Run(Command::SetCustomViews(true))), "Turn on view rules");
+        let on = AppState::for_tests(Settings { custom_sort: true, custom_views: true, ..Default::default() });
+        assert_eq!(named(&on, Action::Run(Command::SetCustomSort(false))), "Turn off sort rules");
+        assert_eq!(named(&on, Action::Run(Command::SetCustomViews(false))), "Turn off view rules");
+        assert_eq!(named(&on, Action::Run(Command::ToggleTheme)), "Light/dark mode");
+        // None of the older names is left, in the list or in the guide. (The settings' rows go
+        // by their titles in the Settings window.)
+        for app in [&off, &on] {
+            let all = actions(app);
+            for it in all.iter().chain(&guide(&all)).filter(|it| !matches!(it.action, Action::Run(Command::OpenSetting(..)))) {
+                let n = it.name.to_lowercase();
+                assert!(!n.contains("custom order") && !n.contains("custom view") && !n.contains("custom sort") && n != "light or dark", "{}", it.name);
+            }
+        }
+    }
+
+    /// Typing "sort" lists "Edit folder rules…" first, above the sorts, and the words people know
+    /// it by find it too.
+    #[test]
+    fn sort_and_other_words_find_the_folder_rules() {
+        let app = AppState::for_tests(crate::settings::Settings::default());
+        let all = actions(&app);
+        let edit = Action::Run(Command::OpenSortEditor);
+        for typed in ["sort", "SORT", "  Sort  "] {
+            let rows = rows_for(&all, typed);
+            assert_eq!(rows[0].name, "Edit folder rules\u{2026}", "{typed}");
+            assert_eq!(rows[0].action, edit);
+            assert_eq!(names(&rows)[1..4], ["Sort by name", "Sort by date modified", "Sort by date created"], "the sorts follow, in their order");
+            assert_eq!(rows.len(), MAX_ROWS);
+            assert!(matches!(rows[MAX_ROWS - 1].action, Action::Search(_)), "the search row is still last");
+        }
+        for typed in ["rules", "folder rules", "order", "views", "custom", "sort order", "custom sort", "custom views", "custom order", "folder", "edit", "edit rules", "sort rules", "cust", "ord", "rule"] {
+            let rows = rows_for(&all, typed);
+            assert!(rows.iter().any(|r| r.action == edit), "{typed}: {:?}", names(&rows));
+        }
+        // Its other words, whole and alone, put it first.
+        for typed in ["order", "views", "custom", "sort order", "custom views"] {
+            assert_eq!(rows_for(&all, typed)[0].action, edit, "{typed}");
+        }
+        // A switch's own name finds the switch first.
+        assert_eq!(rows_for(&all, "sort rules")[0].action, Action::Run(Command::SetCustomSort(true)));
+        assert_eq!(rows_for(&all, "view rules")[0].action, Action::Run(Command::SetCustomViews(false)));
+        // More typed after "sort" is for the sorts.
+        assert_eq!(rows_for(&all, "sort size")[0].name, "Sort by size");
+        assert_eq!(rows_for(&all, "sort by")[0].name, "Sort by name");
+        assert_eq!(rows_for(&all, "sort d")[0].name, "Sort by date modified");
+        for typed in ["sort size", "sort by", "sort d", "sort name", "sorted", "sorts", "resort"] {
+            assert!(!rows_for(&all, typed).iter().any(|r| r.action == edit), "{typed}");
+        }
+    }
+
+    /// The other words change nothing else: whatever is typed, the other rows are the ones that
+    /// showed without them, in the same order.
+    #[test]
+    fn other_words_leave_the_other_rows_as_they_were() {
+        let app = AppState::for_tests(crate::settings::Settings::default());
+        let all = actions(&app);
+        let edit = Action::Run(Command::OpenSortEditor);
+        // The same list, with the row found by its name alone.
+        let mut plain = all.clone();
+        let i = plain.iter().position(|r| r.action == edit).expect("listed");
+        plain[i].action = Action::SelectAll;
+        assert!(other_words(&plain[i].action).is_empty());
+        let name = plain[i].name.clone();
+        let typed = [
+            "s", "so", "sor", "sort", "sort ", "sort s", "sort size", "sort by", "sort b", "o", "or", "order", "v", "view", "views", "c", "cu", "custom", "f", "fo", "folder", "r", "rules",
+            "e", "edit", "new", "n", "tab", "set", "settings", "skin", "hidden", "dark", "light", "split", "x", "zzz", "sv", "nt", "so vi cu", "\u{1f600}", "#", "\u{130}", "\u{f1}", "*.pdf", "tag:red", "C:\\Users",
+        ];
+        for t in typed {
+            let with: Vec<Item> = rows_for(&all, t).into_iter().filter(|r| r.action != edit).collect();
+            let without: Vec<Item> = rows_for(&plain, t).into_iter().filter(|r| r.name != name).collect();
+            // (The row may take a place in the eight, so the others may be one fewer at the end.)
+            let n = with.iter().filter(|r| !matches!(r.action, Action::Search(_))).count();
+            let m = without.iter().filter(|r| !matches!(r.action, Action::Search(_))).count();
+            assert!(n <= m && m <= n + 1, "{t}: {:?} / {:?}", names(&with), names(&without));
+            assert_eq!(names(&with)[..n], names(&without)[..n], "{t}");
+        }
+        // Short starts of "sort" still show the sorts alone, as before.
+        for t in ["s", "so", "sor"] {
+            assert_eq!(names(&rows_for(&all, t)), names(&rows_for(&plain, t)), "{t}");
+        }
+    }
+
+    /// Odd and huge things typed find nothing by the other words, and nothing breaks.
+    #[test]
+    fn other_words_cope_with_odd_text() {
+        let mut row = items(&["Edit folder rules\u{2026}"]).remove(0);
+        // A row without other words is never found by them.
+        assert_eq!(by_other_words(&row, "sort"), None);
+        row.action = Action::Run(Command::OpenSortEditor);
+        assert_eq!(by_other_words(&row, "sort"), Some(true));
+        assert_eq!(by_other_words(&row, " Custom  ORDER "), Some(true));
+        assert_eq!(by_other_words(&row, "sort sort sort"), Some(true), "said twice");
+        assert_eq!(by_other_words(&row, "sort rules"), Some(false));
+        assert_eq!(by_other_words(&row, "vi"), Some(false));
+        let long = "sort ".repeat(4000);
+        assert_eq!(by_other_words(&row, &long), Some(true));
+        let long_word = "s".repeat(300);
+        for odd in ["", "   ", "#", "sort #", "\u{1f600}", "sort\u{1f600}", "\u{130}", "\u{f1}", "s\u{f6}rt", long_word.as_str(), "sort size", "sov", "efr", "o r d e r x"] {
+            assert_eq!(by_other_words(&row, odd), None, "{odd:?}");
+        }
+        // Nothing but the search row for nonsense, as before.
+        assert_eq!(rows_for(&[row.clone()], "sov").len(), 1);
+        assert_eq!(rows_for(&[row], &long_word).len(), 1);
     }
 
     /// A tab at C:\x showing these names (a name ending in "\" is a folder, one starting with "." hidden).
@@ -1080,7 +1266,7 @@ mod tests {
             assert!(seen.insert((it.group, it.name.clone())), "{} twice", it.name);
         }
         // A guide made from nothing is just the things to type.
-        assert_eq!(guide(&[]).len(), 4);
+        assert_eq!(guide(&[]).len(), 8);
         // Keys and clicks on an empty list don't panic.
         let mut b = CommandBox::default();
         assert_eq!(b.key(VK_DOWN.0, Mods::default()), Choice::Nothing);

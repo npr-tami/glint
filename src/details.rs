@@ -61,8 +61,6 @@ pub mod dims {
     pub const ROW_H: f32 = 26.0;
     pub const OPEN_H: f32 = 34.0;
     pub const BUTTON_H: f32 = 30.0;
-    /// How far the Open button's right edge leans.
-    pub const SLANT: f32 = 10.0;
     pub const MONO_FONT: f32 = 11.0;
     pub const MONO_LINE: f32 = 15.0;
     /// Icons are drawn at most this big in the box.
@@ -310,6 +308,14 @@ pub fn info(sel: &Sel, facts: Option<&Facts>, app: &AppState) -> Info {
         }
     }
     out
+}
+
+/// Inside a .zip or .7z a file's size is how big it is unpacked (archive.rs lists that, not what
+/// it takes up packed), and its size chip (`size`, as `info` wrote it) says so: "2 KB unpacked".
+pub(crate) fn mark_unpacked(info: &mut Info, size: &str) {
+    if let Some(chip) = info.chips.iter_mut().find(|c| *c == size) {
+        chip.push_str(" unpacked");
+    }
 }
 
 // ---------------------------------------------------------------- fitting text
@@ -614,14 +620,8 @@ fn button(r: &mut Renderer, theme: &Theme, rect: Rect, label: &str, hover: bool,
     }
     if accent {
         let fill = if pressed { blend(theme.accent, Color::hex(0), 0.18) } else if hover { blend(theme.accent, Color::hex(0xffffff), 0.1) } else { theme.accent };
-        // In a slanted skin the right edge is cut at an angle (like AMD's Radeon software);
-        // straight or rounded otherwise, as the skin says.
-        let cut = theme.lean(dims::SLANT).min(rect.w / 2.0);
-        if cut > 0.0 {
-            r.fill_polygon(&[Point::new(rect.x, rect.y), Point::new(rect.right(), rect.y), Point::new(rect.right() - cut, rect.bottom()), Point::new(rect.x, rect.bottom())], fill);
-        } else {
-            fill_box(r, theme, rect, 0.0, fill);
-        }
+        // Straight (or rounded, as the skin says): nothing is beside it, so nothing leans.
+        fill_box(r, theme, rect, 0.0, fill);
     } else {
         let fill = if pressed { theme.button_pressed.into() } else if hover { theme.chip_hover_paint } else { theme.chip_paint };
         fill_box_paint(r, theme, rect, 0.0, &fill);
@@ -1141,7 +1141,12 @@ impl DetailsPanel {
         let buttons_top = if can_copy { f.copy.y } else { f.open.y } - 10.0;
         r.push_clip(Rect::new(rect.x, rect.y, rect.w, (buttons_top - rect.y).max(0.0)));
         self.paint_preview(r, theme, &sel, facts, f.preview, ctx.scale);
-        let info = info(&sel, facts, app);
+        let mut info = info(&sel, facts, app);
+        if let Some(o) = one.filter(|o| o.is_file()) {
+            if self.in_archive(&o.path) {
+                mark_unpacked(&mut info, &folder::format_size_as(o.entry.size, app.settings.size_format));
+            }
+        }
         let rows = Rect::new(f.preview.x, f.preview.bottom() + 12.0, f.preview.w, (buttons_top - f.preview.bottom() - 12.0).max(0.0));
         let end = draw_info(r, theme, rows, &info);
         // One file: its Fingerprint under the rows.
@@ -1475,7 +1480,11 @@ mod tests {
         assert_eq!(i.chips, vec!["JPG", "2 KB", "4000 \u{d7} 3000"]);
         assert_eq!(i.rows, vec![Row { label: "Folder", value: "pics".into(), path: false }]);
         // Before peek.rs answers: no picture size yet, the rest is there.
-        assert_eq!(info(&Sel::One(Box::new(one)), None, &app).chips, vec!["JPG", "2 KB"]);
+        assert_eq!(info(&Sel::One(Box::new(one.clone())), None, &app).chips, vec!["JPG", "2 KB"]);
+        // Inside a .zip or .7z: the size chip says it's the unpacked size.
+        let mut inside = info(&Sel::One(Box::new(one.clone())), Some(&facts), &app);
+        mark_unpacked(&mut inside, "2 KB");
+        assert_eq!(inside.chips, vec!["JPG", "2 KB unpacked", "4000 \u{d7} 3000"]);
         let many = info(&Sel::Many { count: 3, files: 2, folders: 1, bytes: 4096 }, None, &app);
         assert_eq!(many.name, "3 items selected");
         assert_eq!(many.chips, vec!["2 files", "4 KB", "1 folder"]);

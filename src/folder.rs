@@ -26,7 +26,7 @@ use windows::Win32::Storage::FileSystem::{
     FIND_FIRST_EX_LARGE_FETCH, INVALID_FILE_ATTRIBUTES, WIN32_FIND_DATAW,
 };
 use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
-use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToFileTime, SystemTimeToTzSpecificLocalTime, TzSpecificLocalTimeToSystemTime};
 
 use crate::icons;
 use crate::recycle;
@@ -159,7 +159,7 @@ pub enum SortKey {
     Created,
     /// The folder a search result is in (only while search results are shown).
     Folder,
-    /// Picture size: how many pixels a picture or a video has (media.rs reads it).
+    /// Image dimensions: how many pixels a picture or a video has (media.rs reads it).
     Dimensions,
     /// How long a video or a song plays (media.rs reads it).
     Length,
@@ -432,9 +432,9 @@ fn explain(code: u32, system: &str) -> String {
         _ => {
             let s = system.trim();
             if s.is_empty() {
-                format!("Windows couldn't open this folder (error {}).", code & 0xFFFF)
+                format!("Failed to open this folder (error {}).", code & 0xFFFF)
             } else {
-                format!("Windows couldn't open this folder: {s}")
+                format!("Failed to open this folder: {s}")
             }
         }
     }
@@ -684,7 +684,7 @@ pub fn sort_view(entries: &[Entry], view: &mut [u32], key: SortKey, descending: 
     }));
 }
 
-/// Sorts `view` like [`sort_view`], by a value only some entries have (Picture size and Length,
+/// Sorts `view` like [`sort_view`], by a value only some entries have (Image dimensions and Duration,
 /// which media.rs reads in the background): `values` holds each entry's, by its index into
 /// `entries`. Items without one go last whichever way the column is sorted; ties stay A to Z.
 pub fn sort_view_by<K: Ord>(entries: &[Entry], view: &mut [u32], descending: bool, folders_first: bool, values: &[Option<K>]) {
@@ -931,12 +931,35 @@ fn windows_time(t: &SYSTEMTIME) -> String {
 /// Words in quotes are looked for inside files (search.rs): `"hello world"` in text files,
 /// `"hello world" *.md *.txt` only in those kinds of files. With quotes, each `*` or `?` word is a
 /// pattern of its own (any of them will do) and the other words are for the name.
+/// A few more words, in any capitals, go with all of that:
+/// - `size:>10mb`, `size:<500kb`, `size:1gb..5gb` (b, kb, mb, gb; none is bytes; `size:0` is
+///   exactly that): files only, as folders have no size here;
+/// - `date:today`, `date:yesterday`, `date:2026`, `date:2026-01`, `date:2026-01-31`, and `>` or `<`
+///   before a date for after or before it: by Date modified, in local time;
+/// - a word or pattern with a minus in front leaves those names out (`-draft`, `-*.tmp`; a minus
+///   alone is an ordinary word);
+/// - `regex:` and a regular expression for the name (`regex:^img_\d{4}\.jpe?g$`).
+///
+/// A `size:`, `date:` or `regex:` word that doesn't make sense (`date:2026-13-40`, a pattern still
+/// being typed) keeps nothing, as a word no name has; one with nothing after the colon doesn't
+/// count yet. These can't clash with a real name, as Windows allows no `:` in names; a name that
+/// starts with a minus is found with `*-draft*` or `regex:^-draft`.
 #[derive(Clone, Debug)]
 pub struct NameFilter {
     name: NameRule,
     tag: Option<crate::tags::TagFilter>,
     /// The words in quotes, in lower case: each must be inside the file.
     inside: Vec<String>,
+    /// The words and patterns with a minus in front, in lower case: names with any of them go.
+    without: Vec<NameRule>,
+    /// The `regex:` patterns: the name must match each.
+    regex: Vec<regex_lite::Regex>,
+    /// `size:`: files of at least the first and at most the second number of bytes.
+    size: Option<(u64, u64)>,
+    /// `date:`: changed at or after the first FILETIME and before the second.
+    date: Option<(u64, u64)>,
+    /// A `size:`, `date:` or `regex:` word that doesn't make sense: nothing is kept.
+    broken: bool,
 }
 
 /// The filter's part about the name.
@@ -982,13 +1005,51 @@ impl NameFilter {
 
     /// As `new`, with the tags `tags` gives (asked only for a `tag:` word).
     fn with_tags(text: &str, tags: impl FnOnce() -> Arc<crate::tags::Map>) -> NameFilter {
+        // `regex:` words first, as typed: lower case would turn `\D` (not a digit) into `\d`.
+        let (patterns, text) = take_regex(text.trim());
         let text = text.trim().to_lowercase();
         let (inside, text) = if text.contains('"') { split_quotes(&text) } else { (Vec::new(), text) };
         let (tag, text) = match crate::tags::TagFilter::take(&text, tags) {
             Some((tag, rest)) => (Some(tag), rest),
             None => (None, text),
         };
-        let text = text.trim().to_string();
+        let mut broken = false;
+        let mut regex = Vec::new();
+        for p in patterns {
+            match pattern_regex(&p) {
+                Some(r) => regex.push(r),
+                None => broken = true,
+            }
+        }
+        // The other new words; without any, the text goes on exactly as it was.
+        let (mut size, mut date, mut without) = (None, None, Vec::new());
+        let mut rest: Vec<&str> = Vec::new();
+        let mut taken = false;
+        for w in text.split_whitespace() {
+            if let Some(v) = w.strip_prefix("size:") {
+                taken = true;
+                if !v.is_empty() {
+                    match size_range(v) {
+                        Some(r) => size = Some(narrow(size, r)),
+                        None => broken = true,
+                    }
+                }
+            } else if let Some(v) = w.strip_prefix("date:") {
+                taken = true;
+                if !v.is_empty() {
+                    match date_range(v, today) {
+                        Some(r) => date = Some(narrow(date, r)),
+                        None => broken = true,
+                    }
+                }
+            } else if let Some(v) = w.strip_prefix('-').filter(|v| !v.is_empty()) {
+                taken = true;
+                without.push(if v.contains(['*', '?']) { NameRule::Pattern(v.chars().collect()) } else { NameRule::Words(vec![v.to_string()]) });
+            } else {
+                rest.push(w);
+            }
+        }
+        let text = if taken { rest.join(" ") } else { text.trim().to_string() };
         let name = if !inside.is_empty() {
             let (patterns, words): (Vec<&str>, Vec<&str>) = text.split_whitespace().partition(|w| w.contains(['*', '?']));
             NameRule::Kinds { patterns: patterns.iter().map(|p| p.chars().collect()).collect(), words: words.iter().map(|w| w.to_string()).collect() }
@@ -999,7 +1060,7 @@ impl NameFilter {
         } else {
             NameRule::Words(text.split_whitespace().map(str::to_string).collect())
         };
-        NameFilter { name, tag, inside }
+        NameFilter { name, tag, inside, without, regex, size, date, broken }
     }
 
     /// The words in quotes, to look for inside files (none: only names count).
@@ -1030,13 +1091,31 @@ impl NameFilter {
 
     /// Whether an item is kept: by its name in lower case and, for a `tag:` filter, by its tag
     /// (`path` gives its full path, asked only then).
+    /// `size:` and `date:` words need the item itself: see `keeps_item`.
     pub fn keeps(&self, lower: &str, path: impl FnOnce() -> String) -> bool {
-        self.name_matches(lower) && self.tag.as_ref().is_none_or(|t| t.keeps(path))
+        !self.broken
+            && self.name.matches(lower)
+            && !self.without.iter().any(|w| w.matches(lower))
+            && self.regex.iter().all(|r| r.is_match(lower))
+            && self.tag.as_ref().is_none_or(|t| t.keeps(path))
     }
 
+    /// As `keeps`, and by the item's size and date for `size:` and `date:` words.
+    pub fn keeps_item(&self, e: &Entry, path: impl FnOnce() -> String) -> bool {
+        self.keeps(&e.lower, path) && self.fits(e)
+    }
+
+    /// Whether an item's size and date fit the `size:` and `date:` words (all do without them).
+    pub fn fits(&self, e: &Entry) -> bool {
+        self.size.is_none_or(|(least, most)| !e.is_container() && least <= e.size && e.size <= most)
+            && self.date.is_none_or(|(from, to)| e.modified != 0 && from <= e.modified && e.modified < to)
+    }
+}
+
+impl NameRule {
     /// Whether the words or the pattern keep a name in lower case.
-    fn name_matches(&self, lower: &str) -> bool {
-        match &self.name {
+    fn matches(&self, lower: &str) -> bool {
+        match self {
             NameRule::All => true,
             NameRule::Words(words) => words.iter().all(|w| lower.contains(w.as_str())),
             NameRule::Pattern(p) => {
@@ -1049,6 +1128,156 @@ impl NameFilter {
             }
         }
     }
+}
+
+/// Takes the `regex:` words (in any capitals, not in quotes) out of `text`: their patterns, and the
+/// rest. Without any, the text comes back as it was.
+fn take_regex(text: &str) -> (Vec<String>, String) {
+    let mut patterns = Vec::new();
+    let mut rest = String::new();
+    let mut from = 0;
+    for w in text.split_whitespace() {
+        let at = w.as_ptr() as usize - text.as_ptr() as usize;
+        let outside_quotes = (rest.matches('"').count() + text[from..at].matches('"').count()) % 2 == 0;
+        if outside_quotes && w.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("regex:")) {
+            patterns.push(w[6..].to_string());
+            rest.push_str(&text[from..at]);
+            from = at + w.len();
+        }
+    }
+    if patterns.is_empty() {
+        return (patterns, text.to_string());
+    }
+    rest.push_str(&text[from..]);
+    patterns.retain(|p| !p.is_empty());
+    (patterns, rest)
+}
+
+/// A `regex:` pattern made ready: None when it doesn't make sense. Names are matched in lower case,
+/// so the pattern is too, but for the letter after a `\` (`\D` isn't `\d`). The limits keep a
+/// typed pattern from taking much memory; regex-lite never takes long to match, whatever the pattern.
+fn pattern_regex(pattern: &str) -> Option<regex_lite::Regex> {
+    let mut lower = String::with_capacity(pattern.len());
+    let mut escaped = false;
+    for c in pattern.chars() {
+        if escaped {
+            lower.push(c);
+        } else {
+            lower.extend(c.to_lowercase());
+        }
+        escaped = !escaped && c == '\\';
+    }
+    regex_lite::RegexBuilder::new(&lower).case_insensitive(true).size_limit(1 << 20).nest_limit(64).build().ok()
+}
+
+/// Both ranges at once (`size:>1mb size:<5mb`); the first is None for the first word.
+fn narrow(old: Option<(u64, u64)>, new: (u64, u64)) -> (u64, u64) {
+    old.map_or(new, |(a, b)| (a.max(new.0), b.min(new.1)))
+}
+
+/// A number of bytes as typed after `size:`: `10mb`, `1.5gb`, `500` (bytes). None when it isn't one.
+fn parse_bytes(text: &str) -> Option<u64> {
+    let digits = text.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(text.len());
+    let (number, unit) = text.split_at(digits);
+    let times: u64 = match unit {
+        "" | "b" => 1,
+        "kb" => 1 << 10,
+        "mb" => 1 << 20,
+        "gb" => 1 << 30,
+        _ => return None,
+    };
+    if number.is_empty() || number.starts_with('.') || number.ends_with('.') || number.matches('.').count() > 1 {
+        return None;
+    }
+    if let Ok(n) = number.parse::<u64>() {
+        return n.checked_mul(times);
+    }
+    let bytes = number.parse::<f64>().ok()? * times as f64;
+    (bytes.is_finite() && bytes < u64::MAX as f64).then(|| bytes.round() as u64)
+}
+
+/// What `size:` keeps, as the least and most bytes: `>10mb`, `<500kb`, `1gb..5gb` (either way
+/// round; a side left out has no limit), or exactly `0`.
+fn size_range(text: &str) -> Option<(u64, u64)> {
+    if let Some(v) = text.strip_prefix('>') {
+        return Some((parse_bytes(v)?.checked_add(1)?, u64::MAX));
+    }
+    if let Some(v) = text.strip_prefix('<') {
+        // Below 0 bytes: nothing (an empty range).
+        return Some(parse_bytes(v)?.checked_sub(1).map_or((1, 0), |most| (0, most)));
+    }
+    if let Some((a, b)) = text.split_once("..") {
+        let a = if a.is_empty() { 0 } else { parse_bytes(a)? };
+        let b = if b.is_empty() { u64::MAX } else { parse_bytes(b)? };
+        return Some((a.min(b), a.max(b)));
+    }
+    let n = parse_bytes(text)?;
+    Some((n, n))
+}
+
+/// The days of a date as typed after `date:` (`2026`, `2026-01`, `2026-01-31`, `today`,
+/// `yesterday`), as day numbers (`day_number`): the first, and the one after the last. `today`
+/// gives today's day number, asked only for those two words.
+fn date_days(text: &str, today: impl FnOnce() -> Option<i64>) -> Option<(i64, i64)> {
+    match text {
+        "today" => return today().map(|d| (d, d + 1)),
+        "yesterday" => return today().map(|d| (d - 1, d)),
+        _ => {}
+    }
+    let mut parts = text.split('-');
+    let number = |part: Option<&str>, most: usize| part.filter(|p| !p.is_empty() && p.len() <= most && p.bytes().all(|b| b.is_ascii_digit())).and_then(|p| p.parse::<u16>().ok());
+    let year = number(parts.next(), 4).filter(|y| (1601..=9999).contains(y))?;
+    let day = |month: u16, d: u16| day_number(&SYSTEMTIME { wYear: year, wMonth: month, wDay: d, ..Default::default() });
+    let Some(month) = parts.next() else { return Some((day(1, 1), day(1, 1) + if leap(year) { 366 } else { 365 })) };
+    let month = number(Some(month), 2).filter(|m| (1..=12).contains(m))?;
+    let days = [31, if leap(year) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month as usize - 1];
+    let Some(d) = parts.next() else { return Some((day(month, 1), day(month, 1) + days)) };
+    let d = number(Some(d), 2).filter(|d| (1..=days).contains(&i64::from(*d)))?;
+    parts.next().is_none().then(|| (day(month, d), day(month, d) + 1))
+}
+
+fn leap(year: u16) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+/// What `date:` keeps, as FILETIMEs: from the first, up to (not with) the second. `>` before a
+/// date is after it, `<` before it. `today` gives today's day number (`day_number`).
+fn date_range(text: &str, today: impl FnOnce() -> Option<i64>) -> Option<(u64, u64)> {
+    if let Some(v) = text.strip_prefix('>') {
+        return Some((local_midnight(date_days(v, today)?.1)?, u64::MAX));
+    }
+    if let Some(v) = text.strip_prefix('<') {
+        return Some((0, local_midnight(date_days(v, today)?.0)?));
+    }
+    let (first, after) = date_days(text, today)?;
+    Some((local_midnight(first)?, local_midnight(after)?))
+}
+
+/// The start of a day (a `day_number`) in local time, as a FILETIME.
+fn local_midnight(day: i64) -> Option<u64> {
+    // The other way round from `day_number`.
+    let era = day.div_euclid(146_097);
+    let doe = day - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    let local = SYSTEMTIME { wYear: u16::try_from(y).ok()?, wMonth: m as u16, wDay: d as u16, ..Default::default() };
+    let mut utc = SYSTEMTIME::default();
+    let mut ft = FILETIME::default();
+    // SAFETY: valid in/out pointers to plain structs.
+    unsafe { TzSpecificLocalTimeToSystemTime(None, &local, &mut utc).ok()? };
+    unsafe { SystemTimeToFileTime(&utc, &mut ft).ok()? };
+    Some(((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64)
+}
+
+/// Today's `day_number`, in local time.
+fn today() -> Option<i64> {
+    // SAFETY: no arguments; returns the time now.
+    let now = unsafe { GetSystemTimeAsFileTime() };
+    local_time(((now.dwHighDateTime as u64) << 32) | now.dwLowDateTime as u64).map(|t| day_number(&t))
 }
 
 /// Whether `name` matches the whole pattern: `*` is any run of characters (also none), `?` is one.
@@ -1703,6 +1932,192 @@ mod tests {
         // Without a tag word nothing changes, and the path isn't even asked for.
         assert!(f("invoice").keeps("invoice 4.pdf", || unreachable!()));
         assert!(f("").keeps("anything", || unreachable!()));
+    }
+
+    /// A file with this size, changed at this FILETIME.
+    fn dated(name: &str, size: u64, modified: u64) -> Entry {
+        Entry { modified, ..entry(name, EntryKind::File, size) }
+    }
+
+    /// The names of `items` the filter for `text` keeps, by name, size and date.
+    fn kept<'a>(text: &str, items: &'a [Entry]) -> Vec<&'a str> {
+        let f = NameFilter::with_tags(text, Default::default);
+        items.iter().filter(|e| f.keeps_item(e, || join("C:\\t", &e.name))).map(|e| e.name.as_str()).collect()
+    }
+
+    #[test]
+    fn size_words_keep_files_of_that_size() {
+        const MB: u64 = 1 << 20;
+        let items = [
+            entry("empty.txt", EntryKind::File, 0),
+            entry("small.txt", EntryKind::File, 400 << 10),
+            entry("exactly 500kb.txt", EntryKind::File, 500 << 10),
+            entry("ten.bin", EntryKind::File, 10 * MB),
+            entry("big.iso", EntryKind::File, 3 << 30),
+            entry("huge.vhd", EntryKind::File, 6 << 30),
+            entry("Folder", EntryKind::Folder, 0),
+        ];
+        assert_eq!(kept("size:>10mb", &items), ["big.iso", "huge.vhd"], "more than, not as much as");
+        assert_eq!(kept("size:<500kb", &items), ["empty.txt", "small.txt"], "less than, and folders never");
+        assert_eq!(kept("size:1gb..5gb", &items), ["big.iso"]);
+        assert_eq!(kept("size:5gb..1gb", &items), ["big.iso"], "a range the wrong way round is the same range");
+        assert_eq!(kept("size:500kb..10mb", &items), ["exactly 500kb.txt", "ten.bin"], "both ends count");
+        assert_eq!(kept("size:0", &items), ["empty.txt"], "a number alone is exactly that");
+        assert_eq!(kept("size:>10485759", &items), ["ten.bin", "big.iso", "huge.vhd"], "no unit is bytes");
+        assert_eq!(kept("size:2gb..", &items), ["big.iso", "huge.vhd"]);
+        assert_eq!(kept("size:..400kb", &items), ["empty.txt", "small.txt"]);
+        assert_eq!(kept("size:>0.5gb", &items), ["big.iso", "huge.vhd"], "parts of a unit");
+        assert_eq!(kept("size:<0", &items), Vec::<&str>::new(), "below nothing");
+        // Any capitals, and with other words.
+        for text in ["SIZE:>10MB", "Size:>10Mb", "  size:>10mb  "] {
+            assert_eq!(kept(text, &items), ["big.iso", "huge.vhd"], "{text}");
+        }
+        assert_eq!(kept("size:>1mb size:<5gb", &items), ["ten.bin", "big.iso"], "two size words: both hold");
+        assert_eq!(kept("size:>1mb iso", &items), ["big.iso"]);
+        assert_eq!(kept("*.txt size:>100kb", &items), ["small.txt", "exactly 500kb.txt"]);
+        // Numbers that aren't: nothing, as a word no name has; nothing after the colon: not yet a word.
+        for bad in ["size:>", "size:<", "size:big", "size:>10tb", "size:>-5", "size:>1.", "size:>.5mb", "size:1..2..3", "size:>1.2.3mb", "size:>99999999999gb", "size:>=1mb", "size:mb"] {
+            assert!(kept(bad, &items).is_empty(), "{bad}");
+        }
+        assert_eq!(kept("size:", &items).len(), items.len());
+        // A huge number of bytes that still fits, and one that doesn't.
+        assert_eq!(kept("size:<18446744073709551615", &items).len(), 6);
+        assert!(kept("size:>18446744073709551615", &items).is_empty());
+        assert!(kept("size:>18446744073709551616", &items).is_empty());
+    }
+
+    #[test]
+    fn date_words_keep_items_changed_then() {
+        let day = |y: u16, m: u16, d: u16| day_number(&SYSTEMTIME { wYear: y, wMonth: m, wDay: d, ..Default::default() });
+        let hour = 36_000_000_000;
+        // At noon local time on each day.
+        let at = |y, m, d| local_midnight(day(y, m, d)).unwrap() + 12 * hour;
+        let today = today().unwrap();
+        let items = [
+            dated("old.txt", 1, at(2025, 12, 31)),
+            dated("new year.txt", 1, local_midnight(day(2026, 1, 1)).unwrap()),
+            dated("mid jan.txt", 1, at(2026, 1, 15)),
+            dated("last of jan.txt", 1, local_midnight(day(2026, 2, 1)).unwrap() - 1),
+            dated("leap.txt", 1, at(2028, 2, 29)),
+            dated("unknown.txt", 1, 0),
+            dated("today.txt", 1, local_midnight(today).unwrap() + hour),
+            dated("yesterday.txt", 1, local_midnight(today - 1).unwrap() + hour),
+            Entry { modified: at(2026, 1, 31), ..entry("Folder", EntryKind::Folder, 0) },
+        ];
+        assert_eq!(kept("date:2026-01", &items), ["new year.txt", "mid jan.txt", "last of jan.txt", "Folder"], "folders have a date");
+        assert_eq!(kept("date:2026-01-31", &items), ["last of jan.txt", "Folder"], "to the last moment of the day");
+        assert_eq!(kept("date:2026-1-15", &items), ["mid jan.txt"]);
+        assert_eq!(kept("date:2025", &items), ["old.txt"]);
+        assert_eq!(kept("date:2028-02-29", &items), ["leap.txt"]);
+        assert_eq!(kept("date:<2026-01-01", &items), ["old.txt"], "before, not on");
+        assert_eq!(kept("date:>2026-01-31", &items).first(), Some(&"leap.txt"), "after, not on");
+        assert_eq!(kept("date:<2026", &items), ["old.txt"]);
+        assert_eq!(kept("date:today", &items), ["today.txt"]);
+        assert_eq!(kept("date:yesterday", &items), ["yesterday.txt"]);
+        assert_eq!(kept("DATE:Today", &items), ["today.txt"], "any capitals");
+        assert_eq!(kept("date:>2026-01-01 date:<2026-01-31", &items), ["mid jan.txt"], "two date words: both hold");
+        assert_eq!(kept("date:2026-01 size:0", &items), Vec::<&str>::new());
+        assert_eq!(kept("date:2026-01 jan", &items), ["mid jan.txt", "last of jan.txt"]);
+        // Dates that aren't: nothing.
+        for bad in ["date:2026-13-40", "date:2026-13", "date:2026-02-30", "date:2025-02-29", "date:2026-00-10", "date:26", "date:20260", "date:2026-01-31-1", "date:2026--01", "date:tomorrow", "date:>", "date:1600", "date:>today2", "date:2026-1x"] {
+            assert!(kept(bad, &items).is_empty(), "{bad}");
+        }
+        assert_eq!(kept("date:", &items).len(), items.len(), "not yet a word");
+        assert!(kept("date:2026-01 date:2025", &items).is_empty(), "two that can't both hold");
+    }
+
+    #[test]
+    fn a_minus_leaves_names_out() {
+        let items = [entry("report.docx", EntryKind::File, 1), entry("report draft.docx", EntryKind::File, 1), entry("cache.tmp", EntryKind::File, 1), entry("-notes.txt", EntryKind::File, 1)];
+        assert_eq!(kept("-draft", &items), ["report.docx", "cache.tmp", "-notes.txt"]);
+        assert_eq!(kept("-DRAFT", &items), ["report.docx", "cache.tmp", "-notes.txt"]);
+        assert_eq!(kept("report -draft", &items), ["report.docx"]);
+        assert_eq!(kept("-draft report", &items), ["report.docx"], "in any order");
+        assert_eq!(kept("-*.tmp", &items), ["report.docx", "report draft.docx", "-notes.txt"]);
+        assert_eq!(kept("*.docx -*draft*", &items), ["report.docx"]);
+        assert_eq!(kept("-draft -*.tmp", &items), ["report.docx", "-notes.txt"]);
+        // A minus alone is an ordinary word; a name that starts with one is found another way.
+        assert_eq!(kept("-", &items), ["-notes.txt"]);
+        assert_eq!(kept("*-notes*", &items), ["-notes.txt"]);
+        assert_eq!(kept("regex:^-notes", &items), ["-notes.txt"]);
+        // A word in the middle of a name isn't touched.
+        assert_eq!(kept("rt-dr", &[entry("rt-draft", EntryKind::File, 1)]), ["rt-draft"]);
+    }
+
+    #[test]
+    fn regex_words_match_the_name_in_any_capitals() {
+        let items = [
+            entry("IMG_2024.jpg", EntryKind::File, 1),
+            entry("img_1234.JPEG", EntryKind::File, 1),
+            entry("IMG_12.jpg", EntryKind::File, 1),
+            entry("photo IMG_2024.jpg", EntryKind::File, 1),
+            entry("İstanbul 🌉 #1.png", EntryKind::File, 1),
+            entry("Año.txt", EntryKind::File, 1),
+        ];
+        assert_eq!(kept(r"regex:^IMG_\d{4}\.jpe?g$", &items), ["IMG_2024.jpg", "img_1234.JPEG"]);
+        assert_eq!(kept(r"REGEX:^img_\d{4}\.JPE?G$", &items), ["IMG_2024.jpg", "img_1234.JPEG"]);
+        assert_eq!(kept(r"regex:^\D+$", &items), ["Año.txt"], "a capital after \\ keeps its meaning (not a digit)");
+        assert_eq!(kept("regex:^İst", &items), ["İstanbul 🌉 #1.png"]);
+        assert_eq!(kept("regex:🌉 regex:#1", &items), ["İstanbul 🌉 #1.png"], "each must match");
+        assert_eq!(kept("regex:AÑO", &items), ["Año.txt"]);
+        // With other words, patterns and tags.
+        assert_eq!(kept(r"regex:\d{4} photo", &items), ["photo IMG_2024.jpg"]);
+        assert_eq!(kept(r"*.jpg regex:_\d{4}", &items), ["IMG_2024.jpg", "photo IMG_2024.jpg"]);
+        assert_eq!(kept(r"regex:_\d{4} -photo size:1", &items), ["IMG_2024.jpg", "img_1234.JPEG"]);
+        // A broken or half-typed pattern keeps nothing, and doesn't panic; nothing after it isn't one yet.
+        for broken in ["regex:(", "regex:[a-", r"regex:\", "regex:a{2,1}", "regex:(?<x", "regex:img regex:)"] {
+            assert!(kept(broken, &items).is_empty(), "{broken}");
+        }
+        assert_eq!(kept("regex:", &items).len(), items.len());
+        // A pattern too big to make is refused rather than taking the memory.
+        assert!(kept("regex:((a{100}){100}){100}", &items).is_empty());
+        let deep = format!("regex:{}a{}", "(".repeat(500), ")".repeat(500));
+        assert!(kept(&deep, &items).is_empty());
+        // In quotes it's text to look for inside files.
+        let f = NameFilter::new("\"regex:x\" *.txt");
+        assert_eq!(f.inside(), ["regex:x"]);
+        assert!(f.keeps("a.txt", String::new));
+        // A long name, and a long pattern, still answer at once.
+        let long = "a".repeat(300);
+        let start = Instant::now();
+        assert!(NameFilter::new("regex:(a|aa)*b").keeps(&long, String::new) == false);
+        assert!(NameFilter::new("regex:^(a*)*$").keeps(&long, String::new));
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn the_new_words_go_with_tags_and_quotes() {
+        use crate::tags::{map_of, Tag};
+        let tags = map_of(&[("C:\\t\\big draft.iso", Tag::Red), ("C:\\t\\big.iso", Tag::Red), ("C:\\t\\small.iso", Tag::Red)]);
+        let items = [entry("big draft.iso", EntryKind::File, 2 << 30), entry("big.iso", EntryKind::File, 2 << 30), entry("small.iso", EntryKind::File, 1), entry("other.iso", EntryKind::File, 2 << 30)];
+        let f = NameFilter::with_tags("TAG:red size:>1gb -draft", || tags.clone());
+        let kept: Vec<&str> = items.iter().filter(|e| f.keeps_item(e, || join("C:\\t", &e.name))).map(|e| e.name.as_str()).collect();
+        assert_eq!(kept, ["big.iso"]);
+        // Quotes: inside files; the rest still counts.
+        let q = NameFilter::new("\"hello -draft size:>1gb\" size:<1kb -old *.txt");
+        assert_eq!(q.inside(), ["hello -draft size:>1gb"]);
+        assert!(q.keeps_item(&entry("a.txt", EntryKind::File, 10), String::new));
+        assert!(!q.keeps_item(&entry("a.txt", EntryKind::File, 2000), String::new));
+        assert!(!q.keeps_item(&entry("old a.txt", EntryKind::File, 10), String::new));
+        assert!(!q.keeps_item(&entry("a.md", EntryKind::File, 10), String::new));
+        let r = NameFilter::new(r#""x" regex:"\d""#);
+        assert_eq!(r.inside(), ["x"], "a quote in a pattern doesn't start words for inside files");
+    }
+
+    #[test]
+    fn old_searches_work_as_before() {
+        // Without the new words the filter is made just as it was.
+        for text in ["tax 2024", "*.PDF", "a*  b", "report-??.txt", "  ", "\"hello\" *.md", "rt-draft", "Ünïcödé 🌉 #1", "size", "date", "regex"] {
+            let f = NameFilter::with_tags(text, Default::default);
+            assert!(f.without.is_empty() && f.regex.is_empty() && f.size.is_none() && f.date.is_none() && !f.broken, "{text}");
+        }
+        assert_eq!(NameFilter::new("a*  b").name, NameRule::Pattern("a*  b".chars().collect()), "spaces in a pattern stay");
+        assert_eq!(NameFilter::new("Tax 2024").name, NameRule::Words(vec!["tax".into(), "2024".into()]));
+        // keeps_item and keeps agree when there are no size or date words, also for folders.
+        let f = NameFilter::new("tax");
+        assert!(f.keeps_item(&entry("Tax", EntryKind::Folder, 0), String::new));
+        let long = "İ".repeat(300);
+        assert!(NameFilter::new(&long).keeps_item(&entry(&long, EntryKind::File, 0), String::new));
     }
 
     #[test]

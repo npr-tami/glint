@@ -399,6 +399,9 @@ pub enum Command {
     /// Unpack the selected .zip or .7z here (right-click > Extract here), or into a new folder
     /// named after it (`own_folder`: Extract to "Name"). In the copy queue (app/files.rs).
     Extract { own_folder: bool },
+    /// Inside a .zip or .7z: the selected items (right-click > Extract selected…), or everything
+    /// in it (`all`: Extract all…), into a folder picked first. In the copy queue (app/files.rs).
+    ExtractInside { all: bool },
     /// Pack the selected items into a new archive next to them (right-click > Compress to zip /
     /// Compress to 7z). In the copy queue (app/files.rs).
     Compress(crate::archive::Format),

@@ -58,7 +58,7 @@ All code is in `src/`.
 | `home.rs` | Home's page, laid out like File Explorer's: Quick access tiles, then Recent and Favorites. |
 | `recent.rs` | Home's items: your folders, pinned folders, files opened lately, and favorites. |
 | `list.rs` | The virtualised file list in every view: header, rows, tiles, tree arrows, selection, keys, scrolling, columns, renaming, dragging. |
-| `media.rs` | The Picture size and Length columns: read in the background, kept per folder, and sorted by. |
+| `media.rs` | The Image dimensions and Duration columns: read in the background, kept per folder, and sorted by. |
 | `tags.rs` | Colour tags: kept in their own file, the dot by a name, the `tag:` filter, and following moves and renames. |
 | `foldersize.rs` | Folder sizes in the Size column, worked out in the background. |
 | `views.rs` | Where items go in each view (rows, columns, tiles) and how the arrow keys move. |

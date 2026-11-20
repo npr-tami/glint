@@ -395,7 +395,7 @@ impl Tags {
             // now is never written over: the changes wait for the next try.)
             let mut read = match read_file(&file) {
                 Ok(read) => read,
-                Err(e) => return self.trouble(format!("Failed to save the colour tags: {} couldn't be read ({e}).", file.display())),
+                Err(e) => return self.trouble(format!("Failed to save the colour tags because {} can't be read ({e}).", file.display())),
             };
             for c in &self.pending {
                 c.apply(&mut read);

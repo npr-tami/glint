@@ -56,6 +56,11 @@ const SIZE_BITS: usize = 1 << 24;
 const ATTR_DIRECTORY: u32 = 0x10;
 const ATTR_REPARSE_POINT: u32 = 0x400;
 
+/// What the file list and the status bar both say while a search has found nothing so far, and
+/// when it ended without finding any: the same words in both places.
+pub const CHECKING: &str = "Checking for duplicate files\u{2026}";
+pub const NONE_FOUND: &str = "No duplicate files found.";
+
 /// What a finished search found.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Summary {
@@ -475,6 +480,13 @@ mod tests {
         })
         .expect("not cancelled");
         (found, summary)
+    }
+
+    /// The words the list and the status bar share: an ellipsis while it runs, a sentence after.
+    #[test]
+    fn the_words_for_nothing_to_show() {
+        assert_eq!(CHECKING, "Checking for duplicate files\u{2026}");
+        assert_eq!(NONE_FOUND, "No duplicate files found.");
     }
 
     #[test]

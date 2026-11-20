@@ -33,6 +33,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::ui::Rect;
 
+/// Asked of the main window, which answers at once: whether the key in wParam (with what is held
+/// now) is a shortcut the person has moved there from keys a box hands on (1), or not (0).
+pub const WM_APP_WANTS_KEY: u32 = WM_APP + 5;
+
 /// Posted to the main window: wParam = box id, lParam = TextEventKind as a number.
 pub const WM_APP_TEXT: u32 = WM_APP + 2;
 
@@ -445,10 +449,14 @@ impl TextBox {
 
     /// Grey hint text shown while the box is empty ("Filter").
     pub fn set_hint(&self, hint: &str) {
+        use windows::Win32::Graphics::Gdi::InvalidateRect;
         let w: Vec<u16> = hint.encode_utf16().chain(std::iter::once(0)).collect();
-        // SAFETY: the string lives across the (synchronous) call.
+        // SAFETY: the string lives across the (synchronous) call; the window is our own box.
         unsafe {
             SendMessageW(self.hwnd, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(w.as_ptr() as isize)));
+            // The box draws its hint again at once: a hint that changes while the box sits empty
+            // (going to Home and away) would otherwise show the old words until the box is next drawn.
+            let _ = InvalidateRect(Some(self.hwnd), None, true);
         }
     }
 
@@ -615,9 +623,26 @@ fn ctrl_only() -> bool {
     unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 && GetKeyState(VK_MENU.0 as i32) >= 0 }
 }
 
+/// Whether a key pressed in a box could be a window shortcut the person has moved to keys the
+/// fixed rule below doesn't know: a function key, or Ctrl with a key a box has no use for. Only
+/// then is the window asked (`WM_APP_WANTS_KEY`), never about typing or editing keys.
+fn could_be_moved_shortcut(vk: u16, ctrl: bool, alt: bool) -> bool {
+    if alt {
+        return false;
+    }
+    // F1 to F24.
+    if (0x70..=0x87).contains(&vk) {
+        return true;
+    }
+    // Ctrl with an editing key is the box's: A C V X Y Z, the arrows, Home, End and the Page keys,
+    // Backspace, Enter, Esc, Tab, Space, Insert and Delete. (Shift, Ctrl and Alt alone are no key.)
+    let editing = matches!(vk, 0x08 | 0x09 | 0x0D | 0x10..=0x12 | 0x1B | 0x20..=0x28 | 0x2D | 0x2E | 0xA0..=0xA5) || (vk < 0x80 && matches!(vk as u8, b'A' | b'C' | b'V' | b'X' | b'Y' | b'Z'));
+    ctrl && !editing
+}
+
 /// Whether a key pressed in a box is one of the window's shortcuts the box has no use for (see
 /// `TextBox::pass_shortcuts`).
-fn is_window_shortcut(vk: u16, ctrl: bool, alt: bool) -> bool {
+pub(crate) fn is_window_shortcut(vk: u16, ctrl: bool, alt: bool) -> bool {
     if alt {
         return false;
     }
@@ -638,9 +663,17 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         SKIP_CHAR.with(|s| s.set(false));
         // SAFETY: plain key-state queries.
         let (ctrl, alt) = unsafe { (GetKeyState(VK_CONTROL.0 as i32) < 0, GetKeyState(VK_MENU.0 as i32) < 0) };
-        if data & PASS_SHORTCUTS != 0 && is_window_shortcut(wparam.0 as u16, ctrl, alt) {
-            // A Ctrl+letter also makes a control character next: it isn't typed.
-            SKIP_CHAR.with(|s| s.set(ctrl && (b'A' as usize..=b'Z' as usize).contains(&wparam.0)));
+        let vk = wparam.0 as u16;
+        // The window's shortcuts: the ones a box always hands on, and those the person has moved
+        // from such keys to others (the window says which those are).
+        let passes = data & PASS_SHORTCUTS != 0
+            && (is_window_shortcut(vk, ctrl, alt) || (could_be_moved_shortcut(vk, ctrl, alt) && {
+                // SAFETY: a message to our own parent window, on this same thread.
+                unsafe { GetParent(hwnd).is_ok_and(|parent| SendMessageW(parent, WM_APP_WANTS_KEY, Some(wparam), Some(LPARAM(0))).0 == 1) }
+            }));
+        if passes {
+            // A Ctrl+key can also make a control character next: it isn't typed.
+            SKIP_CHAR.with(|s| s.set(ctrl));
             // Sent, not posted, so the window sees the keys still held (Ctrl, Shift) as they are now.
             // SAFETY: a message to our own parent window, on this same thread.
             unsafe {
@@ -711,6 +744,31 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only keys a box has no use for ask the window: typing and editing keys never do.
+    #[test]
+    fn a_box_asks_the_window_only_about_keys_it_has_no_use_for() {
+        let k = |c: char| u16::from(c as u8);
+        // Function keys, alone or with Ctrl or Shift held (Shift isn't passed: it doesn't matter).
+        assert!(could_be_moved_shortcut(0x70, false, false), "F1");
+        assert!(could_be_moved_shortcut(0x87, true, false), "Ctrl+F24");
+        // Ctrl with a key the box doesn't edit with.
+        for c in ['K', 'T', 'W', 'B', '1', '9'] {
+            assert!(could_be_moved_shortcut(k(c), true, false), "Ctrl+{c}");
+        }
+        assert!(could_be_moved_shortcut(0xBC, true, false), "Ctrl+,");
+        // The box's own: copy, cut, paste, undo, select all, moving and deleting.
+        for c in ['A', 'C', 'V', 'X', 'Y', 'Z'] {
+            assert!(!could_be_moved_shortcut(k(c), true, false), "Ctrl+{c}");
+        }
+        for vk in [0x08, 0x09, 0x0D, 0x1B, 0x20, 0x21, 0x24, 0x25, 0x28, 0x2D, 0x2E, 0x11] {
+            assert!(!could_be_moved_shortcut(vk, true, false), "Ctrl with key {vk:#x}");
+        }
+        // Typing, and anything with Alt (menus, AltGr characters).
+        assert!(!could_be_moved_shortcut(k('K'), false, false));
+        assert!(!could_be_moved_shortcut(k('K'), true, true));
+        assert!(!could_be_moved_shortcut(0x70, false, true), "Alt+F1");
+    }
 
     #[test]
     fn suggestions_are_dark_only_in_dark_skins() {

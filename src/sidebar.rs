@@ -129,7 +129,7 @@ enum Item {
     PinnedHeading,
     /// A pinned folder: an index into `app.settings.pinned`.
     Pin(usize),
-    /// "Ctrl+D or drop folders here", while nothing is pinned.
+    /// "Ctrl+D or drop folders here" (with Pin to sidebar's keys now), while nothing is pinned.
     PinHint,
     /// "This PC": clicking it shows all drives.
     PcHeading,
@@ -1052,10 +1052,15 @@ impl Component for Sidebar {
                         r.stroke_rect(row, 1.0, theme.accent);
                     }
                     // Where the icons start (a hint has none), so it fits the narrow sidebar.
-                    let hint = if placed.item == Item::PinHint { "Ctrl+D or drop folders here" } else { "Right-click to bring items back" };
+                    let hint = if placed.item == Item::PinHint {
+                        let keys = crate::keymap::KeyMap::of_settings(&app.settings).text(crate::keymap::Action::PinToSidebar);
+                        crate::keymap::say_with(&keys, "{keys} or drop folders here", "Drop folders here")
+                    } else {
+                        "Right-click to bring items back".to_string()
+                    };
                     let (x, w) = self.name_span(row);
                     let left = row.x + self.pad_left();
-                    r.text(hint, Rect::new(left, y, w + x - left, row.h), &TextStyle::new(theme.muted));
+                    r.text(&hint, Rect::new(left, y, w + x - left, row.h), &TextStyle::new(theme.muted));
                 }
                 Item::PcHeading => {
                     // A title you can click (it shows all drives): it lights up like a place.
@@ -1280,7 +1285,7 @@ impl Component for Sidebar {
             PICK_PROPERTIES => {
                 // Windows' Properties window for the folder, drive or Recycle Bin (shellmenu.rs).
                 if !crate::shellmenu::properties(ctx.hwnd, vec![path]) {
-                    app.say("Windows couldn't show the properties right now. Try again.");
+                    app.say("Failed to show the properties. Try again.");
                 }
                 Effect::Redraw
             }

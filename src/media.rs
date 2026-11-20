@@ -1,4 +1,4 @@
-//! Picture sizes and lengths for the file list's "Picture size" and "Length" columns (both off until
+//! Image dimensionss and lengths for the file list's "Image dimensions" and "Duration" columns (both off until
 //! ticked in the column titles' right-click menu, and then only shown where something can have them,
 //! [`here`]): how many pixels wide and tall a picture or a video is, and how long a video or a song
 //! plays. They come from Windows' property system, the
@@ -6,7 +6,7 @@
 //! picture's header, read with WIC, as the details panel does).
 //!
 //! - **What is read.** Only files whose extension can have a value for a column that is on
-//!   (pictures and videos for Picture size, videos and songs for Length). Never folders, nothing
+//!   (pictures and videos for Image dimensions, videos and songs for Duration). Never folders, nothing
 //!   inside a .zip or .7z, no cloud file that isn't on this PC (reading it would download it), and
 //!   nothing at all while both columns are off.
 //! - **In what order.** The rows on screen first: every frame, each list says which of them it
@@ -64,7 +64,7 @@ pub struct Facts {
 /// Which of the two columns show.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Columns {
-    /// Picture size.
+    /// Image dimensions.
     pub dims: bool,
     pub length: bool,
 }
@@ -106,7 +106,7 @@ pub fn here(entries: &[Entry], view: &[u32], listing: &str) -> Columns {
     here
 }
 
-/// A Picture size cell: "1920 × 1080" ("" while unknown, or for a file that has none).
+/// A Image dimensions cell: "1920 × 1080" ("" while unknown, or for a file that has none).
 pub fn size_text(facts: Option<&Facts>) -> String {
     match facts.and_then(|f| f.dims) {
         Some((w, h)) => format!("{w} \u{d7} {h}"),
@@ -114,7 +114,7 @@ pub fn size_text(facts: Option<&Facts>) -> String {
     }
 }
 
-/// A Length cell: "3:42", or "1:02:03" from an hour on ("" while unknown, or for a file that has
+/// A Duration cell: "3:42", or "1:02:03" from an hour on ("" while unknown, or for a file that has
 /// none).
 pub fn length_text(facts: Option<&Facts>) -> String {
     facts.and_then(|f| f.length).map(crate::details::duration_text).unwrap_or_default()
@@ -324,8 +324,8 @@ pub fn arrived() -> u64 {
 
 // ---------------------------------------------------------------- sorting
 
-/// Sorts `view` (indexes into `entries`, the listing at `folder`) by Picture size (all its pixels,
-/// then its width) or Length, with what is known so far: folders first as usual (`folders_first`),
+/// Sorts `view` (indexes into `entries`, the listing at `folder`) by Image dimensions (all its pixels,
+/// then its width) or Duration, with what is known so far: folders first as usual (`folders_first`),
 /// files without a value last whichever way, ties A to Z (folder.rs `sort_view_by`).
 pub fn sort_view(entries: &[Entry], view: &mut [u32], folder: &str, key: SortKey, descending: bool, folders_first: bool) {
     let mut values: Vec<Option<(u64, u64)>> = Vec::new();
@@ -343,7 +343,7 @@ pub fn sort_view(entries: &[Entry], view: &mut [u32], folder: &str, key: SortKey
     folder::sort_view_by(entries, view, descending, folders_first, &values);
 }
 
-/// What sorting by `key` goes by: (pixels in all, width) for Picture size, the length for Length.
+/// What sorting by `key` goes by: (pixels in all, width) for Image dimensions, the length for Duration.
 fn sort_value(key: SortKey, f: &Facts) -> Option<(u64, u64)> {
     match key {
         SortKey::Dimensions => f.dims.map(|(w, h)| (u64::from(w) * u64::from(h), u64::from(w))),
@@ -468,7 +468,7 @@ mod tests {
         // Folders only (even one named like a video), or documents: neither column.
         assert_eq!(all(&[("Holiday", folder), ("trip.mp4", folder)], r"C:\x"), Columns::default());
         assert_eq!(all(&[("notes.txt", file), ("plan.pdf", file)], r"C:\x"), Columns::default());
-        // A picture: Picture size. A song: Length. A video: both.
+        // A picture: Image dimensions. A song: Duration. A video: both.
         assert_eq!(all(&[("notes.txt", file), ("cat.jpg", file)], r"C:\x"), Columns { dims: true, length: false });
         assert_eq!(all(&[("Music", folder), ("song.mp3", file)], r"C:\x"), Columns { dims: false, length: true });
         assert_eq!(all(&[("film.mkv", file)], r"C:\x"), Columns { dims: true, length: true });
@@ -494,7 +494,7 @@ mod tests {
             entry("small.jpg", EntryKind::File, 0),
             entry("notes.txt", EntryKind::File, 0),
         ];
-        // Picture size by pixels in all: big 4000 x 3000, small 640 x 480; a, b and the text file unknown.
+        // Image dimensions by pixels in all: big 4000 x 3000, small 640 x 480; a, b and the text file unknown.
         let pixels = |w: u64, h: u64| Some((w * h, w));
         let values = vec![None, None, None, pixels(4000, 3000), pixels(640, 480), None];
         let sorted = |descending: bool, folders_first: bool| {

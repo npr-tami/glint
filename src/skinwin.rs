@@ -488,8 +488,8 @@ fn cards(hints: &[String]) -> Vec<(&'static str, Vec<(Ctl, &'static str, &'stati
                 part(P::ToolbarH, "Toolbar height"),
                 part(P::PathSep, "Sign between folders in the path"),
                 (Ctl::Part(P::PathCurrent), "Current folder in the path", "Box colour: Buttons"),
-                part(P::FilterW, "Filter box width"),
-                part(P::BoxRadius, "Path and filter box corners"),
+                part(P::FilterW, "Search bar width"),
+                part(P::BoxRadius, "Path box and search bar corners"),
                 (Ctl::ToolbarLine, "Bottom line width", ""),
                 col("toolbar", "Toolbar, also the current tab"),
                 col("toolbar-line", "Bottom line"),
@@ -497,8 +497,8 @@ fn cards(hints: &[String]) -> Vec<(&'static str, Vec<(Ctl, &'static str, &'stati
                 col("tool-pressed", "Back, forward, up and refresh, pressed"),
                 col("tool-border", "Back, forward, up and refresh, edge under the mouse"),
                 col("back-button", "Back and forward glass buttons"),
-                col("input", "Path and filter boxes"),
-                col("input-border", "Path and filter box edges"),
+                col("input", "Path box and search bar"),
+                col("input-border", "Path box and search bar edges"),
                 col("path-hover", "Path, under the mouse"),
             ],
         ),
@@ -685,8 +685,8 @@ const COLOURS: [(&str, &str); 76] = [
     ("tool-pressed", "Back, forward, up and refresh, pressed"),
     ("tool-border", "Back, forward, up and refresh, edge under the mouse"),
     ("back-button", "Back and forward glass buttons"),
-    ("input", "Path and filter boxes"),
-    ("input-border", "Path and filter box edges"),
+    ("input", "Path box and search bar"),
+    ("input-border", "Path box and search bar edges"),
     ("path-hover", "Path, under the mouse"),
     // Buttons
     ("button", "Buttons and current folder box"),
@@ -896,6 +896,17 @@ enum Btn {
     /// One column: the skin drop-down at the top, and the menu with New and the rest.
     Skin,
     More,
+}
+
+/// Which sides of a button under the skin list have another button beside it (two to a row, OPEN
+/// SKINS FOLDER on its own): those sides lean, the others are straight.
+fn beside_of(b: Btn) -> crate::pathbar::Beside {
+    use crate::pathbar::Beside;
+    match b {
+        Btn::Undo | Btn::New | Btn::Rename | Btn::Import => Beside::RIGHT,
+        Btn::Redo | Btn::Duplicate | Btn::Delete | Btn::Export => Beside::LEFT,
+        Btn::Folder | Btn::Skin | Btn::More => Beside::NONE,
+    }
 }
 
 const BUTTONS: [(Btn, &str); 9] = [
@@ -1272,6 +1283,8 @@ pub struct SkinWindow {
     flips: kit::Flips,
     /// How thick the scrollbars are in the skin.
     bar: kit::Bar,
+    /// How far paired buttons lean where they meet, in the skin (for their exact shapes).
+    lean: f32,
     /// An older Windows' scroll bar arrow or track held down, repeating (bar 0: the list, 1: the
     /// page).
     holding: kit::Holding,
@@ -1348,7 +1361,7 @@ pub fn create(owner: HWND, theme: &Theme, layout: Layout) -> Option<SkinWindow> 
         let renderer = match Renderer::new(hwnd, dpi) {
             Ok(r) => r,
             Err(e) => {
-                log::error(&format!("The skin customiser couldn't draw: {e}"));
+                log::error(&format!("Failed to draw the skin customiser: {e}"));
                 let _ = DestroyWindow(hwnd);
                 return None;
             }
@@ -1404,6 +1417,7 @@ pub fn create(owner: HWND, theme: &Theme, layout: Layout) -> Option<SkinWindow> 
             repaint_until: 0.0,
             flips: kit::Flips::default(),
             bar: kit::Bar::default(),
+            lean: 0.0,
             holding: kit::Holding::default(),
             colours: Vec::new(),
             colours_for: (0, 0, String::new()),
@@ -2108,6 +2122,7 @@ impl SkinWindow {
         self.renderer.set_title_font(&theme.title_font);
         self.layout_dirty = true;
         self.bar = kit::Bar::of(theme);
+        self.lean = theme.lean(ksize::BUTTON_LEAN);
         self.edit_at = None;
         if self.classic != theme.era.classic() {
             self.classic = theme.era.classic();
@@ -2712,7 +2727,7 @@ impl SkinWindow {
         }
         for (b, label) in BUTTONS {
             let (rect, look) = (self.button_rect(b), self.button_look(b, app));
-            kit::button(&mut self.renderer, theme, rect, label, look);
+            kit::button_beside(&mut self.renderer, theme, rect, label, look, beside_of(b));
         }
     }
 
@@ -3000,15 +3015,19 @@ impl SkinWindow {
                     }
                 }
                 Ctl::Picture => {
+                    // Wide: NONE and BROWSE… side by side lean where they meet. Otherwise BROWSE…
+                    // is on its own (the × is at the row's end), so straight.
+                    let together = wide && clear.is_some();
                     if let Some(n) = clear {
                         if wide {
-                            kit::button(r, theme, n, "NONE", clear_look);
+                            kit::button_beside(r, theme, n, "NONE", clear_look, crate::pathbar::Beside::RIGHT);
                         } else {
                             icon_button(r, theme, n, Glyph::Clear, clear_look);
                         }
                     }
                     if let Some(b) = main {
-                        kit::button(r, theme, b, "BROWSE\u{2026}", main_look);
+                        let beside = if together { crate::pathbar::Beside::LEFT } else { crate::pathbar::Beside::NONE };
+                        kit::button_beside(r, theme, b, "BROWSE\u{2026}", main_look, beside);
                     }
                     if let Some(hx) = hex {
                         let editing = matches!(self.editing, Some(Editing::Picture(_)));
@@ -3214,7 +3233,8 @@ impl SkinWindow {
             if self.layout == Layout::Slim {
                 return ICONS.iter().find(|(b, _)| self.icon_rect(*b).contains(p)).map(|(b, _)| Hot::Button(*b));
             }
-            return BUTTONS.iter().find(|(b, _)| kit::button_contains(self.button_rect(*b), p)).map(|(b, _)| Hot::Button(*b));
+            // Their exact shapes: the corner left empty by a slant isn't the button.
+            return BUTTONS.iter().find(|(b, _)| crate::pathbar::box_contains_beside(self.button_rect(*b), self.lean, beside_of(*b), p)).map(|(b, _)| Hot::Button(*b));
         }
         if self.layout == Layout::Compact {
             if self.skin_box().contains(p) {
@@ -3251,6 +3271,9 @@ impl SkinWindow {
                     // (The pad's dot can sit on its edge: a little room round it.)
                     (Ctl::Place, Part::Main) => r.inset(-8.0, -8.0).contains(p),
                     (Ctl::Place | Ctl::Thumbs, _) => r.contains(p),
+                    // Wide: the wallpaper's NONE and BROWSE… lean where they meet (their exact shapes).
+                    (Ctl::Picture, Part::Clear) if self.layout == Layout::Wide => crate::pathbar::box_contains_beside(r, self.lean, crate::pathbar::Beside::RIGHT, p),
+                    (Ctl::Picture, Part::Main) if self.layout == Layout::Wide => crate::pathbar::box_contains_beside(r, self.lean, crate::pathbar::Beside::LEFT, p),
                     (_, Part::Clear) | (Ctl::Picture, Part::Main) => kit::button_contains(r, p),
                     _ => r.contains(p),
                 };
@@ -4547,7 +4570,7 @@ impl SkinWindow {
                 if app.settings.skin == id {
                     app.pick_skin(if dark { skin::DEFAULT } else { skin::DEFAULT_LIGHT });
                 }
-                self.say(if recycled { format!("Moved {name} to the Recycle Bin") } else { format!("Deleted {name}") }, false);
+                self.say(if recycled { format!("Moved {name} to the Recycle Bin.") } else { format!("Deleted {name}.") }, false);
                 // The file worker's word on it comes next and takes over (where the Recycle Bin is
                 // switched off for the drive, Windows asks, then deletes it for good).
                 self.status_mine = false;
@@ -4698,7 +4721,7 @@ impl SkinWindow {
             JobDone::Export(path) => {
                 // The skin the dialog was opened for, even if another was picked meanwhile.
                 let id = self.dialog_for.take().unwrap_or_else(|| app.settings.skin.clone());
-                self.say(format!("Exporting to {}\u{2026}.", path.display()), false);
+                self.say(format!("Exporting to {}\u{2026}", path.display()), false);
                 app.skins.export(&id, path);
                 self.invalidate();
                 Vec::new()
@@ -4980,11 +5003,12 @@ pub(crate) fn icon_button(r: &mut Renderer, theme: &Theme, at: Rect, g: Glyph, l
     }
 }
 
-/// An icon on a button's face, in the skin's shape (the sort order's editor's ⋯, ? and ☰).
-pub(crate) fn icon_face(r: &mut Renderer, theme: &Theme, at: Rect, g: Glyph, look: Look) {
-    kit::button(r, theme, at, "", look);
+/// An icon on a button's face, in the skin's shape (the sort order's editor's ⋯, ? and ☰), leaning
+/// only on the sides with another button `beside` it.
+pub(crate) fn icon_face(r: &mut Renderer, theme: &Theme, at: Rect, g: Glyph, look: Look, beside: crate::pathbar::Beside) {
+    kit::button_beside(r, theme, at, "", look, beside);
     let ink = if look.enabled { theme.text } else { theme.muted.with_alpha(theme.muted.a * 0.45) };
-    glyph(r, g, at, ink);
+    glyph(r, g, crate::pathbar::face(at, theme.lean(ksize::BUTTON_LEAN), beside), ink);
 }
 
 /// A section's heading that folds it (one column): a small triangle (pointing right while it's

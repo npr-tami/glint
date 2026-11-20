@@ -73,7 +73,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDC_ARROW, MINMAXINFO, SIZE_MINIMIZED, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SW_RESTORE, SW_SHOW, WA_INACTIVE, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_COMMAND,
     WM_CTLCOLOREDIT, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW,
     WS_CAPTION, WS_CLIPCHILDREN, WS_SYSMENU, WS_THICKFRAME,
 };
 
@@ -101,6 +101,8 @@ use pages::{Act, Ctl, Facts, Item, Row};
 pub const TITLE: &str = "Glint settings";
 /// The page list's width, and its rows.
 const NAV_W: f32 = 130.0;
+/// Beside a page's name in the list: where it starts, and room after it (kit::nav_item).
+const NAV_ROOM: f32 = 18.0 + 8.0 + 4.0;
 const NAV_ITEM_H: f32 = 30.0;
 /// Space above the first page in the list.
 const NAV_TOP: f32 = 8.0;
@@ -141,11 +143,10 @@ const CHECK: f32 = 13.0;
 const CHECK_GAP: f32 = 8.0;
 /// Drop-downs and buttons, a little smaller than in the other windows.
 const CTL_H: f32 = 22.0;
-/// The shortcuts: the keys' column, and a line.
+/// The shortcuts that can't be changed: the keys' column (at the right, under the buttons of the
+/// ones that can), and a line.
 const KEYS_W: f32 = 128.0;
 const KEYS_ROW_H: f32 = 22.0;
-/// Two columns of shortcuts from this width.
-const KEYS_TWO_W: f32 = 520.0;
 /// Drop-downs are as wide as their longest choice, within these.
 const DROPDOWN_MIN: f32 = 120.0;
 const DROPDOWN_MAX: f32 = 240.0;
@@ -514,6 +515,9 @@ pub struct SettingsWindow {
     size: (f32, f32),
     /// The skin is 98 / 2000's: the window has their raised frame (frame.rs).
     classic: bool,
+    /// How wide the page list on the left is: wider than NAV_W when a page's name needs it
+    /// ("Keyboard shortcuts" in a skin with bigger text).
+    nav_list_w: f32,
     started: Instant,
     page: usize,
     /// The window's own choices, as of the last layout.
@@ -548,6 +552,10 @@ pub struct SettingsWindow {
     show_more: bool,
     /// RESET PAGE was pressed once at this time and waits for a second press.
     reset_asked_at: Option<f64>,
+    /// The shortcut whose button was pressed: it waits for the new keys (its name in keymap.rs).
+    waiting: Option<&'static str>,
+    /// Why the last keys pressed for that shortcut weren't taken: shown under it.
+    shortcut_said: Option<(&'static str, String)>,
     /// The line at the bottom: Report a bug, and RESET PAGE (window coordinates).
     bug_at: Option<Rect>,
     reset_at: Option<Rect>,
@@ -727,7 +735,7 @@ pub fn create(owner: HWND, theme: &Theme, place: Option<[i32; 4]>, opens: Settin
         let renderer = match Renderer::new(hwnd, dpi) {
             Ok(r) => r,
             Err(e) => {
-                log::error(&format!("The Settings window couldn't draw: {e}"));
+                log::error(&format!("Failed to draw the Settings window: {e}"));
                 let _ = DestroyWindow(hwnd);
                 return None;
             }
@@ -750,6 +758,7 @@ pub fn create(owner: HWND, theme: &Theme, place: Option<[i32; 4]>, opens: Settin
             dpi,
             size: (0.0, 0.0),
             classic: false,
+            nav_list_w: NAV_W,
             started: Instant::now(),
             page: page.min(PAGES.len() - 1),
             style: Style::of(&Map::new()),
@@ -774,6 +783,8 @@ pub fn create(owner: HWND, theme: &Theme, place: Option<[i32; 4]>, opens: Settin
             query: String::new(),
             show_more: false,
             reset_asked_at: None,
+            waiting: None,
+            shortcut_said: None,
             bug_at: None,
             reset_at: None,
             swatches: Vec::new(),
@@ -1178,7 +1189,7 @@ impl SettingsWindow {
         if self.tabs() {
             0.0
         } else {
-            NAV_W
+            self.nav_list_w
         }
     }
 
@@ -1330,7 +1341,7 @@ impl SettingsWindow {
         if self.tabs() {
             return self.pills.get(i).copied().unwrap_or_default();
         }
-        Rect::new(0.0, self.search_bottom() + NAV_TOP + i as f32 * NAV_ITEM_H, NAV_W, NAV_ITEM_H)
+        Rect::new(0.0, self.search_bottom() + NAV_TOP + i as f32 * NAV_ITEM_H, self.nav_list_w, NAV_ITEM_H)
     }
 
     fn track(&self) -> Rect {
@@ -1361,7 +1372,21 @@ impl SettingsWindow {
             update_said: update::about(life::is_main(), self.values.get("CheckForUpdates").and_then(Value::as_bool).unwrap_or(true)).0,
             update_busy: !update::about(life::is_main(), true).1 && life::is_main(),
         };
-        pages::page(page, &facts)
+        let mut items = pages::page(page, &facts);
+        // The shortcut waiting for its new keys says so, with why the last ones weren't taken.
+        for item in &mut items {
+            let Item::Card(rows) = item else { continue };
+            for row in rows {
+                let Ctl::Shortcut(name, keys, _) = &mut row.ctl else { continue };
+                if self.waiting == Some(*name) {
+                    *keys = WAITING.to_string();
+                }
+                if let Some((_, said)) = self.shortcut_said.as_ref().filter(|(n, _)| n == name) {
+                    row.note = Some(said.clone());
+                }
+            }
+        }
+        items
     }
 
     /// What shows: the page's groups (heading, rows) - or, while searching, what was found on every
@@ -1385,8 +1410,9 @@ impl SettingsWindow {
                     })),
                 }
             }
-            // Shortcuts found (F2 finds Rename) are listed as the Keys page lists them, in a group of
-            // their own after the settings found.
+            // The fixed shortcuts found (Ctrl+1 finds Go to tab) are listed as the Keyboard shortcuts page
+            // lists them, in a group of their own after the settings found. (The ones that can be
+            // changed - F2 finds Rename - are found with the settings, buttons and all.)
             let (keys, found): (Vec<Row>, Vec<Row>) = found.into_iter().partition(|r| matches!(r.ctl, Ctl::Text(_)));
             if !found.is_empty() {
                 groups.push((PAGES[page].to_string(), found));
@@ -1403,6 +1429,11 @@ impl SettingsWindow {
     fn layout(&mut self) {
         self.layout_dirty = false;
         self.style = Style::of(&self.values);
+        // The page list is wide enough for the longest name in bold (the page shown), with the room
+        // kit::nav_item leaves round it (more in 98 / 2000's list box).
+        let bold = TextStyle::new(Color::hex(0)).size(ksize::NAV_FONT).semibold();
+        let widest = PAGES.iter().map(|name| self.renderer.measure(name, &bold)).fold(0.0, f32::max);
+        self.nav_list_w = NAV_W.max((widest + NAV_ROOM + if self.classic { 18.0 } else { 0.0 }).ceil());
         // The pages as tabs along the top, as many to a line as fit.
         self.pills.clear();
         if self.tabs() && flat_on() {
@@ -1465,7 +1496,8 @@ impl SettingsWindow {
                 .into_iter()
                 .filter(|row| row.only_if.is_none_or(|(k, v)| self.values.get(k) == Some(&v.json())))
                 .partition(|row| basic && row.more);
-            more += hidden.len();
+            // (Rows that are only words, like where the columns show, aren't settings to count.)
+            more += hidden.iter().filter(|row| row.ctl != Ctl::None).count();
             later.push((title.clone(), hidden));
             sections.push((title, shown));
         }
@@ -1590,7 +1622,7 @@ impl SettingsWindow {
         let now = self.now();
         let asked = self.reset_asked_at.is_some_and(|t| now - t < CLEAR_CONFIRM_SECONDS);
         self.reset_at = (self.style.reset && self.query.trim().is_empty()).then(|| {
-            let w = button_w(&mut self.renderer, if asked { "PRESS AGAIN" } else { "RESET PAGE" });
+            let w = button_w(&mut self.renderer, if asked { "PRESS AGAIN" } else { "RESET THIS PAGE" });
             Rect::new(self.size.0 - PAD_X - w, foot.y + (FOOT_H - CTL_H) / 2.0, w, CTL_H)
         });
         let plain = TextStyle::new(Color::hex(0)).size(ksize::NOTE_FONT);
@@ -1673,7 +1705,7 @@ impl SettingsWindow {
         }
         if !self.tabs() {
             let list_top = self.search_bottom();
-            let list = Rect::new(0.0, list_top, NAV_W, (self.foot_rect().y - list_top).max(0.0));
+            let list = Rect::new(0.0, list_top, self.nav_list_w, (self.foot_rect().y - list_top).max(0.0));
             kit::page_list_well(&mut self.renderer, theme, list);
         }
         self.paint_caption(theme);
@@ -1794,7 +1826,7 @@ impl SettingsWindow {
             let asked = self.reset_asked_at.is_some();
             let me = Hot::Reset;
             let look = Look { hover: self.hover == Some(me), pressed: self.pressed == Some(me) && self.hover == Some(me), focused: self.cues && self.focus == Spot::Reset, enabled: true };
-            draw_button(r, theme, rect, if asked { "PRESS AGAIN" } else { "RESET PAGE" }, look);
+            draw_button(r, theme, rect, if asked { "PRESS AGAIN" } else { "RESET THIS PAGE" }, look);
         }
     }
 
@@ -1819,6 +1851,7 @@ impl SettingsWindow {
         let listed = |values: &Map<String, Value>, k: &str, item: &str| values.get(k).and_then(Value::as_array).is_some_and(|a| a.iter().any(|v| v.as_str() == Some(item)));
         match &row.ctl {
             Ctl::ToggleIn(k, item) => listed(&self.values, k, item) != listed(&self.defaults, k, item),
+            Ctl::Shortcut(_, _, changed) => *changed,
             Ctl::Toggle(k) | Ctl::ToggleNot(k) | Ctl::ButtonToggle(_, _, k) | Ctl::Choice(k, _) if !k.starts_with('@') => self.values.get(*k) != self.defaults.get(*k),
             _ => false,
         }
@@ -1839,11 +1872,13 @@ impl SettingsWindow {
             r.fill_ellipse(Point::new(p.dot.x, p.dot.y + dy), DOT / 2.0, DOT / 2.0, theme.accent);
         }
         if p.shape == Shape::Keys {
-            // A shortcut: the keys, then what they do (greyed while it doesn't work yet).
-            let (keys, what) = if live { (theme.text, theme.muted) } else { (theme.muted.with_alpha(0.7), theme.muted.with_alpha(0.7)) };
-            r.text(&p.row.title, Rect::new(p.text_x, rect.y, KEYS_W - 8.0, rect.h), &TextStyle::new(keys).size(TITLE_FONT).semibold());
-            let what_text = if let Ctl::Text(w) = &p.row.ctl { *w } else { "" };
-            r.text(what_text, Rect::new(p.text_x + KEYS_W, rect.y, (p.text_w - KEYS_W).max(0.0), rect.h), &TextStyle::new(what).size(TITLE_FONT));
+            // A shortcut that can't be changed: what it does, then its keys at the right, as the
+            // rows above it read (greyed while it doesn't work yet).
+            let (what, keys) = if live { (theme.text, theme.muted) } else { (theme.muted.with_alpha(0.7), theme.muted.with_alpha(0.7)) };
+            r.text(&p.row.title, Rect::new(p.text_x, rect.y, (p.text_w - KEYS_W - 8.0).max(0.0), rect.h), &TextStyle::new(what).size(TITLE_FONT));
+            let keys_text = if let Ctl::Text(k) = &p.row.ctl { *k } else { "" };
+            let keys_x = p.text_x + (p.text_w - KEYS_W).max(0.0);
+            r.text(keys_text, Rect::new(keys_x, rect.y, KEYS_W.min(p.text_w), rect.h), &TextStyle::new(keys).size(TITLE_FONT).semibold().align(Align::Right));
             return;
         }
         let mut y = rect.y + p.text_y;
@@ -1915,8 +1950,8 @@ impl SettingsWindow {
                     let current = self.values.get(*key);
                     let label = choices.iter().find(|(v, _)| Some(&v.json()) == current).map(|(_, l)| l.clone()).unwrap_or_else(|| match current {
                         Some(Value::String(s)) => s.clone(),
-                        // (A width dragged by hand, not one of the choices.)
-                        Some(Value::Number(n)) => n.as_f64().map_or_else(String::new, |n| format!("{}", n.round())),
+                        // (A width dragged by hand, not one of the choices: with its unit, like them.)
+                        Some(Value::Number(n)) => n.as_f64().map_or_else(String::new, |n| if *key == "DetailsWidth" { format!("{} px", n.round()) } else { format!("{}", n.round()) }),
                         _ => String::new(),
                     });
                     draw_dropdown(r, theme, m, &label, look_at(Part::Main, &parts));
@@ -1925,6 +1960,14 @@ impl SettingsWindow {
             (Ctl::Button(label, _), _) => {
                 if let Some(m) = main {
                     draw_button(r, theme, m, label, look_at(Part::Main, &parts));
+                }
+            }
+            (Ctl::Shortcut(_, keys, _), _) => {
+                if let Some(m) = main {
+                    draw_button(r, theme, m, keys, look_at(Part::Main, &parts));
+                }
+                if let Some(s) = second {
+                    draw_button(r, theme, s, RESET_ONE, look_at(Part::Second, &parts));
                 }
             }
             (Ctl::Folder, _) => {
@@ -2051,7 +2094,7 @@ impl SettingsWindow {
             for part in placed.parts() {
                 let Some(r) = placed.hit_of(part).map(|r| self.on_screen(r)) else { continue };
                 let hit = match (&placed.row.ctl, part) {
-                    (Ctl::Button(..) | Ctl::ButtonToggle(..), Part::Main) | (Ctl::Folder, Part::Second) => kit::button_contains(r, p),
+                    (Ctl::Button(..) | Ctl::ButtonToggle(..), Part::Main) | (Ctl::Folder | Ctl::Shortcut(..), Part::Second) | (Ctl::Shortcut(..), Part::Main) => kit::button_contains(r, p),
                     _ => r.contains(p),
                 };
                 if hit {
@@ -2093,9 +2136,28 @@ impl SettingsWindow {
         }
     }
 
+    /// Right-click on a shortcut's keys button: the shortcut has no keys any more ("Not set"; RESET
+    /// gives them back). Elsewhere it does nothing.
+    fn right_click(&mut self, p: Point, app: &mut AppState) -> Vec<Ask> {
+        let Some(Hot::Ctl(i, Part::Main)) = self.target_at(p) else { return Vec::new() };
+        let Ctl::Shortcut(name, ..) = &self.rows[i].row.ctl else { return Vec::new() };
+        let Some(spec) = crate::keymap::ALL.iter().find(|s| s.name == *name) else { return Vec::new() };
+        if !self.rows[i].enabled {
+            return Vec::new();
+        }
+        self.stop_waiting();
+        self.shortcut_said = None;
+        self.set_focus(Spot::Ctl(i, Part::Main));
+        let saved = &app.settings.shortcuts;
+        let new = crate::keymap::KeyMap::of(saved).remove(saved, spec.action);
+        self.set_shortcuts(app, new)
+    }
+
     fn mouse_down(&mut self, p: Point) -> Vec<Ask> {
         self.cues = false;
         self.act_on_char = None;
+        // A click anywhere ends waiting for a shortcut's new keys (its own button starts it again).
+        self.stop_waiting();
         // An older Windows' scroll bar: an arrow button moves the page a line, the track a page,
         // again and again while the button is held.
         let (place, now) = (self.bar.place(self.content_rect()), self.now());
@@ -2268,6 +2330,7 @@ impl SettingsWindow {
         let page = page.min(PAGES.len() - 1);
         if page != self.page {
             self.page = page;
+            self.stop_waiting();
             self.layout_dirty = true;
             self.scroller.jump_to(0.0);
             self.hover = None;
@@ -2299,7 +2362,13 @@ impl SettingsWindow {
         let is = |k: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| vk == k.0;
         let n = PAGES.len();
         self.act_on_char = None; // a new key: an earlier one's character won't come any more
-        if alt && !is(VK_DOWN) {
+        if let Some(name) = self.waiting {
+            asks.extend(self.take_shortcut(name, vk, ctrl, shift, alt, app));
+            return true;
+        }
+        // Light/dark mode, with its shortcut as in the main window (an Alt one too).
+        let theme_key = crate::keymap::KeyMap::of_settings(&app.settings).find(crate::keymap::Chord::new(vk, ctrl, shift, alt)) == Some(crate::keymap::Action::LightDarkMode);
+        if alt && !is(VK_DOWN) && !theme_key {
             return false; // Alt+F4, Alt+Space: Windows
         }
         let view = self.content_rect().h;
@@ -2313,8 +2382,7 @@ impl SettingsWindow {
             _ if (ctrl && is(VK_TAB) && shift) || (ctrl && is(VK_PRIOR)) => self.go_to_page((self.page + n - 1) % n, true),
             _ if ctrl && vk == 'F' as u16 && self.style.search => self.set_focus(Spot::Search),
             _ if is(VK_TAB) => self.move_focus(if shift { -1 } else { 1 }, true),
-            // Light or dark, as in the main window.
-            _ if ctrl && shift && vk == 'L' as u16 => asks.push(Ask::Command(Command::ToggleTheme)),
+            _ if theme_key => asks.push(Ask::Command(Command::ToggleTheme)),
             _ if ctrl && is(VK_OEM_COMMA) => {}
             _ if self.focus == Spot::Nav && along => {
                 self.clear_search();
@@ -2365,11 +2433,61 @@ impl SettingsWindow {
 
     // ------------------------------------------------------------ changing things
 
+    /// A key pressed while a shortcut waits for its new keys: Esc stops waiting; Ctrl, Shift or
+    /// Alt alone go on waiting; other keys become the shortcut at once, or are refused with a line
+    /// saying why (and it goes on waiting). What each key means is keymap.rs's to say.
+    fn take_shortcut(&mut self, name: &'static str, vk: u16, ctrl: bool, shift: bool, alt: bool, app: &mut AppState) -> Vec<Ask> {
+        use crate::keymap::{KeyMap, Pressed, ALL};
+        let Some(spec) = ALL.iter().find(|s| s.name == name) else {
+            self.stop_waiting();
+            return Vec::new();
+        };
+        let saved = app.settings.shortcuts.clone();
+        // (Read as the main window reads its keys: Ctrl+\ is the key that types "\" here.)
+        let keys = crate::window::pressed_chord(vk, crate::ui::Mods { ctrl, shift, alt }, &KeyMap::of(&saved));
+        match crate::keymap::pressed_while_waiting(&saved, spec.action, keys) {
+            Pressed::Wait => Vec::new(),
+            Pressed::Stop => {
+                self.stop_waiting();
+                Vec::new()
+            }
+            Pressed::Set(new) => {
+                self.stop_waiting();
+                self.set_shortcuts(app, new)
+            }
+            Pressed::Refused(why) => {
+                self.shortcut_said = Some((name, why));
+                self.layout_dirty = true;
+                self.invalidate();
+                Vec::new()
+            }
+        }
+    }
+
+    /// No shortcut waits for its keys any more (and what was said about the last ones goes).
+    fn stop_waiting(&mut self) {
+        if self.waiting.is_some() || self.shortcut_said.is_some() {
+            self.waiting = None;
+            self.shortcut_said = None;
+            self.layout_dirty = true;
+            self.invalidate();
+        }
+    }
+
+    /// Saves the changed shortcuts (settings.json's "Shortcuts"): they work at once.
+    fn set_shortcuts(&mut self, app: &mut AppState, saved: std::collections::BTreeMap<String, String>) -> Vec<Ask> {
+        let map: Map<String, Value> = saved.into_iter().map(|(k, v)| (k, Value::String(v))).collect();
+        let asks = self.set_value(app, "Shortcuts", Value::Object(map));
+        // The messages that name a shortcut follow too.
+        crate::keymap::remember(&app.settings.shortcuts);
+        asks
+    }
+
     /// Gives `key` a new value in `app.settings`, then does what that setting does right away.
     fn set_value(&mut self, app: &mut AppState, key: &'static str, value: Value) -> Vec<Ask> {
         let before = app.settings.clone();
         if !set_in(&mut app.settings, key, value.clone()) {
-            log::error(&format!("The Settings window couldn't give {key} the value {value}"));
+            log::error(&format!("Failed to give {key} the value {value} in the Settings window"));
             return Vec::new();
         }
         self.values = values_of(&app.settings);
@@ -2476,6 +2594,33 @@ impl SettingsWindow {
                 vec![Ask::Job(Job::Drop(list, Rect::new(at.x + b, at.y + b, at.w, at.h)))]
             }
             (Ctl::Button(_, act), _) | (Ctl::ButtonToggle(_, act, _), Part::Main) => self.act(act),
+            // A shortcut's button: it waits for the new keys (see `key`). RESET: back to its default.
+            (Ctl::Shortcut(name, ..), Part::Main) => {
+                self.waiting = Some(name);
+                self.shortcut_said = None;
+                self.set_focus(Spot::Ctl(i, Part::Main));
+                self.layout_dirty = true;
+                self.invalidate();
+                Vec::new()
+            }
+            (Ctl::Shortcut(name, ..), Part::Second) => {
+                let Some(spec) = crate::keymap::ALL.iter().find(|s| s.name == name) else { return Vec::new() };
+                let mut saved = app.settings.shortcuts.clone();
+                saved.remove(spec.name);
+                self.stop_waiting();
+                // The keyboard stays on the row: its keys button (RESET goes now).
+                self.set_focus(Spot::Ctl(i, Part::Main));
+                match crate::keymap::KeyMap::of(&app.settings.shortcuts).change(&saved, spec.action, crate::keymap::Chord::parse(spec.default).unwrap_or_default()) {
+                    Ok(new) => self.set_shortcuts(app, new),
+                    // Its default went to another shortcut meanwhile: say so, as for a key pressed.
+                    Err(why) => {
+                        self.shortcut_said = Some((name, why));
+                        self.layout_dirty = true;
+                        self.invalidate();
+                        Vec::new()
+                    }
+                }
+            }
             (Ctl::Folder, Part::Main) => {
                 self.set_focus(Spot::Ctl(i, Part::Main));
                 Vec::new()
@@ -2515,6 +2660,7 @@ impl SettingsWindow {
                 let key = match row.ctl {
                     Ctl::Toggle(k) | Ctl::ToggleNot(k) | Ctl::ToggleIn(k, _) | Ctl::ButtonToggle(_, _, k) | Ctl::Choice(k, _) => k,
                     Ctl::Folder => "StartupFolder",
+                    Ctl::Shortcut(..) => "Shortcuts",
                     _ => continue,
                 };
                 if !key.starts_with('@') && !keys.contains(&key) {
@@ -2573,7 +2719,7 @@ impl SettingsWindow {
                     let started = shell::background("settings: clear cache", move || post(to, Bg::Cleared(settings::clear_cache())));
                     if !started {
                         self.clearing = false;
-                        self.cache_said = Some("Windows couldn't do that right now. Try again.".into());
+                        self.cache_said = Some("Failed to do that. Try again.".into());
                     }
                 } else {
                     // The button itself asks: it says PRESS AGAIN for a moment.
@@ -2614,7 +2760,7 @@ impl SettingsWindow {
         let started = shell::background("settings: portable", move || post(to, Bg::Portable(settings::set_portable(on))));
         if !started {
             self.portable_busy = false;
-            self.portable_said = Some("Windows couldn't do that right now. Try again.".into());
+            self.portable_said = Some("Failed to do that. Try again.".into());
         }
         Vec::new()
     }
@@ -2843,6 +2989,11 @@ impl SettingsWindow {
                 asks.extend(self.mouse_up(p, app));
                 Some(LRESULT(0))
             }
+            WM_RBUTTONUP => {
+                let p = self.client_point(lparam);
+                asks.extend(self.right_click(p, app));
+                Some(LRESULT(0))
+            }
             WM_CAPTURECHANGED => {
                 self.pressed = None;
                 self.drag = None;
@@ -2854,6 +3005,8 @@ impl SettingsWindow {
                 self.wheel(hi_word(wparam.0) as u16 as i16 as f32 / 120.0);
                 Some(LRESULT(0))
             }
+            // (A key held down from pressing a shortcut's button isn't its new keys.)
+            WM_KEYDOWN | WM_SYSKEYDOWN if self.waiting.is_some() && (lparam.0 >> 30) & 1 != 0 => Some(LRESULT(0)),
             WM_KEYDOWN | WM_SYSKEYDOWN => self.key(wparam.0 as u16, app, &mut asks).then_some(LRESULT(0)),
             // Space or Enter's character, after the key opened a drop-down (see `key`). Other
             // letters typed at the window do nothing (and don't beep), nor Alt+letter (there is
@@ -2974,7 +3127,13 @@ impl Drop for SettingsWindow {
 }
 
 /// The words of the link at the bottom that opens GitHub's issues page.
-const REPORT_BUG: &str = "Report a bug";
+const REPORT_BUG: &str = "Report an issue on GitHub";
+/// A shortcut's button while it waits for the new keys.
+const WAITING: &str = "Press the new shortcut\u{2026}";
+/// The button beside a changed shortcut that puts it back.
+const RESET_ONE: &str = "RESET";
+/// The keys a shortcut's button is at least as wide as.
+const KEYS_SPAN: &str = "Ctrl+Shift+Tab";
 /// At the bottom: there's no OK or Apply.
 
 /// Whether a row is something searched for (`query`, in small letters): its title, its note, its
@@ -2987,6 +3146,7 @@ fn row_matches(row: &Row, heading: &str, query: &str) -> bool {
         || match &row.ctl {
             Ctl::Choice(_, choices) => choices.iter().any(|(_, label)| has(label)),
             Ctl::Text(what) => has(what),
+            Ctl::Shortcut(_, keys, _) => has(keys),
             _ => false,
         }
 }
@@ -3122,6 +3282,8 @@ fn place_row(r: &mut Renderer, row: Row, shape: Shape, left: f32, y: f32, w: f32
             let control = match &placed.row.ctl {
                 Ctl::Choice(_, choices) => drop_width(r, choices.iter().map(|(_, l)| l.as_str())).max(drop_w).min(w),
                 Ctl::Button(label, _) => button_w(r, label),
+                // A shortcut's keys (the buttons as wide as most, so they line up), RESET before them.
+                Ctl::Shortcut(_, keys, changed) => button_w(r, keys).max(button_w(r, KEYS_SPAN)) + if *changed { button_w(r, RESET_ONE) + CONTROL_GAP } else { 0.0 },
                 _ => 0.0,
             };
             let beside = right - lx - if control > 0.0 { control + CONTROL_GAP } else { 0.0 };
@@ -3140,6 +3302,11 @@ fn place_row(r: &mut Renderer, row: Row, shape: Shape, left: f32, y: f32, w: f32
                     placed.main = Some(Rect::new(right - control, cy, control, CTL_H));
                 }
             }
+            if let (Ctl::Shortcut(_, _, true), Some(m)) = (&placed.row.ctl, placed.main) {
+                let reset = button_w(r, RESET_ONE);
+                placed.second = Some(Rect::new(m.x, m.y, reset, m.h));
+                placed.main = Some(Rect::new(m.x + reset + CONTROL_GAP, m.y, (m.w - reset - CONTROL_GAP).max(0.0), m.h));
+            }
         }
     }
     // The (i) right after the title's last line (past what a click on the title takes).
@@ -3156,17 +3323,13 @@ fn place_row(r: &mut Renderer, row: Row, shape: Shape, left: f32, y: f32, w: f32
 /// The (i)'s size.
 const INFO: f32 = 14.0;
 
-/// Lays out the shortcuts as a cheat sheet: the keys, then what they do, a line each - in two
-/// columns when there's room. Returns where they end.
+/// Lays out the shortcuts that can't be changed: what each does, then its keys at the right, a
+/// line each. Returns where they end.
 fn place_keys(r: &mut Renderer, rows: Vec<Row>, left: f32, y: f32, w: f32, out: &mut Vec<Placed>) -> f32 {
     let _ = r;
-    let cols = if w >= KEYS_TWO_W { 2 } else { 1 };
-    let gap = 16.0;
-    let col_w = ((w - (cols - 1) as f32 * gap) / cols as f32).floor();
-    let per_col = rows.len().div_ceil(cols).max(1);
-    for (n, row) in rows.into_iter().enumerate() {
-        let (col, line) = (n / per_col, n % per_col);
-        let x = left + col as f32 * (col_w + gap);
+    let (x, col_w) = (left, w.floor());
+    let lines = rows.len();
+    for (line, row) in rows.into_iter().enumerate() {
         let rect = Rect::new(x, y + line as f32 * KEYS_ROW_H, col_w, KEYS_ROW_H);
         let enabled = row.live();
         out.push(Placed {
@@ -3188,7 +3351,7 @@ fn place_keys(r: &mut Renderer, rows: Vec<Row>, left: f32, y: f32, w: f32, out: 
             row,
         });
     }
-    y + per_col as f32 * KEYS_ROW_H
+    y + lines as f32 * KEYS_ROW_H
 }
 
 /// A skin's tile: its colours (background, a panel, the accent as a bar, a line of its text) over
@@ -3380,9 +3543,9 @@ mod tests {
         assert!(row_matches(&new_tab, "Startup", "this pc"), "a choice");
         let system = row_of(2, "ShowSystem");
         assert!(row_matches(&system, "Show", "protected"), "its title");
-        let keys = Row { title: "Ctrl+H".into(), note: None, ctl: Ctl::Text("Show or hide hidden files"), key: "@Keys", indent: false, needs: None, only_if: None, more: false, radios: false, long: false, info: false };
+        let keys = Row { title: "Show or hide hidden files".into(), note: None, ctl: Ctl::Text("Ctrl+H"), key: "@Keys", indent: false, needs: None, only_if: None, more: false, radios: false, long: false, info: false };
         assert!(row_matches(&keys, "Shortcuts", "hidden") && row_matches(&keys, "Shortcuts", "ctrl+h"));
-        // The Keys page's own: F2 finds Rename.
+        // The Keyboard shortcuts page's own: F2 finds Rename.
         let values = values_of(&Settings::default());
         let facts = pages::plain_facts(&values);
         let f2: Vec<Row> = pages::page(3, &facts)
@@ -3394,7 +3557,7 @@ mod tests {
             .filter(|r| row_matches(r, "Shortcuts", "f2"))
             .collect();
         assert_eq!(f2.len(), 1);
-        assert_eq!(f2[0].ctl, Ctl::Text("Rename"));
+        assert_eq!((f2[0].title.as_str(), &f2[0].ctl), ("Rename", &Ctl::Shortcut("Rename", "F2".into(), false)));
     }
 
     #[test]

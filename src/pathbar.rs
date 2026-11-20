@@ -11,8 +11,8 @@
 //! The path is only split as text - the disk is never asked - so this is instant. Measuring the
 //! names is done only when the steps or the width change, not on every frame.
 //!
-//! This file also holds two small drawing helpers the toolbar shares: the slanted box and the
-//! chevron.
+//! This file also holds two small drawing helpers the toolbar shares: the slanted box (a button
+//! leans only on a side with another button beside it, `Beside`) and the chevron.
 
 use crate::app::AppState;
 use crate::render::{Align, Renderer, TextStyle};
@@ -415,31 +415,65 @@ impl PathBar {
     }
 }
 
+/// Which sides of a button have another button right beside it. In a slanted skin a side with a
+/// button beside it leans (so the two lean the same way, the gap between them even); a side with
+/// nothing beside it is straight. A button on its own is straight on both sides.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Beside {
+    pub left: bool,
+    pub right: bool,
+}
+
+impl Beside {
+    pub const NONE: Beside = Beside { left: false, right: false };
+    pub const LEFT: Beside = Beside { left: true, right: false };
+    pub const RIGHT: Beside = Beside { left: false, right: true };
+    pub const BOTH: Beside = Beside { left: true, right: true };
+
+    /// How far its left and right sides lean (0: straight).
+    fn leans(self, lean: f32) -> (f32, f32) {
+        (if self.left { lean } else { 0.0 }, if self.right { lean } else { 0.0 })
+    }
+}
+
+/// Where to centre a button's word or icon: its box halfway down. A box leaning on one side only
+/// has its middle a quarter of the lean away from the middle of its rect, toward the leaning side.
+pub fn face(rect: Rect, lean: f32, beside: Beside) -> Rect {
+    let (left, right) = beside.leans(lean);
+    Rect::new(rect.x + (left - right) / 4.0, rect.y, rect.w, rect.h)
+}
+
 /// The four corners of `rect` slanted like "/": the top edge shifted `lean` to the right of the
 /// bottom edge (both side edges lean the same way - a parallelogram).
 pub fn slanted_points(rect: Rect, lean: f32) -> [Point; 4] {
-    [
-        Point::new(rect.x + lean, rect.y),
-        Point::new(rect.right(), rect.y),
-        Point::new(rect.right() - lean, rect.bottom()),
-        Point::new(rect.x, rect.bottom()),
-    ]
+    points_beside(rect, lean, Beside::BOTH)
 }
 
-/// Fills a slanted box. Top and bottom land on whole pixels so they stay sharp; only the slanted
-/// sides are smoothed.
-pub fn fill_slanted(r: &mut Renderer, rect: Rect, lean: f32, color: Color) {
-    let (top, bottom) = (r.snap(rect.y), r.snap(rect.bottom()));
-    let snapped = Rect::new(rect.x, top, rect.w, bottom - top);
-    r.fill_polygon(&slanted_points(snapped, lean), color);
+/// The same, with only the sides that have a button beside them leaning: a straight side stands
+/// on the box's own edge (its bottom corner on the left, its top corner on the right).
+pub fn points_beside(rect: Rect, lean: f32, beside: Beside) -> [Point; 4] {
+    let (left, right) = beside.leans(lean);
+    [
+        Point::new(rect.x + left, rect.y),
+        Point::new(rect.right(), rect.y),
+        Point::new(rect.right() - right, rect.bottom()),
+        Point::new(rect.x, rect.bottom()),
+    ]
 }
 
 /// Fills a box in the skin's shape (theme.rs `Shape`): slanted by `lean` (0: straight), straight,
 /// or with round corners. `lean` is what the box leans in this skin (`Theme::lean`).
 pub fn fill_box(r: &mut Renderer, theme: &Theme, rect: Rect, lean: f32, color: Color) {
+    fill_box_beside(r, theme, rect, lean, Beside::BOTH, color);
+}
+
+/// Fills a button's box, as `fill_box`, leaning only on the sides with a button `beside` it. Top
+/// and bottom (and a straight side) land on whole pixels so they stay sharp; only the slanted
+/// sides are smoothed.
+pub fn fill_box_beside(r: &mut Renderer, theme: &Theme, rect: Rect, lean: f32, beside: Beside, color: Color) {
     let radius = theme.corner(rect.h);
-    if lean > 0.0 {
-        fill_slanted(r, rect, lean, color);
+    if lean > 0.0 && beside != Beside::NONE {
+        r.fill_polygon(&points_beside(sharp(r, rect, beside), lean, beside), color);
     } else if radius > 0.0 {
         r.fill_round_rect(rect, radius, color);
     } else {
@@ -450,12 +484,24 @@ pub fn fill_box(r: &mut Renderer, theme: &Theme, rect: Rect, lean: f32, color: C
 /// Fills a box in the skin's shape, as `fill_box`, with a paint (a gradient runs across the box's
 /// short side).
 pub fn fill_box_paint(r: &mut Renderer, theme: &Theme, rect: Rect, lean: f32, paint: &Paint) {
-    if lean > 0.0 {
-        let (top, bottom) = (r.snap(rect.y), r.snap(rect.bottom()));
-        r.fill_polygon_paint(&slanted_points(Rect::new(rect.x, top, rect.w, bottom - top), lean), paint);
+    fill_box_paint_beside(r, theme, rect, lean, Beside::BOTH, paint);
+}
+
+/// The same for a button, leaning only on the sides with a button `beside` it.
+pub fn fill_box_paint_beside(r: &mut Renderer, theme: &Theme, rect: Rect, lean: f32, beside: Beside, paint: &Paint) {
+    if lean > 0.0 && beside != Beside::NONE {
+        r.fill_polygon_paint(&points_beside(sharp(r, rect, beside), lean, beside), paint);
     } else {
         r.fill_paint(rect, theme.corner(rect.h), paint);
     }
+}
+
+/// `rect` with its top and bottom, and each side with no button beside it, on whole pixels.
+fn sharp(r: &Renderer, rect: Rect, beside: Beside) -> Rect {
+    let (top, bottom) = (r.snap(rect.y), r.snap(rect.bottom()));
+    let left = if beside.left { rect.x } else { r.snap(rect.x) };
+    let right = if beside.right { rect.right() } else { r.snap(rect.right()) };
+    Rect::new(left, top, right - left, bottom - top)
 }
 
 /// Windows 2000's 3D edge just inside `rect` (`bevels: true`), two DIPs deep: light on the top and
@@ -496,9 +542,14 @@ pub fn fill_solid(r: &mut Renderer, theme: &Theme, rect: Rect, round: f32, paint
 /// `fill_solid`'s underlay for a box in the skin's shape (`fill_box`): call it before filling a
 /// box under the mouse with a faint `paint`.
 pub fn under_box(r: &mut Renderer, theme: &Theme, rect: Rect, lean: f32, paint: &Paint) {
+    under_box_beside(r, theme, rect, lean, Beside::BOTH, paint);
+}
+
+/// The same for a button, leaning only on the sides with a button `beside` it.
+pub fn under_box_beside(r: &mut Renderer, theme: &Theme, rect: Rect, lean: f32, beside: Beside, paint: &Paint) {
     if let Some(under) = theme.under() {
         if paint.first().a < 1.0 || paint.last().a < 1.0 {
-            fill_box(r, theme, rect, lean, under);
+            fill_box_beside(r, theme, rect, lean, beside, under);
         }
     }
 }
@@ -636,17 +687,23 @@ pub fn outline_box(r: &mut Renderer, theme: &Theme, rect: Rect, lean: f32, width
 /// box's own shape: sides leaning by `lean` as the box's do, or corners as round as its `radius`
 /// (and a little rounder, so the ring keeps the same distance all the way round).
 pub fn ring_around(r: &mut Renderer, rect: Rect, lean: f32, radius: f32, width: f32, color: Color) {
+    ring_around_beside(r, rect, lean, Beside::BOTH, radius, width, color);
+}
+
+/// The same round a button that leans only on the sides with a button `beside` it.
+pub fn ring_around_beside(r: &mut Renderer, rect: Rect, lean: f32, beside: Beside, radius: f32, width: f32, color: Color) {
     let d = width / 2.0; // the line's middle: its inside edge lies on the box's edge
-    if lean > 0.0 && rect.h > 0.0 {
+    if lean > 0.0 && rect.h > 0.0 && beside != Beside::NONE {
         // Each side moved out by d, the slanted ones along their slant.
-        let k = lean / rect.h;
-        let side = d * (1.0 + k * k).sqrt();
+        let (left, right) = beside.leans(lean);
+        let (kl, kr) = (left / rect.h, right / rect.h);
+        let (sl, sr) = (d * (1.0 + kl * kl).sqrt(), d * (1.0 + kr * kr).sqrt());
         let (top, bottom) = (rect.y - d, rect.bottom() + d);
         let mut ring = vec![
-            Point::new(rect.x - side + k * (rect.h + d), top),
-            Point::new(rect.right() + side + k * d, top),
-            Point::new(rect.right() + side - k * (rect.h + d), bottom),
-            Point::new(rect.x - side - k * d, bottom),
+            Point::new(rect.x - sl + kl * (rect.h + d), top),
+            Point::new(rect.right() + sr + kr * d, top),
+            Point::new(rect.right() + sr - kr * (rect.h + d), bottom),
+            Point::new(rect.x - sl - kl * d, bottom),
         ];
         ring.push(ring[0]);
         ring.push(ring[1]); // round the first corner too
@@ -658,25 +715,26 @@ pub fn ring_around(r: &mut Renderer, rect: Rect, lean: f32, radius: f32, width: 
     }
 }
 
-/// Whether `p` is inside such a box (the exact slanted shape, so two slanted boxes side by side
-/// never overlap; the whole rectangle otherwise).
-pub fn box_contains(rect: Rect, lean: f32, p: Point) -> bool {
-    if lean > 0.0 {
-        slanted_contains(rect, lean, p)
+/// Whether `p` is on a button that leans only on the sides with a button `beside` it (the exact
+/// shape, so two buttons side by side never overlap).
+pub fn box_contains_beside(rect: Rect, lean: f32, beside: Beside, p: Point) -> bool {
+    if lean > 0.0 && beside != Beside::NONE {
+        let (left, right) = beside.leans(lean);
+        leaning_contains(rect, left, right, p)
     } else {
         rect.contains(p)
     }
 }
 
-/// Whether `p` is inside the slanted box (the exact shape, so two boxes side by side never overlap).
-pub fn slanted_contains(rect: Rect, lean: f32, p: Point) -> bool {
+/// Whether `p` is inside `rect` with its left side leaning `left` and its right side `right`.
+fn leaning_contains(rect: Rect, left: f32, right: f32, p: Point) -> bool {
     if p.y < rect.y || p.y >= rect.bottom() || rect.h <= 0.0 {
         return false;
     }
     let down = (p.y - rect.y) / rect.h; // 0 at the top, 1 at the bottom
-    let left = rect.x + lean * (1.0 - down);
-    let right = rect.right() - lean * down;
-    p.x >= left && p.x < right
+    let l = rect.x + left * (1.0 - down);
+    let r = rect.right() - right * down;
+    p.x >= l && p.x < r
 }
 
 /// A small "›" drawn as two lines, `half` DIPs from its middle to its ends.
@@ -687,6 +745,30 @@ pub fn chevron_right(r: &mut Renderer, c: Point, half: f32, color: Color) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_sides_with_a_button_beside_them_lean() {
+        let b = Rect::new(10.0, 0.0, 100.0, 30.0);
+        let xs = |beside| points_beside(b, 8.0, beside).map(|p| p.x);
+        // [top left, top right, bottom right, bottom left]
+        assert_eq!(xs(Beside::BOTH), [18.0, 110.0, 102.0, 10.0]);
+        assert_eq!(xs(Beside::RIGHT), [10.0, 110.0, 102.0, 10.0], "a straight left side on the box's edge");
+        assert_eq!(xs(Beside::LEFT), [18.0, 110.0, 110.0, 10.0], "a straight right side on the box's edge");
+        assert_eq!(xs(Beside::NONE), [10.0, 110.0, 110.0, 10.0]);
+        assert_eq!(slanted_points(b, 8.0), points_beside(b, 8.0, Beside::BOTH));
+        // The mouse: a straight side takes the whole edge, a leaning one only its own part.
+        let (top_left, bottom_right) = (Point::new(11.0, 1.0), Point::new(109.0, 29.0));
+        assert!(box_contains_beside(b, 8.0, Beside::RIGHT, top_left) && !box_contains_beside(b, 8.0, Beside::BOTH, top_left));
+        assert!(box_contains_beside(b, 8.0, Beside::LEFT, bottom_right) && !box_contains_beside(b, 8.0, Beside::BOTH, bottom_right));
+        assert!(box_contains_beside(b, 8.0, Beside::NONE, top_left) && box_contains_beside(b, 8.0, Beside::NONE, bottom_right));
+        // Without a slant (another skin), every side is straight.
+        assert!(box_contains_beside(b, 0.0, Beside::BOTH, top_left));
+        // The word sits in the middle of the box halfway down: a quarter of the lean toward the
+        // leaning side, or where it always was.
+        assert_eq!(face(b, 8.0, Beside::RIGHT).x, 8.0);
+        assert_eq!(face(b, 8.0, Beside::LEFT).x, 12.0);
+        assert_eq!((face(b, 8.0, Beside::BOTH), face(b, 8.0, Beside::NONE), face(b, 0.0, Beside::LEFT)), (b, b, b));
+    }
 
     /// This PC › Local Disk (C:) › glint-qa, as wide as Glint's own steps measure (padding and the
     /// lean in): the last can be cut to "glint…" at 60.

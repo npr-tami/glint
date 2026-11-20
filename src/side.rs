@@ -4,7 +4,8 @@
 //!
 //! It is one part of the window (ui::Component). Its rectangle starts with the gap between the list
 //! and the pane (theme `size::GAP`, the window's colour, like the gaps between the other panels):
-//! that gap is the splitter. Dragging it changes the pane's width, which settings.json remembers -
+//! that gap is the splitter. A short grip in its middle shows it can be dragged, and it lights up
+//! under the mouse. Dragging it changes the pane's width, which settings.json remembers -
 //! one width for the details panel ("DetailsWidth") and one for the preview ("PreviewWidth"); a
 //! double-click puts it back to the standard width. The window lays the list out around the pane
 //! (`pane_width`), and the pane asks for a new layout with `Command::SideWidth`.
@@ -25,6 +26,9 @@ const PREVIEW_MIN: f32 = 300.0;
 const LIST_MIN: f32 = 280.0;
 /// The splitter can be grabbed this far into the pane too (the gap alone is thin).
 const GRAB: f32 = 3.0;
+/// The grip in the middle of the splitter: how tall and how thick.
+const GRIP_H: f32 = 28.0;
+const GRIP_W: f32 = 2.0;
 
 /// What the pane shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +58,8 @@ pub struct Side {
     showing: Showing,
     /// How wide the gap is (the skin's, `Theme::gap`).
     gap: f32,
+    /// The mouse is over the splitter: it lights up.
+    split_hover: bool,
 }
 
 impl Default for Side {
@@ -73,6 +79,7 @@ impl Side {
             down_on_pane: false,
             showing: Showing::Nothing,
             gap: size::GAP,
+            split_hover: false,
         }
     }
 
@@ -135,6 +142,12 @@ impl Side {
         Rect::new(self.rect.x + self.gap, self.rect.y, (self.rect.w - self.gap).max(0.0), self.rect.h)
     }
 
+    /// The grip: a short bar down the middle of the gap, halfway down.
+    fn grip(&self) -> Rect {
+        let h = GRIP_H.min(self.rect.h);
+        Rect::new(self.rect.x + self.gap / 2.0 - GRIP_W / 2.0, self.rect.y + (self.rect.h - h) / 2.0, GRIP_W, h)
+    }
+
     fn on_splitter(&self, p: Point) -> bool {
         !self.rect.is_empty() && p.x >= self.rect.x && p.x < self.rect.x + self.gap + GRAB && p.y >= self.rect.y && p.y < self.rect.bottom()
     }
@@ -159,6 +172,13 @@ impl Side {
             return Effect::None;
         }
         self.preview.char_input(ch)
+    }
+}
+
+impl Side {
+    /// The mouse is (`on`) or isn't over the splitter now. True when that changed (to draw it again).
+    fn set_split_hover(&mut self, on: bool) -> bool {
+        std::mem::replace(&mut self.split_hover, on) != on
     }
 }
 
@@ -194,8 +214,15 @@ impl Component for Side {
             return;
         }
         // The gap is the window's own colour (the renderer cleared it); while dragging it shows red.
+        // Otherwise its grip shows it can be dragged (in the scroll bars' colours, which every skin
+        // makes visible on the window), lit up with a line all the way down under the mouse.
         if self.split.is_some() {
             r.fill_rect(Rect::new(self.rect.x + self.gap / 2.0 - 1.0, self.rect.y, 2.0, self.rect.h), theme.accent);
+        } else if self.split_hover {
+            r.fill_rect(Rect::new(self.rect.x + self.gap / 2.0 - 0.5, self.rect.y, 1.0, self.rect.h), theme.scroll_thumb_hover);
+            r.fill_round_rect(self.grip(), GRIP_W / 2.0, theme.accent);
+        } else {
+            r.fill_round_rect(self.grip(), GRIP_W / 2.0, theme.scroll_thumb);
         }
         match self.showing {
             Showing::Details => self.details.paint(r, theme, app, ctx),
@@ -223,18 +250,30 @@ impl Component for Side {
             let now = self.pane().w;
             return if (w - now).abs() >= 0.5 { Effect::Command(Command::SideWidth(w)) } else { Effect::None };
         }
-        match self.showing {
+        let lit = self.set_split_hover(self.on_splitter(e.pos));
+        let effect = match self.showing {
             Showing::Details => self.details.mouse_move(e.pos, app),
             Showing::Preview => self.preview.mouse_move(e),
             Showing::Nothing => Effect::None,
+        };
+        if lit && matches!(effect, Effect::None) {
+            Effect::Redraw
+        } else {
+            effect
         }
     }
 
     fn mouse_leave(&mut self, _ctx: &Ctx, _app: &mut AppState) -> Effect {
-        match self.showing {
+        let lit = self.set_split_hover(false);
+        let effect = match self.showing {
             Showing::Details => self.details.mouse_leave(),
             Showing::Preview => self.preview.mouse_leave(),
             Showing::Nothing => Effect::None,
+        };
+        if lit && matches!(effect, Effect::None) {
+            Effect::Redraw
+        } else {
+            effect
         }
     }
 
@@ -257,6 +296,8 @@ impl Component for Side {
 
     fn mouse_up(&mut self, ctx: &Ctx, e: &MouseEvent, app: &mut AppState) -> Effect {
         if self.split.take().is_some() {
+            // (Let go off the splitter: it's no longer lit.)
+            self.split_hover = self.on_splitter(e.pos);
             return Effect::Redraw;
         }
         if !std::mem::take(&mut self.down_on_pane) {
@@ -325,5 +366,38 @@ mod tests {
         assert_eq!(side.showing(&app), Showing::Details);
         side.set_width(&mut app, 0.0);
         assert_eq!(app.settings.details_width, 0.0, "a double-click: the standard width again");
+    }
+
+    #[test]
+    fn the_splitter_shows_a_grip_and_lights_up_under_the_mouse() {
+        let mut app = AppState::for_tests(crate::settings::Settings { show_details: true, ..Default::default() });
+        let ctx = Ctx { hwnd: windows::Win32::Foundation::HWND::default(), scale: 1.0, now: 0.0, maximized: false, active: true };
+        let mut side = Side::new();
+        side.layout(Rect::new(700.0, 40.0, 300.0, 600.0), &ctx, &app);
+        let gap = app.theme.gap();
+        // The grip: in the middle of the gap, halfway down.
+        let g = side.grip();
+        assert_eq!((g.w, g.h), (GRIP_W, GRIP_H));
+        assert!((g.x + g.w / 2.0 - (700.0 + gap / 2.0)).abs() < 0.01);
+        assert!((g.y + g.h / 2.0 - 340.0).abs() < 0.01);
+        let at = |x: f32, y: f32| MouseEvent { pos: Point::new(x, y), button: MouseButton::Left, mods: Mods::default(), wheel: 0.0 };
+        // Onto the splitter (anywhere down it): lit, and drawn again; once is enough.
+        assert!(matches!(side.mouse_move(&ctx, &at(700.0, 50.0), &mut app), Effect::Redraw));
+        assert!(side.split_hover);
+        assert_eq!(side.cursor(Point::new(700.0, 50.0), &app), CursorKind::SizeWE);
+        assert!(matches!(side.mouse_move(&ctx, &at(700.5, 400.0), &mut app), Effect::None));
+        // Off it, onto the pane: not lit.
+        side.mouse_move(&ctx, &at(900.0, 300.0), &mut app);
+        assert!(!side.split_hover);
+        assert_eq!(side.cursor(Point::new(900.0, 300.0), &app), CursorKind::Arrow);
+        // Out of the pane altogether.
+        side.mouse_move(&ctx, &at(700.0, 300.0), &mut app);
+        assert!(matches!(side.mouse_leave(&ctx, &mut app), Effect::Redraw));
+        assert!(!side.split_hover);
+        // A drag let go away from it: not lit any more. A double-click asks for the standard width.
+        side.mouse_down(&ctx, &at(701.0, 300.0), &mut app);
+        side.mouse_up(&ctx, &at(600.0, 300.0), &mut app);
+        assert!(!side.split_hover);
+        assert!(matches!(side.double_click(&ctx, &at(701.0, 300.0), &mut app), Effect::Command(Command::SideWidth(w)) if w == 0.0));
     }
 }

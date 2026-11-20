@@ -18,6 +18,7 @@ use windows::Win32::Foundation::HWND;
 use super::{wake, AppState, Loaded, Tab};
 use crate::fileops::{self, check_name, dotted_extension, items_text, same_path, Job, NameCheck, Outcome};
 use crate::folder::{file_name, join, parent, EntryKind};
+use crate::keymap::{self, Action};
 use crate::tags::Tag;
 use crate::ui::MenuAbout;
 
@@ -168,6 +169,13 @@ impl AppState {
         Some(paths)
     }
 
+    /// Why the items of the archive folder on screen can't be cut, renamed or deleted (one inside
+    /// another archive, or one with password-protected items), as reading it found. The menu greys
+    /// those out; the keys say this instead.
+    pub fn archive_cant_change(&self) -> Option<&'static str> {
+        crate::archive::cant_change(&self.tab().folder.path)
+    }
+
     /// The selected items inside the archive on screen, as (archive file, their paths inside it),
     /// when the tab is inside a .zip or .7z.
     fn archive_chosen(&self) -> Option<(String, Vec<String>)> {
@@ -189,7 +197,7 @@ impl AppState {
             }
         });
         if !started {
-            self.say("Windows couldn't start this right now. Try again.");
+            self.say("Failed to start this. Try again.");
         }
         started
     }
@@ -245,6 +253,31 @@ impl AppState {
         self.start_job(Job::Extract { archive, own_folder }, after);
     }
 
+    /// Right-click > Extract selected… / Extract all… inside a .zip or .7z: Windows' folder picker
+    /// asks where to (starting at the archive's folder), then it's extracted there in the copy queue.
+    pub(super) fn extract_inside(&mut self, all: bool) {
+        let Some((archive, items)) = self.archive_chosen() else { return };
+        if !all && items.is_empty() {
+            return self.say("Select what to extract first.");
+        }
+        if self.tab().waiting_long() {
+            return;
+        }
+        let start = parent(&archive).unwrap_or_default();
+        if let Some(dest) = pick_folder(self.owner().hwnd(), &start) {
+            self.extract_inside_to(all, items, dest);
+        }
+    }
+
+    /// `extract_inside` once the folder is picked: the job for `items` (paths inside the archive
+    /// on screen) or, with `all`, for everything in that archive.
+    fn extract_inside_to(&mut self, all: bool, items: Vec<String>, dest: String) {
+        let Some((archive, at)) = crate::archive::split(&self.tab().folder.path) else { return };
+        let items = if all { Vec::new() } else { items };
+        let after = AfterJob::new(self.tab().id);
+        self.start_job(Job::ExtractInto { archive, at, items, dest }, after);
+    }
+
     /// Right-click > Compress to zip / Compress to 7z: the selected items go into one new archive
     /// next to them, in the copy queue. It's selected once it's made, and Ctrl+Z sends it to the
     /// Recycle Bin.
@@ -264,6 +297,9 @@ impl AppState {
     /// another folder or in File Explorer.
     pub(super) fn copy_files(&mut self, cut: bool) {
         if let Some((archive, items)) = self.archive_chosen().filter(|_| cut) {
+            if let Some(why) = self.archive_cant_change() {
+                return self.say(why);
+            }
             return self.cut_in_archive(archive, items);
         }
         // Inside a .zip or .7z: copying takes the items out first (they're files on the clipboard
@@ -330,7 +366,8 @@ impl AppState {
         let seq = fileops::clipboard_sequence();
         let t = self.tab();
         self.cut = Some(CutMark { seq, folder: t.folder.path.clone(), names: t.selected_entries().iter().map(|&i| t.folder.entries[i].lower.clone()).collect() });
-        self.say(format!("Cut {}. Paste (Ctrl+V) in a folder to move {} there.", items_text(&items), if items.len() == 1 { "it" } else { "them" }));
+        let paste = self.keys(Action::Paste);
+        self.say(cut_in_archive_note(&items, &archive, &paste));
         self.archive_cut = Some(ArchiveCut { seq, archive, items });
     }
 
@@ -398,11 +435,16 @@ impl AppState {
             if items.is_empty() || self.tab().waiting_long() {
                 return;
             }
+            if let Some(why) = self.archive_cant_change() {
+                return self.say(why);
+            }
             let after = AfterJob { select_next: self.next_after_selection(), ..AfterJob::new(self.tab().id) };
             let title = format!("Delete {} from \u{201c}{}\u{201d}?", items_text(&items), file_name(&archive));
+            let undo = self.keys(Action::Undo);
+            let back = keymap::say_with(&undo, if items.len() == 1 { "{keys} brings it back." } else { "{keys} brings them back." }, if items.len() == 1 { "Undo brings it back." } else { "Undo brings them back." });
             let job = Job::ArchiveChange { archive, change: crate::archive::Change::Remove(items), recycle: Vec::new() };
             if self.settings.ask_before_deleting(false) {
-                self.ask(title, "Ctrl+Z brings it back.".into(), "DELETE", job, after);
+                self.ask(title, back, "DELETE", job, after);
             } else {
                 self.start_job(job, after);
             }
@@ -551,7 +593,7 @@ impl AppState {
         }
         let step = if redo { self.history.take_redo() } else { self.history.take_undo() };
         let Some(step) = step else {
-            self.say(if redo { "Nothing to redo" } else { "Nothing to undo" });
+            self.say(if redo { "Nothing to redo." } else { "Nothing to undo." });
             return;
         };
         let job = if redo { step.redo_job() } else { step.undo_job() };
@@ -590,7 +632,7 @@ impl AppState {
             }
         });
         if !started {
-            self.say("Windows couldn't start this right now. Try again.");
+            self.say("Failed to start this. Try again.");
         }
         started
     }
@@ -641,11 +683,12 @@ impl AppState {
                 }
             }
             Some((redo, step)) if outcome.ok => {
+                let then = keymap::say_with(&self.keys(Action::Redo), " \u{b7} {keys} to redo.", ".");
                 outcome.note = Some(match (&step, redo) {
                     (_, true) => format!("Redid {}.", step.describe()),
                     // Undoing a delete brings the items back from the Recycle Bin.
-                    (crate::undo::Step::Recycled { paths }, false) => format!("Restored {} \u{b7} Ctrl+Y to redo.", items_text(paths)),
-                    (_, false) => format!("Undid {} \u{b7} Ctrl+Y to redo.", step.describe()),
+                    (crate::undo::Step::Recycled { paths }, false) => format!("Restored {}{then}", items_text(paths)),
+                    (_, false) => format!("Undid {}{then}", step.describe()),
                 });
                 if redo {
                     self.history.redone(step);
@@ -833,6 +876,60 @@ impl AppState {
                 t.rebuild_view();
             }
         }
+    }
+}
+
+/// What Cut inside a .zip or .7z says: what was cut from which archive, and how to move it
+/// (`paste`: Paste's shortcut now, "" for none).
+fn cut_in_archive_note(items: &[String], archive: &str, paste: &str) -> String {
+    let how = keymap::say_with(paste, "Paste ({keys})", "Paste");
+    format!("Cut {} from \u{201c}{}\u{201d}. {how} in a folder to move {} there.", items_text(items), file_name(archive), if items.len() == 1 { "it" } else { "them" })
+}
+
+/// What Copy path says once `n` paths are on the clipboard; inside the archive file `archive`, the
+/// paths go through it, and it says so.
+pub(super) fn paths_copied(n: usize, archive: Option<&str>) -> String {
+    let inside = archive.map(|a| format!(" inside \u{201c}{}\u{201d}", file_name(a))).unwrap_or_default();
+    if n == 1 {
+        format!("Path{inside} copied.")
+    } else {
+        format!("{n} paths{inside} copied.")
+    }
+}
+
+/// Windows' folder picker (as Settings uses for the start folder), owned by `owner`, for where
+/// Extract selected… and Extract all… put things: starting at `start` when that's a folder on a
+/// local disk (a network folder could keep it waiting). None if cancelled.
+fn pick_folder(owner: HWND, start: &str) -> Option<String> {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+    use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, SIGDN_FILESYSPATH};
+    // SAFETY: COM is set up on this (the UI) thread (main.rs); every interface is released when
+    // dropped and the returned string is freed with CoTaskMemFree.
+    unsafe {
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let options = dialog.GetOptions().ok()?;
+        let _ = dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+        let _ = dialog.SetTitle(w!("Folder to extract to"));
+        let _ = dialog.SetOkButtonLabel(w!("Extract"));
+        let drive: String = start.chars().take(3).collect();
+        let local = drive.len() == 3 && drive.ends_with(":\\") && {
+            let root: Vec<u16> = drive.encode_utf16().chain(std::iter::once(0)).collect();
+            matches!(GetDriveTypeW(PCWSTR(root.as_ptr())), 2 | 3) // removable, fixed
+        };
+        if local {
+            let path: Vec<u16> = start.encode_utf16().chain(std::iter::once(0)).collect();
+            if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(path.as_ptr()), None) {
+                let _ = dialog.SetFolder(&item);
+            }
+        }
+        dialog.Show(Some(owner)).ok()?;
+        let item = dialog.GetResult().ok()?;
+        let name = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let text = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as *const _));
+        text.filter(|t| !t.is_empty())
     }
 }
 
@@ -1224,13 +1321,24 @@ mod tests {
         }
         assert!(fileops::exists(&s.at("1.txt")) && fileops::exists(&s.at("x.txt")));
         a.run(Command::Undo);
-        assert_eq!(a.note(), Some("Nothing to undo"));
+        assert_eq!(a.note(), Some("Nothing to undo."));
         assert!(!a.history.busy);
         a.run(Command::Redo);
         finish_job(&mut a);
         assert_eq!(a.note(), Some("Redid renaming \u{201c}1.txt\u{201d}."));
         assert!(fileops::exists(&s.at("2.txt")));
         assert_eq!(a.history.next_undo(), Some(&first));
+        // With Redo on another key the note names it; with none it ends after the name.
+        a.settings.shortcuts.insert("Redo".into(), "F8".into());
+        a.run(Command::Undo);
+        finish_job(&mut a);
+        assert_eq!(a.note(), Some("Undid renaming \u{201c}1.txt\u{201d} \u{b7} F8 to redo."));
+        a.run(Command::Redo);
+        finish_job(&mut a);
+        a.settings.shortcuts = [("Undo".to_string(), "Ctrl+Y".to_string())].into();
+        a.run(Command::Undo);
+        finish_job(&mut a);
+        assert_eq!(a.note(), Some("Undid renaming \u{201c}1.txt\u{201d}."));
     }
 
     #[test]
@@ -1256,5 +1364,117 @@ mod tests {
         a.run(Command::Undo);
         finish_job(&mut a);
         assert!(fileops::exists(&s.at("1.txt")) && !fileops::exists(&s.at("2.txt")));
+    }
+
+    #[test]
+    fn extract_selected_and_all_inside_an_archive_go_to_the_folder_picked() {
+        use std::io::Write;
+        let s = Scratch::new("extract-inside");
+        let zip = s.at("Photos #1.zip");
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&zip).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        for (name, data) in [("a.txt", "alpha"), ("docs/b.txt", "beta"), ("c.txt", "gamma")] {
+            w.start_file(name, opts).unwrap();
+            w.write_all(data.as_bytes()).unwrap();
+        }
+        w.finish().unwrap();
+        let dest = s.at("out");
+        std::fs::create_dir(&dest).unwrap();
+        let mut a = AppState::for_tests(crate::settings::Settings::default());
+        a.hidden = true; // (no folder watch in a test)
+        let mut docs = entry("docs", 0x10);
+        docs.kind = EntryKind::Folder;
+        let t = &mut a.tabs[0];
+        t.path = zip.clone();
+        apply_listing(t, Folder { path: zip.clone(), entries: vec![entry("a.txt", 0x20), docs, entry("c.txt", 0x20)], ..Default::default() });
+        // Nothing selected: Extract selected… says so, before any folder is asked for.
+        a.extract_inside(false);
+        assert_eq!(a.note(), Some("Select what to extract first."));
+        // A file and a folder.
+        a.tabs[0].selected = vec![true, true, false];
+        let (_, items) = a.archive_chosen().unwrap();
+        a.extract_inside_to(false, items.clone(), dest.clone());
+        finish_job(&mut a);
+        assert_eq!(a.note(), Some("Extracted 2 items to \u{201c}out\u{201d}."));
+        assert_eq!(std::fs::read_to_string(join(&dest, "a.txt")).unwrap(), "alpha");
+        assert_eq!(std::fs::read_to_string(join(&join(&dest, "docs"), "b.txt")).unwrap(), "beta");
+        assert!(!fileops::exists(&join(&dest, "c.txt")));
+        // Everything, with names already there numbered; Ctrl+Z takes back only what it made.
+        a.extract_inside_to(true, items, dest.clone());
+        finish_job(&mut a);
+        assert_eq!(a.note(), Some("Extracted \u{201c}Photos #1.zip\u{201d} to \u{201c}out\u{201d}."));
+        let mut there: Vec<String> = std::fs::read_dir(&dest).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        there.sort();
+        assert_eq!(there, ["a (2).txt", "a.txt", "c.txt", "docs", "docs (2)"]);
+        assert_eq!(a.history.next_undo(), Some(&crate::undo::Step::Made { paths: ["a (2).txt", "docs (2)", "c.txt"].iter().map(|n| join(&dest, n)).collect(), what: "extract" }));
+    }
+
+    #[test]
+    fn archive_words_say_what_happens_inside_it() {
+        assert_eq!(cut_in_archive_note(&["docs\\a.txt".to_string()], "C:\\t\\Photos.zip", "Ctrl+V"), "Cut \u{201c}a.txt\u{201d} from \u{201c}Photos.zip\u{201d}. Paste (Ctrl+V) in a folder to move it there.");
+        assert_eq!(cut_in_archive_note(&["a".to_string(), "b".to_string()], "C:\\t\\x #1.7z", "Ctrl+V"), "Cut 2 items from \u{201c}x #1.7z\u{201d}. Paste (Ctrl+V) in a folder to move them there.");
+        // Paste moved to another key, or given none.
+        assert_eq!(cut_in_archive_note(&["a".to_string()], "C:\\t\\P.zip", "Ctrl+Alt+P"), "Cut \u{201c}a\u{201d} from \u{201c}P.zip\u{201d}. Paste (Ctrl+Alt+P) in a folder to move it there.");
+        assert_eq!(cut_in_archive_note(&["a".to_string()], "C:\\t\\P.zip", ""), "Cut \u{201c}a\u{201d} from \u{201c}P.zip\u{201d}. Paste in a folder to move it there.");
+        assert_eq!(paths_copied(1, None), "Path copied.");
+        assert_eq!(paths_copied(3, None), "3 paths copied.");
+        assert_eq!(paths_copied(1, Some("C:\\t\\Photos.zip")), "Path inside \u{201c}Photos.zip\u{201d} copied.");
+        assert_eq!(paths_copied(2, Some("C:\\t\\\u{130}\u{f1} \u{1F600}.7z")), "2 paths inside \u{201c}\u{130}\u{f1} \u{1F600}.7z\u{201d} copied.");
+    }
+
+    #[test]
+    fn delete_inside_an_archive_asks_in_its_terms_or_says_why_it_cant() {
+        use std::io::Write;
+        let s = Scratch::new("archive-delete");
+        let zip_of = |entries: &[(&str, &[u8])]| {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            for (name, data) in entries {
+                w.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+                w.write_all(data).unwrap();
+            }
+            w.finish().unwrap().into_inner()
+        };
+        let zip = s.at("Photos.zip");
+        std::fs::write(&zip, zip_of(&[("a.txt", b"a"), ("b.txt", b"b"), ("inner.zip", &zip_of(&[("c.txt", b"c"), ("d.txt", b"d")]))])).unwrap();
+        let open = |a: &mut AppState, inner: &str| {
+            let full = if inner.is_empty() { zip.clone() } else { format!("{zip}\\{inner}") };
+            let listed = crate::archive::read(&zip, inner, &full);
+            let t = &mut a.tabs[0];
+            t.path = full;
+            let n = listed.entries.len();
+            apply_listing(t, listed);
+            t.selected = vec![true; n];
+        };
+        let mut a = AppState::for_tests(crate::settings::Settings { confirm_delete: crate::settings::ConfirmDelete::Always, ..Default::default() });
+        a.hidden = true; // (no folder watch in a test)
+        // In the archive itself: asked, in the archive's words.
+        open(&mut a, "");
+        a.tabs[0].selected[2] = false;
+        a.delete(false);
+        let q = a.question.take().expect("asked");
+        assert_eq!(q.title, "Delete 2 items from \u{201c}Photos.zip\u{201d}?");
+        assert_eq!(q.text, "Ctrl+Z brings them back.");
+        a.tabs[0].selected = vec![true, false, false];
+        a.delete(true);
+        let q = a.question.take().expect("asked");
+        assert_eq!((q.title.as_str(), q.text.as_str()), ("Delete \u{201c}a.txt\u{201d} from \u{201c}Photos.zip\u{201d}?", "Ctrl+Z brings it back."));
+        assert_eq!(a.archive_cant_change(), None);
+        // Undo on another key, or left with none (Redo took its key): the line says so.
+        a.settings.shortcuts.insert("Undo".into(), "F9".into());
+        a.delete(true);
+        assert_eq!(a.question.take().expect("asked").text, "F9 brings it back.");
+        a.settings.shortcuts = [("Redo".to_string(), "Ctrl+Z".to_string())].into();
+        a.delete(true);
+        assert_eq!(a.question.take().expect("asked").text, "Undo brings it back.");
+        a.settings.shortcuts.clear();
+        // In the archive inside it: Del and Ctrl+X say why, and nothing is asked or cut.
+        open(&mut a, "inner.zip");
+        a.delete(false);
+        assert!(a.question.is_none());
+        assert_eq!(a.note(), Some(crate::archive::NESTED_NOTE));
+        a.say("");
+        a.copy_files(true);
+        assert_eq!(a.note(), Some(crate::archive::NESTED_NOTE));
+        assert!(a.archive_cut.is_none());
     }
 }

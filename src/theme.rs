@@ -357,10 +357,11 @@ pub enum SidebarStyle {
 }
 
 /// How the skin cuts buttons and boxes (SORT, SETTINGS, the folder you're in, a logo word's box, the
-/// buttons and switches of Glint's own windows).
+/// buttons of Glint's own windows; switches and checkboxes only take the rounded corners).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Shape {
-    /// Leaning like "/" (AMD Radeon): both sides slanted by the skin's `slant`.
+    /// Leaning like "/" (AMD Radeon) by the skin's `slant`: a button only on a side with another
+    /// button beside it (pathbar.rs `Beside`), the folder you're in and the logo word's box on both.
     #[default]
     Slanted,
     /// Plain square boxes (NVIDIA).
@@ -779,8 +780,8 @@ impl Theme {
         self.scrollbar_w + 2.0 * self.scrollbar_margin()
     }
 
-    /// How far a box leans whose lean in AMD Radeon is `standard` (SORT and SETTINGS 8, a switch
-    /// 6), in this skin: in proportion to its slant, and 0 unless its shape is slanted.
+    /// How far a box leans whose lean in AMD Radeon is `standard` (SORT and SETTINGS 8, the note
+    /// box 6), in this skin: in proportion to its slant, and 0 unless its shape is slanted.
     pub fn lean(&self, standard: f32) -> f32 {
         if self.shape == Shape::Slanted {
             standard * self.slant / STANDARD_SLANT

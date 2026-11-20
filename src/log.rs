@@ -204,9 +204,9 @@ fn tell_about_crash(message: &str, saved: bool) {
             file.parent().map_or(String::new(), |d| d.display().to_string())
         )
     } else if error_log_on() {
-        format!("Glint ran into a problem it can't recover from and has to close.\n\n{message}\n\nThe details couldn't be saved. Press Ctrl+C to copy this message.")
+        format!("Glint ran into a problem it can't recover from and has to close.\n\n{message}\n\nFailed to save the details. Press Ctrl+C to copy this message.")
     } else {
-        format!("Glint ran into a problem it can't recover from and has to close.\n\n{message}\n\nError logging is off (Settings > About > Log errors), so the details weren't saved. Press Ctrl+C to copy this message.")
+        format!("Glint ran into a problem it can't recover from and has to close.\n\n{message}\n\nError logging is off (Settings > About > Write errors to a file), so the details weren't saved. Press Ctrl+C to copy this message.")
     };
     let text_w = wide(&text);
     let buttons = if saved { MB_YESNO } else { MB_OK };

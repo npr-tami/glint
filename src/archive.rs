@@ -429,13 +429,59 @@ fn number_alike(items: &mut [Item]) {
 pub fn read(archive: &str, inner: &str, full_path: &str) -> Folder {
     let start = Instant::now();
     let mut f = Folder { path: full_path.to_string(), ..Default::default() };
-    let listed = resolve(archive, inner).and_then(|(archive, inner)| list(&archive).and_then(|(_, items)| children(&items, &inner)));
+    let listed = resolve(archive, inner).and_then(|(real, inner)| {
+        let (_, items) = list(&real)?;
+        // (What `change` would refuse there, noted for the menus and keys.)
+        let why = if real != archive {
+            Some(NESTED_NOTE)
+        } else if items.iter().any(|i| i.locked) {
+            Some(edit::LOCKED)
+        } else {
+            None
+        };
+        note_cant_change(full_path, why);
+        children(&items, &inner)
+    });
     match listed {
         Ok(entries) => f.entries = entries,
         Err(msg) => f.error = Some(msg),
     }
     f.read_ms = start.elapsed().as_secs_f64() * 1000.0;
     f
+}
+
+/// Why Cut, Rename and Delete can't work in a folder of an archive in another archive (`change`
+/// refuses those), in one short sentence.
+pub const NESTED_NOTE: &str = "Glint can't change an archive inside another archive.";
+
+/// Folders of archives Glint can't change, as reading them found (the folder's path in lower case,
+/// and why): inside an archive in another archive, or in an archive with password-protected items.
+/// Noted on the thread that reads the folder, so the menus can grey out Cut, Rename and Delete
+/// there, and the keys say why, without opening the archive again on the window's thread. Only
+/// the last few are kept.
+static CANT_CHANGE: std::sync::Mutex<Vec<(String, &'static str)>> = std::sync::Mutex::new(Vec::new());
+const CANT_CHANGE_KEPT: usize = 16;
+
+fn note_cant_change(folder_path: &str, why: Option<&'static str>) {
+    if folder_path.is_empty() {
+        return;
+    }
+    let key = folder_path.trim_end_matches('\\').to_lowercase();
+    let Ok(mut known) = CANT_CHANGE.lock() else { return };
+    known.retain(|(k, _)| *k != key);
+    if let Some(why) = why {
+        if known.len() >= CANT_CHANGE_KEPT {
+            known.remove(0);
+        }
+        known.push((key, why));
+    }
+}
+
+/// Why the items of this folder of an archive (as on screen) can't be cut, renamed or deleted,
+/// when reading it found that. None for everything else.
+pub fn cant_change(folder_path: &str) -> Option<&'static str> {
+    let key = folder_path.trim_end_matches('\\').to_lowercase();
+    CANT_CHANGE.lock().ok()?.iter().find(|(k, _)| *k == key).map(|&(_, why)| why)
 }
 
 /// The direct children of `inner` among the archive's items.
@@ -727,7 +773,52 @@ fn unpack_size_in(opened: &Opened, items: &[Item], inner_items: &[String]) -> u6
 /// they can be cleaned up when it stops partway (a cancel). Reports to the copy queue.
 pub fn extract_all(archive: &str, dest_dir: &str, made: &mut Vec<String>) -> Result<(), String> {
     let (mut opened, items) = list(archive)?;
-    let meter = Meter::new(items.iter().filter(|i| !i.is_dir).map(|i| i.size).sum());
+    let keep = vec![Some(0); items.len()];
+    unpack_free(archive, &mut opened, &items, &keep, dest_dir, made)
+}
+
+/// Extract all… while looking inside an archive: the whole archive the folder `inner` of
+/// `archive` is in - for a folder inside an archive in the archive, that inner archive - into
+/// `dest_dir`, as [`extract_all`] does it.
+pub fn extract_whole(archive: &str, inner: &str, dest_dir: &str, made: &mut Vec<String>) -> Result<(), String> {
+    let (real, _) = resolve(archive, inner)?;
+    extract_all(&real, dest_dir, made)
+}
+
+/// Extract selected… while looking inside an archive: these items of it (paths inside it; a folder
+/// brings everything under it, an item inside an archive in the archive comes from that one) into
+/// `dest_dir`, replacing nothing, as [`extract_all`] does: a top item whose name is taken there
+/// gets the next free one. The top items it makes go in `made` before they are made. Reports to the
+/// copy queue.
+pub fn extract_some(archive: &str, inner_items: &[String], dest_dir: &str, made: &mut Vec<String>) -> Result<(), String> {
+    for (real, those) in by_archive(archive, inner_items)? {
+        let (mut opened, items) = list(&real)?;
+        let wants: HashSet<String> = those.iter().map(|w| folded(&inner_parts(w))).collect();
+        let depths: BTreeSet<usize> = those.iter().map(|w| inner_parts(w).len()).collect();
+        // Each item's path is kept from the wanted item it is (or is under); the rest stay in.
+        let mut found: HashSet<String> = HashSet::new();
+        let keep: Vec<Option<usize>> = items
+            .iter()
+            .map(|item| {
+                let parts: Vec<&str> = item.parts().collect();
+                let n = depths.iter().copied().take_while(|&n| n <= parts.len()).find(|&n| wants.contains(&folded(&parts[..n])))?;
+                found.insert(folded(&parts[..n]));
+                Some(n - 1)
+            })
+            .collect();
+        if let Some(missing) = those.iter().find(|w| !found.contains(&folded(&inner_parts(w)))) {
+            return Err(format!("\u{201c}{missing}\u{201d} isn't in this archive."));
+        }
+        unpack_free(&real, &mut opened, &items, &keep, dest_dir, made)?;
+    }
+    Ok(())
+}
+
+/// Unpacks the items of `items` that `keep` gives a place (each one's path from that part on)
+/// into `dest_dir`, replacing nothing: a top item whose name is taken there gets the next free
+/// one. Its top items go in `made` before they are made.
+fn unpack_free(archive: &str, opened: &mut Opened, items: &[Item], keep: &[Option<usize>], dest_dir: &str, made: &mut Vec<String>) -> Result<(), String> {
+    let meter = Meter::new(items.iter().zip(keep).filter(|(i, k)| k.is_some() && !i.is_dir).map(|(i, _)| i.size).sum());
     // The archive's top names (lower case) and the names they get in `dest_dir`.
     let mut renamed: HashMap<String, String> = HashMap::new();
     let mut given: HashSet<String> = HashSet::new();
@@ -736,7 +827,8 @@ pub fn extract_all(archive: &str, dest_dir: &str, made: &mut Vec<String>) -> Res
     let mut planned: HashMap<String, usize> = HashMap::new();
     let mut plan: Vec<(usize, PathBuf)> = Vec::new();
     for (i, item) in items.iter().enumerate() {
-        let mut parts: Vec<&str> = item.parts().collect();
+        let Some(from) = keep[i] else { continue };
+        let mut parts: Vec<&str> = item.parts().skip(from).collect();
         let key = parts[0].to_lowercase();
         if !renamed.contains_key(&key) {
             let is_dir = item.is_dir || parts.len() > 1;
@@ -755,7 +847,7 @@ pub fn extract_all(archive: &str, dest_dir: &str, made: &mut Vec<String>) -> Res
             }
         }
     }
-    unpack(archive, &mut opened, &items, &plan, &meter)
+    unpack(archive, opened, items, &plan, &meter)
 }
 
 /// Writes the planned items (index in `items`, where it goes): folders first, then the files. A
@@ -829,7 +921,7 @@ fn extract_zip(archive: &str, zip: &mut zip::ZipArchive<BufReader<File>>, files:
             zip::result::ZipError::CompressionMethodNotSupported(_) => format!("\u{201c}{name}\u{201d} is packed in a way Glint can't unpack yet."),
             zip::result::ZipError::UnsupportedArchive(m) if m == zip::result::ZipError::PASSWORD_REQUIRED => PASSWORD.to_string(),
             zip::result::ZipError::InvalidPassword => PASSWORD.to_string(),
-            zip::result::ZipError::Io(e) => format!("\u{201c}{name}\u{201d} couldn't be read from the archive ({e})."),
+            zip::result::ZipError::Io(e) => format!("Failed to read \u{201c}{name}\u{201d} from the archive ({e})."),
             _ => format!("\u{201c}{name}\u{201d} is damaged in this zip file."),
         };
         let Some(at) = item.hidden else {
@@ -1103,7 +1195,7 @@ fn pack_zip(plan: &Packing, file: File, out: &Path, meter: &Meter) -> Result<(),
     use zip::write::SimpleFileOptions;
     let zip_error = |e: zip::result::ZipError| match e {
         zip::result::ZipError::Io(e) => write_error(out, &e),
-        e => format!("\u{201c}{}\u{201d} couldn't be written ({e}).", out.display()),
+        e => format!("Failed to write \u{201c}{}\u{201d} ({e}).", out.display()),
     };
     let mut zip = zip::ZipWriter::new(BufWriter::new(file));
     let mut buf = vec![0u8; 256 * 1024];
@@ -1133,7 +1225,7 @@ fn pack_zip(plan: &Packing, file: File, out: &Path, meter: &Meter) -> Result<(),
 
 fn pack_7z(plan: &Packing, file: File, out: &Path, meter: &Meter) -> Result<(), String> {
     use sevenz_rust2::ArchiveWriter;
-    let seven_error = |e: sevenz_rust2::Error| meter.problem.take().unwrap_or_else(|| format!("\u{201c}{}\u{201d} couldn't be written ({e}).", out.display()));
+    let seven_error = |e: sevenz_rust2::Error| meter.problem.take().unwrap_or_else(|| format!("Failed to write \u{201c}{}\u{201d} ({e}).", out.display()));
     let mut w = ArchiveWriter::new(BufWriter::new(file)).map_err(seven_error)?;
     // Files go in solid blocks of up to SOLID_BLOCK bytes, packed together. Those already packed
     // (photos, videos, archives...), which LZMA2 would only spend its time on, are stored as they
@@ -1479,7 +1571,7 @@ fn open_error(e: &io::Error) -> String {
     match e.kind() {
         io::ErrorKind::NotFound => "This archive isn't there any more.".to_string(),
         io::ErrorKind::PermissionDenied => "Glint isn't allowed to open this archive.".to_string(),
-        _ => format!("This archive couldn't be opened ({e})."),
+        _ => format!("Failed to open this archive ({e})."),
     }
 }
 
@@ -1490,7 +1582,7 @@ fn read_error(path: &Path, e: &io::Error) -> String {
     match e.kind() {
         io::ErrorKind::NotFound => format!("\u{201c}{path}\u{201d} isn't there any more."),
         io::ErrorKind::PermissionDenied => format!("Glint isn't allowed to read \u{201c}{path}\u{201d}."),
-        _ => format!("\u{201c}{path}\u{201d} couldn't be read ({e})."),
+        _ => format!("Failed to read \u{201c}{path}\u{201d} ({e})."),
     }
 }
 
@@ -1499,7 +1591,7 @@ fn write_error(path: &Path, e: &io::Error) -> String {
     match e.kind() {
         io::ErrorKind::PermissionDenied => format!("Glint isn't allowed to write \u{201c}{path}\u{201d}."),
         io::ErrorKind::StorageFull => format!("There's no room left to write \u{201c}{path}\u{201d}."),
-        _ => format!("\u{201c}{path}\u{201d} couldn't be written ({e})."),
+        _ => format!("Failed to write \u{201c}{path}\u{201d} ({e})."),
     }
 }
 
@@ -1508,7 +1600,7 @@ fn unpack_error(name: &str, e: &io::Error) -> String {
     if let Some(inner) = e.get_ref().and_then(|i| i.downcast_ref::<sevenz_rust2::Error>()) {
         return sevenz_error(inner);
     }
-    format!("\u{201c}{name}\u{201d} is damaged in this archive and couldn't be unpacked.")
+    format!("Failed to unpack \u{201c}{name}\u{201d}: it's damaged in this archive.")
 }
 
 fn read_error_7z(e: &io::Error) -> String {
@@ -2670,7 +2762,7 @@ mod tests {
         zip_with(&zip, &[("ok.txt", b"ok"), (&format!("{}.txt", "n".repeat(300)), b"too long")]);
         let out = t.dir("toolong");
         let err = extract_all(&s(&zip), &s(&out), &mut Vec::new()).expect_err("too long");
-        assert!(err.contains("couldn't be written"), "{err}");
+        assert!(err.contains("Failed to write"), "{err}");
         assert_eq!(tree(&out), expected(&[("ok.txt", Some(b"ok"))]));
     }
 
@@ -2712,7 +2804,7 @@ mod tests {
             let lock = std::fs::OpenOptions::new().read(true).share_mode(0).open(top.join("sub").join("big.bin")).expect("lock");
             let out = t.join(&format!("locked{}", format.ext()));
             let err = pack(&plan, &s(&out), format).expect_err("locked");
-            assert!(err.contains("big.bin") && err.contains("couldn't be read"), "{format:?}: {err}");
+            assert!(err.contains("big.bin") && err.contains("Failed to read"), "{format:?}: {err}");
             assert!(!out.exists(), "{format:?}");
             drop(lock);
             // A file deleted since it was found.
@@ -3008,5 +3100,179 @@ mod tests {
             extract_all(&s(&out), &s(&back), &mut Vec::new()).expect("extract");
             eprintln!("{format:?}: {} MB packed in {packed:?} to {} MB, unpacked in {:?}", plan.total >> 20, size >> 20, start.elapsed());
         }
+    }
+
+    #[test]
+    fn extract_selected_takes_files_and_folders_with_all_inside() {
+        let t = Scratch::new("extractsome");
+        for ext in [".zip", ".7z"] {
+            let archive = t.join(&format!("x{ext}"));
+            archive_with(&archive, &[("top.txt", b"top"), ("docs/a.txt", b"a"), ("docs/deep/b.txt", b"b"), ("docs/empty/", b""), ("other/c.txt", b"c")]);
+            let a = s(&archive);
+            // Two files from inside a folder: they land right in the folder picked.
+            let out = t.dir(&format!("files{ext}"));
+            let mut made = Vec::new();
+            extract_some(&a, &["docs\\a.txt".to_string(), "docs\\deep\\b.txt".to_string()], &s(&out), &mut made).expect("files");
+            assert_eq!(made, [s(&out.join("a.txt")), s(&out.join("b.txt"))], "{ext}");
+            assert_eq!(tree(&out), [("a.txt".to_string(), Some(b"a".to_vec())), ("b.txt".to_string(), Some(b"b".to_vec()))], "{ext}");
+            // A folder brings everything in it, empty folders too; the rest stays in the archive.
+            let out = t.dir(&format!("folder{ext}"));
+            let mut made = Vec::new();
+            extract_some(&a, &["DOCS".to_string()], &s(&out), &mut made).expect("folder");
+            assert_eq!(made, [s(&out.join("docs"))], "{ext}");
+            assert_eq!(names_in(&out), ["docs"], "{ext}");
+            assert_eq!(std::fs::read(out.join("docs").join("deep").join("b.txt")).expect("read"), b"b");
+            assert!(out.join("docs").join("empty").is_dir(), "{ext}");
+            // What isn't in it: nothing is written.
+            let out = t.dir(&format!("missing{ext}"));
+            let wrong = extract_some(&a, &["nope.txt".to_string()], &s(&out), &mut Vec::new());
+            assert_eq!(wrong, Err("\u{201c}nope.txt\u{201d} isn't in this archive.".to_string()), "{ext}");
+            assert!(names_in(&out).is_empty());
+            // Extract all: everything, from wherever in the archive it's asked.
+            let out = t.dir(&format!("all{ext}"));
+            let mut made = Vec::new();
+            extract_whole(&a, "docs\\deep", &s(&out), &mut made).expect("all");
+            assert_eq!(names_in(&out), ["docs", "other", "top.txt"], "{ext}");
+            assert_eq!(std::fs::read(out.join("other").join("c.txt")).expect("read"), b"c");
+        }
+    }
+
+    #[test]
+    fn extract_selected_numbers_names_taken_and_does_it_twice() {
+        let t = Scratch::new("extractsometaken");
+        let zip = t.join("x.zip");
+        zip_with(&zip, &[("docs/a.txt", b"new a"), ("docs/sub/b.txt", b"new b"), ("note.txt", b"new note")]);
+        let z = s(&zip);
+        let dest = t.dir("dest");
+        std::fs::write(dest.join("NOTE.TXT"), b"mine").expect("write");
+        std::fs::create_dir(dest.join("sub")).expect("mkdir");
+        let picked = ["note.txt".to_string(), "docs\\sub".to_string()];
+        let mut made = Vec::new();
+        extract_some(&z, &picked, &s(&dest), &mut made).expect("first");
+        // (In the archive's order.)
+        assert_eq!(made, [s(&dest.join("sub (2)")), s(&dest.join("note (2).txt"))]);
+        // Twice: the next free names, and nothing earlier is touched.
+        let mut again = Vec::new();
+        extract_some(&z, &picked, &s(&dest), &mut again).expect("second");
+        assert_eq!(again, [s(&dest.join("sub (3)")), s(&dest.join("note (3).txt"))]);
+        assert_eq!(std::fs::read(dest.join("NOTE.TXT")).expect("read"), b"mine");
+        assert!(names_in(&dest.join("sub")).is_empty());
+        assert_eq!(std::fs::read(dest.join("sub (3)").join("b.txt")).expect("read"), b"new b");
+        // Extract all over what's there now: numbered as Extract here numbers.
+        let mut all = Vec::new();
+        extract_whole(&z, "", &s(&dest), &mut all).expect("all");
+        assert_eq!(all, [s(&dest.join("docs")), s(&dest.join("note (4).txt"))]);
+    }
+
+    #[test]
+    fn extract_selected_and_all_reach_into_an_archive_in_the_archive() {
+        let t = Scratch::new("extractsomenested");
+        let inner = zip_bytes(&[("in/deep.txt", b"deep"), ("top.txt", b"inner top")]);
+        let outer = t.join("o.7z");
+        archive_with(&outer, &[("sub/inner.zip", &inner), ("outer.txt", b"outer")]);
+        let o = s(&outer);
+        let out = t.dir("some");
+        let mut made = Vec::new();
+        extract_some(&o, &["sub\\inner.zip\\in".to_string()], &s(&out), &mut made).expect("some");
+        assert_eq!(made, [s(&out.join("in"))]);
+        assert_eq!(std::fs::read(out.join("in").join("deep.txt")).expect("read"), b"deep");
+        // Extract all inside the inner archive: all of that one, not the outer.
+        let out = t.dir("all");
+        extract_whole(&o, "sub\\inner.zip\\in", &s(&out), &mut Vec::new()).expect("all");
+        assert_eq!(names_in(&out), ["in", "top.txt"]);
+        // The inner archive itself, selected in the outer one, comes out whole.
+        let out = t.dir("whole");
+        extract_some(&o, &["sub\\inner.zip".to_string()], &s(&out), &mut Vec::new()).expect("whole");
+        assert_eq!(std::fs::read(out.join("inner.zip")).expect("read"), inner);
+    }
+
+    #[test]
+    fn extract_selected_keeps_odd_and_long_names() {
+        let t = Scratch::new("extractsomeodd");
+        let mut odd = vec!["#1 report.txt".to_string(), "a".repeat(120) + ".txt"];
+        if crate::search::odd_names_work(&t.0) {
+            odd.extend(["\u{130}stanbul \u{f1}and\u{fa} \u{1F600}.txt".to_string(), "\u{5e9}\u{5dc}\u{5d5}\u{5dd}.txt".to_string()]);
+        }
+        let deep = format!("{}/{}", "folder ".repeat(12).trim(), odd[0]);
+        let mut entries: Vec<(String, Vec<u8>)> = odd.iter().map(|n| (n.clone(), n.as_bytes().to_vec())).collect();
+        entries.push((deep.clone(), b"deep".to_vec()));
+        let refs: Vec<(&str, &[u8])> = entries.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+        let zip = t.join("odd #.zip");
+        zip_with(&zip, &refs);
+        let out = t.dir("out");
+        let mut wanted = odd.clone();
+        wanted.push(deep.split('/').next().expect("folder").to_string());
+        extract_some(&s(&zip), &wanted, &s(&out), &mut Vec::new()).expect("extract");
+        for n in &odd {
+            assert_eq!(std::fs::read(out.join(n)).expect("read"), n.as_bytes(), "{n}");
+        }
+        let long = out.join(deep.replace('/', "\\"));
+        assert!(s(&long).chars().count() > 150);
+        assert_eq!(std::fs::read(&long).expect("read"), b"deep");
+    }
+
+    #[test]
+    fn a_cancelled_extract_selected_says_what_it_made() {
+        let t = Scratch::new("extractsomecancel");
+        let big: Vec<u8> = (0..600_000u32).map(|i| (i % 251) as u8).collect();
+        let archive = t.join("big.zip");
+        archive_with(&archive, &[("sub/big.bin", &big), ("sub/later.bin", &big), ("left.txt", b"left")]);
+        let dest = t.dir("dest");
+        let label = format!("archive test: cancelled extract selected {}", std::process::id());
+        let ticket = crate::copyqueue::Ticket::join(label.clone());
+        assert!(ticket.wait_turn());
+        let id = crate::copyqueue::shown().into_iter().find(|t| t.label == label).expect("listed").id;
+        crate::copyqueue::cancel(id);
+        let mut made = Vec::new();
+        assert_eq!(extract_some(&s(&archive), &["sub".to_string()], &s(&dest), &mut made), Err(CANCELLED.to_string()));
+        drop(ticket);
+        assert!(tree(&dest).iter().all(|(_, data)| data.is_none()), "{:?}", names_in(&dest));
+        assert_eq!(made, [s(&dest.join("sub"))]);
+    }
+
+    #[test]
+    fn reading_an_archive_folder_notes_when_it_cant_be_changed() {
+        let t = Scratch::new("cantchange");
+        let outer = t.join("o #1.zip");
+        zip_with(&outer, &[("sub/inner.zip", &zip_bytes(&[("in/deep.txt", b"deep")])), ("a.txt", b"a")]);
+        let o = s(&outer);
+        // A folder of the archive itself: it can be changed.
+        let plain = format!("{o}\\sub");
+        assert_eq!(read(&o, "sub", &plain).error, None);
+        assert_eq!(cant_change(&plain), None);
+        // A folder of the archive inside it: not, whatever the capitals or a \ at the end.
+        let nested = format!("{o}\\sub\\inner.zip\\in");
+        assert_eq!(names(&read(&o, "sub\\inner.zip\\in", &nested)), ["deep.txt"]);
+        assert_eq!(cant_change(&nested.to_uppercase()), Some(NESTED_NOTE));
+        assert_eq!(cant_change(&format!("{nested}\\")), Some(NESTED_NOTE));
+        // That's true: the change itself is refused there.
+        let refused = change(&o, &Change::Remove(vec!["sub\\inner.zip\\in\\deep.txt".into()]), &AtomicBool::new(false));
+        assert!(refused.is_err());
+        // An archive with a password-protected item: the same, until it's read without one.
+        let half = t.join("half.zip");
+        zip_with(&half, &[("plain.txt", b"plain"), ("secret.txt", b"secret")]);
+        let mut bytes = std::fs::read(&half).expect("read");
+        for i in 0..bytes.len().saturating_sub(50) {
+            let name_at = match &bytes[i..i + 4] {
+                b"PK\x03\x04" => i + 30,
+                b"PK\x01\x02" => i + 46,
+                _ => continue,
+            };
+            if bytes[name_at..].starts_with(b"secret.txt") {
+                let flags = if bytes[i + 2] == 3 { i + 6 } else { i + 8 };
+                bytes[flags] |= 1;
+            }
+        }
+        std::fs::write(&half, bytes).expect("write");
+        let h = s(&half);
+        read(&h, "", &h);
+        assert_eq!(cant_change(&h), Some(edit::LOCKED));
+        assert_eq!(change(&h, &Change::Remove(vec!["plain.txt".into()]), &AtomicBool::new(false)).err().as_deref(), Some(edit::LOCKED));
+        std::fs::remove_file(&half).expect("remove");
+        zip_with(&half, &[("plain.txt", b"plain")]);
+        read(&h, "", &h);
+        assert_eq!(cant_change(&h), None);
+        // Not read: nothing is known, so nothing is greyed out.
+        assert_eq!(cant_change(&format!("{o}\\elsewhere")), None);
     }
 }

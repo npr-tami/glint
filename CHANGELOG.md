@@ -2,6 +2,24 @@
 
 The newest version is at the top.
 
+## 26.11.5 · 20/11/2026 08:56
+
+- Added changing and removing keyboard shortcuts
+- Added size:, date:, regex: and -word to the search bar
+- Added Extract selected and Extract all in zip and 7z files
+- Added colours for code files in the preview
+- Changed buttons to slant only where they meet
+- Changed switches and tick boxes to straight
+- Changed Folder rules to open as its own window
+- Changed the status bar to show the total size
+- Renamed many settings to be clearer
+- Fixed editing zips made on Linux or a Mac
+- Fixed a lost first letter in the Command box
+- Fixed cut-off column titles
+- Improved whole-drive search speed
+- Improved Disk space with clearer types
+- Some other improvements and bugfixes
+
 ## 26.11.4 · 18/11/2026 12:19
 
 - Changed how Temp Win+E fix works

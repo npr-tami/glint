@@ -8,9 +8,10 @@
 //!
 //! **Renaming many** (F2 with several items selected, or right-click > Rename all…): a new name with
 //! `#` for the number ("Holiday #" makes "Holiday 1", "Holiday 2"…; "###" makes "001"), and/or text
-//! to find and what to put instead. Extensions stay as they are. The preview shows the first few new
-//! names, and says so when two would get the same name or a name is taken by another item; nothing
-//! happens until it's all fine. It's one step for Ctrl+Z.
+//! to find and what to put instead (it's looked for in the new name, once the new name is made).
+//! Extensions stay as they are. The preview lists every new name (it scrolls), and says so when two
+//! would get the same name or a name is taken by another item; nothing happens until it's all fine.
+//! It's one step for Ctrl+Z.
 
 use super::files::AfterJob;
 use super::AppState;
@@ -43,7 +44,11 @@ pub struct Field {
 /// What a form's typing would do, for its preview.
 #[derive(Default)]
 pub struct Preview {
+    /// Lines that always show, above the list.
     pub lines: Vec<String>,
+    /// Each item that changes, its name now and its new one ("a.jpg", "Holiday 1.jpg"): form.rs
+    /// shows them a line each, a few at a time, and scrolls through the rest.
+    pub list: Vec<(String, String)>,
     /// Why it can't be done as typed (shown in the accent colour; yes does nothing).
     pub problem: Option<String>,
     /// Something would happen (otherwise yes does nothing, without a problem to say).
@@ -56,9 +61,6 @@ enum Kind {
     /// and whether each is a folder (folders have no extension to keep).
     RenameMany { paths: Vec<String>, folders: Vec<bool> },
 }
-
-/// How many new names the preview lists.
-const PREVIEW_LINES: usize = 6;
 
 impl AppState {
     fn open_form(&mut self, title: String, fields: Vec<Field>, yes: &'static str, kind: Kind) {
@@ -91,9 +93,9 @@ impl AppState {
         let folders = chosen.iter().map(|&i| t.folder.entries[i].is_container()).collect();
         let title = format!("Rename {} items", paths.len());
         let fields = vec![
-            Field { label: "New name", hint: "Holiday #", start: String::new(), note: "# becomes 1, 2, 3" },
+            Field { label: "New name", hint: "Holiday #", start: String::new(), note: "Use # for sequential numbers, for example Photo # \u{2192} Photo 1, Photo 2." },
             Field { label: "Find", hint: "", start: String::new(), note: "" },
-            Field { label: "Replace with", hint: "", start: String::new(), note: "" },
+            Field { label: "Replace with", hint: "", start: String::new(), note: THEN_FIND },
         ];
         self.open_form(title, fields, "RENAME", Kind::RenameMany { paths, folders });
     }
@@ -110,23 +112,25 @@ impl AppState {
                 if self.settings.tab_sets.iter().any(|s| s.name.eq_ignore_ascii_case(name)) {
                     lines.push(format!("Replaces the set called \u{201c}{name}\u{201d}"));
                 }
-                Preview { lines, problem: None, ready: !name.is_empty() }
+                Preview { lines, list: Vec::new(), problem: None, ready: !name.is_empty() }
             }
             Kind::RenameMany { paths, folders } => {
                 let names: Vec<&str> = paths.iter().map(|p| file_name(p)).collect();
+                // (Said only while it's so: a new name typed without a #.)
+                let mut lines: Vec<String> = Vec::new();
+                if numbers_added(value(0), names.len()) {
+                    lines.push(NUMBER_ADDED.into());
+                }
                 match new_names(&names, folders, value(0), value(1), value(2)) {
-                    Err(problem) => Preview { lines: Vec::new(), problem: Some(problem), ready: false },
+                    Err(problem) => Preview { lines, list: Vec::new(), problem: Some(problem), ready: false },
                     Ok(new) => {
-                        let changes: Vec<(&str, &String)> = names.iter().zip(&new).filter(|(a, b)| **a != b.as_str()).map(|(a, b)| (*a, b)).collect();
-                        let mut lines: Vec<String> = changes.iter().take(PREVIEW_LINES).map(|(a, b)| format!("{a}  \u{2192}  {b}")).collect();
-                        if changes.len() > PREVIEW_LINES {
-                            lines.push(format!("and {} more", changes.len() - PREVIEW_LINES));
-                        }
+                        let list: Vec<(String, String)> = names.iter().zip(&new).filter(|(a, b)| **a != b.as_str()).map(|(a, b)| (a.to_string(), b.clone())).collect();
                         let problem = self.taken_name(paths, &new);
-                        if changes.is_empty() {
+                        if list.is_empty() {
                             lines.push("Nothing changes yet".into());
                         }
-                        Preview { lines, problem, ready: !changes.is_empty() }
+                        let ready = !list.is_empty();
+                        Preview { lines, list, problem, ready }
                     }
                 }
             }
@@ -215,13 +219,26 @@ impl AppState {
     }
 }
 
+/// Said under the new name while a new name without `#` gets numbers anyway (`numbers_added`).
+pub const NUMBER_ADDED: &str = "A number is added automatically when renaming multiple items.";
+/// Said under Replace with: how it goes with the new name (as `new_names` does it).
+const THEN_FIND: &str = "Find and Replace with are applied after New name.";
+
+/// Whether a new name typed as `pattern` gets a number put after it for `count` items: it has no
+/// `#` of its own and there's more than one item (they can't all have the same name).
+pub fn numbers_added(pattern: &str, count: usize) -> bool {
+    let pattern = pattern.trim();
+    !pattern.is_empty() && !pattern.contains('#') && count > 1
+}
+
 /// The new names for `names` (one item each; `folders` says which are folders): `pattern` with `#`
 /// for the number (empty keeps each name), then `find` replaced with `replace` (ignoring capitals).
 /// Extensions of files stay as they are. Err: why it can't be done.
 pub fn new_names(names: &[&str], folders: &[bool], pattern: &str, find: &str, replace: &str) -> Result<Vec<String>, String> {
-    let pattern = pattern.trim();
     // "Holiday" for several items: they're numbered after it ("Holiday 1").
-    let pattern = if !pattern.is_empty() && !pattern.contains('#') && names.len() > 1 { format!("{pattern} #") } else { pattern.to_string() };
+    let numbers = numbers_added(pattern, names.len());
+    let pattern = pattern.trim();
+    let pattern = if numbers { format!("{pattern} #") } else { pattern.to_string() };
     let mut out: Vec<String> = Vec::with_capacity(names.len());
     for (n, (&name, &folder)) in names.iter().zip(folders).enumerate() {
         // (Found in the name itself: lower case can have another length, "x.\u{212A}".)
@@ -388,6 +405,11 @@ mod tests {
         a
     }
 
+    /// A change as the form's list shows it.
+    fn line(change: &(String, String)) -> String {
+        format!("{}  \u{2192}  {}", change.0, change.1)
+    }
+
     fn typed(new_name: &str, find: &str, replace: &str) -> Vec<String> {
         vec![new_name.into(), find.into(), replace.into()]
     }
@@ -419,7 +441,115 @@ mod tests {
         a.ask_rename_many();
         let p = a.form_preview(&typed("#", "", ""));
         assert!(p.ready && p.problem.is_none(), "{:?}", p.problem);
-        assert_eq!((p.lines.len(), p.lines[0].as_str(), p.lines[6].as_str()), (7, "10.png  \u{2192}  1.png", "and 4 more"));
+        assert_eq!((p.list.len(), line(&p.list[0]).as_str(), line(&p.list[9]).as_str()), (10, "10.png  \u{2192}  1.png", "1.png  \u{2192}  10.png"));
+        assert!(p.lines.is_empty(), "every name is in the list, none counted as \u{201c}more\u{201d}");
+    }
+
+    #[test]
+    fn the_number_note_shows_only_while_a_number_is_really_added() {
+        let mut a = app_with(&["a.jpg", "b.jpg", "c.jpg"], &["a.jpg", "b.jpg", "c.jpg"]);
+        a.ask_rename_many();
+        let note = |p: &Preview| p.lines.iter().any(|l| l == NUMBER_ADDED);
+        // No #: numbers are added, and it says so.
+        let p = a.form_preview(&typed("Photo", "", ""));
+        assert!(note(&p));
+        assert_eq!(line(&p.list[0]), "a.jpg  \u{2192}  Photo 1.jpg");
+        assert!(note(&a.form_preview(&typed("  Photo  ", "", ""))));
+        // With a #, nothing is added beyond what it asks for; empty (or only spaces) changes nothing.
+        for typed_name in ["Photo #", "Photo ###", "#", "", "   "] {
+            assert!(!note(&a.form_preview(&typed(typed_name, "", ""))), "{typed_name:?}");
+        }
+        // Only Find and Replace with: no numbers.
+        let p = a.form_preview(&typed("", "a", "z"));
+        assert!(!note(&p) && p.list == [("a.jpg".to_string(), "z.jpg".to_string())]);
+        // It's true even while the name can't be used (it says why too).
+        let p = a.form_preview(&typed("x?", "", ""));
+        assert!(note(&p) && p.problem.is_some() && p.list.is_empty());
+        // One item alone never gets a number (the function the form and the renaming share).
+        assert!(!numbers_added("Photo", 1) && numbers_added("Photo", 2) && !numbers_added("Photo #", 2));
+        assert_eq!(new_names(&["a.jpg"], &[false], "Photo", "", "").unwrap(), ["Photo.jpg"]);
+    }
+
+    #[test]
+    fn the_forms_words_say_how_to_number_and_in_which_order_things_happen() {
+        let mut a = app_with(&["a.jpg", "b.jpg"], &["a.jpg", "b.jpg"]);
+        a.ask_rename_many();
+        let f = a.form.as_ref().unwrap();
+        let notes: Vec<&str> = f.fields.iter().map(|f| f.note).collect();
+        assert_eq!(notes, ["Use # for sequential numbers, for example Photo # \u{2192} Photo 1, Photo 2.", "", "Find and Replace with are applied after New name."]);
+        // ...which is what happens: Find looks in the new name (with its number), not the old one.
+        assert_eq!(new_names(&["a.jpg", "b.jpg"], &[false, false], "Photo #", "Photo", "Trip").unwrap(), ["Trip 1.jpg", "Trip 2.jpg"]);
+        assert_eq!(new_names(&["a.jpg", "b.jpg"], &[false, false], "Photo #", "a", "z").unwrap(), ["Photo 1.jpg", "Photo 2.jpg"], "the old names' a is gone");
+        assert_eq!(new_names(&["a.jpg", "b.jpg"], &[false, false], "Trip #", "#", "No. ").unwrap(), ["Trip 1.jpg", "Trip 2.jpg"], "the # is a number by then");
+        assert_eq!(new_names(&["a.jpg", "b.jpg"], &[false, false], "Trip", "1", "one").unwrap(), ["Trip one.jpg", "Trip 2.jpg"], "the added number too");
+    }
+
+    #[test]
+    fn find_and_replace_with_empty_boxes() {
+        let two = [false, false];
+        // Find empty: Replace with is ignored.
+        assert_eq!(new_names(&["a.txt", "b.txt"], &two, "", "", "zzz").unwrap(), ["a.txt", "b.txt"]);
+        assert_eq!(new_names(&["a.txt", "b.txt"], &two, "N", "", "zzz").unwrap(), ["N 1.txt", "N 2.txt"]);
+        // Replace with empty: what's found is taken out.
+        assert_eq!(new_names(&["ab.txt", "cb.txt"], &two, "", "B", "").unwrap(), ["a.txt", "c.txt"]);
+        let mut a = app_with(&["a.txt", "b.txt"], &["a.txt", "b.txt"]);
+        a.ask_rename_many();
+        let p = a.form_preview(&typed("", "", "zzz"));
+        assert!(!p.ready && p.list.is_empty() && p.lines == ["Nothing changes yet"]);
+    }
+
+    #[test]
+    fn odd_names_are_numbered_and_listed_whole() {
+        let names = ["\u{1f389} party #1.jpg", "\u{130}stanbul.png", "a\u{f1}o.txt", "#.md"];
+        let mut a = app_with(&names, &names);
+        a.ask_rename_many();
+        let p = a.form_preview(&typed("\u{130}\u{f1} \u{1f389} #", "", ""));
+        assert!(p.ready && p.problem.is_none(), "{:?}", p.problem);
+        // (The list follows the order on screen: by name.)
+        let wanted: Vec<String> = a.tab().view.iter().map(|&i| a.tab().folder.entries[i as usize].name.clone()).collect();
+        assert_eq!(p.list.len(), 4);
+        for (n, (pair, old)) in p.list.iter().zip(&wanted).enumerate() {
+            let ext = old.rfind('.').map(|i| &old[i..]).unwrap_or("");
+            assert_eq!(line(pair), format!("{old}  \u{2192}  \u{130}\u{f1} \u{1f389} {}{ext}", n + 1));
+        }
+        // A # in the old names is just a letter there.
+        assert_eq!(new_names(&["#1.txt", "#2.txt"], &[false, false], "", "#", "No ").unwrap(), ["No 1.txt", "No 2.txt"]);
+        // \u{130} (whose small letter is longer) is still found.
+        assert_eq!(new_names(&["\u{130}x.txt", "y.txt"], &[false, false], "", "\u{130}", "I").unwrap(), ["Ix.txt", "y.txt"]);
+    }
+
+    #[test]
+    fn very_long_names_are_listed_or_refused_with_why() {
+        let long = format!("{}.txt", "n".repeat(240));
+        let names = [long.as_str(), "b.txt"];
+        let mut a = app_with(&names, &names);
+        a.ask_rename_many();
+        let p = a.form_preview(&typed("", "n", "m"));
+        assert!(p.ready && p.problem.is_none(), "{:?}", p.problem);
+        assert_eq!(p.list, [(long.clone(), format!("{}.txt", "m".repeat(240)))]);
+        // 300 letters can't be a name: it says so, and the note about the number still shows.
+        let p = a.form_preview(&typed(&"\u{1f389}".repeat(300), "", ""));
+        assert!(p.problem.unwrap().contains("too long") && p.list.is_empty() && !p.ready);
+        assert!(p.lines.iter().any(|l| l == NUMBER_ADDED));
+    }
+
+    #[test]
+    fn five_thousand_items_are_all_in_the_preview_list() {
+        let names: Vec<String> = (0..5000).map(|n| format!("IMG_{n:04}.jpg")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut a = app_with(&names, &names);
+        a.ask_rename_many();
+        let started = std::time::Instant::now();
+        let p = a.form_preview(&typed("Trip #", "", ""));
+        assert!(p.ready && p.problem.is_none(), "{:?}", p.problem);
+        assert_eq!(p.list.len(), 5000);
+        assert_eq!(line(&p.list[0]), "IMG_0000.jpg  \u{2192}  Trip 1.jpg");
+        assert_eq!(line(&p.list[4999]), "IMG_4999.jpg  \u{2192}  Trip 5000.jpg");
+        assert!(p.lines.is_empty() && !p.list.iter().any(|l| line(l).contains("more")));
+        // It's worked out on each frame drawn while the form is open: it must stay quick.
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
+        // Asking twice gives the same.
+        assert_eq!(a.form_preview(&typed("Trip #", "", "")).list, p.list);
     }
 
     /// A fresh folder under the temp folder for a test's real files, removed when it ends.

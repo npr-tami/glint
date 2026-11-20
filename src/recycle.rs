@@ -118,13 +118,15 @@ pub struct Listing {
 }
 
 impl Listing {
-    /// The status bar's line about the bin: "1.2 GB in the Recycle Bin".
-    pub fn size_text(&self) -> String {
-        if self.items.is_empty() {
-            "The Recycle Bin is empty.".to_string()
-        } else {
-            format!("{} in the Recycle Bin", format_size(self.total))
-        }
+    /// What the status bar says the bin holds, right after its number of items: "185.2 MB in
+    /// Recycle Bin" (read together: "9 items  ·  185.2 MB in Recycle Bin"). None for an empty bin.
+    pub fn size_text(&self) -> Option<String> {
+        (!self.items.is_empty()).then(|| format!("{} in Recycle Bin", format_size(self.total)))
+    }
+
+    /// What the status bar says about an empty bin (None while it holds something).
+    pub fn empty_text(&self) -> Option<&'static str> {
+        self.items.is_empty().then_some("The Recycle Bin is empty.")
     }
 }
 
@@ -318,13 +320,13 @@ fn take_string(p: PWSTR) -> Option<String> {
 
 /// The real Recycle Bin, as Windows lists it.
 fn read_shell() -> Result<Vec<(Entry, BinItem)>, String> {
-    let bin = BinFolder::open().ok_or_else(|| "Windows couldn't open the Recycle Bin.".to_string())?;
+    let bin = BinFolder::open().ok_or_else(|| "Failed to open the Recycle Bin.".to_string())?;
     let mut list: Option<IEnumIDList> = None;
     let flags = (SHCONTF_FOLDERS.0 | SHCONTF_NONFOLDERS.0 | SHCONTF_INCLUDEHIDDEN.0) as u32;
     // SAFETY: a valid out-pointer; an empty bin may answer S_FALSE with no list at all.
     let hr = unsafe { bin.folder.EnumObjects(HWND::default(), flags, &mut list) };
     if hr.is_err() {
-        return Err(format!("Windows couldn't list the Recycle Bin: {}", fileops::explain(hr)));
+        return Err(format!("Failed to list the Recycle Bin: {}", fileops::explain(hr)));
     }
     let Some(list) = list else { return Ok(Vec::new()) };
     let from_column = bin.column_of(&DISPLACED_FROM);
@@ -469,7 +471,10 @@ fn still_listed(item: &BinItem, test: Option<&str>) -> bool {
 }
 
 /// What a restore or delete says about an item that isn't the one listed any more.
-const NOT_LISTED: &str = "it changed in the Recycle Bin since it was listed (press F5 and try again)";
+/// What's said of an item that changed in the Recycle Bin since it was listed.
+fn not_listed() -> String {
+    crate::keymap::say_with(&crate::keymap::keys_now(crate::keymap::Action::Refresh), "it changed in the Recycle Bin since it was listed (press {keys} and try again)", "it changed in the Recycle Bin since it was listed (refresh and try again)")
+}
 
 // ---------------------------------------------------------------- jobs
 
@@ -639,7 +644,7 @@ fn restore(items: &[BinItem], test: Option<&str>) -> Outcome {
             continue;
         }
         if !still_listed(item, test) {
-            problems.push(format!("\u{201c}{shown}\u{201d}: {NOT_LISTED}"));
+            problems.push(format!("\u{201c}{shown}\u{201d}: {}", not_listed()));
             continue;
         }
         match restore_one(real, &item.original) {
@@ -729,7 +734,7 @@ fn delete(items: &[BinItem], test: Option<&str>) -> Outcome {
             continue;
         };
         if !still_listed(item, test) {
-            problems.push(format!("\u{201c}{name}\u{201d}: {NOT_LISTED}"));
+            problems.push(format!("\u{201c}{name}\u{201d}: {}", not_listed()));
             continue;
         }
         match delete_for_good(real) {

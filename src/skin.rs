@@ -133,7 +133,7 @@ pub const COLOURS: &[(&str, &str)] = &[
     ("panel", "file list and details panel"),
     ("sidebar", "sidebar"),
     ("status-bar", "status bar"),
-    ("input", "path and filter boxes"),
+    ("input", "path box and search bar"),
     ("button", "buttons, and the current folder in the path"),
     ("button-hover", "buttons under the mouse"),
     ("text", "text"),
@@ -175,7 +175,7 @@ pub const COLOURS: &[(&str, &str)] = &[
     ("status-text", "status bar text"),
     ("status-line", "line along the top of the status bar"),
     ("selection-text", "text on selected rows"),
-    ("input-border", "edge of the path and filter boxes"),
+    ("input-border", "edge of the path box and search bar"),
     ("button-text", "words and signs on buttons"),
     ("marble", "minimise and maximise (caption-buttons: marbles)"),
     ("marble-close", "close (caption-buttons: marbles)"),
@@ -187,7 +187,7 @@ pub const COLOURS: &[(&str, &str)] = &[
     ("tool-border", "edge of toolbar buttons under the mouse"),
     ("selection-border", "edge of selected rows"),
     ("title-gloss", "shine over the top half of the title bar"),
-    ("title-text", "window titles (Settings, Sort order and views)"),
+    ("title-text", "window titles (Settings, Folder rules)"),
     ("title-text-inactive", "window titles while the window isn't active"),
     ("title-text-shadow", "shadow under window titles"),
     ("title-bar-inactive", "the title bar while the window isn't active"),
@@ -2030,7 +2030,7 @@ impl Library {
             let whose = |file: &str| if i == 0 { format!("its picture {file}") } else { format!("the picture {file} of {}", names[i]) };
             problems.extend(s.problems.iter().map(|m| match m {
                 Missing::NotFound(file) => format!("{} wasn't found", whose(file)),
-                Missing::NotCopied(file, why) => format!("{} couldn't be copied ({why})", whose(file)),
+                Missing::NotCopied(file, why) => format!("copying {} failed ({why})", whose(file)),
             }));
         }
         // An other half its `twin` line names that wasn't next to it - and isn't one of the skins
@@ -2062,7 +2062,7 @@ impl Library {
         if !queue(self.hwnd, job) {
             // No thread could be made: it's as good as done (and said so).
             self.ops_done += 1;
-            WRITTEN.lock().unwrap_or_else(PoisonError::into_inner).push(Err("Windows couldn't save the skin right now. Try again.".into()));
+            WRITTEN.lock().unwrap_or_else(PoisonError::into_inner).push(Err("Failed to save the skin. Try again.".into()));
             post(self.hwnd, EVENT_WRITTEN);
         }
     }
@@ -2839,8 +2839,8 @@ fn run_job(job: FileJob) -> Result<String, String> {
             let problem = match recycle(&file, bin) {
                 // Where the Recycle Bin is switched off for the drive, Windows asked and deleted it
                 // for good: the Recycle Bin holds no more than before.
-                Ok(true) if bin && before.is_some_and(|n| bin_items(&file).is_some_and(|now| now <= n)) => return Ok(format!("Deleted {name}")),
-                Ok(true) => return Ok(if bin { format!("Moved {name} to the Recycle Bin") } else { format!("Deleted {name}") }),
+                Ok(true) if bin && before.is_some_and(|n| bin_items(&file).is_some_and(|now| now <= n)) => return Ok(format!("Deleted {name}.")),
+                Ok(true) => return Ok(if bin { format!("Moved {name} to the Recycle Bin.") } else { format!("Deleted {name}.") }),
                 Ok(false) => format!("{name} wasn't deleted"),
                 Err(e) => format!("Failed to delete the skin \u{201c}{name}\u{201d}: {e}"),
             };
@@ -3895,6 +3895,13 @@ logo-style: box
         assert!(!lib.free_for(at, "Huge") && !lib.free_for(at, "taken"));
         assert_eq!(lib.rename(&lib.entries()[at].id.clone(), "Huge"), None, "refused before anything is queued");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hint for a window's title names the windows as they're called.
+    #[test]
+    fn the_title_text_hint_names_the_windows() {
+        let hint = all_settings().find(|(k, _)| *k == "title-text").map(|(_, about)| about);
+        assert_eq!(hint, Some("window titles (Settings, Folder rules)"));
     }
 
     #[test]

@@ -16,7 +16,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_LEFT, VK_RETURN,
 
 use crate::app::Question;
 use crate::kit::{self, Look};
-use crate::pathbar::{box_contains, fill_box};
+use crate::pathbar::{box_contains_beside, face, fill_box_beside, Beside};
 use crate::render::{Align, Renderer, TextStyle};
 use crate::theme::{Color, Theme};
 use crate::ui::{Point, Rect};
@@ -98,9 +98,9 @@ impl AskBox {
     }
 
     fn button_at(&self, p: Point) -> Option<Button> {
-        if box_contains(self.yes, self.lean, p) {
+        if box_contains_beside(self.yes, self.lean, Beside::RIGHT, p) {
             Some(Button::Yes)
-        } else if box_contains(self.no, self.lean, p) {
+        } else if box_contains_beside(self.no, self.lean, Beside::LEFT, p) {
             Some(Button::No)
         } else {
             None
@@ -179,8 +179,8 @@ impl AskBox {
 
         if glass {
             let look = |b: Button| Look { hover: self.hover == Some(b), pressed: self.pressed == Some(b) && self.hover == Some(b), focused: self.focus == b, enabled: true };
-            kit::primary_button(r, theme, self.yes, yes, look(Button::Yes));
-            kit::button(r, theme, self.no, "CANCEL", look(Button::No));
+            kit::primary_button_beside(r, theme, self.yes, yes, look(Button::Yes), Beside::RIGHT);
+            kit::button_beside(r, theme, self.no, "CANCEL", look(Button::No), Beside::LEFT);
             return;
         }
         let yes_color = match (self.pressed, self.hover) {
@@ -188,15 +188,15 @@ impl AskBox {
             (_, Some(Button::Yes)) => theme.accent.with_alpha(0.88),
             _ => theme.accent,
         };
-        fill_box(r, theme, self.yes, self.lean, yes_color);
-        r.text(yes, self.yes, &label_style.color(theme.on_accent));
+        fill_box_beside(r, theme, self.yes, self.lean, Beside::RIGHT, yes_color);
+        r.text(yes, face(self.yes, self.lean, Beside::RIGHT), &label_style.color(theme.on_accent));
         let no_color = if self.hover == Some(Button::No) { theme.chip_hover } else { theme.chip };
-        fill_box(r, theme, self.no, self.lean, if self.pressed == Some(Button::No) && self.hover == Some(Button::No) { theme.button_pressed } else { no_color });
-        r.text("CANCEL", self.no, &label_style);
+        fill_box_beside(r, theme, self.no, self.lean, Beside::LEFT, if self.pressed == Some(Button::No) && self.hover == Some(Button::No) { theme.button_pressed } else { no_color });
+        r.text("CANCEL", face(self.no, self.lean, Beside::LEFT), &label_style);
 
         // The keyboard's button gets a thin outline (Enter or Space presses it).
-        let focused = if self.focus == Button::Yes { self.yes } else { self.no };
-        kit::focus_ring(r, theme, focused, self.lean);
+        let (focused, beside) = if self.focus == Button::Yes { (self.yes, Beside::RIGHT) } else { (self.no, Beside::LEFT) };
+        kit::focus_ring_beside(r, theme, focused, self.lean, beside);
     }
 
     pub fn mouse_move(&mut self, p: Point) -> Answer {

@@ -1864,7 +1864,8 @@ impl Recipe {
     }
 
     /// The name as written of the "in …" rules that sort this folder, if any (its own, or a folder's
-    /// above it with -and_subfolders).
+    /// above it with -and_subfolders). Only the tests ask, to see which rules a folder gets.
+    #[cfg(test)]
     pub fn folder_label(&self, folder: &str) -> Option<&str> {
         self.block_for(folder, true).map(|i| self.folders[i].1.as_str())
     }
@@ -1885,6 +1886,47 @@ impl Recipe {
     /// With none (only "in …" rules, for other folders), it sorts by its column as usual.
     pub fn applies(&self, folder: &str) -> bool {
         self.rules_for(folder).sorts()
+    }
+
+    /// What the rules that sort this folder do, in a few plain words, in the order they decide
+    /// ("folders first, programs last, then newest first"): the kinds of things from the top down
+    /// (past three, just how many more), the ones at the very bottom, then the order of the things
+    /// in each kind. With no order rule that's A to Z: what `sort` falls back on. None when no
+    /// rules sort the folder (its column does).
+    pub fn summary(&self, folder: &str) -> Option<String> {
+        let rules = self.rules_for(folder);
+        if !rules.sorts() {
+            return None;
+        }
+        let orders = |list: &[Order]| list.iter().map(|o| o.text.as_str()).collect::<Vec<_>>().join(", then ");
+        // (A kind with an order of its own says so: "pictures first (biggest first)".)
+        let named = |g: &Group, place: &str| {
+            let own = if g.orders.is_empty() { String::new() } else { format!(" ({})", orders(&g.orders)) };
+            format!("{}{place}{own}", g.label)
+        };
+        let tier = |t: Place| rules.groups.iter().filter(move |g| g.tier == t);
+        // As they come on screen (`group_index`): the _first lines and the lines stacked under
+        // them, then the others; the _last lines and theirs at the very bottom.
+        let top: Vec<&Group> = tier(Place::First).chain(tier(Place::Normal)).collect();
+        let bottom: Vec<&Group> = tier(Place::Last).collect();
+        let mut parts: Vec<String> = Vec::new();
+        if let [first, rest @ ..] = top.as_slice() {
+            parts.push(named(first, " first"));
+            if rest.len() <= 2 {
+                parts.extend(rest.iter().map(|g| format!("then {}", named(g, ""))));
+            } else {
+                parts.push(format!("then {} more kinds", rest.len()));
+            }
+        }
+        match bottom.as_slice() {
+            [] => {}
+            [one] => parts.push(named(one, " last")),
+            [a, b] => parts.push(format!("{} and {}", named(a, ""), named(b, " last"))),
+            more => parts.push(format!("{} kinds last", more.len())),
+        }
+        let order = if rules.orders.is_empty() { "A to Z".to_string() } else { orders(&rules.orders) };
+        parts.push(if parts.is_empty() { order } else { format!("then {order}") });
+        Some(parts.join(", "))
     }
 
     /// How this folder is shown, when the rules say: its own "in …" view (or that of a folder above
@@ -3692,6 +3734,113 @@ mod tests {
         let r = Recipe::parse("folder_first newest\n-image");
         assert_eq!(r.explained[0].1, "Folders at the very top, newest first");
         assert_eq!(Recipe::parse("-image").explained[0].1, "Pictures first");
+    }
+
+    /// The plain summary of the rules that sort a folder, pattern by pattern.
+    #[test]
+    fn the_rules_in_effect_are_summed_up_in_plain_words() {
+        let sum = |text: &str, folder: &str| Recipe::parse(text).summary(folder);
+        let here = |text: &str| sum(text, "C:\\t").unwrap_or_default();
+        // Just an order, or several.
+        assert_eq!(here("-a_to_z"), "A to Z");
+        assert_eq!(here("-newest_first"), "newest first");
+        assert_eq!(here("-newest_by_day\n-a_to_z"), "newest first (by day), then A to Z");
+        // Kinds from the top down, then the order.
+        assert_eq!(here("-newest_first\n-folder_first"), "folders first, then newest first");
+        assert_eq!(here("-a_to_z\n-folder_first\n-png\n-image"), "folders first, then .png files, then pictures, then A to Z");
+        assert_eq!(here("-image\n-video\n-a_to_z"), "pictures first, then videos, then A to Z");
+        // The very bottom: one kind, two, more.
+        assert_eq!(here("-a_to_z\n-folder_first\n\n-program_last"), "folders first, programs last, then A to Z");
+        assert_eq!(here("-z_to_a\n-program_last"), "programs last, then Z to A");
+        assert_eq!(here("-image\n-folder_first\n-exe_last\n-updated"), "folders first, then pictures, .exe files and changed in the last 24 hours last, then A to Z");
+        assert_eq!(here("-exe_last\n-png_last\n-zip_last"), "3 kinds last, then A to Z");
+        // More than three kinds from the top: the first, and how many more.
+        assert_eq!(here("-folder_first\n-image\n-video\n-document"), "folders first, then 3 more kinds, then A to Z");
+        assert_eq!(here(STARTER), "folders first, then 4 more kinds, programs last, then newest first");
+        // A kind's own order.
+        assert_eq!(here("-a_to_z\n-folder_first\n-image -biggest_first"), "folders first, then pictures (biggest first), then A to Z");
+        assert_eq!(here("-image -biggest_first -newest"), "pictures first (biggest first, then newest first), then A to Z");
+        assert_eq!(here("-a_to_z\n-program_last -smallest"), "programs last (smallest first), then A to Z");
+        // Everything else, where it's written; names, sizes and dates as the lines read.
+        assert_eq!(here("-other\n-folder"), "everything else first, then folders, then A to Z");
+        assert_eq!(here("-name_has_invoice_first\n-bigger_than_100mb_last\n-oldest"), "names with \"invoice\" first, bigger than 100 MB last, then oldest first");
+        // A _first line written after other kinds still comes first on screen.
+        assert_eq!(here("-image\n\n-folder_first"), "folders first, then pictures, then A to Z");
+    }
+
+    /// The summary is of the rules that really sort the folder: its own, a folder's above it with
+    /// and_subfolders, else the ones for every folder; none when only its column sorts it.
+    #[test]
+    fn the_summary_is_of_the_rules_that_sort_the_folder() {
+        let text = "-a_to_z\n-folder_first\nin C:\\pics (\nand_subfolders\n-newest_first\n-large_icons\n)\nin C:\\pics\\keep (\n-z_to_a\n)\nin C:\\view (\n-list\n)";
+        let r = Recipe::parse(text);
+        assert_eq!(r.summary("C:\\t").as_deref(), Some("folders first, then A to Z"));
+        assert_eq!(r.summary("C:\\pics").as_deref(), Some("newest first"));
+        assert_eq!(r.summary("c:\\PICS\\2024\\may\\").as_deref(), Some("newest first"), "the folders inside it too");
+        assert_eq!(r.summary("C:\\pics\\keep").as_deref(), Some("Z to A"), "its own rules win");
+        assert_eq!(r.summary("C:\\view").as_deref(), Some("folders first, then A to Z"), "just a view: sorted as every folder");
+        assert_eq!(r.summary("").as_deref(), Some("folders first, then A to Z"), "(the editor leaves This PC out itself)");
+        // Nothing sorts it: only a view, only rules for other folders, notes, or nothing at all.
+        for (text, folder) in [("in C:\\pics (\n-large_icons\n)", "C:\\pics"), ("in C:\\pics (\n-a_to_z\n)", "C:\\other"), ("# just a note\n\n", "C:\\t"), ("", "C:\\t"), ("-large_icons", "C:\\t"), ("-newest_frist\n-older_than_soon", "C:\\t")] {
+            assert_eq!(Recipe::parse(text).summary(folder), None, "{text:?} in {folder}");
+            assert!(!Recipe::parse(text).applies(folder));
+        }
+        // Said twice, it's the same.
+        assert_eq!(r.summary("C:\\pics"), r.summary("C:\\pics"));
+        // Lines Glint doesn't know or leaves out aren't in it.
+        assert_eq!(Recipe::parse("-newest\n-newest_frist\n-folder_first\n-folder").summary("C:\\t").as_deref(), Some("folders first, then newest first"));
+    }
+
+    /// What the summary says is what `sort` does: the kind named first is on top, the one named
+    /// last at the bottom, and "A to Z" is the order when no order rule is written.
+    #[test]
+    fn the_summary_is_true_to_the_order() {
+        let first = |text: &str| sorted_in(text, "C:\\t").first().cloned().unwrap();
+        let last = |text: &str| sorted_in(text, "C:\\t").last().cloned().unwrap();
+        let sum = |text: &str| Recipe::parse(text).summary("C:\\t").unwrap();
+        // "folders first … programs last": a folder on top, a program at the bottom.
+        let text = "-a_to_z\n-folder_first\n\n-program_last";
+        assert_eq!(sum(text), "folders first, programs last, then A to Z");
+        assert_eq!((first(text).as_str(), last(text).as_str()), ("Alpha", "z.exe"));
+        // No order rule: A to Z, as the summary says.
+        assert_eq!(sum("-folder_first"), "folders first, then A to Z");
+        assert_eq!(order("-folder_first"), order("-a_to_z\n-folder_first"));
+        assert_eq!(order("-image -biggest_first"), order("-image -biggest_first\n-a_to_z"));
+        // "pictures first (biggest first)": the biggest picture on top.
+        assert!(sum("-image -biggest_first").starts_with("pictures first (biggest first)"));
+        assert_eq!(first("-image -biggest_first"), "q.jpg");
+        // A _first line written last is still the one on top.
+        assert!(sum("-image\n\n-folder_first").starts_with("folders first, then pictures"));
+        assert_eq!(first("-image\n\n-folder_first"), "Alpha");
+        // Two kinds at the bottom come in the order said: .exe files, then the changed files.
+        let text = "-image\n-folder_first\n-exe_last\n-updated";
+        assert!(sum(text).contains(".exe files and changed in the last 24 hours last"));
+        assert_eq!(order(text), "Alpha,Zeta,p.png,q.jpg,s.png,c.pdf,b.exe,z.exe,a.txt,m.txt");
+    }
+
+    /// Odd folder names, long paths and a great many lines: the summary stays short and right.
+    #[test]
+    fn the_summary_copes_with_odd_names_and_many_lines() {
+        // A folder with an emoji, a #, a dotted I and an n with a tilde in its name (quoted, as
+        // a # would start a note).
+        let odd = "C:\\t\\\u{1f600} #1 \u{130}\u{f1}";
+        let r = Recipe::parse(&format!("-a_to_z\nin \"{odd}\" (\n-biggest_first\n-folder_last\n)"));
+        assert!(!r.has_errors(), "{:?}", r.messages);
+        assert_eq!(r.summary(odd).as_deref(), Some("folders last, then biggest first"));
+        assert_eq!(r.summary("C:\\t").as_deref(), Some("A to Z"));
+        // A path 300 letters long.
+        let long = format!("C:\\{}", "a".repeat(300));
+        let r = Recipe::parse(&format!("in {long} (\n-oldest\n)"));
+        assert_eq!(r.summary(&long).as_deref(), Some("oldest first"));
+        assert_eq!(r.summary(&long[..long.len() - 1]), None, "not a folder whose name is a letter shorter");
+        // Odd words in a name rule are said as written.
+        assert_eq!(Recipe::parse("-name_has_\u{f1}and\u{fa}_first").summary("C:\\t").as_deref(), Some("names with \"\u{f1}and\u{fa}\" first, then A to Z"));
+        // Thousands of kinds: the first, and a count.
+        let many: String = (0..5000).map(|i| format!("-name_has_x{i}\n")).collect();
+        let r = Recipe::parse(&many);
+        assert_eq!(r.summary("C:\\t").as_deref(), Some("names with \"x0\" first, then 4999 more kinds, then A to Z"));
+        let many: String = (0..5000).map(|i| format!("-name_has_x{i}_last\n\n")).collect();
+        assert_eq!(Recipe::parse(&many).summary("C:\\t").as_deref(), Some("5000 kinds last, then A to Z"));
     }
 
     #[test]

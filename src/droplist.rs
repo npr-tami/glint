@@ -326,7 +326,7 @@ pub fn show(owner: HWND, list: &DropList) -> u32 {
         let mut renderer = match Renderer::new(hwnd, dpi) {
             Ok(r) => r,
             Err(e) => {
-                log::error(&format!("A drop-down list couldn't draw: {e}"));
+                log::error(&format!("Failed to draw a drop-down list: {e}"));
                 let _ = DestroyWindow(hwnd);
                 return 0;
             }

@@ -79,8 +79,9 @@ pub struct TextLimits {
 
 /// The details panel's: a box's worth of lines (64 KB, 40 lines, 400 characters).
 pub const PANEL_TEXT: TextLimits = TextLimits { bytes: 64 * 1024, lines: 40, line_chars: 400 };
-/// The Space preview's: the first 200 KB.
-pub const PREVIEW_TEXT: TextLimits = TextLimits { bytes: 200 * 1024, lines: 20_000, line_chars: 2_000 };
+/// The Space preview's: the first 200 KB, with every line whole however long it is (the preview
+/// wraps long lines, and only ever draws the part of one that's on screen).
+pub const PREVIEW_TEXT: TextLimits = TextLimits { bytes: 200 * 1024, lines: 20_000, line_chars: 200 * 1024 };
 
 /// What to find out about one item.
 #[derive(Clone, Debug)]
@@ -441,7 +442,7 @@ fn size_and_length(item: &IShellItem2) -> (Option<(u32, u32)>, Option<u64>) {
 }
 
 /// The same for a file on disk, with a picture's header read with WIC when Windows has no size for
-/// it (as the details panel does): the list's Picture size and Length columns (media.rs).
+/// it (as the details panel does): the list's Image dimensions and Duration columns (media.rs).
 pub fn size_and_length_of(path: &str, picture: bool, wic: Option<&windows::Win32::Graphics::Imaging::IWICImagingFactory>) -> (Option<(u32, u32)>, Option<u64>) {
     let (mut dims, length) = shell_item(path).map_or((None, None), |item| size_and_length(&item));
     if dims.is_none() && picture {
@@ -781,6 +782,22 @@ mod tests {
         let t = decode_text(many.as_bytes(), true, false, TextLimits { bytes: 1000, lines: 3, line_chars: 4 }).unwrap();
         assert_eq!(t.lines, vec!["line", "line", "line"]);
         assert!(t.cut, "more lines than kept");
+    }
+
+    #[test]
+    fn the_preview_gets_a_long_line_whole() {
+        // A minified file: one line of 150,000 characters. The Space preview wraps it, so it
+        // gets all of it; the details panel's small box still gets a line's first 400.
+        let line = "x".repeat(150_000);
+        let t = decode_text(line.as_bytes(), true, false, PREVIEW_TEXT).unwrap();
+        assert_eq!((t.lines.len(), t.lines[0].len(), t.cut), (1, 150_000, false));
+        let t = decode_text(line.as_bytes(), true, false, PANEL_TEXT).unwrap();
+        assert_eq!((t.lines.len(), t.lines[0].len()), (1, 400));
+        // The first 200 KB of a longer one, read up to its last whole character.
+        let mut bytes = "\u{f1}".repeat(PREVIEW_TEXT.bytes / 2).into_bytes();
+        bytes.pop();
+        let t = decode_text(&bytes, false, false, PREVIEW_TEXT).unwrap();
+        assert_eq!((t.lines.len(), t.lines[0].chars().count(), t.cut), (1, PREVIEW_TEXT.bytes / 2 - 1, true));
     }
 
     #[test]

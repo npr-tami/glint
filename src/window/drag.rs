@@ -458,8 +458,9 @@ impl Window {
             // Counted from the archive, not the list: a folder there shows 0 bytes, and a 7z unpacks
             // what's packed before an item too.
             // (The archive is read once for both.)
-            let too_much = "That's a lot to drag out of an archive. Copy it (Ctrl+C) and paste it instead.";
-            let taken = crate::archive::extract_at_most(&archive, &items, MOST, too_much);
+            let copy = self.app.keys(crate::keymap::Action::Copy);
+            let too_much = crate::keymap::say_with(&copy, "That's a lot to drag out of an archive. Copy it ({keys}) and paste it instead.", "That's a lot to drag out of an archive. Copy it and paste it instead.");
+            let taken = crate::archive::extract_at_most(&archive, &items, MOST, &too_much);
             match taken {
                 Ok((dir, paths)) => {
                     d.names = paths.iter().map(|p| crate::folder::file_name(p).to_string()).collect();

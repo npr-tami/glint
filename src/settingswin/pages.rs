@@ -1,4 +1,4 @@
-//! What the Settings window shows: its five pages (General, Look, Files, Keys, About).
+//! What the Settings window shows: its five pages (General, Appearance, Files, Keyboard shortcuts, About).
 //! Every row has a short title, a note only where the title can't say enough, a control, and the
 //! setting it changes - by its name in settings.json ("ShowHidden"), so a row works with whatever
 //! Rust type holds it.
@@ -20,23 +20,38 @@ use serde_json::{Map, Value};
 use crate::app::AppState;
 use crate::folder;
 use crate::life;
-use crate::settings::{Settings, Terminal, COLUMN_NAMES};
+use crate::settings::{DateFormat, Settings, SizeFormat, Terminal, COLUMN_NAMES};
 use crate::update;
 use crate::ui::Command;
 
 /// The pages, in the order of the tabs (or the list on the left).
-pub const PAGES: [&str; 5] = ["General", "Appearance", "Files", "Keys", "About"];
+pub const PAGES: [&str; 5] = ["General", "Appearance", "Files", "Keyboard shortcuts", "About"];
 /// Where SETTINGS > About Glint goes: the About page, at the row about updates.
 pub const ABOUT: usize = 4;
 pub const ABOUT_ROW: &str = "Updates";
 
-/// Why "Temp Win+E fix" is there, behind its (i).
-/// The (i) next to "Setup info" in About.
+/// The (i) next to "System info" in About.
 pub const SETUP_INFO: &str = "Copies your Glint and Windows versions and the settings that change how Glint works. Paste it into a bug report: then whoever looks at the bug can set up Glint the same way and see it happen. No file, folder, user or PC names are included.";
 
+/// Why "Alternative Win+E handling" is there, behind its (i).
 pub const TEMP_WIN_E_FIX: &str = "Windows 11 sometimes takes Win+E back for File Explorer, like after a restart. This keeps a small part of Glint running in the background so Win+E keeps opening Glint, even when Glint is closed.";
 
-pub const UPDATE_AUTOMATICALLY: &str = "Downloads new versions and puts them in place without the update window. The new version opens the next time Glint starts, and the status bar says so.";
+/// How to close Glint fully, behind the (i) of "Keep running in the background".
+pub const STAY_RUNNING: &str = "When on, closing the window only hides Glint, so it opens again instantly. To close it fully, right-click the Settings button or the tray icon and pick Exit Glint. With the tray icon hidden, open Glint first, then use the Settings button.";
+
+/// When "Install updates automatically" installs, and that Glint doesn't restart, behind its (i).
+pub const UPDATE_AUTOMATICALLY: &str = "Installs a new version as soon as an automatic check finds one, without asking. Glint doesn't restart: the new version opens the next time Glint starts, and the status bar says so.";
+
+/// What "Row size" changes, behind its (i).
+pub const ROW_SIZE: &str = "Only changes spacing.";
+
+/// Where the columns picked in Settings show, under "Default columns".
+pub const DEFAULT_COLUMNS: &str = "The same columns show in every folder.";
+
+/// The file size the "Size format" choices show as their example.
+const SIZE_EXAMPLE: u64 = 3_247_000;
+/// From Windows' first second (1601) to 1970's, to turn the time now into a file's kind of time.
+const SECONDS_1601_TO_1970: u64 = 11_644_473_600;
 
 /// What works in this version: settings by their name in settings.json, and "@" names for the
 /// rest (buttons, things Windows keeps). Rows about anything else are hidden.
@@ -136,7 +151,7 @@ pub fn findable(settings: &Settings) -> Vec<(String, usize)> {
             for row in rows {
                 // Round buttons with no question of their own go by their group's title.
                 let title = if row.title.is_empty() && matches!(row.ctl, Ctl::Choice(..)) { heading } else { row.title.trim() };
-                if title.is_empty() || !live(row.key) || matches!(row.ctl, Ctl::Text(_)) || out.iter().any(|(t, _)| t == title) {
+                if title.is_empty() || !live(row.key) || matches!(row.ctl, Ctl::Text(_) | Ctl::Shortcut(..)) || out.iter().any(|(t, _)| t == title) {
                     continue;
                 }
                 out.push((title.to_string(), i));
@@ -214,7 +229,7 @@ pub fn after_change(key: &str, before: &Settings, app: &mut AppState) -> Option<
         // Light or dark picks the skin's light or dark version (AppState::set_dark keeps "Skin" in
         // step with what's on screen).
         "Theme" => Some(Command::SetTheme(app.settings.theme)),
-        // A skin picked: "Light or dark" follows it (app/skins.rs); the windows follow the look.
+        // A skin picked: "Light/dark mode" follows it (app/skins.rs); the windows follow the look.
         "Skin" => {
             let id = app.settings.skin.clone();
             app.pick_skin(&id);
@@ -269,7 +284,8 @@ pub fn after_change(key: &str, before: &Settings, app: &mut AppState) -> Option<
         "StayRunning" => {
             let on = app.settings.stay_running;
             life::apply_stay_running(&mut app.settings, on);
-            app.say(if on { "Closing now hides Glint (Ctrl+Q exits)." } else { "Closing now exits Glint." });
+            let keys = app.keys(crate::keymap::Action::ExitGlint);
+            app.say(if on { crate::keymap::say_with(&keys, "Closing now hides Glint ({keys} exits).", "Closing now hides Glint.") } else { "Closing now exits Glint.".to_string() });
             None
         }
         "TrayIcon" => {
@@ -415,10 +431,13 @@ pub enum Ctl {
     /// A drop-down list: the setting and its choices with their names.
     Choice(&'static str, Vec<(Val, String)>),
     Button(String, Act),
-    /// A button and a switch side by side (EDIT… and the custom sort order).
+    /// A button and a switch side by side (EDIT… and the sort rules).
     ButtonToggle(String, Act, &'static str),
-    /// Text in a second column (the shortcuts).
+    /// Text in a second column (the shortcuts that can't be changed).
     Text(&'static str),
+    /// A shortcut that can be changed: its name in settings.json's "Shortcuts" (keymap.rs), the keys
+    /// as they show on its button, and whether it differs from its default (then RESET shows too).
+    Shortcut(&'static str, String, bool),
     /// The text box for the start folder, with BROWSE.
     Folder,
     /// Nothing: only words (Glint's version on About).
@@ -513,7 +532,7 @@ pub struct Facts<'a> {
     pub clear_asked: bool,
     /// What switching Portable said last.
     pub portable_said: Option<String>,
-    /// What COPY next to Setup info said last.
+    /// What COPY next to System info said last.
     pub bug_said: Option<String>,
     /// The row whose (i) is open: its words show as its note.
     pub info_open: Option<&'static str>,
@@ -549,8 +568,8 @@ fn choice(key: &'static str, title: &str, note: Option<&str>, choices: &[(Val, &
 }
 
 /// A shortcut and what it does; `key` says whether it works yet.
-fn keys(key: &'static str, keys: &str, what: &'static str) -> Row {
-    Row::new(key, keys, None, Ctl::Text(what))
+fn keys(key: &'static str, keys: &'static str, what: &str) -> Row {
+    Row::new(key, what, None, Ctl::Text(keys))
 }
 
 /// The rows of page `i` (see [`PAGES`]).
@@ -559,7 +578,7 @@ pub fn page(i: usize, f: &Facts) -> Vec<Item> {
         0 => general(f),
         1 => look(f),
         2 => files(),
-        3 => keys_page(),
+        3 => keys_page(f),
         _ => about(f),
     };
     // Rows about what isn't in this version yet stay hidden until it works (see LIVE).
@@ -587,14 +606,14 @@ fn general(f: &Facts) -> Vec<Item> {
     vec![
         Item::Heading("Startup"),
         Item::Card(vec![
-            choice("Startup", "Open Glint to", None, &[(S("restore"), "Tabs from last time"), (S("home"), "User folder"), (S("thispc"), "This PC"), (S("folder"), "A specific folder")]).long(),
+            choice("Startup", "On startup, open", None, &[(S("restore"), "Previous tabs"), (S("home"), "User folder"), (S("thispc"), "This PC"), (S("folder"), "A specific folder")]).long(),
             Row::new("StartupFolder", "", None, Ctl::Folder).only_if("Startup", S("folder")),
-            toggle("RememberSplit", "Reopen split view", None).more(),
+            toggle("RememberSplit", "Restore split view on startup", None).more(),
         ]),
         Item::Heading("Home page"),
         Item::Card(vec![
-            choice("HomeOpens", "Home opens", None, &[(S("page"), "Home page"), (S("folder"), "User folder")]).long().more(),
-            choice("HomeColumns", "Home columns", None, &[(Val::N(2.0), "Up to 2"), (Val::N(3.0), "Up to 3"), (Val::N(4.0), "Up to 4"), (Val::N(5.0), "Up to 5"), (Val::N(6.0), "Up to 6")]).only_if("HomeOpens", S("page")).more(),
+            choice("HomeOpens", "Home button opens", None, &[(S("page"), "Home page"), (S("folder"), "User folder")]).long().more(),
+            choice("HomeColumns", "Maximum columns on Home", None, &[(Val::N(2.0), "Up to 2"), (Val::N(3.0), "Up to 3"), (Val::N(4.0), "Up to 4"), (Val::N(5.0), "Up to 5"), (Val::N(6.0), "Up to 6")]).only_if("HomeOpens", S("page")).more(),
             choice("HomeTiles", "Home icon size", None, &[(S("small"), "Small"), (S("normal"), "Medium"), (S("large"), "Large")]).only_if("HomeOpens", S("page")).more(),
         ]),
         Item::Heading("New tabs"),
@@ -608,20 +627,20 @@ fn general(f: &Facts) -> Vec<Item> {
         ]),
         Item::Heading("Background"),
         Item::Card(vec![
-            toggle("StayRunning", "Keep running when closed", None),
-            toggle("TrayIcon", "Tray icon", None).indent().needs("StayRunning"),
+            toggle("StayRunning", "Keep running in the background", f.info_open.filter(|k| *k == "StayRunning").map(|_| STAY_RUNNING)).info(),
+            toggle("TrayIcon", "Show system tray icon", None).indent().needs("StayRunning"),
             toggle("StartWithWindows", "Start with Windows", None),
         ]),
         Item::Heading("Default file explorer"),
         Item::Card(vec![
             toggle("@Folders", "Open folders and drives in Glint", None),
             toggle("@WinE", "Win+E opens Glint", None),
-            toggle("WinEAfterQuit", "Temp Win+E fix", f.info_open.filter(|k| *k == "WinEAfterQuit").map(|_| TEMP_WIN_E_FIX)).indent().needs("@WinE").info(),
+            toggle("WinEAfterQuit", "Alternative Win+E handling", f.info_open.filter(|k| *k == "WinEAfterQuit").map(|_| TEMP_WIN_E_FIX)).indent().needs("@WinE").info(),
         ]),
         Item::Heading("Right-click menu"),
         Item::Card(vec![
-            toggle("ShellItemsInMenu", "Other apps' items", None).more(),
-            Row::new("Terminal", "Terminal", None, Ctl::Choice("Terminal", terminals)).long().more(),
+            toggle("ShellItemsInMenu", "Show menu commands from other apps", None).more(),
+            Row::new("Terminal", "Open terminals in", None, Ctl::Choice("Terminal", terminals)).long().more(),
         ]),
     ]
 }
@@ -649,28 +668,28 @@ fn look(f: &Facts) -> Vec<Item> {
         Item::Heading("Skin"),
         Item::Card(vec![
             Row::new("Skin", "", None, Ctl::Choice("Skin", skin_choices(f))).long(),
-            choice("Theme", "Light or dark", None, &[(S("system"), "System"), (S("light"), "Light"), (S("dark"), "Dark")]).radios(),
-            choice("ZipIcon", "Zip icon", None, &[(S("label"), "Red label"), (S("folder"), "Folder"), (S("page"), "Page"), (S("glint"), "Glint icon")]).long().more(),
-            Row::new("@SkinEditor", "Skins", None, Ctl::Button("EDIT\u{2026}".into(), Act::SkinEditor)),
-            choice("SkinsWindow", "Skin editor", None, &[(S("compact"), "Compact"), (S("slim"), "Slim"), (S("wide"), "Wide")]).long(),
+            choice("Theme", "Light/dark mode", None, &[(S("system"), "System"), (S("light"), "Light"), (S("dark"), "Dark")]).radios(),
+            choice("ZipIcon", "ZIP icon style", None, &[(S("label"), "Red label"), (S("folder"), "Folder"), (S("page"), "Page"), (S("glint"), "Glint icon")]).long().more(),
+            Row::new("@SkinEditor", "Skins", None, Ctl::Button("EDIT SKINS\u{2026}".into(), Act::SkinEditor)),
+            choice("SkinsWindow", "Skin editor layout", None, &[(S("compact"), "Compact"), (S("slim"), "Slim"), (S("wide"), "Wide")]).long(),
         ]),
         Item::Heading("Layout"),
         Item::Card(vec![
             choice(
                 "View",
-                "View",
+                "File view",
                 None,
                 &[(S("details"), "Details"), (S("list"), "List"), (S("medium"), "Medium icons"), (S("large"), "Large icons"), (S("extralarge"), "Extra large icons"), (S("tree"), "Tree")],
             )
             .long(),
-            choice("Size", "Row size", None, &[(S("small"), "Small"), (S("medium"), "Medium"), (S("large"), "Large")]).radios(),
+            choice("Size", "Row size", f.info_open.filter(|k| *k == "Size").map(|_| ROW_SIZE), &[(S("small"), "Small"), (S("medium"), "Medium"), (S("large"), "Large")]).radios().info(),
             toggle("ShowSidebar", "Sidebar", None),
             toggle("ShowDetails", "Details panel", None),
             choice(
                 "DetailsWidth",
                 "Details panel width",
                 None,
-                &[(Val::N(0.0), "Default (280)"), (Val::N(240.0), "240"), (Val::N(300.0), "300"), (Val::N(340.0), "340"), (Val::N(400.0), "400"), (Val::N(480.0), "480")],
+                &[(Val::N(0.0), "Default (280 px)"), (Val::N(240.0), "240 px"), (Val::N(300.0), "300 px"), (Val::N(340.0), "340 px"), (Val::N(400.0), "400 px"), (Val::N(480.0), "480 px")],
             )
             .long()
             .more(),
@@ -678,26 +697,26 @@ fn look(f: &Facts) -> Vec<Item> {
         ]),
         Item::Heading("Status bar"),
         Item::Card(vec![
-            toggle("StatusCount", "Number of items", None).needs("ShowStatusBar").more(),
-            toggle("StatusSelected", "Size of what\u{2019}s selected", None).needs("ShowStatusBar").more(),
-            toggle("StatusFree", "Free space", None).needs("ShowStatusBar").more(),
-            toggle("StatusTotal", "Folder\u{2019}s total size", None).needs("ShowStatusBar").more(),
-            toggle("StatusOpened", "How fast the folder opened", None).needs("ShowStatusBar").more(),
-            toggle("StatusStarted", "How fast Glint started", None).needs("ShowStatusBar").more(),
-            toggle("StatusMemory", "Memory use", None).needs("ShowStatusBar").more(),
+            toggle("StatusCount", "Item count", None).needs("ShowStatusBar").more(),
+            toggle("StatusSelected", "Selected items\u{2019} size", None).needs("ShowStatusBar").more(),
+            toggle("StatusFree", "Available disk space", None).needs("ShowStatusBar").more(),
+            toggle("StatusTotal", "Total size", None).needs("ShowStatusBar").more(),
+            toggle("StatusOpened", "Folder opening time", None).needs("ShowStatusBar").more(),
+            toggle("StatusStarted", "Startup time", None).needs("ShowStatusBar").more(),
+            toggle("StatusMemory", "Memory usage", None).needs("ShowStatusBar").more(),
         ]),
         // The window's own choices, together and last, so they never get in the way.
         Item::Heading("Settings window"),
         Item::Card(vec![
-            choice("SettingsOpens", "Opens", None, &[(S("floating"), "Floating"), (S("side"), "Next to Glint"), (S("panel"), "In the details panel")]).long(),
-            choice("SettingsPages", "Pages", None, &[(S("tabs"), "Tabs on top"), (S("list"), "List on the left")]).long(),
-            choice("SettingsStyle", "Choices look like", None, &[(S("ticks"), "Ticks and dots"), (S("sentences"), "Sentences")]).long(),
-            choice("SettingsShow", "Show", None, &[(S("all"), "All settings"), (S("basic"), "Basic first")]).long(),
-            choice("SettingsSkins", "Skins as", None, &[(S("list"), "Drop-down"), (S("tiles"), "Tiles")]).long(),
-            toggle("SettingsSearch", "Search bar", None),
-            toggle("SettingsDots", "Dot on changed settings", None),
-            toggle("SettingsReset", "Reset page button", None),
-            toggle("SettingsLastPage", "Reopen on the last page", None),
+            choice("SettingsOpens", "Display settings as", None, &[(S("floating"), "Floating"), (S("side"), "Next to Glint"), (S("panel"), "In the details panel")]).long(),
+            choice("SettingsPages", "Page navigation", None, &[(S("tabs"), "Tabs on top"), (S("list"), "List on the left")]).long(),
+            choice("SettingsStyle", "Option style", None, &[(S("ticks"), "Checkboxes and radio buttons"), (S("sentences"), "Sentences")]).long(),
+            choice("SettingsShow", "Settings to show", None, &[(S("all"), "All settings"), (S("basic"), "Basic first")]).long(),
+            choice("SettingsSkins", "Skin picker style", None, &[(S("list"), "Drop-down"), (S("tiles"), "Tiles")]).long(),
+            toggle("SettingsSearch", "Show settings search", None),
+            toggle("SettingsDots", "Mark settings that differ from defaults", None),
+            toggle("SettingsReset", "Show \u{201c}Reset this page\u{201d} button", None),
+            toggle("SettingsLastPage", "Remember last settings page", None),
         ]),
     ]
 }
@@ -705,6 +724,19 @@ fn look(f: &Facts) -> Vec<Item> {
 fn files() -> Vec<Item> {
     use Val::S;
     let column = |name: &'static str, title: &str| Row::new("Columns", title, None, Ctl::ToggleIn("Columns", name)).more();
+    // Each choice with an example, in the person's own date and number style (as the column
+    // titles' menu shows them).
+    let now = (update::now_seconds() + SECONDS_1601_TO_1970) * 10_000_000;
+    let earlier = now.saturating_sub(2 * 3600 * 10_000_000);
+    let dates = [
+        (S("default"), format!("System ({})", folder::format_date(now))),
+        (S("relative"), format!("Relative ({})", folder::format_date_as(earlier, DateFormat::Relative))),
+        (S("iso"), format!("Year first ({})", folder::format_date_as(now, DateFormat::Iso))),
+    ];
+    let sizes = [
+        (S("auto"), format!("Automatic ({})", folder::format_size_as(SIZE_EXAMPLE, SizeFormat::Auto))),
+        (S("kb"), format!("Always in KB ({})", folder::format_size_as(SIZE_EXAMPLE, SizeFormat::Kb))),
+    ];
     vec![
         Item::Heading("Show"),
         Item::Card(vec![
@@ -712,64 +744,72 @@ fn files() -> Vec<Item> {
             toggle("ShowSystem", "Protected system files", None).indent().needs("ShowHidden"),
             Row::new("HideKnownExtensions", "File extensions", None, Ctl::ToggleNot("HideKnownExtensions")),
         ]),
-        Item::Heading("Columns"),
-        Item::Card(vec![column("modified", "Date modified"), column("created", "Date created"), column("type", "Type"), column("size", "Size"), column("dimensions", "Picture size"), column("length", "Length")]),
+        Item::Heading("Default columns"),
+        Item::Card(vec![
+            // (Only words: where these columns show. It comes and goes with the columns under it.)
+            Row::new("Columns", "", Some(DEFAULT_COLUMNS), Ctl::None).more(),
+            column("modified", "Date modified"),
+            column("created", "Date created"),
+            column("type", "Type"),
+            column("size", "Size"),
+            column("dimensions", "Image dimensions"),
+            column("length", "Duration"),
+        ]),
         Item::Heading("Dates and sizes"),
         Item::Card(vec![
-            choice("DateFormat", "Dates", None, &[(S("default"), "System"), (S("relative"), "Relative (Today, Yesterday…)"), (S("iso"), "Year first (2026-10-06 14:32)")]).more(),
-            choice("SizeFormat", "Sizes", None, &[(S("auto"), "Automatic (KB, MB, GB)"), (S("kb"), "Always in KB")]).more(),
+            Row::new("DateFormat", "Date format", None, Ctl::Choice("DateFormat", dates.to_vec())).more(),
+            Row::new("SizeFormat", "Size format", None, Ctl::Choice("SizeFormat", sizes.to_vec())).more(),
         ]),
-        Item::Heading("Sorting and views"),
+        Item::Heading("Folder rules"),
         Item::Card(vec![
             toggle("FoldersFirst", "Folders first", None),
-            Row::new("CustomSort", "Custom sort order", None, Ctl::ButtonToggle("EDIT\u{2026}".into(), Act::SortEditor, "CustomSort")),
-            Row::new("CustomViews", "Custom views", None, Ctl::ButtonToggle("EDIT\u{2026}".into(), Act::SortEditor, "CustomViews")).more(),
-            choice("SortWindow", "Sort editor", None, &[(S("compact"), "Compact"), (S("slim"), "Slim"), (S("wide"), "Wide")]).long(),
+            Row::new("CustomSort", "Sort rules", None, Ctl::ButtonToggle("EDIT\u{2026}".into(), Act::SortEditor, "CustomSort")),
+            Row::new("CustomViews", "View rules", None, Ctl::ButtonToggle("EDIT\u{2026}".into(), Act::SortEditor, "CustomViews")).more(),
+            choice("SortWindow", "Rules editor", None, &[(S("compact"), "Compact"), (S("slim"), "Slim"), (S("wide"), "Wide")]).long(),
         ]),
         Item::Heading("Ask before deleting"),
         Item::Card(vec![choice("ConfirmDelete", "", None, &[(S("permanent"), "Only when deleting permanently"), (S("always"), "Always"), (S("never"), "Never")]).radios()]),
     ]
 }
 
-fn keys_page() -> Vec<Item> {
+fn keys_page(f: &Facts) -> Vec<Item> {
+    use crate::keymap::{Group, KeyMap, ALL};
     use Val::S;
-    vec![
+    // The shortcuts as they are now (settings.json's "Shortcuts" holds the changed ones).
+    let saved = f.values.get("Shortcuts").and_then(Value::as_object).map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect()).unwrap_or_default();
+    let map = KeyMap::of(&saved);
+    let mut items = vec![
         Item::Heading("Backspace"),
         Item::Card(vec![choice("Backspace", "", None, &[(S("up"), "Goes up a folder"), (S("back"), "Goes back")]).radios()]),
-        Item::Heading("Shortcuts"),
-        Item::Card(vec![
-            keys("@Keys", "Ctrl+T / Ctrl+W", "New tab / close tab"),
-            keys("@Keys", "Ctrl+Shift+T", "Reopen closed tab"),
-            keys("@Keys", "Ctrl+L or F4", "Type a path"),
-            keys("@Keys", "Ctrl+F", "Search bar"),
-            keys("@Search", "Ctrl+Shift+F", "Search subfolders"),
-            keys("@Keys", "Ctrl+Z / Ctrl+Y", "Undo / redo"),
-            keys("@Keys", "F2", "Rename"),
-            keys("@Keys", "Ctrl+Shift+C", "Copy path"),
-            keys("@Preview", "Space", "Preview"),
-            keys("@Keys", "Shift+right-click", "Full right-click menu"),
-            keys("@Keys", "Ctrl+Shift+1 to 6", "Change view"),
-            keys("@Keys", "Ctrl+\\ / F6", "Split view / other side"),
-            keys("@Keys", "Ctrl+B", "Show or hide sidebar"),
-            keys("ShowDetails", "Alt+P", "Show or hide details panel"),
-            keys("@Keys", "Ctrl+H", "Show or hide hidden files"),
-            keys("@Keys", "Ctrl+Shift+L", "Light or dark"),
-            keys("@Pins", "Ctrl+D", "Pin to sidebar"),
-            keys("@Keys", "Ctrl+`", "Open in terminal"),
-            keys("@DiskUsage", "Ctrl+Shift+U", "Disk space"),
-            keys("@Keys", "Ctrl+,", "Settings"),
-            keys("@Keys", "Ctrl+U", "Command box"),
-            keys("@Keys", "Ctrl+Q", "Exit Glint"),
-        ]),
-    ]
+    ];
+    // Every one in one box, Glint's own first.
+    let rows = Group::ALL
+        .iter()
+        .flat_map(|group| ALL.iter().filter(move |s| s.group == *group))
+        .map(|s| {
+            let text = map.text(s.action);
+            // (No keys: removed with a right-click, or a hand-edited settings.json gave them to another.)
+            let shown = if text.is_empty() { "Not set".to_string() } else { text };
+            Row::new(s.live, s.label, None, Ctl::Shortcut(s.name, shown, map.changed(s.action)))
+        })
+        .collect();
+    items.push(Item::Heading("Shortcuts"));
+    items.push(Item::Card(rows));
+    items.push(Item::Heading("Can't be changed"));
+    items.push(Item::Card(vec![
+        keys("@Keys", "Shift+right-click", "Full right-click menu"),
+        keys("@Keys", "Ctrl+Shift+1 to 6", "Change view"),
+        keys("@Keys", "Ctrl+1 to 9", "Go to tab 1 to 9"),
+    ]));
+    items
 }
 
 /// About: Glint's version and updates, help, and Glint's own files (Portable last: it moves them).
 fn about(f: &Facts) -> Vec<Item> {
     let cache_label = match f.cache_size {
         _ if f.clear_asked => "PRESS AGAIN".to_string(),
-        Some(bytes) => format!("CLEAR ({})", folder::format_size(bytes)),
-        None => "CLEAR".to_string(),
+        Some(bytes) => format!("CLEAR CACHE ({})", folder::format_size(bytes)),
+        None => "CLEAR CACHE".to_string(),
     };
     let mut cache_note = f.cache.clone();
     if let Some(said) = &f.cache_said {
@@ -782,9 +822,9 @@ fn about(f: &Facts) -> Vec<Item> {
         (None, Some(said)) => Some(said.clone()),
         (None, None) => None,
     };
-    let mut portable_note = "Keep Glint's files next to Glint.exe, in \u{201c}Glint data\u{201d}".to_string();
+    let mut portable_note = "Keep Glint's files next to Glint.exe, in \u{201c}Glint data\u{201d}.".to_string();
     if f.portable_locked {
-        portable_note.push_str("\nPortable is locked while testing.");
+        portable_note.push_str("\nPortable mode is locked while testing.");
     }
     if let Some(said) = &f.portable_said {
         portable_note = format!("{portable_note}\n{said}");
@@ -793,23 +833,23 @@ fn about(f: &Facts) -> Vec<Item> {
         Item::Heading("Glint"),
         Item::Card(vec![
             Row::new("@About", &format!("Glint {}", crate::log::VERSION), Some("A light file explorer for Windows. This is a beta: some things may not work yet."), Ctl::None),
-            Row::new("@Update", ABOUT_ROW, Some(&f.update_said), Ctl::Button(if f.update_busy { "CHECKING\u{2026}".into() } else { "CHECK NOW".into() }, Act::Update)).needs("@UpdateReady"),
+            Row::new("@Update", ABOUT_ROW, Some(&f.update_said), Ctl::Button(if f.update_busy { "CHECKING\u{2026}".into() } else { "CHECK FOR UPDATES".into() }, Act::Update)).needs("@UpdateReady"),
             toggle("CheckForUpdates", "Check for updates automatically", None).indent(),
-            toggle("UpdateAutomatically", "Update automatically", f.info_open.filter(|k| *k == "UpdateAutomatically").map(|_| UPDATE_AUTOMATICALLY)).indent().needs("CheckForUpdates").info(),
+            toggle("UpdateAutomatically", "Install updates automatically", f.info_open.filter(|k| *k == "UpdateAutomatically").map(|_| UPDATE_AUTOMATICALLY)).indent().needs("CheckForUpdates").info(),
         ]),
         Item::Heading("Help"),
         Item::Card(vec![
-            Row::new("@ReportBug", "Report a bug", None, Ctl::Button("REPORT".into(), Act::ReportBug)),
-            Row::new("@BugInfo", "Setup info", bug_note.as_deref(), Ctl::Button("COPY".into(), Act::CopyBugInfo)).info(),
+            Row::new("@ReportBug", "Report an issue on GitHub", None, Ctl::Button("REPORT".into(), Act::ReportBug)),
+            Row::new("@BugInfo", "System info", bug_note.as_deref(), Ctl::Button("COPY".into(), Act::CopyBugInfo)).info(),
             Row::new("@Discord", "Discord", None, Ctl::Button("OPEN".into(), Act::Discord)),
         ]),
         Item::Heading("Glint's files"),
         Item::Card(vec![
             Row::new("@SettingsFolder", "Settings folder", Some(&f.config), Ctl::Button("OPEN".into(), Act::OpenSettingsFolder)),
             Row::new("@LogsFolder", "Log folder", Some(&f.logs), Ctl::Button("OPEN".into(), Act::OpenLogsFolder)),
-            toggle("ErrorLog", "Log errors", None),
-            Row::new("@Cache", "Cache", Some(&cache_note), Ctl::Button(cache_label, Act::ClearCache)),
-            Row::new("@Portable", "Portable", Some(&portable_note), Ctl::Toggle("@Portable")).more(),
+            toggle("ErrorLog", "Write errors to a file", None),
+            Row::new("@Cache", "Disk cache", Some(&cache_note), Ctl::Button(cache_label, Act::ClearCache)),
+            Row::new("@Portable", "Portable mode", Some(&portable_note), Ctl::Toggle("@Portable")).more(),
         ]),
     ]
 }
@@ -921,12 +961,12 @@ mod tests {
         assert!(live("@Update") && live("CheckForUpdates"), "0.3.0: updates");
         assert!(live("ShowDetails") && live("@Preview"), "the details panel and the preview");
         assert!(live("View") && live("ShowStatusBar") && live("ShowSidebar"), "views and the status bar switch");
-        assert!(live("CustomSort"), "the custom sort order");
+        assert!(live("CustomSort"), "the sort rules");
         assert!(live("Skin") && live("@SkinEditor"));
     }
 
     /// The skin drop-down lists the built-in skins, then the person's own (and a chosen one whose
-    /// file is gone, by its name); "Light or dark" offers Same as Windows.
+    /// file is gone, by its name); "Light/dark mode" offers Same as Windows.
     #[test]
     fn the_skins_are_listed() {
         let lib = crate::skin::Library::new();
@@ -947,7 +987,61 @@ mod tests {
         let Ctl::Choice(_, modes) = &theme.ctl else { panic!() };
         assert_eq!(modes[0], (Val::S("system"), "System".to_string()));
         let editor = rows(&items).find(|r| r.key == "@SkinEditor").unwrap();
-        assert_eq!(editor.ctl, Ctl::Button("EDIT\u{2026}".into(), Act::SkinEditor));
+        assert_eq!(editor.ctl, Ctl::Button("EDIT SKINS\u{2026}".into(), Act::SkinEditor));
+    }
+
+    /// The Keyboard shortcuts page: Backspace first, then every shortcut that can be changed in one
+    /// box (Glint's own first), with its keys as they are now; the fixed ones last, as plain text.
+    #[test]
+    fn keyboard_shortcuts_page() {
+        assert_eq!(PAGES[3], "Keyboard shortcuts");
+        let values = |shortcuts: Value| {
+            let Value::Object(mut v) = serde_json::to_value(Settings::default()).unwrap() else { panic!() };
+            v.insert("Shortcuts".into(), shortcuts);
+            v
+        };
+        let plain = values(serde_json::json!({}));
+        let items = page(3, &facts(&plain));
+        let headings: Vec<&str> = items.iter().filter_map(|i| if let Item::Heading(h) = i { Some(*h) } else { None }).collect();
+        assert_eq!(headings, ["Backspace", "Shortcuts", "Can't be changed"]);
+        let order: Vec<&str> = rows(&items).filter(|r| matches!(r.ctl, Ctl::Shortcut(..))).map(|r| r.title.as_str()).collect();
+        assert_eq!(order[..4], ["Command box", "Settings", "Exit Glint", "New tab"], "Glint's own first");
+        assert_eq!(order.last(), Some(&"Light/dark mode"));
+        assert!(rows(&items).any(|r| r.ctl == Ctl::Choice("Backspace", vec![(Val::S("up"), "Goes up a folder".into()), (Val::S("back"), "Goes back".into())])));
+        let shortcut = |items: &[Item], title: &str| rows(items).find(|r| r.title == title).map(|r| r.ctl.clone());
+        // The rows that held two hold one each now.
+        for (title, keys, name) in [("New tab", "Ctrl+T", "NewTab"), ("Close tab", "Ctrl+W", "CloseTab"), ("Undo", "Ctrl+Z", "Undo"), ("Redo", "Ctrl+Y", "Redo"), ("Split view", "Ctrl+\\", "SplitView"), ("Switch pane", "F6", "SwitchPane"), ("Light/dark mode", "Ctrl+Shift+L", "LightDarkMode")] {
+            assert_eq!(shortcut(&items, title), Some(Ctl::Shortcut(name, keys.into(), false)), "{title}");
+        }
+        for r in rows(&items) {
+            assert!(!r.title.contains(" / ") && !r.title.contains(" or F"), "{}", r.title);
+            if let Ctl::Shortcut(_, keys, _) = &r.ctl {
+                assert!(!keys.contains(" / "), "{keys}");
+            }
+        }
+        assert_eq!(rows(&items).filter(|r| matches!(r.ctl, Ctl::Shortcut(..))).count(), crate::keymap::ALL.len());
+        assert!(!rows(&items).any(|r| r.title == "Light or dark"));
+        // The fixed ones: listed, not buttons. Preview isn't one: it has a button like the others.
+        for (keys, what) in [("Shift+right-click", "Full right-click menu"), ("Ctrl+Shift+1 to 6", "Change view"), ("Ctrl+1 to 9", "Go to tab 1 to 9")] {
+            assert!(rows(&items).any(|r| r.title == what && r.ctl == Ctl::Text(keys)), "{keys}");
+        }
+        assert_eq!(shortcut(&items, "Preview"), Some(Ctl::Shortcut("Preview", "Space".into(), false)));
+        assert_eq!(rows(&items).filter(|r| r.title == "Preview").count(), 1);
+        // Changed: its new keys, marked changed; one a hand-edited file left without keys says so.
+        let changed = values(serde_json::json!({"CloseTab": "Ctrl+T", "Rename": "Alt+Shift+R", "Redo": 5}));
+        let items = page(3, &facts(&changed));
+        assert_eq!(shortcut(&items, "Close tab"), Some(Ctl::Shortcut("CloseTab", "Ctrl+T".into(), true)));
+        assert_eq!(shortcut(&items, "Rename"), Some(Ctl::Shortcut("Rename", "Alt+Shift+R".into(), true)));
+        assert_eq!(shortcut(&items, "New tab"), Some(Ctl::Shortcut("NewTab", "Not set".into(), true)));
+        assert_eq!(shortcut(&items, "Redo"), Some(Ctl::Shortcut("Redo", "Ctrl+Y".into(), false)));
+        // Removed with a right-click: "Not set", and RESET beside it.
+        let removed = values(serde_json::json!({"Preview": "", "ExitGlint": ""}));
+        let items = page(3, &facts(&removed));
+        assert_eq!(shortcut(&items, "Preview"), Some(Ctl::Shortcut("Preview", "Not set".into(), true)));
+        assert_eq!(shortcut(&items, "Exit Glint"), Some(Ctl::Shortcut("ExitGlint", "Not set".into(), true)));
+        assert_eq!(shortcut(&items, "Settings"), Some(Ctl::Shortcut("Settings", "Ctrl+,".into(), false)));
+        // Not settings for the command box to find (it has the actions themselves).
+        assert!(!findable(&Settings::default()).iter().any(|(t, _)| t == "New tab" || t == "Rename"));
     }
 
     /// Rows about what doesn't work yet (Discord) are hidden; the shortcuts list Ctrl+Q and Disk space;
@@ -959,14 +1053,95 @@ mod tests {
             assert!(rows(&page(p, &facts(&values))).all(Row::live), "page {p}");
         }
         let keys = page(3, &facts(&values));
-        assert!(rows(&keys).any(|r| r.key == "@DiskUsage" && r.title == "Ctrl+Shift+U"));
-        assert!(rows(&keys).any(|r| r.title == "Ctrl+Q" && r.ctl == Ctl::Text("Exit Glint")));
+        assert!(rows(&keys).any(|r| r.key == "@DiskUsage" && r.title == "Disk space" && r.ctl == Ctl::Shortcut("DiskSpace", "Ctrl+Shift+U".into(), false)));
+        assert!(rows(&keys).any(|r| r.title == "Exit Glint" && r.ctl == Ctl::Shortcut("ExitGlint", "Ctrl+Q".into(), false)));
         assert!(!rows(&page(ABOUT, &facts(&values))).any(|r| r.key == "@Discord"));
-        assert_eq!(title_of("StayRunning").as_deref(), Some("Keep running when closed"));
+        assert_eq!(title_of("StayRunning").as_deref(), Some("Keep running in the background"));
         assert_eq!(title_of("NewTab").as_deref(), Some("New tabs"), "round buttons go by their group");
-        assert_eq!(title_of("Columns").as_deref(), Some("Columns"));
+        assert_eq!(title_of("Columns").as_deref(), Some("Default columns"));
         assert_eq!(title_of("HideKnownExtensions").as_deref(), Some("File extensions"));
         assert_eq!(title_of("NoSuchSetting"), None);
+    }
+
+    /// Date format and Size format show an example next to each choice, in the person's own
+    /// style; the columns say where they apply; the rules about folders go by one name.
+    #[test]
+    fn examples_columns_and_folder_rules() {
+        let Value::Object(values) = serde_json::to_value(Settings::default()).unwrap() else { panic!() };
+        let items = page(2, &facts(&values));
+        let labels = |key: &str| -> Vec<String> {
+            let row = rows(&items).find(|r| r.key == key).unwrap_or_else(|| panic!("{key}"));
+            let Ctl::Choice(_, choices) = &row.ctl else { panic!("{key}") };
+            choices.iter().map(|(_, l)| l.clone()).collect()
+        };
+        assert_eq!(title_of("DateFormat").as_deref(), Some("Date format"));
+        let dates = labels("DateFormat");
+        assert_eq!(dates.len(), 3);
+        for (label, start) in dates.iter().zip(["System (", "Relative (", "Year first (20"]) {
+            assert!(label.starts_with(start) && label.ends_with(')') && label.len() > start.len() + 4, "{label}");
+        }
+        // Year first is the same everywhere: "Year first (2026-10-06 14:32)".
+        assert_eq!(dates[2].len(), "Year first (2026-10-06 14:32)".len(), "{}", dates[2]);
+        assert_eq!(title_of("SizeFormat").as_deref(), Some("Size format"));
+        let sizes = labels("SizeFormat");
+        assert_eq!(sizes.len(), 2);
+        assert!(sizes[0].starts_with("Automatic (3") && sizes[0].ends_with(" MB)"), "{}", sizes[0]);
+        assert!(sizes[1].starts_with("Always in KB (3") && sizes[1].ends_with(" KB)"), "{}", sizes[1]);
+        // The columns: a line of words first (no control, hidden with the columns), then the six.
+        let at = items.iter().position(|i| *i == Item::Heading("Default columns")).expect("the heading");
+        let Item::Card(columns) = &items[at + 1] else { panic!() };
+        assert_eq!((columns[0].title.as_str(), columns[0].note.as_deref(), &columns[0].ctl, columns[0].more), ("", Some(DEFAULT_COLUMNS), &Ctl::None, true));
+        let titles: Vec<&str> = columns[1..].iter().map(|r| r.title.as_str()).collect();
+        assert_eq!(titles, ["Date modified", "Date created", "Type", "Size", "Image dimensions", "Duration"]);
+        assert!(columns[1..].iter().all(|r| matches!(r.ctl, Ctl::ToggleIn("Columns", _)) && r.more));
+        assert!(!findable(&Settings::default()).iter().any(|(t, _)| t.is_empty()), "a line of words isn't a setting to find");
+        // Folder rules: one name for the sort and view rules and their editor.
+        assert!(items.contains(&Item::Heading("Folder rules")));
+        assert_eq!(title_of("FoldersFirst").as_deref(), Some("Folders first"));
+        assert_eq!(title_of("CustomSort").as_deref(), Some("Sort rules"));
+        assert_eq!(title_of("CustomViews").as_deref(), Some("View rules"));
+        assert_eq!(title_of("SortWindow").as_deref(), Some("Rules editor"));
+    }
+
+    /// An (i) shows its words only while it's open, on the row it belongs to.
+    #[test]
+    fn the_i_rows_say_their_words_when_open() {
+        let Value::Object(values) = serde_json::to_value(Settings::default()).unwrap() else { panic!() };
+        for (p, key, words) in [(0, "StayRunning", STAY_RUNNING), (0, "WinEAfterQuit", TEMP_WIN_E_FIX), (1, "Size", ROW_SIZE), (ABOUT, "UpdateAutomatically", UPDATE_AUTOMATICALLY)] {
+            let closed = page(p, &facts(&values));
+            let row = rows(&closed).find(|r| r.key == key).unwrap_or_else(|| panic!("{key}"));
+            assert!(row.info && row.note.is_none(), "{key}");
+            let open = page(p, &Facts { info_open: Some(key), ..facts(&values) });
+            let row = rows(&open).find(|r| r.key == key).unwrap();
+            assert_eq!(row.note.as_deref(), Some(words), "{key}");
+            assert!(rows(&open).filter(|r| r.key != key).all(|r| r.note.as_deref() != Some(words)));
+            // (Whole sentences, and never the word the app doesn't use for closing.)
+            assert!(words.ends_with('.') && !words.to_lowercase().contains("quit"), "{words}");
+        }
+    }
+
+    /// About: the buttons and rows by their names; the cache button says what it clears and keeps
+    /// the size's unit.
+    #[test]
+    fn about_names_its_rows_and_buttons() {
+        let Value::Object(values) = serde_json::to_value(Settings::default()).unwrap() else { panic!() };
+        let items = page(ABOUT, &facts(&values));
+        let row = |key: &str| rows(&items).find(|r| r.key == key).unwrap_or_else(|| panic!("{key}")).clone();
+        assert_eq!(row("@Update").ctl, Ctl::Button("CHECK FOR UPDATES".into(), Act::Update));
+        assert_eq!(row("UpdateAutomatically").title, "Install updates automatically");
+        assert_eq!(row("@ReportBug").title, "Report an issue on GitHub");
+        assert_eq!(row("@BugInfo").title, "System info");
+        assert_eq!(row("ErrorLog").title, "Write errors to a file");
+        assert_eq!((row("@Cache").title.as_str(), row("@Cache").ctl), ("Disk cache", Ctl::Button("CLEAR CACHE (0 B)".into(), Act::ClearCache)));
+        assert_eq!(row("@Portable").title, "Portable mode");
+        let asked = page(ABOUT, &Facts { clear_asked: true, ..facts(&values) });
+        assert!(rows(&asked).any(|r| r.ctl == Ctl::Button("PRESS AGAIN".into(), Act::ClearCache)));
+        let unmeasured = page(ABOUT, &Facts { cache_size: None, ..facts(&values) });
+        assert!(rows(&unmeasured).any(|r| r.ctl == Ctl::Button("CLEAR CACHE".into(), Act::ClearCache)));
+        let big = page(ABOUT, &Facts { cache_size: Some(5 * 1024 * 1024 * 1024), ..facts(&values) });
+        let Some(Ctl::Button(label, _)) = rows(&big).find(|r| r.key == "@Cache").map(|r| r.ctl.clone()) else { panic!() };
+        assert!(label.starts_with("CLEAR CACHE (5") && label.ends_with(" GB)"), "{label}");
+        assert_eq!(crate::kit::sentence_case(&label), label.replace("CLEAR CACHE", "Clear cache"), "the unit keeps its capitals on a button in sentence case");
     }
 
     /// A row size picked in the window keeps the same rows on screen, as the column titles' menu

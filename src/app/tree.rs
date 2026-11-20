@@ -323,7 +323,7 @@ impl AppState {
         }
         let n = ViewMode::ALL.iter().position(|(v, _)| *v == mode).unwrap_or(0) + 1;
         if ruled {
-            self.say(format!("This folder has a custom view. Showing {} for now.", mode.name()));
+            self.say(format!("{} until you open this folder again.", mode.name()));
         } else {
             self.say(format!("{} (Ctrl+Shift+{n}) for this folder.", mode.name()));
         }
@@ -419,7 +419,7 @@ impl AppState {
             if b.items.is_none() {
                 let k = b.key.clone();
                 t.tree.open.retain(|b| b.key != k);
-                self.say("Windows couldn't start reading that folder right now. Try again.");
+                self.say("Failed to read that folder. Try again.");
             }
         }
     }
@@ -665,6 +665,28 @@ mod tests {
         open(&mut t, "C:\\x\\src", &["main.rs"]);
         apply_listing(&mut t, listing("C:\\y", &["src/"]));
         assert!(!t.tree.is_open());
+    }
+
+    /// A view picked with VIEW in a folder its view rule shows another way is just for now, and
+    /// the note says so; without a rule the folder keeps it.
+    #[test]
+    fn a_view_picked_under_a_view_rule_is_for_now_and_says_so() {
+        use crate::settings::Settings;
+        let mut a = AppState::for_tests(Settings { sort_recipe: Some("in C:\\pics (\n-large_icons\n)\n".into()), ..Default::default() });
+        a.hidden = true; // (no folder watch in a test)
+        let views = a.view_rules();
+        a.tabs[0].views = Some(views);
+        a.tabs[0].folder_views = a.folder_views.clone();
+        apply_listing(a.tab_mut(), listing("C:\\pics", &["a.txt"]));
+        assert_eq!(a.tab().view_mode, ViewMode::Large);
+        a.set_view(ViewMode::List);
+        assert_eq!(a.note(), Some("List until you open this folder again."));
+        a.set_view(ViewMode::ExtraLarge);
+        assert_eq!(a.note(), Some("Extra large icons until you open this folder again."));
+        // A folder without one: the pick is the folder's, and the note doesn't speak of rules.
+        apply_listing(a.tab_mut(), listing("C:\\docs", &["a.txt"]));
+        a.set_view(ViewMode::List);
+        assert_eq!(a.note(), Some("List (Ctrl+Shift+5) for this folder."));
     }
 
     #[test]

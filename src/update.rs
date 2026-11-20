@@ -389,12 +389,13 @@ pub fn about(main: bool, _auto: bool) -> (String, bool) {
             },
             Some((Found::Failed(why), at)) => format!("Failed to check for updates at {at}: {why}."),
             Some((Found::UpToDate(theirs), at)) => match Version::parse(theirs) {
-                Some(v) if v < ours => format!("Current version: {ours}, newer than the newest release ({theirs}). Checked at {at}."),
-                _ => format!("Current version: {ours}. It's the newest. Checked at {at}."),
+                // A build newer than the newest release (only ever a test build): just the version.
+                Some(v) if v < ours => format!("Current version: {ours}.\nLast checked at {at}."),
+                _ => format!("Current version: {ours}. Up to date.\nLast checked at {at}."),
             },
             Some((Found::Newer(r), at)) if r.required => format!("Current version: {ours}. Glint {} is a required fix for it. Found at {at}.", r.version),
             Some((Found::Newer(r), at)) => format!("Current version: {ours}. New version available: {}. Found at {at}.", r.version),
-            Some((Found::NotReady(v), at)) => format!("Glint {v} is coming soon. Checked at {at}."),
+            Some((Found::NotReady(v), at)) => format!("Glint {v} is coming soon.\nLast checked at {at}."),
         }
     };
     (said, !st.checking && !st.installing)
@@ -740,7 +741,7 @@ fn shorten(text: &str, max: usize) -> String {
 /// read single releases with it).
 #[cfg(test)]
 fn read_latest(json: &[u8], ours: &Version) -> Found {
-    let Ok(release) = serde_json::from_slice::<ReleaseJson>(json) else { return Found::Failed("GitHub sent an answer Glint couldn't use".into()) };
+    let Ok(release) = serde_json::from_slice::<ReleaseJson>(json) else { return Found::Failed("GitHub sent an answer Glint can't use".into()) };
     read_release(release, ours)
 }
 
@@ -748,7 +749,7 @@ fn read_latest(json: &[u8], ours: &Version) -> Found {
 /// with the highest version number, judged as `read_latest` does. Drafts are left out, and so are
 /// pre-releases unless `ours` is a beta itself.
 fn read_releases(json: &[u8], ours: &Version) -> Found {
-    let Ok(list) = serde_json::from_slice::<Vec<ReleaseJson>>(json) else { return Found::Failed("GitHub sent an answer Glint couldn't use".into()) };
+    let Ok(list) = serde_json::from_slice::<Vec<ReleaseJson>>(json) else { return Found::Failed("GitHub sent an answer Glint can't use".into()) };
     let best = list
         .into_iter()
         .filter(|r| !r.draft && (!r.prerelease || ours.is_beta()) && valid_tag(r.tag_name.trim()))
@@ -1011,7 +1012,7 @@ pub fn built_from_source(exe: &Path) -> bool {
 
 /// Puts the new Glint.exe in place of ours (see the module comment). Returns the exe now in place.
 fn install(release: &Release) -> Result<PathBuf, String> {
-    let ours = std::env::current_exe().map_err(|e| format!("Glint couldn't find its own glint.exe ({e})"))?;
+    let ours = std::env::current_exe().map_err(|e| format!("Failed to find Glint.exe ({e})"))?;
     if built_from_source(&ours) {
         return Err(format!("This Glint was built from its source code ({}), so it doesn't replace itself. Build the new version from the source code too.", ours.display()));
     }
@@ -1043,7 +1044,7 @@ fn download(release: &Release, cache: &Path) -> Result<PathBuf, String> {
     if !download_allowed(&release.url) || release.size == 0 || release.size > MAX_EXE {
         return Err("The new Glint.exe isn't where GitHub keeps a release's files. Nothing was changed.".into());
     }
-    std::fs::create_dir_all(cache).map_err(|e| format!("The cache folder ({}) couldn't be made ({e}). Nothing was changed.", cache.display()))?;
+    std::fs::create_dir_all(cache).map_err(|e| format!("Failed to make the cache folder {} ({e}). Nothing was changed.", cache.display()))?;
     remove_downloads(cache);
     // Written as "Glint-<version>.exe.part" and named "Glint-<version>.exe" only once it's whole and
     // checked: a download cut off (Glint closed, the PC turned off) never looks like a whole one, and
@@ -1057,7 +1058,7 @@ fn download(release: &Release, cache: &Path) -> Result<PathBuf, String> {
         .truncate(true)
         .share_mode(0)
         .open(&file)
-        .map_err(|e| format!("The new Glint.exe couldn't be saved in {} ({e}). Nothing was changed.", cache.display()))?;
+        .map_err(|e| format!("Failed to save the new Glint.exe in {} ({e}). Nothing was changed.", cache.display()))?;
     let mut written = 0u64;
     let mut fingerprint = Sha256::new();
     status_lock().downloading = Some((0, release.size));
@@ -1070,7 +1071,7 @@ fn download(release: &Release, cache: &Path) -> Result<PathBuf, String> {
             return Err(format!("it's bigger than GitHub said ({} bytes)", release.size));
         }
         fingerprint.update(piece);
-        out.write_all(piece).map_err(|e| format!("it couldn't be saved ({e})"))?;
+        out.write_all(piece).map_err(|e| format!("saving it failed ({e})"))?;
         status_lock().downloading = Some((written, release.size));
         Ok(())
     });
@@ -1089,7 +1090,7 @@ fn download(release: &Release, cache: &Path) -> Result<PathBuf, String> {
         if STOP.load(Ordering::SeqCst) {
             return Err(stopped_why());
         }
-        return Err(format!("The new Glint.exe couldn't be downloaded: {why}. Nothing was changed."));
+        return Err(format!("Failed to download the new Glint.exe: {why}. Nothing was changed."));
     }
     // The fingerprint GitHub lists for it: anything else is not the file that was released (changed
     // on the way, or swapped). Without one, the size above and the version check later are all.
@@ -1111,7 +1112,7 @@ fn download(release: &Release, cache: &Path) -> Result<PathBuf, String> {
 fn finish_download(part: &Path, done: &Path) -> Result<PathBuf, String> {
     rename_patiently(part, done).map(|_| done.to_path_buf()).map_err(|e| {
         let _ = std::fs::remove_file(part);
-        format!("The new Glint.exe couldn't be saved in {} ({e}). Nothing was changed.", done.parent().map_or(String::new(), |p| p.display().to_string()))
+        format!("Failed to save the new Glint.exe in {} ({e}). Nothing was changed.", done.parent().map_or(String::new(), |p| p.display().to_string()))
     })
 }
 
@@ -1249,7 +1250,7 @@ fn install_into(new_exe: &Path, ours: &Path, verify: impl Fn(&Path) -> Result<()
                 new_exe.parent().map_or(String::new(), |p| p.display().to_string())
             )
         } else {
-            format!("the new Glint.exe couldn't be copied to {} ({e})", dir.display())
+            format!("copying the new Glint.exe to {} failed ({e})", dir.display())
         });
     }
     if std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0) != size {
@@ -1273,16 +1274,16 @@ fn install_into(new_exe: &Path, ours: &Path, verify: impl Fn(&Path) -> Result<()
     let old = old_name(dir, &stem);
     if let Err(e) = rename_patiently(ours, &old) {
         let _ = std::fs::remove_file(&ready);
-        return Err(format!("{} couldn't be renamed ({e}). Nothing was changed.", ours.display()));
+        return Err(format!("Failed to rename {} ({e}). Nothing was changed.", ours.display()));
     }
     if let Err(e) = rename_patiently(&ready, ours) {
         // Back as it was.
         let back = rename_patiently(&old, ours).or_else(|_| std::fs::copy(&old, ours).map(|_| ()));
         let _ = std::fs::remove_file(&ready);
         return Err(match back {
-            Ok(()) => format!("the new Glint.exe couldn't be put in place ({e}). Glint stays as it was."),
+            Ok(()) => format!("putting the new Glint.exe in place failed ({e}). Glint stays as it was."),
             Err(b) => format!(
-                "the new Glint.exe couldn't be put in place ({e}), and the old one couldn't get its name back ({b}). Your Glint is now called {}: rename it back to {}.",
+                "putting the new Glint.exe in place failed ({e}), and so did giving the old one its name back ({b}). Your Glint is now called {}: rename it back to {}.",
                 old.display(),
                 ours.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned())
             ),
@@ -1384,7 +1385,7 @@ fn run(exe: &Path, args: &[&OsStr], limit: Duration) -> Result<String, String> {
         cmd.current_dir(dir);
     }
     let job = Job::new();
-    let mut child = cmd.spawn().map_err(|e| format!("it couldn't be started: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("starting it failed: {e}"))?;
     let process = HANDLE(child.as_raw_handle());
     if let Some(j) = &job {
         // SAFETY: both handles are alive (the child isn't waited for yet). Best effort: without it
@@ -1450,7 +1451,7 @@ pub fn restart_if_installed() {
     }
     match cmd.spawn() {
         Ok(_) => log::line(&format!("update: started {} {AFTER_UPDATE}", exe.display())),
-        Err(e) => log::error(&format!("The new Glint is in place, but it couldn't be started ({e}). Start Glint again yourself.")),
+        Err(e) => log::error(&format!("The new Glint is in place, but failed to start ({e}). Start Glint again yourself.")),
     }
 }
 
@@ -2079,10 +2080,12 @@ mod tests {
         };
         let said = |found: Found| said_after(found, 0);
         assert_eq!(about(true, false).0, format!("Current version: {ours}."));
-        assert_eq!(said(Found::UpToDate(ours.to_string())), format!("Current version: {ours}. It's the newest. Checked at 18:48."));
+        assert_eq!(said(Found::UpToDate(ours.to_string())), format!("Current version: {ours}. Up to date.\nLast checked at 18:48."));
+        // Newer than the newest release (a test build): the version and when, nothing more.
+        assert_eq!(said(Found::UpToDate("0.0.1".into())), format!("Current version: {ours}.\nLast checked at 18:48."));
         assert_eq!(said(Found::Unavailable("no release yet".into())), "Failed to check for updates right now. Tried at 18:48.");
         assert_eq!(said(Found::Failed("the connection to GitHub wasn't safe".into())), "Failed to check for updates at 18:48: the connection to GitHub wasn't safe.");
-        assert_eq!(said(Found::NotReady("99.0.0".into())), "Glint 99.0.0 is coming soon. Checked at 18:48.");
+        assert_eq!(said(Found::NotReady("99.0.0".into())), "Glint 99.0.0 is coming soon.\nLast checked at 18:48.");
         let newer = Release { version: "99.0.0".into(), ..Default::default() };
         assert_eq!(said(Found::Newer(newer.clone())), format!("Current version: {ours}. New version available: 99.0.0. Found at 18:48."));
         assert_eq!(said(Found::Newer(Release { required: true, ..newer })), format!("Current version: {ours}. Glint 99.0.0 is a required fix for it. Found at 18:48."));

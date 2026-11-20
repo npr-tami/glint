@@ -68,8 +68,10 @@ mod frame;
 mod icons;
 mod inuse;
 mod life;
+mod keymap;
 mod kit;
 mod home;
+mod highlight;
 mod list;
 mod log;
 // The chrome logo in the title bars (its pictures are baked in from res/logo).
@@ -91,6 +93,7 @@ mod retroctl;
 mod registry;
 mod render;
 mod search;
+mod searchindex;
 mod settings;
 mod settingswin;
 mod shell;
@@ -257,6 +260,7 @@ fn main() {
     // Start reading the first folder now, while the window is being made.
     let reopen_split = (main && loaded.remember_split).then(|| loaded.split_folder.clone()).flatten();
     let mut app = app::AppState::new(loaded, &tabs, active, dark);
+    keymap::remember(&app.settings.shortcuts);
     if let Some(folder) = reopen_split {
         app.reopen_split(folder);
     }
@@ -279,7 +283,7 @@ fn main() {
         Ok(h) => h,
         Err(e) => {
             log::line(&format!("could not create the window: {e}"));
-            log::error(&format!("Glint couldn't create its window: {e}"));
+            log::error(&format!("Failed to create Glint's window: {e}"));
             return;
         }
     };

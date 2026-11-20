@@ -791,7 +791,7 @@ pub fn drag_out(hwnd: HWND, folder: &str, names: &[String], right: bool) -> Resu
         return Err("Wait until the files dropped a moment ago are copied.".to_string());
     }
     let Some(data) = data_object(hwnd, folder, names, &listed) else {
-        return Err("Windows couldn't pick these items up to drag them.".to_string());
+        return Err("Failed to pick these items up to drag them.".to_string());
     };
     // SAFETY: COM calls on this (the UI) thread with live objects. The drop source lives until the
     // drag loop is over.
@@ -816,7 +816,7 @@ pub fn drag_out(hwnd: HWND, folder: &str, names: &[String], right: bool) -> Resu
                 let mut effect = DROPEFFECT_NONE;
                 let hr = DoDragDrop(&data, &source, allowed, &mut effect);
                 if hr.is_err() {
-                    return Err(format!("Windows couldn't start dragging ({}).", fileops::explain(hr)));
+                    return Err(format!("Failed to start dragging ({}).", fileops::explain(hr)));
                 }
                 effect.0
             }

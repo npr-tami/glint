@@ -10,6 +10,9 @@
 //!   (the pane filled, cut where it must) are one click. The zoom mode stays while stepping
 //!   through pictures.
 //! - Text files show their first 200 KB as monospaced text with line numbers; the wheel scrolls.
+//!   Long lines wrap inside the pane (a line's number is on its first row only). The WRAP switch
+//!   in the top bar turns that off ("PreviewWrap" in settings.json): lines then run on to the
+//!   right, and Shift+wheel scrolls sideways.
 //! - Animated GIFs play by themselves, looping (anim.rs decodes their frames on peek.rs's thread).
 //! - Videos show their thumbnail with a big play button; they play only when the person clicks it
 //!   (or the picture), with play/pause, a seek bar with the time, mute and volume under them
@@ -56,8 +59,11 @@ const ZOOM_STEP: f32 = 1.25;
 /// Text files.
 const MONO_FONT: f32 = 12.5;
 const MONO_LINE: f32 = 18.0;
-/// Text lines scrolled per wheel notch.
+/// Text lines scrolled per wheel notch, and columns per notch sideways (Shift, with wrap off).
 const WHEEL_LINES: f32 = 3.0;
+const WHEEL_COLS: f32 = 8.0;
+/// A row of text holds at least this many columns, however narrow the pane is.
+const MIN_COLS: usize = 8;
 /// The video controls' height, and one line of the info strip.
 const CONTROLS_H: f32 = 40.0;
 const INFO_LINE: f32 = 18.0;
@@ -118,6 +124,8 @@ enum Hit {
     Next,
     /// The "i" button: the info strip on or off.
     Info,
+    /// The WRAP switch (text files): long lines wrap, or run on to the right.
+    Wrap,
     /// The video's play / pause button.
     Play,
     Seek,
@@ -180,10 +188,20 @@ struct Shown {
     view: Rect,
     /// A picture: its own size in pixels, and the zoom it was drawn at.
     picture: Option<((f32, f32), f32)>,
-    /// Text: how many lines it has and how many fit.
-    text: Option<(usize, usize)>,
+    /// Text: its rows, and how far it scrolls.
+    text: Option<TextShown>,
     /// A video: its controls.
     controls: Option<Controls>,
+}
+
+/// A text file as the last frame showed it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TextShown {
+    /// How many rows it takes (a wrapped line takes several), and how many fit in the pane.
+    rows: usize,
+    fits: usize,
+    /// How many columns it can be scrolled sideways (0 when it wraps, or no line is too long).
+    across: f32,
 }
 
 /// Where the top bar's buttons are.
@@ -197,6 +215,7 @@ struct Bar {
     prev: Rect,
     next: Rect,
     info: Rect,
+    wrap: Rect,
 }
 
 pub struct PreviewPane {
@@ -211,8 +230,16 @@ pub struct PreviewPane {
     pan: Point,
     /// The item zoom, pan and scroll belong to.
     view_key: String,
-    /// The first text line shown (fractions while scrolling).
+    /// The first row of text shown (fractions while scrolling), and with wrap off how many
+    /// columns it's scrolled sideways.
     scroll: f32,
+    scroll_x: f32,
+    /// The text on screen cut into rows (made again when the pane's width or WRAP changes).
+    rows: Option<Rows>,
+    /// Colours for those rows (highlight.rs), for a code or settings file: made with them.
+    colours: Option<crate::highlight::Painter>,
+    /// The coloured runs of the row being drawn (kept to save making a list for every row).
+    runs: Vec<(usize, usize, crate::highlight::Kind)>,
     hover: Hit,
     pressed: Hit,
     /// Dragging the picture: where the mouse went down and the pan then.
@@ -230,6 +257,9 @@ pub struct PreviewPane {
     volume: Option<f32>,
     muted: bool,
     dragging: Option<Drag>,
+    /// The item shown last, and whether it is inside a .zip or .7z (found out once for each: it
+    /// may ask the disk).
+    archived: (String, bool),
     hwnd: HWND,
 }
 
@@ -253,6 +283,10 @@ impl PreviewPane {
             pan: Point::default(),
             view_key: String::new(),
             scroll: 0.0,
+            scroll_x: 0.0,
+            rows: None,
+            colours: None,
+            runs: Vec::new(),
             hover: Hit::None,
             pressed: Hit::None,
             panning: None,
@@ -265,6 +299,7 @@ impl PreviewPane {
             volume: None,
             muted: false,
             dragging: None,
+            archived: (String::new(), false),
             hwnd: HWND::default(),
         }
     }
@@ -285,6 +320,7 @@ impl PreviewPane {
         self.asked.clear();
         self.view_key.clear();
         self.facts.clear();
+        self.rows = None;
         self.panning = None;
         self.hover = Hit::None;
         self.pressed = Hit::None;
@@ -310,7 +346,11 @@ impl PreviewPane {
         let info = Rect::new(prev.x - 8.0 - b, y, b, b);
         let name_x = zoom.right() + 8.0;
         let name = Rect::new(name_x, r.y, (info.x - 8.0 - name_x).max(0.0), TOP_H);
-        Bar { close, fit, actual, fill, zoom, name, prev, next, info }
+        // WRAP (text files only) sits where a picture's zoom is said; in the narrowest pane it
+        // gives way to the "i" button.
+        let wrap_x = fill.right() + 4.0;
+        let wrap = Rect::new(wrap_x, y, 46.0_f32.min((info.x - 2.0 - wrap_x).max(0.0)), b);
+        Bar { close, fit, actual, fill, zoom, name, prev, next, info, wrap }
     }
 
     fn view_rect(&self) -> Rect {
@@ -334,6 +374,8 @@ impl PreviewPane {
             Hit::Next
         } else if b.info.contains(p) {
             Hit::Info
+        } else if self.shown.is_some_and(|s| s.text.is_some()) && b.wrap.contains(p) {
+            Hit::Wrap
         } else if let Some(c) = self.shown.and_then(|s| s.controls).filter(|c| c.bar.contains(p)) {
             if c.play.contains(p) {
                 Hit::Play
@@ -372,6 +414,8 @@ impl PreviewPane {
         self.stop_media();
         self.pan = Point::default();
         self.scroll = 0.0;
+        self.scroll_x = 0.0;
+        self.rows = None;
         self.panning = None;
         if matches!(self.zoom, Zoom::Custom(_)) {
             self.zoom = Zoom::Fit;
@@ -418,6 +462,7 @@ impl PreviewPane {
             // item that comes back is asked about again.
             self.view_key.clear();
             self.full = None;
+            self.rows = None;
             self.asked.clear();
             self.stop_media();
         }
@@ -520,7 +565,7 @@ impl PreviewPane {
         }
         let text = facts.as_ref().and_then(|f| f.text.clone()).filter(|_| by_name || real_thumb.is_none());
         if let Some(text) = text {
-            self.paint_text(r, theme, view, &text);
+            self.paint_text(r, theme, view, &text, app.settings.preview_wrap, crate::highlight::lang_for(&one.entry.ext));
             return None;
         }
         if waiting_for_text {
@@ -532,7 +577,17 @@ impl PreviewPane {
         if let Some(t) = &thumb {
             details::draw_fitted(r, t, img, s, 256.0);
         }
-        let info = details::info(&Sel::One(Box::new(one.clone())), facts.as_ref(), app);
+        let mut info = details::info(&Sel::One(Box::new(one.clone())), facts.as_ref(), app);
+        // Inside a .zip or .7z its size is the unpacked size, as the details panel says.
+        if one.is_file() {
+            if self.archived.0 != one.path {
+                let inside = folder::parent(&one.path).is_some_and(|p| crate::archive::split(&p).is_some());
+                self.archived = (one.path.clone(), inside);
+            }
+            if self.archived.1 {
+                details::mark_unpacked(&mut info, &folder::format_size_as(one.entry.size, app.settings.size_format));
+            }
+        }
         let area = Rect::new(view.x + pad, img.bottom() + 16.0, (view.w - 2.0 * pad).max(0.0), (view.bottom() - img.bottom() - 16.0 - pad).max(0.0));
         details::draw_info(r, theme, area, &info);
         None
@@ -772,54 +827,111 @@ impl PreviewPane {
         }
     }
 
-    /// The first 200 KB of a text file, with line numbers.
-    fn paint_text(&mut self, r: &mut Renderer, theme: &Theme, view: Rect, text: &peek::Text) {
+    /// The first 200 KB of a text file, with line numbers. Long lines wrap inside the pane; with
+    /// `wrap` off they run on to the right, and Shift+wheel scrolls to the rest of them.
+    fn paint_text(&mut self, r: &mut Renderer, theme: &Theme, view: Rect, text: &Arc<peek::Text>, wrap: bool, lang: Option<&'static crate::highlight::Lang>) {
         let inner = view.inset(12.0, 10.0);
         let fits = (inner.h / MONO_LINE).floor().max(1.0) as usize;
-        let extra = usize::from(text.cut);
-        let total = text.lines.len() + extra;
-        if let Some(sh) = self.shown.as_mut() {
-            sh.text = Some((total, fits));
-        }
         if text.lines.is_empty() && !text.cut {
+            self.rows = None;
+            if let Some(sh) = self.shown.as_mut() {
+                sh.text = Some(TextShown { rows: 0, fits, across: 0.0 });
+            }
             r.text("Empty file", view, &TextStyle::new(theme.muted).align(Align::Center));
             return;
         }
+        let digits = text.lines.len().max(1).to_string().len();
+        let cw = r.mono_char_width(MONO_FONT).max(1.0);
+        let gutter = digits as f32 * cw + 14.0;
+        // Where the text itself goes: right of the numbers, up to the scrollbar.
+        let area = Rect::new(inner.x + gutter, view.y, (inner.w - gutter - 8.0).max(0.0), view.h);
+        let cols = ((area.w / cw) as usize).max(MIN_COLS);
+        self.lay_out(text, cols, wrap, lang);
+        let Some((rows, across)) = self.rows.as_ref().map(|rows| (rows.len(), rows.across())) else { return };
+        let total = rows + usize::from(text.cut);
+        if let Some(sh) = self.shown.as_mut() {
+            sh.text = Some(TextShown { rows: total, fits, across });
+        }
         let max_scroll = total.saturating_sub(fits) as f32;
         self.scroll = self.scroll.clamp(0.0, max_scroll);
-        let digits = text.lines.len().max(1).to_string().len();
-        let cw = r.mono_char_width(MONO_FONT);
-        let gutter = digits as f32 * cw + 14.0;
-        let first = self.scroll.floor() as usize;
-        let mut y = inner.y - self.scroll.fract() * MONO_LINE;
+        self.scroll_x = self.scroll_x.clamp(0.0, across);
+        let (scroll, scroll_x) = (self.scroll, self.scroll_x);
+        let Some(rows) = self.rows.as_ref() else { return };
+        let (colours, runs) = (&mut self.colours, &mut self.runs);
+        let first = scroll.floor() as usize;
+        let top = inner.y - scroll.fract() * MONO_LINE;
+        let on_screen = (first..total).map(|n| (n, top + (n - first) as f32 * MONO_LINE)).take_while(|&(_, y)| y <= inner.bottom());
         let color = details::blend(theme.text, theme.panel, 0.08);
         r.push_clip(view);
         r.fill_rect(Rect::new(view.x, view.y, inner.x - view.x + gutter - 6.0, view.h), theme.window.with_alpha(0.35));
-        for i in first..total {
-            if y > inner.bottom() {
-                break;
+        // The numbers are the file's own line numbers: a line has its number on its first row,
+        // and the rows it wraps onto have none.
+        for (n, y) in on_screen.clone() {
+            if let Some(number) = rows.number(n) {
+                let number = format!("{number:>digits$}");
+                r.mono_text(&number, Rect::new(inner.x, y, gutter, MONO_LINE), MONO_FONT, theme.muted);
             }
-            let line_rect = Rect::new(inner.x + gutter, y, (inner.w - gutter - 8.0).max(0.0), MONO_LINE);
-            match text.lines.get(i) {
-                Some(line) => {
-                    let number = format!("{:>digits$}", i + 1);
-                    r.mono_text(&number, Rect::new(inner.x, y, gutter, MONO_LINE), MONO_FONT, theme.muted);
-                    if !line.is_empty() {
-                        r.mono_text(line, line_rect, MONO_FONT, color);
+        }
+        // The text, kept off the numbers while it's scrolled sideways. Only the part of a row
+        // that's on screen is handed over to be drawn, however long its line is.
+        r.push_clip(area);
+        for (n, y) in on_screen {
+            match rows.row(n) {
+                Some((line, start, end)) => {
+                    let (piece, col) = columns(&text.lines[line][start..end], scroll_x.floor() as usize, cols + 2);
+                    if piece.is_empty() {
+                        continue;
+                    }
+                    let x = area.x + (col as f32 - scroll_x) * cw;
+                    let Some(colours) = colours.as_mut() else {
+                        mono_run(r, piece, x, y, cw, area.right(), color);
+                        continue;
+                    };
+                    // In colour: each run where its columns start. (Only what's on screen is
+                    // coloured: the row's runs from its first byte shown to its last.)
+                    let from = piece.as_ptr() as usize - text.lines[line].as_ptr() as usize;
+                    colours.runs(n, |k| rows.row(k), &text.lines, from, from + piece.len(), runs);
+                    let mut at = 0;
+                    for &(a, b, kind) in runs.iter() {
+                        let run = &text.lines[line][a..b];
+                        mono_run(r, run, x + at as f32 * cw, y, cw, area.right(), crate::highlight::color(theme, kind, color));
+                        at += width(run);
                     }
                 }
-                None => r.text("Only the first 200 KB is shown", line_rect, &TextStyle::new(theme.muted).size(11.5)),
+                None => r.text("Only the first 200 KB is shown", Rect::new(area.x, y, area.w, MONO_LINE), &TextStyle::new(theme.muted).size(11.5)),
             }
-            y += MONO_LINE;
         }
-        // A thin scrollbar when it's longer than the pane.
+        r.pop_clip();
+        // A thin scrollbar when it's longer than the pane, and one along the bottom when lines
+        // run past its right edge.
         if total > fits {
             let track = Rect::new(view.right() - 6.0 - 3.0, view.y + 4.0, 6.0, view.h - 8.0);
             let h = (track.h * fits as f32 / total as f32).max(24.0).min(track.h);
-            let top = track.y + (track.h - h) * (self.scroll / max_scroll.max(1.0));
+            let top = track.y + (track.h - h) * (scroll / max_scroll.max(1.0));
             r.fill_paint(Rect::new(track.x, top, track.w, h), 3.0, &theme.scroll_thumb_paint);
         }
+        if across > 0.0 {
+            let track = Rect::new(area.x, view.bottom() - 6.0 - 3.0, area.w, 6.0);
+            let w = (track.w * cols as f32 / (cols as f32 + across)).max(24.0).min(track.w);
+            let left = track.x + (track.w - w) * (scroll_x / across);
+            r.fill_paint(Rect::new(left, track.y, w, track.h), 3.0, &theme.scroll_thumb_paint);
+        }
         r.pop_clip();
+    }
+
+    /// Cuts the text into rows for a pane `cols` columns wide - again only when the text, the
+    /// width or WRAP changed. The line that was at the top stays at the top.
+    fn lay_out(&mut self, text: &Arc<peek::Text>, cols: usize, wrap: bool, lang: Option<&'static crate::highlight::Lang>) {
+        if self.rows.as_ref().is_some_and(|rows| rows.is_for(text, cols, wrap)) {
+            return;
+        }
+        self.colours = lang.map(crate::highlight::Painter::new);
+        let top = self.rows.as_ref().filter(|rows| Arc::ptr_eq(&rows.text, text)).and_then(|rows| rows.row(self.scroll.floor() as usize));
+        let rows = Rows::new(text.clone(), cols, wrap);
+        if let Some((line, start, _)) = top {
+            self.scroll = rows.row_at(line, start) as f32 + self.scroll.fract();
+        }
+        self.rows = Some(rows);
     }
 
     fn paint_bar(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState, one: Option<&One>) {
@@ -829,9 +941,12 @@ impl PreviewPane {
         r.fill_rect(Rect::new(self.rect.x, self.rect.y + TOP_H, self.rect.w, 1.0), theme.line);
         let picture = self.shown.and_then(|s| s.picture);
         let button_bg = |r: &mut Renderer, rect: Rect, hit: Hit, on: bool, enabled: bool| {
-            if on && theme.era.old() {
+            let hovered = enabled && self.hover == hit;
+            if on && (theme.era.old() || hovered) {
                 // An older Windows' "on" toolbar button: pressed in (its selection is too dark here).
-                fill_box(r, theme, rect, 0.0, theme.button_pressed);
+                // Any "on" button under the mouse lights up as the others do, keeping its bar.
+                let fill = if theme.era.old() || self.pressed == hit { theme.button_pressed } else { theme.button_hover };
+                fill_box(r, theme, rect, 0.0, fill);
                 r.fill_rect(Rect::new(rect.x, rect.bottom() - 2.0, rect.w, 2.0), theme.accent);
             } else if on {
                 fill_box_paint(r, theme, rect, 0.0, &theme.accent_tint_paint);
@@ -871,6 +986,12 @@ impl PreviewPane {
         }
         if let Some((_, z)) = picture {
             r.text(&zoom_text(z), bar.zoom, &TextStyle::new(theme.muted).align(Align::Center));
+        }
+        // WRAP (text files): lit while long lines wrap. (Its word gets the room around the
+        // button too, so it's never cut short in the narrowest pane.)
+        if self.shown.is_some_and(|s| s.text.is_some()) {
+            button_bg(r, bar.wrap, Hit::Wrap, app.settings.preview_wrap, true);
+            r.text("WRAP", bar.wrap.inset(-8.0, 0.0), &TextStyle::new(theme.text).size(11.0).semibold().align(Align::Center));
         }
         // The "i" button: the info strip under pictures and videos.
         button_bg(r, bar.info, Hit::Info, app.settings.preview_info, true);
@@ -1065,6 +1186,10 @@ impl PreviewPane {
                 app.settings.preview_info = !app.settings.preview_info;
                 Effect::Redraw
             }
+            Hit::Wrap => {
+                app.settings.preview_wrap = !app.settings.preview_wrap;
+                Effect::Redraw
+            }
             Hit::Play | Hit::View => self.toggle_video(app),
             Hit::Mute => {
                 self.muted = !self.muted;
@@ -1104,7 +1229,8 @@ impl PreviewPane {
     }
 
     /// Ctrl+wheel zooms a picture around the mouse; the plain wheel scrolls text, and moves a
-    /// picture that is bigger than the pane (Shift: sideways).
+    /// picture that is bigger than the pane (Shift: sideways). Shift also scrolls text sideways
+    /// when WRAP is off and a line runs past the pane.
     pub fn wheel(&mut self, e: &MouseEvent) -> Effect {
         let Some(sh) = self.shown else { return Effect::None };
         if sh.picture.is_some() {
@@ -1120,8 +1246,16 @@ impl PreviewPane {
             self.pan = clamp_pan(pan, (natural.0 * z / self.scale, natural.1 * z / self.scale), (sh.view.w, sh.view.h));
             return Effect::Redraw;
         }
-        if let Some((total, fits)) = sh.text {
-            let max = total.saturating_sub(fits) as f32;
+        if let Some(text) = sh.text {
+            if e.mods.shift && text.across > 0.0 {
+                let to = (self.scroll_x - e.wheel * WHEEL_COLS).clamp(0.0, text.across);
+                if to != self.scroll_x {
+                    self.scroll_x = to;
+                    return Effect::Redraw;
+                }
+                return Effect::None;
+            }
+            let max = text.rows.saturating_sub(text.fits) as f32;
             let to = (self.scroll - e.wheel * WHEEL_LINES).clamp(0.0, max);
             if to != self.scroll {
                 self.scroll = to;
@@ -1130,6 +1264,238 @@ impl PreviewPane {
         }
         Effect::None
     }
+}
+
+// ---------------------------------------------------------------- text rows
+
+/// A text file's lines cut into the rows the pane shows: with wrap on a long line takes several
+/// rows, with it off every line is one row. It's worked out once for a text, a width and the
+/// WRAP switch, and scrolling then only looks rows up. It goes when another file is shown or the
+/// pane closes.
+struct Rows {
+    text: Arc<peek::Text>,
+    /// How many columns fit across the pane, and whether long lines wrap.
+    cols: usize,
+    wrap: bool,
+    /// With wrap on: every row's line, and the byte of that line it starts at, top to bottom.
+    /// With wrap off this stays empty: row n is simply line n.
+    rows: Vec<(u32, u32)>,
+    /// With wrap off: how many columns the longest line takes.
+    widest: usize,
+}
+
+impl Rows {
+    fn new(text: Arc<peek::Text>, cols: usize, wrap: bool) -> Rows {
+        let mut rows = Vec::new();
+        let mut widest = 0;
+        if wrap {
+            rows.reserve(text.lines.len());
+            let mut starts = Vec::new();
+            for (i, line) in text.lines.iter().enumerate() {
+                starts.clear();
+                wrap_line(line, cols, &mut starts);
+                rows.extend(starts.iter().map(|&start| (i as u32, start)));
+            }
+        } else {
+            widest = text.lines.iter().map(|line| width(line)).max().unwrap_or(0);
+        }
+        Rows { text, cols, wrap, rows, widest }
+    }
+
+    fn is_for(&self, text: &Arc<peek::Text>, cols: usize, wrap: bool) -> bool {
+        Arc::ptr_eq(&self.text, text) && self.cols == cols && self.wrap == wrap
+    }
+
+    fn len(&self) -> usize {
+        if self.wrap {
+            self.rows.len()
+        } else {
+            self.text.lines.len()
+        }
+    }
+
+    /// Row `n`: its line, and the bytes of the line it runs from and to.
+    fn row(&self, n: usize) -> Option<(usize, usize, usize)> {
+        if !self.wrap {
+            return self.text.lines.get(n).map(|line| (n, 0, line.len()));
+        }
+        let &(line, start) = self.rows.get(n)?;
+        let end = match self.rows.get(n + 1) {
+            Some(&(next, at)) if next == line => at as usize,
+            _ => self.text.lines.get(line as usize)?.len(),
+        };
+        Some((line as usize, start as usize, end))
+    }
+
+    /// The number to show beside row `n`: the file's own line number, on a line's first row
+    /// only (the rows it wraps onto have none).
+    fn number(&self, n: usize) -> Option<usize> {
+        match self.row(n)? {
+            (line, 0, _) => Some(line + 1),
+            _ => None,
+        }
+    }
+
+    /// The row that holds byte `at` of line `line`.
+    fn row_at(&self, line: usize, at: usize) -> usize {
+        if !self.wrap {
+            return line;
+        }
+        // (The last row that starts at or before it.)
+        self.rows.partition_point(|&(l, start)| (l as usize, start as usize) <= (line, at)).saturating_sub(1)
+    }
+
+    /// How many columns the text can be scrolled sideways: none when it wraps or every line fits,
+    /// else to the end of the longest line and one column of air after it.
+    fn across(&self) -> f32 {
+        if self.wrap || self.widest <= self.cols {
+            0.0
+        } else {
+            (self.widest - self.cols + 1) as f32
+        }
+    }
+}
+
+/// How many columns of the monospaced grid a character takes, as near as can be told without
+/// measuring it: one for what the monospaced fonts have themselves (Latin, Greek, Cyrillic,
+/// Hebrew, Arabic, punctuation, arrows, box drawing), none for marks that sit on the letter
+/// before them, two for Chinese, Japanese and Korean, and three for emoji and symbols, which
+/// Windows draws in another font that is wider than two columns. Where it can't know, it says
+/// more rather than less: a row then wraps a little early, and nothing is cut off at the pane's
+/// edge. It never says more columns than the character has bytes in UTF-8, so a line of n bytes
+/// always fits in n columns.
+fn cells(c: char) -> usize {
+    match c as u32 {
+        0x00..=0x2FF => 1,
+        // Marks on the letter before (accents, Hebrew and Arabic points).
+        0x300..=0x36F | 0x483..=0x489 | 0x591..=0x5BD | 0x5BF | 0x5C1 | 0x5C2 | 0x5C4 | 0x5C5 | 0x5C7 => 0,
+        0x610..=0x61A | 0x64B..=0x65F | 0x670 | 0x6D6..=0x6DC | 0x6DF..=0x6E4 | 0x6E7 | 0x6E8 | 0x6EA..=0x6ED => 0,
+        0x370..=0x6FF => 1,
+        0x700..=0x7FF => 2,
+        // Indian and South-East Asian writing up to Georgian: about a column each on average.
+        0x800..=0x10FF => 1,
+        0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE00..=0xFE0F | 0xFE20..=0xFE2F => 0,
+        // Zero-width spaces and joiners, and the marks that say which way text runs.
+        0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF => 0,
+        // More Latin and Greek; punctuation, currency signs, arrows and maths; box drawing and shapes.
+        0x1E00..=0x1FFF | 0x2000..=0x22FF | 0x2500..=0x25FF => 1,
+        // Symbols and dingbats (many are drawn as emoji).
+        0x2600..=0x27BF | 0x2B00..=0x2BFF => 3,
+        // Half-width Japanese and Korean, and the "unknown character" sign.
+        0xFF61..=0xFFDC | 0xFFF9..=0xFFFD => 1,
+        0x1100..=0xFFFF => 2,
+        // Skin tones and tags change the emoji before them.
+        0x1F3FB..=0x1F3FF | 0xE0000..=0xE0FFF => 0,
+        0x1F000..=0x1FAFF => 3,
+        _ => 2,
+    }
+}
+
+/// A line's characters, each with the byte it starts at and the columns it takes ([`cells`]).
+/// What is drawn as part of the emoji before it takes none: an emoji joined on with a zero-width
+/// joiner (the people of a family), and the second letter of a flag.
+struct Widths<'a> {
+    chars: std::str::CharIndices<'a>,
+    joined: bool,
+    flag: bool,
+}
+
+impl<'a> Widths<'a> {
+    fn new(line: &'a str) -> Widths<'a> {
+        Widths { chars: line.char_indices(), joined: false, flag: false }
+    }
+}
+
+impl Iterator for Widths<'_> {
+    type Item = (usize, char, usize);
+
+    fn next(&mut self) -> Option<(usize, char, usize)> {
+        let (at, c) = self.chars.next()?;
+        let joined = std::mem::replace(&mut self.joined, c == '\u{200D}');
+        let flag_letter = ('\u{1F1E6}'..='\u{1F1FF}').contains(&c);
+        let second = flag_letter && self.flag;
+        self.flag = flag_letter && !second;
+        let w = cells(c);
+        Some((at, c, if second || (joined && w == 3) { 0 } else { w }))
+    }
+}
+
+/// How many columns a line takes.
+fn width(line: &str) -> usize {
+    if line.is_ascii() {
+        line.len()
+    } else {
+        Widths::new(line).map(|(_, _, w)| w).sum()
+    }
+}
+
+/// Where each row of a wrapped line starts (bytes; the first is always 0), for rows of `cols`
+/// columns. A row ends at the last space before a word that doesn't fit, as in any word wrap;
+/// a word longer than a row (a long path, minified code) is cut where the row ends. Spaces at
+/// the end of a row never start the next one: past the edge they just aren't seen.
+fn wrap_line(line: &str, cols: usize, starts: &mut Vec<u32>) {
+    starts.push(0);
+    let cols = cols.max(MIN_COLS);
+    // (No character takes more columns than it has bytes, so this line fits as it is.)
+    if line.len() <= cols {
+        return;
+    }
+    // The row being filled: where it starts and the columns used; and the word being read: where
+    // it starts, and the columns used before it.
+    let (mut row, mut used) = (0, 0);
+    let mut word: Option<(usize, usize)> = None;
+    for (at, c, w) in Widths::new(line) {
+        if matches!(c, ' ' | '\t' | '\u{3000}') {
+            used += w;
+            word = None;
+            continue;
+        }
+        let (word_at, before) = *word.get_or_insert((at, used));
+        if w > 0 && used + w > cols {
+            if word_at > row && used - before + w <= cols {
+                // The whole word goes down to the next row.
+                starts.push(word_at as u32);
+                (row, used) = (word_at, used - before);
+            } else {
+                starts.push(at as u32);
+                (row, used) = (at, 0);
+            }
+            word = Some((row, 0));
+        }
+        used += w;
+    }
+}
+
+/// The part of `s` that is on screen when it's scrolled `from` columns sideways and `count`
+/// columns show: that part, and the column it starts at. (A wide character cut in half by the
+/// left edge is left out, so it may start a column or two after `from`.)
+fn columns(s: &str, from: usize, count: usize) -> (&str, usize) {
+    if s.is_ascii() {
+        let a = from.min(s.len());
+        return (&s[a..(from + count).min(s.len())], a);
+    }
+    let (mut col, mut start) = (0, None);
+    for (at, _, w) in Widths::new(s) {
+        match start {
+            None if col >= from && w > 0 => start = Some((at, col)),
+            Some((a, first)) if col + w > from + count => return (&s[a..at], first),
+            _ => {}
+        }
+        col += w;
+    }
+    match start {
+        Some((a, first)) => (&s[a..], first),
+        None => ("", col),
+    }
+}
+
+/// Draws a run of monospaced text from `x`. Plain ASCII gets a box just as wide as its columns
+/// (so the same word is laid out once, wherever it's drawn); anything else may be wider than
+/// its columns say, and gets the room up to `right`.
+fn mono_run(r: &mut Renderer, run: &str, x: f32, y: f32, cw: f32, right: f32, color: Color) {
+    let fitted = (width(run) + 1) as f32 * cw;
+    let w = if run.is_ascii() { fitted } else { fitted.max(right - x) };
+    r.mono_text(run, Rect::new(x, y, w, MONO_LINE), MONO_FONT, color);
 }
 
 /// The biggest rectangle of `natural`'s shape inside `area`, centred.
@@ -1441,4 +1807,297 @@ mod tests {
         assert!(c.get("log 0").is_none() && c.get("log 31").is_some() && c.get("log 30").is_some());
     }
 
+    // ------------------------------------------------------------ text: wrapping
+
+    /// The rows `line` is cut into for a pane `cols` columns wide. (Cutting it up fails if a row
+    /// would start in the middle of a character.)
+    fn wrapped(line: &str, cols: usize) -> Vec<&str> {
+        let mut starts = Vec::new();
+        wrap_line(line, cols, &mut starts);
+        assert_eq!(starts[0], 0, "the first row starts the line");
+        assert!(starts.windows(2).all(|w| w[0] < w[1]), "rows go forward: {starts:?}");
+        let ends = starts.iter().skip(1).map(|&s| s as usize).chain([line.len()]);
+        starts.iter().zip(ends).map(|(&a, b)| &line[a as usize..b]).collect()
+    }
+
+    fn text_of(lines: &[&str]) -> Arc<peek::Text> {
+        Arc::new(peek::Text { lines: lines.iter().map(|l| l.to_string()).collect(), cut: false })
+    }
+
+    #[test]
+    fn long_lines_wrap_at_spaces() {
+        assert_eq!(wrapped("the quick brown fox", 10), ["the quick ", "brown fox"]);
+        // A line that fits, an empty one, and one just as wide as the pane stay one row.
+        assert_eq!(wrapped("short", 10), ["short"]);
+        assert_eq!(wrapped("", 10), [""]);
+        assert_eq!(wrapped("0123456789", 10), ["0123456789"]);
+        assert_eq!(wrapped("0123456789a", 10), ["0123456789", "a"]);
+        // Spaces at the end of a row stay on it (past the edge, unseen): the next row starts with
+        // a word. So do the spaces a line starts with, when they alone fill the row.
+        assert_eq!(wrapped("aaaaaaaa    bbbb", 8), ["aaaaaaaa    ", "bbbb"]);
+        assert_eq!(wrapped("          x", 8), ["          ", "x"]);
+        assert_eq!(wrapped(&" ".repeat(500), 8), [" ".repeat(500)]);
+        // A word that fits a row of its own goes down whole; one longer than a row is cut where
+        // the row ends (a long path has no spaces at all).
+        assert_eq!(wrapped("hello wonderful", 8), ["hello ", "wonderfu", "l"]);
+        assert_eq!(wrapped("C:\\Users\\YourName\\Documents", 10), ["C:\\Users\\Y", "ourName\\Do", "cuments"]);
+        // However narrow the pane, a row holds a few characters.
+        assert_eq!(wrapped("0123456789", 0), ["01234567", "89"]);
+        assert_eq!(wrapped("0123456789", 3), ["01234567", "89"]);
+    }
+
+    #[test]
+    fn a_huge_line_without_a_space_wraps_into_full_rows() {
+        let line = "x".repeat(100_000);
+        let rows = wrapped(&line, 80);
+        assert_eq!(rows.len(), 1250);
+        assert!(rows.iter().all(|row| row.len() == 80));
+        // The same with two-byte letters, and with spaces only every 30,000 characters.
+        let line = "\u{f1}".repeat(100_000);
+        let rows = wrapped(&line, 80);
+        assert_eq!(rows.len(), 1250);
+        assert!(rows.iter().all(|row| row.chars().count() == 80));
+        let line = ["y".repeat(30_000), "z".repeat(30_000), "\u{130}".repeat(40_000)].join(" ");
+        let rows = wrapped(&line, 100);
+        assert!(rows.iter().all(|row| width(row.trim_end()) <= 100), "no row is wider than the pane");
+        assert_eq!(rows.concat(), line, "nothing is lost or shown twice");
+        assert_eq!(rows.len(), 300 + 300 + 400, "full rows: the space after a word sits past the edge");
+    }
+
+    #[test]
+    fn emoji_wide_and_right_to_left_text_wrap_whole() {
+        // An emoji takes three columns and a Chinese or Japanese character two: neither is ever
+        // cut in half, and a row never holds more columns than the pane has.
+        assert_eq!(wrapped("\u{1F600}\u{1F600}\u{1F600}", 8), ["\u{1F600}\u{1F600}", "\u{1F600}"]);
+        assert_eq!(wrapped("日本語のテキスト", 8), ["日本語の", "テキスト"]);
+        // A family (people joined with zero-width joiners), a flag (two letters), a thumbs-up
+        // with a skin tone and a heart with its "draw me as an emoji" mark are one emoji each.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        assert_eq!((width(family), width("\u{1F1E9}\u{1F1EA}"), width("\u{1F44D}\u{1F3FD}"), width("\u{2764}\u{FE0F}")), (3, 3, 3, 3));
+        assert_eq!(wrapped(&family.repeat(3), 8), [family.repeat(2), family.to_string()]);
+        // Hebrew wraps at its spaces like any other writing (each row is then drawn right to left
+        // by Windows).
+        assert_eq!(wrapped("שלום עולם שלום עולם", 10), ["שלום עולם ", "שלום עולם"]);
+        assert_eq!(wrapped("مرحبا بالعالم", 8), ["مرحبا ", "بالعالم"]);
+        // An accent typed after its letter stays on the letter's row.
+        assert_eq!(wrapped("aaaaaaaa\u{301}b", 8), ["aaaaaaaa\u{301}", "b"]);
+        // Letters outside ASCII are a column each.
+        assert_eq!(width("\u{130}\u{f1}#\u{e9}"), 4);
+        assert_eq!(wrapped("\u{130}stanbul \u{f1}and\u{fa} #1", 8), ["\u{130}stanbul ", "\u{f1}and\u{fa} #1"]);
+    }
+
+    #[test]
+    fn no_row_is_wider_than_the_pane() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        let lines = [
+            "fn main() { println!(\"{}\", some_function_with_a_long_name(argument_one, argument_two)); }".to_string(),
+            "    indented    with   runs   of   spaces    and a_very_long_identifier_that_never_ends_and_never_ends".to_string(),
+            format!("emoji {family} mixed \u{1F600}\u{1F600} with 日本語 and עברית and \u{130}\u{f1} {}", "\u{1F1E9}\u{1F1EA}".repeat(9)),
+            "日本語".repeat(40),
+            "a\u{301}".repeat(60),
+            "\u{1F600}".repeat(50),
+            format!("{}\u{3000}{}", "全角".repeat(10), "スペース".repeat(10)),
+        ];
+        for line in &lines {
+            for cols in [1, 8, 9, 13, 40, 80, 200] {
+                let rows = wrapped(line, cols);
+                assert_eq!(rows.concat(), *line);
+                for row in rows {
+                    let seen = row.trim_end_matches([' ', '\u{3000}']);
+                    assert!(width(seen) <= cols.max(MIN_COLS), "{seen:?} is wider than {cols} columns");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_character_never_takes_more_columns_than_bytes() {
+        // (What lets a short line skip being measured: n bytes always fit in n columns.)
+        for c in (0..=0x10FFFF_u32).filter_map(char::from_u32) {
+            assert!(cells(c) <= c.len_utf8(), "U+{:X}", c as u32);
+        }
+        assert_eq!(width(""), 0);
+    }
+
+    #[test]
+    fn a_wrapped_line_keeps_its_own_number() {
+        let text = text_of(&["one", "", "the quick brown fox jumps", "last"]);
+        let rows = Rows::new(text.clone(), 10, true);
+        // The third line takes three rows.
+        let all: Vec<_> = (0..rows.len()).map(|n| rows.row(n).unwrap()).collect();
+        assert_eq!(all, [(0, 0, 3), (1, 0, 0), (2, 0, 10), (2, 10, 20), (2, 20, 25), (3, 0, 4)]);
+        // Its number is on its first row only, and the line after it is still line 4.
+        let numbers: Vec<_> = (0..rows.len() + 1).map(|n| rows.number(n)).collect();
+        assert_eq!(numbers, [Some(1), Some(2), Some(3), None, None, Some(4), None]);
+        assert_eq!((rows.row(6), rows.across()), (None, 0.0));
+        // Which row a place in the text is on.
+        assert_eq!((rows.row_at(0, 0), rows.row_at(2, 0), rows.row_at(2, 9), rows.row_at(2, 10), rows.row_at(2, 24), rows.row_at(3, 0)), (0, 2, 2, 3, 4, 5));
+        // With wrap off a line is a row, and the longest one says how far it scrolls sideways
+        // (to its end and one column more).
+        let rows = Rows::new(text.clone(), 10, false);
+        assert_eq!(rows.len(), 4);
+        assert_eq!((rows.row(2), rows.row(4)), (Some((2, 0, 25)), None));
+        assert_eq!((0..5).map(|n| rows.number(n)).collect::<Vec<_>>(), [Some(1), Some(2), Some(3), Some(4), None]);
+        assert_eq!((rows.row_at(2, 20), rows.across()), (2, 16.0));
+        // Wide enough for every line: nothing to scroll to.
+        assert_eq!(Rows::new(text, 25, false).across(), 0.0);
+        // No lines at all (only the "first 200 KB" note would show).
+        let none = Rows::new(text_of(&[]), 10, true);
+        assert_eq!((none.len(), none.row(0), none.number(0), none.row_at(0, 0)), (0, None, None, 0));
+    }
+
+    #[test]
+    fn only_the_part_of_a_row_on_screen_is_drawn() {
+        assert_eq!(columns("0123456789", 0, 4), ("0123", 0));
+        assert_eq!(columns("0123456789", 3, 4), ("3456", 3));
+        assert_eq!(columns("0123456789", 8, 4), ("89", 8));
+        assert_eq!(columns("0123456789", 50, 4), ("", 10));
+        assert_eq!(columns("", 0, 4), ("", 0));
+        // A wide character cut in half by either edge is left out.
+        assert_eq!(columns("日本語", 0, 4), ("日本", 0));
+        assert_eq!(columns("日本語", 1, 4), ("本", 2));
+        assert_eq!(columns("日本語", 1, 5), ("本語", 2));
+        assert_eq!(columns("日本語", 6, 4), ("", 6));
+        // An accent comes with its letter.
+        assert_eq!(columns("xe\u{301}y", 1, 1), ("e\u{301}", 1));
+        // Of a huge line only what shows is handed over, wherever it's scrolled to.
+        let long = "x".repeat(100_000);
+        let (piece, col) = columns(&long, 50_000, 82);
+        assert_eq!((piece.len(), col), (82, 50_000));
+        let (piece, col) = columns(&long, 99_990, 82);
+        assert_eq!((piece.len(), col), (10, 99_990));
+        let long = "\u{1F600}\u{e9}".repeat(25_000);
+        let (piece, col) = columns(&long, 50_000, 82);
+        assert_eq!((width(piece), col), (80, 50_000));
+        assert_eq!(width(&long), 100_000);
+    }
+
+    #[test]
+    fn the_line_at_the_top_stays_there_when_the_pane_is_resized_or_wrap_is_switched() {
+        let mut lines = vec!["short".to_string(); 50];
+        lines.push("word ".repeat(100));
+        lines.extend(vec!["after".to_string(); 50]);
+        let text = Arc::new(peek::Text { lines, cut: false });
+        let mut pane = PreviewPane::new();
+        pane.lay_out(&text, 40, true, None);
+        assert_eq!(pane.rows.as_ref().map(Rows::len), Some(50 + 13 + 50), "500 columns in rows of 40");
+        // Scrolled half a row into the fifth row of the long line.
+        pane.scroll = 54.5;
+        let (line, start, _) = pane.rows.as_ref().unwrap().row(54).unwrap();
+        assert_eq!((line, start), (50, 160));
+        // The pane gets narrower: the same words are at the top, as far into their row.
+        pane.lay_out(&text, 20, true, None);
+        let (line, from, to) = pane.rows.as_ref().unwrap().row(pane.scroll.floor() as usize).unwrap();
+        assert_eq!((line, from <= start && start < to, pane.scroll.fract()), (50, true, 0.5));
+        // WRAP off: a line is a row, so that line is the 51st row. On again: its first row.
+        pane.lay_out(&text, 20, false, None);
+        assert_eq!(pane.scroll, 50.5);
+        pane.lay_out(&text, 20, true, None);
+        assert_eq!(pane.scroll, 50.5);
+        // Asked again with nothing changed (every frame is): it isn't cut into rows again.
+        let before = pane.rows.as_ref().unwrap().rows.as_ptr();
+        pane.lay_out(&text, 20, true, None);
+        assert_eq!(pane.rows.as_ref().unwrap().rows.as_ptr(), before);
+        // Another file starts from its top, and closing the pane lets the rows go.
+        pane.new_item("another file");
+        assert!(pane.rows.is_none() && pane.scroll == 0.0 && pane.scroll_x == 0.0);
+        pane.lay_out(&text, 20, true, None);
+        pane.closed();
+        assert!(pane.rows.is_none());
+    }
+
+    #[test]
+    fn the_wheel_scrolls_rows_and_with_wrap_off_shift_scrolls_sideways() {
+        let mut pane = PreviewPane::new();
+        let view = Rect::new(0.0, 41.0, 400.0, 300.0);
+        let wheel = |notches: f32, shift: bool| MouseEvent { pos: Point::new(10.0, 100.0), button: MouseButton::Middle, mods: crate::ui::Mods { shift, ..Default::default() }, wheel: notches };
+        // Wrapped: 100 rows of which 10 fit.
+        pane.shown = Some(Shown { view, picture: None, text: Some(TextShown { rows: 100, fits: 10, across: 0.0 }), controls: None });
+        assert!(matches!(pane.wheel(&wheel(-1.0, false)), Effect::Redraw));
+        assert_eq!(pane.scroll, WHEEL_LINES);
+        let _ = pane.wheel(&wheel(-1000.0, false));
+        assert_eq!(pane.scroll, 90.0, "it stops at the last row");
+        assert!(matches!(pane.wheel(&wheel(-1.0, false)), Effect::None));
+        // Nothing runs past the edge while it wraps, so Shift changes nothing.
+        let _ = pane.wheel(&wheel(1.0, true));
+        assert_eq!((pane.scroll, pane.scroll_x), (87.0, 0.0));
+        // WRAP off and a line 50 columns too long: Shift goes sideways, and stops at both ends.
+        pane.shown = Some(Shown { view, picture: None, text: Some(TextShown { rows: 100, fits: 10, across: 50.0 }), controls: None });
+        assert!(matches!(pane.wheel(&wheel(-1.0, true)), Effect::Redraw));
+        assert_eq!((pane.scroll, pane.scroll_x), (87.0, WHEEL_COLS));
+        let _ = pane.wheel(&wheel(-1000.0, true));
+        assert_eq!(pane.scroll_x, 50.0);
+        assert!(matches!(pane.wheel(&wheel(-1.0, true)), Effect::None));
+        let _ = pane.wheel(&wheel(1000.0, true));
+        assert_eq!(pane.scroll_x, 0.0);
+        // Without Shift it still goes up and down.
+        let _ = pane.wheel(&wheel(1.0, false));
+        assert_eq!((pane.scroll, pane.scroll_x), (84.0, 0.0));
+        // A text that fits doesn't move at all.
+        pane.scroll = 0.0;
+        pane.shown = Some(Shown { view, picture: None, text: Some(TextShown { rows: 3, fits: 10, across: 0.0 }), controls: None });
+        assert!(matches!(pane.wheel(&wheel(-1.0, false)), Effect::None));
+        assert_eq!(pane.scroll, 0.0);
+    }
+
+    #[test]
+    fn the_wrap_switch_is_there_for_text_and_turns_wrapping_off_and_on() {
+        let mut app = AppState::for_tests(crate::settings::Settings::default());
+        assert!(app.settings.preview_wrap, "long lines wrap unless it's turned off");
+        let mut pane = PreviewPane::new();
+        let click = |pane: &mut PreviewPane, app: &mut AppState, at: Point| {
+            let e = MouseEvent { pos: at, button: MouseButton::Left, mods: crate::ui::Mods::default(), wheel: 0.0 };
+            let _ = pane.mouse_move(&e);
+            let _ = pane.mouse_down(&e);
+            let pressed = pane.pressed;
+            let _ = pane.mouse_up(&e, app);
+            pressed
+        };
+        // In the widest pane and the narrowest one.
+        for w in [1200.0, 300.0] {
+            pane.rect = Rect::new(600.0, 0.0, w, 400.0);
+            let bar = pane.bar();
+            assert!(bar.wrap.w >= 30.0 && bar.wrap.right() <= bar.info.x, "it has room left of the \u{201c}i\u{201d} button at {w}");
+            let at = Point::new(bar.wrap.x + bar.wrap.w / 2.0, bar.wrap.y + bar.wrap.h / 2.0);
+            // A picture, a video or a file's details on screen: no switch, and a click there does nothing.
+            pane.shown = Some(Shown { view: pane.view_rect(), picture: None, text: None, controls: None });
+            assert_ne!(pane.hit(at), Hit::Wrap);
+            let _ = click(&mut pane, &mut app, at);
+            assert!(app.settings.preview_wrap);
+            // A text file.
+            pane.shown = Some(Shown { view: pane.view_rect(), picture: None, text: Some(TextShown { rows: 10, fits: 20, across: 0.0 }), controls: None });
+            assert_eq!(pane.hit(at), Hit::Wrap);
+            assert_eq!(click(&mut pane, &mut app, at), Hit::Wrap);
+            assert!(!app.settings.preview_wrap, "one click turns it off");
+            assert_eq!(pane.hover, Hit::Wrap, "and it shows the mouse is on it");
+            // Pressed, then let go somewhere else: nothing changes.
+            let e = MouseEvent { pos: at, button: MouseButton::Left, mods: crate::ui::Mods::default(), wheel: 0.0 };
+            let _ = pane.mouse_down(&e);
+            let _ = pane.mouse_up(&MouseEvent { pos: Point::new(at.x, 200.0), ..e }, &mut app);
+            assert!(!app.settings.preview_wrap);
+            // The other buttons leave it alone, and another click turns it on again.
+            let _ = click(&mut pane, &mut app, Point::new(bar.info.x + 5.0, bar.info.y + 5.0));
+            assert!(!app.settings.preview_wrap);
+            let _ = click(&mut pane, &mut app, at);
+            assert!(app.settings.preview_wrap);
+        }
+    }
+
+    #[test]
+    fn the_wrap_choice_is_remembered() {
+        use crate::settings::Settings;
+        // A settings.json from before the switch was there: long lines wrap.
+        let old: Settings = serde_json::from_str("{\"PreviewInfo\": false, \"ShowHidden\": true}").unwrap();
+        assert!(old.preview_wrap && !old.preview_info && old.show_hidden);
+        // Turned off, it's written and read back that way; and on again.
+        let mut s = Settings { preview_wrap: false, ..Default::default() };
+        let text = s.to_json();
+        assert!(text.contains("\"PreviewWrap\": false"), "{text}");
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        assert!(!back.preview_wrap);
+        assert_eq!(back, s);
+        s.preview_wrap = true;
+        let back: Settings = serde_json::from_str(&s.to_json()).unwrap();
+        assert!(back.preview_wrap);
+    }
 }

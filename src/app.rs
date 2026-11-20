@@ -23,6 +23,7 @@ pub use crate::folder::SortKey;
 use crate::fileops::{self, Outcome};
 use crate::folder::{self, Drive, Entry, Folder, NameFilter};
 use crate::icons::Icons;
+use crate::keymap::{self, Action};
 use crate::log;
 use crate::recent;
 use crate::recycle;
@@ -126,7 +127,7 @@ pub struct Tab {
     /// How many entries show when no filter is typed (the listing minus hidden items), for "3 of
     /// 12 items".
     pub visible_total: usize,
-    /// Which of the Picture size and Length columns something in the view can fill (media::here):
+    /// Which of the Image dimensions and Duration columns something in the view can fill (media::here):
     /// they only show then.
     pub media_here: crate::media::Columns,
     /// Duplicates shown: how many sets and the bytes their extra copies take (status.rs), worked
@@ -311,7 +312,7 @@ impl Tab {
                 continue;
             }
             self.visible_total += 1;
-            if filter.keeps(&e.lower, || e.path_in(&self.folder.path)) {
+            if filter.keeps_item(e, || e.path_in(&self.folder.path)) {
                 self.view.push(i as u32);
             }
         }
@@ -321,7 +322,7 @@ impl Tab {
             None if recent::is_recent(&self.folder.path) && !self.column_now => {}
             // Duplicates: set by set, biggest first, as they were found (until a column is clicked).
             None if self.search.as_ref().is_some_and(|s| s.is_dupes()) && !self.column_now => {}
-            // Picture size and Length: by what media.rs has read so far (list.rs sorts again as more
+            // Image dimensions and Duration: by what media.rs has read so far (list.rs sorts again as more
             // comes in).
             None if matches!(self.sort, SortKey::Dimensions | SortKey::Length) => {
                 crate::media::sort_view(entries, &mut self.view, &self.folder.path, self.sort, self.descending, self.folders_first)
@@ -432,8 +433,8 @@ fn column_title(key: SortKey) -> &'static str {
         SortKey::Size => "Size",
         SortKey::Created => "Date created",
         SortKey::Folder => "Folder",
-        SortKey::Dimensions => "Picture size",
-        SortKey::Length => "Length",
+        SortKey::Dimensions => "Image dimensions",
+        SortKey::Length => "Duration",
     }
 }
 
@@ -819,10 +820,11 @@ impl AppState {
                 self.start_search(i, false);
             }
         }
+        let keys = self.keys(Action::HiddenFiles);
         self.say(match (on, self.settings.show_hidden) {
-            (true, true) => "Showing protected system files",
-            (true, false) => "Protected system files show when hidden files do (Ctrl+H)",
-            (false, _) => "Hiding protected system files",
+            (true, true) => "Showing protected system files.".to_string(),
+            (true, false) => keymap::say_with(&keys, "Protected system files show when hidden files do ({keys}).", "Protected system files show when hidden files do."),
+            (false, _) => "Hiding protected system files.".to_string(),
         });
     }
 
@@ -886,7 +888,7 @@ impl AppState {
         self.settings.custom_views = on;
         let sort = self.settings.custom_sort;
         self.set_custom_sort(sort, None);
-        self.say(if on { "Custom views on" } else { "Custom views off" });
+        self.say(if on { "View rules on." } else { "View rules off." });
     }
 
     /// Turns the custom sort order on or off, with new rules when `recipe` is given (the sort
@@ -1012,6 +1014,12 @@ impl AppState {
 
     pub fn tab_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active]
+    }
+
+    /// How the shortcut for `a` shows now in this window ("" when it has none), for the messages
+    /// that name it.
+    pub fn keys(&self, a: Action) -> String {
+        keymap::KeyMap::of_settings(&self.settings).text(a)
     }
 
     /// Shows a short note in the status bar for a few seconds.
@@ -1150,6 +1158,7 @@ impl AppState {
             Command::MoveTab(from, to) => self.move_tab(from, to),
             Command::SendToOtherSide { moving } => self.send_to_other_side(moving),
             Command::Extract { own_folder } => self.extract_archive(own_folder),
+            Command::ExtractInside { all } => self.extract_inside(all),
             Command::Compress(format) => self.compress(format),
             Command::TagSelected(tag) => self.tag_selected(Some(tag)),
             Command::UntagSelected => self.tag_selected(None),
@@ -1494,9 +1503,9 @@ impl AppState {
         });
         if !started {
             // No thread to be had (the system is out of resources): say so instead of loading forever.
+            let error = Some(keymap::say_with(&self.keys(Action::Refresh), "Failed to read this folder. Try again with {keys}.", "Failed to read this folder. Refresh to try again."));
             let t = &mut self.tabs[tab_index];
             t.loading = None;
-            let error = Some("Windows couldn't start reading this folder. Try again with F5.".to_string());
             apply_listing(t, Folder { path: t.path.clone(), error, ..Default::default() });
             return;
         }
@@ -1953,8 +1962,13 @@ impl AppState {
         }
         let hwnd = HWND(self.hwnd.load(Ordering::SeqCst) as *mut _);
         let text = paths.iter().map(|p| if p.contains(' ') { format!("\"{p}\"") } else { p.clone() }).collect::<Vec<_>>().join("\r\n");
+        // (Inside a .zip or .7z it's the path Glint shows there, through the archive: said so. At
+        // the archive's top with nothing selected it's the archive file's own path.)
+        let t = self.tab();
+        let nothing_chosen = t.selected_entries().is_empty();
+        let archive = crate::archive::split(&t.folder.path).filter(|(_, inner)| !(nothing_chosen && inner.is_empty())).map(|(archive, _)| archive);
         let note = if shell::copy_text(hwnd, &text) {
-            if paths.len() == 1 { "Path copied.".to_string() } else { format!("{} paths copied.", paths.len()) }
+            files::paths_copied(paths.len(), archive.as_deref())
         } else {
             "Failed to copy. Try again in a moment.".to_string()
         };
@@ -2052,7 +2066,7 @@ impl AppState {
             self.say("Properties shows the items of one folder at a time.");
         }
         if !shellmenu::properties(self.owner().hwnd(), paths) {
-            self.say("Windows couldn't show the properties right now. Try again.");
+            self.say("Failed to show the properties. Try again.");
         }
     }
 
@@ -2163,8 +2177,9 @@ impl AppState {
         let i = self.active;
         self.tabs[i].filter.clear();
         self.tabs[i].column_now = false; // the sets as they're found, whatever column sorted the folder
+        // No passing note here: the list and the status bar say it is checking for as long as it
+        // is (dupes.rs), and a note would go on saying so for seconds after a quick scan has ended.
         self.start_search_for(i, false, true);
-        self.say("Looking for files with the same content\u{2026}.");
     }
 
     /// "Select extra copies": in each set of duplicates, every file but the first one in the list is
@@ -2237,7 +2252,7 @@ impl AppState {
                 t.selected = vec![false; t.folder.entries.len()];
                 (t.focus, t.anchor) = (None, None);
                 t.rebuild_view();
-                self.say("Windows couldn't start searching right now. Try again.");
+                self.say("Failed to start searching. Try again.");
             }
         }
     }
@@ -2408,6 +2423,9 @@ fn take_results(t: &mut Tab, batch: search::Batch) {
     if replace {
         clear_results(t);
     }
+    if !batch.changed.is_empty() || !batch.gone.is_empty() {
+        update_results(t, batch.changed, &batch.gone);
+    }
     let start = t.folder.entries.len();
     t.folder.entries.extend(batch.entries);
     t.selected.resize(t.folder.entries.len(), false);
@@ -2457,6 +2475,42 @@ fn prune_duplicates(t: &mut Tab, gone: &std::collections::HashSet<String>) {
     if let Some(first) = t.selected_entries().first().copied() {
         (t.focus, t.anchor) = (Some(first), Some(first));
     }
+}
+
+/// The index's results as the walk found them again (search.rs): `changed` take the place of the
+/// results with the same path (new ones go at the end), and the results at the paths in `gone`
+/// leave the list. The selection and the cursor stay on the same items.
+fn update_results(t: &mut Tab, changed: Vec<Entry>, gone: &[String]) {
+    let at: HashMap<&str, usize> = t.folder.entries.iter().enumerate().filter_map(|(i, e)| Some((e.target.as_deref()?, i))).collect();
+    let spots: Vec<Option<usize>> = changed.iter().map(|e| e.target.as_deref().and_then(|p| at.get(p).copied())).collect();
+    drop(at);
+    for (e, spot) in changed.into_iter().zip(spots) {
+        match spot {
+            Some(i) => t.folder.entries[i] = e,
+            None => {
+                t.folder.entries.push(e);
+                t.selected.push(false);
+            }
+        }
+    }
+    if gone.is_empty() {
+        return;
+    }
+    let gone: std::collections::HashSet<&str> = gone.iter().map(String::as_str).collect();
+    let keep: Vec<bool> = t.folder.entries.iter().map(|e| !e.target.as_deref().is_some_and(|p| gone.contains(p))).collect();
+    // Where each item that stays will be.
+    let mut moved = Vec::with_capacity(keep.len());
+    let mut n = 0;
+    for &k in &keep {
+        moved.push(k.then_some(n));
+        n += usize::from(k);
+    }
+    let mut k = keep.iter();
+    t.folder.entries.retain(|_| *k.next().unwrap_or(&true));
+    let mut k = keep.iter();
+    t.selected.retain(|_| *k.next().unwrap_or(&true));
+    t.focus = t.focus.and_then(|i| moved.get(i).copied().flatten());
+    t.anchor = t.anchor.and_then(|i| moved.get(i).copied().flatten());
 }
 
 /// No search results (yet).
@@ -2967,11 +3021,38 @@ mod tests {
     }
 
     #[test]
+    fn results_from_the_index_are_brought_up_to_date_in_place() {
+        let mut t = Tab::new(1, "C:\\x".into());
+        t.folder.path = "C:\\x".into();
+        t.search = Some(search::test_search("C:\\x"));
+        let first = search::Batch { entries: ["C:\\x\\a.txt", "C:\\x\\gone.txt", "C:\\x\\c.txt"].iter().map(|p| result(p)).collect(), ..Default::default() };
+        take_results(&mut t, first);
+        let c = t.folder.entries.iter().position(|e| e.name == "c.txt").unwrap();
+        t.select_only_row(t.view.iter().position(|&i| i as usize == c).unwrap());
+        // The walk: c.txt has grown, d.txt is new.
+        let grown = Entry { size: 99, ..result("C:\\x\\c.txt") };
+        take_results(&mut t, search::Batch { entries: vec![result("C:\\x\\d.txt")], changed: vec![grown], ..Default::default() });
+        assert_eq!(t.folder.entries.len(), 4, "changed in place, not twice");
+        assert_eq!(t.folder.entries.iter().find(|e| e.name == "c.txt").unwrap().size, 99);
+        // gone.txt was deleted since: it goes, and c.txt stays the one selected and under the cursor.
+        take_results(&mut t, search::Batch { gone: vec!["C:\\x\\gone.txt".into()], done: true, ..Default::default() });
+        let mut names: Vec<&str> = t.folder.entries.iter().map(|e| e.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["a.txt", "c.txt", "d.txt"]);
+        assert_eq!(t.selected.len(), 3);
+        assert_eq!(selected_paths(&t), vec!["C:\\x\\c.txt"]);
+        assert_eq!(t.focus.map(|i| t.folder.entries[i].name.as_str()), Some("c.txt"));
+        // A path given twice, or one not shown, is no trouble.
+        take_results(&mut t, search::Batch { gone: vec!["C:\\x\\nowhere".into(), "C:\\x\\a.txt".into(), "C:\\x\\a.txt".into()], ..Default::default() });
+        assert_eq!(t.folder.entries.len(), 2);
+    }
+
+    #[test]
     fn search_results_stream_in_and_keep_the_selection_by_path() {
         let mut t = Tab::new(1, "C:\\x".into());
         t.folder.path = "C:\\x".into();
         t.search = Some(search::test_search("C:\\x"));
-        let batch = |paths: &[&str], done: bool| search::Batch { entries: paths.iter().map(|p| result(p)).collect(), done, capped: false, summary: None };
+        let batch = |paths: &[&str], done: bool| search::Batch { entries: paths.iter().map(|p| result(p)).collect(), done, ..Default::default() };
         take_results(&mut t, batch(&["C:\\x\\b\\r.txt", "C:\\x\\a\\r.txt"], false));
         assert_eq!(t.view.len(), 2);
         assert_eq!(selected_paths(&t), vec!["C:\\x\\a\\r.txt"], "the first match is selected");
@@ -3005,7 +3086,7 @@ mod tests {
         let mut s = search::test_search("C:\\x");
         s.dupes = Some(Default::default());
         t.search = Some(s);
-        let batch = |paths: &[&str], done: bool| search::Batch { entries: paths.iter().map(|p| result(p)).collect(), done, capped: false, summary: None };
+        let batch = |paths: &[&str], done: bool| search::Batch { entries: paths.iter().map(|p| result(p)).collect(), done, ..Default::default() };
         take_results(&mut t, batch(&["C:\\x\\a.txt", "C:\\x\\sub\\a.txt"], false));
         assert!(t.selected_entries().is_empty());
         assert_eq!(t.focus_row(), Some(0));
@@ -3074,6 +3155,19 @@ mod tests {
         // Clicked again: turned around.
         a.run(Command::SortBy(SortKey::Name));
         assert_eq!(shown(a.tab()), ["c.txt", "b.txt", "a.txt"]);
+    }
+
+    #[test]
+    fn the_search_bar_keeps_items_by_size_too() {
+        let mut t = tab_with(&["small.txt", "big.iso", "draft.iso"]);
+        t.folder.entries[1].size = 5 << 20;
+        t.folder.entries[2].size = 5 << 20;
+        t.filter = "size:>1mb -draft".into();
+        t.rebuild_view();
+        assert_eq!(shown(&t), ["big.iso"]);
+        t.filter = "size:".into();
+        t.rebuild_view();
+        assert_eq!(shown(&t).len(), 3, "nothing after the colon yet: everything");
     }
 
     #[test]
@@ -3167,8 +3261,10 @@ mod tests {
         assert_eq!(a.tab().view_mode, ViewMode::Large);
         a.run(Command::SetCustomViews(false));
         assert_eq!(a.tab().view_mode, ViewMode::Details, "off: the tab's own view");
+        assert_eq!(a.note(), Some("View rules off."));
         a.run(Command::SetCustomViews(true));
         assert_eq!(a.tab().view_mode, ViewMode::Large, "on again: the rule's");
+        assert_eq!(a.note(), Some("View rules on."));
     }
 
     #[test]
@@ -3188,7 +3284,7 @@ mod tests {
         // In the folder with the rule: just for now.
         a.set_view(ViewMode::Tree);
         assert_eq!((a.tab().view_mode, a.tab().own_view), (ViewMode::Tree, ViewMode::Details));
-        assert!(a.note().is_some_and(|n| n.contains("for now")));
+        assert_eq!(a.note(), Some("Tree until you open this folder again."));
         open(&mut a, "C:\\x");
         assert_eq!(a.tab().view_mode, ViewMode::Details, "not the folder it was picked in");
         open(&mut a, "C:\\pics\\2026");

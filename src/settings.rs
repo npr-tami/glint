@@ -234,7 +234,7 @@ fn settle_in(exe_dir: &Path, home: &Path, local: &Path) -> Vec<String> {
     if !portable.join("config").exists() && older_portable(exe_dir) {
         // (Only Glint's own files: a cache or logs folder there may be shared with another program.)
         if let Err(e) = move_folder(&exe_dir.join("config"), &portable.join("config")) {
-            problems.push(format!("Glint's settings next to Glint.exe couldn't be moved into {} ({e}).", portable.display()));
+            problems.push(format!("Failed to move Glint's settings next to Glint.exe into {} ({e}).", portable.display()));
         }
         for log in ["error.log", "error.old.log"] {
             let _ = move_file(&exe_dir.join("logs").join(log), &portable.join("logs").join(log));
@@ -256,7 +256,7 @@ fn settle_in(exe_dir: &Path, home: &Path, local: &Path) -> Vec<String> {
             let (from, to) = (mine(found.portable), mine(to_portable));
             for part in PARTS {
                 if let Err(e) = move_folder(&from.join(part), &to.join(part)) {
-                    problems.push(format!("Glint's {part} folder couldn't be moved from {} to {} ({e}).", from.display(), to.display()));
+                    problems.push(format!("Failed to move Glint's {part} folder from {} to {} ({e}).", from.display(), to.display()));
                 }
             }
             // A link, or a file in use, can't move and keeps the old config folder in `Glint data`.
@@ -458,7 +458,7 @@ fn reason(e: &std::io::Error) -> String {
 /// disk: call it on a background thread.
 pub fn set_portable(on: bool) -> Result<String, String> {
     if test_folders() {
-        return Err("portable is locked while testing.".to_string());
+        return Err("portable mode is locked while testing.".to_string());
     }
     let exe_dir = exe_dir().ok_or("Glint can't find out where Glint.exe is.")?;
     // No save while the files move (it would go to a place that's about to be deleted).
@@ -619,6 +619,12 @@ fn clear_files(dir: &Path) {
     for (file, _) in cache_files(dir) {
         let _ = std::fs::remove_file(file);
     }
+}
+
+/// A drive's search index (searchindex.rs) in the cache folder `cache`: a plain file right in it,
+/// so Clear deletes it too, and it follows Portable mode with the rest of the cache.
+pub fn search_index_file(cache: &Path, drive: char) -> PathBuf {
+    cache.join(format!("search-index-{drive}.dat"))
 }
 
 // ---------------------------------------------------------------- the settings
@@ -923,7 +929,7 @@ impl ViewMode {
 }
 
 /// The extra columns next to Name, by their names in settings.json ("Columns"), in the list's order:
-/// "dimensions" is Picture size, "length" how long a video or song plays (both read by media.rs).
+/// "dimensions" is Image dimensions, "length" how long a video or song plays (both read by media.rs).
 pub const COLUMN_NAMES: [&str; 6] = ["modified", "created", "type", "size", "dimensions", "length"];
 
 /// What the title bars show at the left: the skin's word in its slanted box (GLINT unless the skin
@@ -1173,7 +1179,7 @@ pub struct Settings {
     /// "Show file name extensions".
     pub hide_known_extensions: bool,
     /// The columns next to Name: any of "modified", "created", "type", "size", "dimensions"
-    /// (Picture size), "length".
+    /// (Image dimensions), "length".
     pub columns: Vec<String>,
     /// Folders above files (otherwise they're sorted together).
     pub folders_first: bool,
@@ -1185,6 +1191,10 @@ pub struct Settings {
     pub single_click: bool,
     /// What Backspace does: up | back.
     pub backspace: Backspace,
+    /// The keyboard shortcuts changed from their defaults, by name: {"NewTab": "Ctrl+K"} (keymap.rs).
+    /// One that's missing or can't be read is at its default.
+    #[serde(deserialize_with = "crate::keymap::lenient")]
+    pub shortcuts: BTreeMap<String, String>,
     /// Double-clicking the list's empty space goes up a folder.
     pub double_click_up: bool,
     /// How tabs show their items when they have no view of their own (new windows, folders from
@@ -1261,8 +1271,10 @@ pub struct Settings {
     /// The sort order editor's guide is shown (GUIDE; hidden at first). (Older versions wrote
     /// "SortGuideHidden", shown at first: it's left out, so everyone starts with it hidden.)
     pub sort_guide_shown: bool,
-    /// The sort order editor is on its own (DETACH), not docked beside the main window.
-    pub sort_detached: bool,
+    /// The Folder rules editor is docked beside the main window (DOCK). Not at first: it opens on its
+    /// own, in the middle, wide enough for its lines. (Older versions wrote "SortDetached", docked
+    /// at first: it's left out, so everyone starts with it on its own.)
+    pub sort_docked: bool,
     /// How the sort order editor is laid out.
     pub sort_window: SortWindow,
     /// Where the sort order editor was last on its own: left, top, width, height in screen pixels.
@@ -1284,6 +1296,8 @@ pub struct Settings {
     pub preview_width: f32,
     /// The Space preview shows a picture's or video's size and other facts under it (its "i" button).
     pub preview_info: bool,
+    /// The Space preview wraps a text file's long lines inside the pane (its WRAP switch).
+    pub preview_wrap: bool,
     /// How loud the Space preview plays videos (0 to 1), as last set there.
     pub preview_volume: f32,
 }
@@ -1342,6 +1356,7 @@ impl Default for Settings {
             size_format: SizeFormat::Auto,
             single_click: false,
             backspace: Backspace::Up,
+            shortcuts: BTreeMap::new(),
             double_click_up: false,
             view: ViewMode::Details,
             pinned: Vec::new(),
@@ -1372,7 +1387,7 @@ impl Default for Settings {
             column_widths: None,
             upgraded: 0,
             sort_guide_shown: false,
-            sort_detached: false,
+            sort_docked: false,
             sort_window: SortWindow::Compact,
             sort_bounds: None,
             theme_guide_hidden: false,
@@ -1383,6 +1398,7 @@ impl Default for Settings {
             details_width: 0.0,
             preview_width: 0.0,
             preview_info: true,
+            preview_wrap: true,
             preview_volume: 0.5,
         }
     }
@@ -1436,6 +1452,7 @@ const CHOICES: &[&str] = &[
     "SizeFormat",
     "SingleClick",
     "Backspace",
+    "Shortcuts",
     "DoubleClickUp",
     "View",
     "FolderViews",
@@ -1464,6 +1481,7 @@ const CHOICES: &[&str] = &[
     "RemindUpdateAfter",
     // The Space preview (preview.rs).
     "PreviewInfo",
+    "PreviewWrap",
     "PreviewVolume",
 ];
 
@@ -1574,6 +1592,11 @@ impl Settings {
                 && w.is_finite()
                 && (COLUMN_MIN..=COLUMN_MAX).contains(w)
         });
+        // Image dimensions (once "Picture size") still at its old width, which every width is saved
+        // with: never dragged, so it takes the new one that fits its title.
+        if self.column_width_map.get("dimensions") == Some(&110.0) {
+            self.column_width_map.remove("dimensions");
+        }
         if self.startup_folder.as_deref().is_some_and(|f| f.trim().is_empty()) {
             self.startup_folder = None;
         }
@@ -1656,7 +1679,7 @@ impl Settings {
 }
 
 /// A sort column as the number saved in settings.json (0 Name, 1 Date
-/// modified, 2 Type, 3 Size, 4 Folder (search results), 5 Date created, 6 Picture size, 7 Length).
+/// modified, 2 Type, 3 Size, 4 Folder (search results), 5 Date created, 6 Image dimensions, 7 Duration).
 pub fn sort_number(key: SortKey) -> u32 {
     match key {
         SortKey::Name => 0,
@@ -1838,12 +1861,12 @@ pub fn load() -> Settings {
         Parsed::Partly(s, dropped) => {
             // By their names in Settings ("Keep running when closed"), where Settings shows them.
             let names: Vec<String> = dropped.iter().map(|key| crate::settingswin::title_of(key).unwrap_or_else(|| key.clone())).collect();
-            keep_bad_copy(&format!("Some settings couldn't be read and are back to normal: {}.", names.join(", ")));
+            keep_bad_copy(&format!("Failed to read some settings, so they are back to normal: {}.", names.join(", ")));
             remember_synced(&s, true);
             s
         }
         Parsed::Broken(reason) => {
-            keep_bad_copy(&format!("The settings in {} couldn't be read ({reason}), so Glint started with the defaults.", path.display()));
+            keep_bad_copy(&format!("Failed to read the settings in {} ({reason}), so Glint started with the defaults.", path.display()));
             remember_synced(&Settings::default(), false);
             Settings::default()
         }
@@ -2379,6 +2402,35 @@ mod tests {
         assert!(d.settings_search && d.settings_dots && d.settings_reset && !d.settings_last_page);
     }
 
+    /// Changed shortcuts are written by name and read back after a restart; a file without them
+    /// (an older Glint's) or with odd ones still loads, with the defaults where they can't be read.
+    #[test]
+    fn shortcuts_survive_a_restart() {
+        let mut s = Settings::default();
+        s.shortcuts.insert("NewTab".into(), "Ctrl+K".into());
+        s.shortcuts.insert("DeletePermanently".into(), "Ctrl+Shift+Delete".into());
+        let text = serde_json::to_string_pretty(&s).unwrap();
+        assert!(text.contains("\"Shortcuts\": {"), "{text}");
+        assert!(text.contains("\"NewTab\": \"Ctrl+K\""), "{text}");
+        let Parsed::Good(back) = parse(&text) else { panic!() };
+        assert_eq!(back.shortcuts, s.shortcuts);
+        let k = crate::keymap::KeyMap::of_settings(&back);
+        assert_eq!(k.text(crate::keymap::Action::NewTab), "Ctrl+K");
+        // An older file: every shortcut at its default.
+        let Parsed::Good(old) = parse("{\"Backspace\": \"back\"}") else { panic!() };
+        assert!(old.shortcuts.is_empty());
+        assert_eq!(crate::keymap::KeyMap::of_settings(&old), crate::keymap::KeyMap::defaults());
+        // Odd entries are dropped one by one; the other settings are all still read.
+        let Parsed::Good(odd) = parse("{\"Backspace\": \"back\", \"Shortcuts\": {\"NewTab\": 7, \"CloseTab\": \"Ctrl+Banana\", \"Rename\": \"F8\"}}") else { panic!() };
+        assert_eq!(odd.backspace, Backspace::Back);
+        assert_eq!(odd.shortcuts.len(), 2);
+        let k = crate::keymap::KeyMap::of_settings(&odd);
+        assert_eq!(k.text(crate::keymap::Action::Rename), "F8");
+        assert!(!k.changed(crate::keymap::Action::CloseTab) && !k.changed(crate::keymap::Action::NewTab));
+        let Parsed::Good(odd) = parse("{\"Shortcuts\": \"Ctrl+K\"}") else { panic!() };
+        assert!(odd.shortcuts.is_empty());
+    }
+
     #[test]
     fn the_old_values_are_read() {
         let text = "{\"Size\": \"large\", \"DateFormat\": \"iso\", \"SizeFormat\": \"kb\", \"Backspace\": \"back\", \"RailGroup\": \"pc\", \
@@ -2616,6 +2668,19 @@ mod tests {
     }
 
     #[test]
+    fn clearing_the_cache_deletes_the_search_index() {
+        let dir = std::env::temp_dir().join(format!("glint-cache-index-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let place = crate::searchindex::Place { root: "C:\\t".into(), volume: 7, file: search_index_file(&dir, 'C') };
+        crate::searchindex::write_now(&place, vec![crate::searchindex::Block { dir: "C:\\t".into(), items: Vec::new() }], true);
+        assert!(place.file.exists() && place.file.parent() == Some(dir.as_path()));
+        assert!(cache_files(&dir).iter().any(|(f, _)| *f == place.file), "counted in the cache's size");
+        clear_files(&dir);
+        assert!(!place.file.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn pins_and_hidden_places_use_the_old_names() {
         let mut s = Settings { pinned: vec!["C:\\Work".into(), "D:\\".into()], hidden_places: vec!["music".into()], ..Default::default() };
         s.pin_names.insert("C:\\Work".into(), "Job".into());
@@ -2752,7 +2817,7 @@ mod tests {
         s.set_column("type", true);
         assert_eq!(s.columns, vec!["created", "type", "size"]);
         assert!(!s.shows_column("modified") && s.shows_column("CREATED"));
-        // Picture size and Length (off unless asked for) go after Size, and are read back.
+        // Image dimensions and Duration (off unless asked for) go after Size, and are read back.
         assert!(!Settings::default().shows_column("dimensions") && !Settings::default().shows_column("length"));
         s.set_column("length", true);
         s.set_column("dimensions", true);
@@ -2760,6 +2825,13 @@ mod tests {
         s.column_width_map.insert("length".into(), 90.0);
         let Parsed::Good(back) = parse(&s.to_json()) else { panic!() };
         assert_eq!((back.columns, back.column_width_map.get("length")), (s.columns.clone(), Some(&90.0)));
+        // Image dimensions saved at its old width (never dragged) takes the new one; dragged, it stays.
+        s.column_width_map.insert("dimensions".into(), 110.0);
+        let Parsed::Good(back) = parse(&s.to_json()) else { panic!() };
+        assert_eq!(back.column_width_map.get("dimensions"), None);
+        s.column_width_map.insert("dimensions".into(), 112.5);
+        let Parsed::Good(back) = parse(&s.to_json()) else { panic!() };
+        assert_eq!(back.column_width_map.get("dimensions"), Some(&112.5));
     }
 
     fn saved(path: &str, pinned: bool) -> SavedTab {

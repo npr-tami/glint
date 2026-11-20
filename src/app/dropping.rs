@@ -67,7 +67,7 @@ impl AppState {
             }
         });
         if !started {
-            self.say("Windows couldn't start this right now. Try again.");
+            self.say("Failed to start this. Try again.");
         }
         started
     }

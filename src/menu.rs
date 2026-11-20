@@ -93,10 +93,13 @@ const PICK_EXTRACT_HERE: u32 = 88;
 const PICK_EXTRACT_TO: u32 = 89;
 const PICK_ZIP: u32 = 90;
 const PICK_7Z: u32 = 91;
+// Inside a zip or 7z: Extract selected… and Extract all… (into a folder picked first).
+const PICK_EXTRACT_SELECTED: u32 = 120;
+const PICK_EXTRACT_ALL: u32 = 121;
 // Colour tags (tags.rs): Tag › (from PICK_TAG, in `Tag::ALL`'s order), and Remove tag.
 const PICK_TAG: u32 = 92;
 const PICK_UNTAG: u32 = 98;
-// The Picture size and Length columns (media.rs).
+// The Image dimensions and Duration columns (media.rs).
 const PICK_SORT_DIMENSIONS: u32 = 99;
 const PICK_SORT_LENGTH: u32 = 100;
 
@@ -143,6 +146,9 @@ pub fn for_items(app: &AppState, at: Point, how: How) -> Effect {
     let files = (!t.folder.path.is_empty() || t.is_searching()) && first.kind != EntryKind::Drive;
     // Inside a .zip or .7z (archive.rs): open and copy out, nothing that would change it.
     let inside = crate::archive::split(&t.folder.path).is_some();
+    // An archive in another archive, or one with password-protected items: nothing in it can be
+    // cut, renamed or deleted (archive.rs `cant_change`).
+    let locked_in = inside && app.archive_cant_change().is_some();
     let mut items = vec![MenuItem::new(PICK_OPEN, "Open\tEnter")];
     if folders > 0 {
         items.push(MenuItem::new(PICK_NEW_TABS, if folders > 1 { "Open in new tabs\tCtrl+Enter" } else { "Open in new tab\tCtrl+Enter" }));
@@ -169,7 +175,7 @@ pub fn for_items(app: &AppState, at: Point, how: How) -> Effect {
     }
     items.push(MenuItem::separator());
     if files {
-        items.push(MenuItem::new(PICK_CUT, "Cut\tCtrl+X"));
+        items.push(MenuItem::new(PICK_CUT, "Cut\tCtrl+X").disabled(locked_in));
         items.push(MenuItem::new(PICK_COPY, "Copy\tCtrl+C"));
         if single && first.is_container() && app.can_paste() {
             items.push(MenuItem::new(PICK_PASTE_INTO, "Paste into folder"));
@@ -191,10 +197,15 @@ pub fn for_items(app: &AppState, at: Point, how: How) -> Effect {
         items.push(MenuItem::new(PICK_7Z, "Compress to 7z"));
     }
     if files && inside {
+        items.push(MenuItem::separator());
+        items.push(MenuItem::new(PICK_EXTRACT_SELECTED, "Extract selected\u{2026}"));
+        items.push(MenuItem::new(PICK_EXTRACT_ALL, "Extract all\u{2026}"));
+    }
+    if files && inside {
         // Inside a .zip or .7z: one at a time, and a delete there can always be undone.
         items.push(MenuItem::separator());
-        items.push(MenuItem::new(PICK_RENAME, "Rename\tF2").disabled(!single));
-        items.push(MenuItem::new(PICK_DELETE, "Delete\tDel"));
+        items.push(MenuItem::new(PICK_RENAME, "Rename\tF2").disabled(!single || locked_in));
+        items.push(MenuItem::new(PICK_DELETE, "Delete\tDel").disabled(locked_in));
     }
     if files && !inside {
         items.push(MenuItem::separator());
@@ -280,8 +291,8 @@ pub fn for_background(app: &AppState, at: Point, how: How) -> Effect {
         key(PICK_SORT_CREATED, "Date created", SortKey::Created),
         key(PICK_SORT_TYPE, "Type", SortKey::Type),
         key(PICK_SORT_SIZE, "Size", SortKey::Size),
-        key(PICK_SORT_DIMENSIONS, "Picture size", SortKey::Dimensions),
-        key(PICK_SORT_LENGTH, "Length", SortKey::Length),
+        key(PICK_SORT_DIMENSIONS, "Image dimensions", SortKey::Dimensions),
+        key(PICK_SORT_LENGTH, "Duration", SortKey::Length),
         MenuItem::separator(),
         MenuItem::new(PICK_ASCENDING, "Ascending").checked(!t.descending && !custom),
         MenuItem::new(PICK_DESCENDING, "Descending").checked(t.descending && !custom),
@@ -298,6 +309,10 @@ pub fn for_background(app: &AppState, at: Point, how: How) -> Effect {
         items.push(MenuItem::new(PICK_PASTE, "Paste\tCtrl+V").disabled(!app.can_paste()));
         items.push(MenuItem::new(PICK_NEW_FOLDER, "New folder\tCtrl+Shift+N"));
         items.push(MenuItem::new(PICK_NEW_TEXT, "New text file"));
+        items.push(MenuItem::separator());
+    }
+    if inside {
+        items.push(MenuItem::new(PICK_EXTRACT_ALL, "Extract all\u{2026}"));
         items.push(MenuItem::separator());
     }
     let dupes = t.search.as_ref().is_some_and(|s| s.is_dupes());
@@ -460,6 +475,8 @@ pub fn pick(id: u32, app: &mut AppState) -> Effect {
         PICK_MOVE_OTHER => Command::SendToOtherSide { moving: true },
         PICK_EXTRACT_HERE => Command::Extract { own_folder: false },
         PICK_EXTRACT_TO => Command::Extract { own_folder: true },
+        PICK_EXTRACT_SELECTED => Command::ExtractInside { all: false },
+        PICK_EXTRACT_ALL => Command::ExtractInside { all: true },
         PICK_ZIP => Command::Compress(crate::archive::Format::Zip),
         PICK_7Z => Command::Compress(crate::archive::Format::SevenZ),
         PICK_REDO => Command::Redo,
@@ -789,6 +806,101 @@ mod tests {
         let inside = tag_menu(&mut app, &zip.to_string_lossy(), &["a.txt"]);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(inside.is_none());
+    }
+
+    #[test]
+    fn inside_an_archive_the_menus_offer_extract_selected_and_all() {
+        use crate::folder::{Entry, Folder};
+        let entry = |name: &str| Entry {
+            name: name.into(),
+            lower: name.to_lowercase(),
+            kind: EntryKind::File,
+            size: 0,
+            modified: 0,
+            created: 0,
+            attributes: 0x20,
+            ext: String::new(),
+            type_name: std::sync::Arc::from(""),
+            target: None,
+            free: 0,
+        };
+        let dir = std::env::temp_dir().join(format!("glint-menu-test-extract-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zip = dir.join("Photos \u{1F600} #1.zip");
+        std::fs::write(&zip, b"").unwrap();
+        let labels = |folder: &str, selected: bool| {
+            let mut app = AppState::for_tests(crate::settings::Settings::default());
+            let t = &mut app.tabs[0];
+            t.path = folder.to_string();
+            crate::app::apply_listing(t, Folder { path: folder.to_string(), entries: vec![entry("a.txt"), entry("b.txt")], ..Default::default() });
+            t.selected = vec![selected; 2];
+            let menu = if selected { for_items(&app, Point::new(0.0, 0.0), How::default()) } else { for_background(&app, Point::new(0.0, 0.0), How::default()) };
+            let Effect::FilesMenu(m) = menu else { panic!("no menu") };
+            m.menu.items.into_iter().map(|i| i.label).collect::<Vec<_>>()
+        };
+        let inside = zip.to_string_lossy().into_owned();
+        let sub = format!("{inside}\\docs");
+        let items = labels(&sub, true);
+        let background = labels(&inside, false);
+        let outside_items = labels("C:\\t", true);
+        let outside_background = labels("C:\\t", false);
+        let _ = std::fs::remove_dir_all(&dir);
+        let has = |v: &[String], l: &str| v.iter().any(|x| x == l);
+        assert!(has(&items, "Extract selected\u{2026}") && has(&items, "Extract all\u{2026}"), "{items:?}");
+        assert!(!has(&background, "Extract selected\u{2026}") && has(&background, "Extract all\u{2026}"), "{background:?}");
+        // Outside an archive, neither: Extract here and Extract to stay for an archive file.
+        for v in [&outside_items, &outside_background] {
+            assert!(!has(v, "Extract selected\u{2026}") && !has(v, "Extract all\u{2026}"), "{v:?}");
+        }
+        let mut app = AppState::for_tests(crate::settings::Settings::default());
+        assert!(matches!(pick(PICK_EXTRACT_SELECTED, &mut app), Effect::Command(Command::ExtractInside { all: false })));
+        assert!(matches!(pick(PICK_EXTRACT_ALL, &mut app), Effect::Command(Command::ExtractInside { all: true })));
+    }
+
+    #[test]
+    fn inside_an_archive_glint_cant_change_cut_rename_and_delete_are_greyed() {
+        use crate::folder::Folder;
+        use std::io::Write;
+        let zip_of = |entries: &[(&str, &[u8])]| {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            for (name, data) in entries {
+                w.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+                w.write_all(data).unwrap();
+            }
+            w.finish().unwrap().into_inner()
+        };
+        let dir = std::env::temp_dir().join(format!("glint-menu-test-cant-change-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let outer = dir.join("outer.zip");
+        std::fs::write(&outer, zip_of(&[("a.txt", b"a"), ("inner.zip", &zip_of(&[("b.txt", b"b")]))])).unwrap();
+        let o = outer.to_string_lossy().into_owned();
+        // Each folder as reading it finds it (archive.rs notes which can't be changed).
+        let greyed = |inner: &str| {
+            let full = if inner.is_empty() { o.clone() } else { format!("{o}\\{inner}") };
+            let listed = crate::archive::read(&o, inner, &full);
+            assert_eq!(listed.error, None);
+            let mut app = AppState::for_tests(crate::settings::Settings::default());
+            let t = &mut app.tabs[0];
+            t.path = full.clone();
+            let n = listed.entries.len();
+            crate::app::apply_listing(t, Folder { path: full, ..listed });
+            t.selected = vec![false; n];
+            t.selected[0] = true;
+            let Effect::FilesMenu(m) = for_items(&app, Point::new(0.0, 0.0), How::default()) else { panic!("no menu") };
+            let mut out: Vec<(String, bool)> = m.menu.items.into_iter().map(|i| (i.label, i.disabled)).filter(|(l, _)| ["Cut\tCtrl+X", "Rename\tF2", "Delete\tDel", "Copy\tCtrl+C", "Copy path\tCtrl+Shift+C"].contains(&l.as_str())).collect();
+            out.sort();
+            out
+        };
+        let plain = greyed("");
+        let nested = greyed("inner.zip");
+        let _ = std::fs::remove_dir_all(&dir);
+        let all = |off: bool| -> Vec<(String, bool)> {
+            let mut v: Vec<(String, bool)> = [("Copy\tCtrl+C", false), ("Copy path\tCtrl+Shift+C", false), ("Cut\tCtrl+X", off), ("Delete\tDel", off), ("Rename\tF2", off)].iter().map(|&(l, d)| (l.to_string(), d)).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(plain, all(false));
+        assert_eq!(nested, all(true), "copying out still works there");
     }
 
     #[test]

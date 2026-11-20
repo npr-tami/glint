@@ -1,8 +1,10 @@
-//! The custom sort order's editor (SORT > Edit custom order…, Settings > Files and folders > EDIT…):
-//! a window of Glint's own, drawn in the Settings window's style (kit.rs), docked beside the main
-//! window and moving and resizing with it (window/sorting.rs keeps it there). DETACH in its title
-//! bar lets it go: then it moves and resizes on its own, like Settings, and is remembered that way
-//! ("SortDetached", "SortBounds"); DOCK puts it back.
+//! Folder rules, the editor for the custom sort order and folders' views (SORT > Edit folder
+//! rules…, Settings > Files and folders > EDIT…):
+//! a window of Glint's own, drawn in the Settings window's style (kit.rs). It opens on its own, in
+//! the middle of the screen and wide enough for its longest line; it moves and resizes like
+//! Settings, and is remembered where it was left ("SortBounds"). DOCK in its title bar puts it
+//! beside the main window, moving and resizing with it (window/sorting.rs keeps it there), and
+//! DETACH lets it go again ("SortDocked").
 //!
 //! - **The rules box**, drawn by Glint with a monospaced font (so it can show more than an EDIT
 //!   could): line numbers down its left side (a red dot by a line with a mistake, a triangle by one
@@ -15,13 +17,14 @@
 //!   typing a word at a time (Ctrl+Y puts it back; kept while Glint runs), Ctrl+/ makes lines notes
 //!   and back, Alt+Up / Alt+Down move them, and right-clicking gives a menu of all that.
 //! - **On screen** above it: which rules sort the folder in the main window (a bar beside them in
-//!   the rules box), or that custom sort is off or a column sorts it for now, with a link to change
-//!   that.
+//!   the rules box), or that sort rules are off or a column sorts it for now, with a link to change
+//!   that. Under it, one plain sentence saying what the rules do there ("This folder: folders
+//!   first, then newest first, shown as large icons.").
 //! - **Problems** under it, every one, wrapped so they can be read whole (scrolling when there are
 //!   many): the line's mistake first; one with a fix ("did you mean -newest?") is a link that fixes
 //!   it, and clicking the words goes to the line. A folder written in the rules that isn't there is
 //!   a tip, with the closest folder beside it as the fix.
-//! - **The switch** (custom sort on or off), **START FROM…** (ready-made orders: it asks before
+//! - **The switch** (sort rules on or off), **START FROM…** (ready-made orders: it asks before
 //!   replacing rules of your own) and **GUIDE**, which shows a short guide at the bottom (hidden at
 //!   first; "SortGuideShown"). The rules box takes the rest of the window: the main window beside
 //!   it shows the result.
@@ -53,19 +56,23 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindow, GetWindowLongPtrW, GetWindowRect, IsIconic, KillTimer,
     LoadCursorW, LoadIconW, PostMessageW, RegisterClassExW, SetCursor, SetTimer, SetWindowPos, ShowWindow, CS_DBLCLKS, GWL_STYLE,
-    GW_OWNER, HTCAPTION, HTCLIENT, IDC_ARROW, IDC_HAND, IDC_IBEAM, MINMAXINFO, SIZE_MINIMIZED, SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, SW_SHOWNOACTIVATE, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_APP,
+    GW_OWNER, HTCAPTION, HTCLIENT, IDC_ARROW, IDC_HAND, IDC_IBEAM, MINMAXINFO, SIZE_MINIMIZED, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE, SW_SHOWNOACTIVATE, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_APP,
     WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO,
     WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST,
     WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CLIPCHILDREN, WS_POPUP, WS_SYSMENU,
     WS_THICKFRAME,
 };
 
-use crate::app::AppState;
+use crate::app::{AppState, Tab};
 use crate::complete::{self, Completion, Lister, Place};
+use crate::diskspace;
 use crate::folder::{self, EntryKind};
 use crate::frame;
 use crate::kit::{self, size as ksize, Bar, Look};
+use crate::pathbar::Beside;
 use crate::log;
+use crate::recent;
+use crate::recycle;
 use crate::render::{Align, FrameResult, Renderer, TextStyle};
 use crate::settings::SortWindow as Shape;
 use crate::shell;
@@ -76,7 +83,7 @@ use crate::ui::{Menu, MenuItem, Point, Rect};
 use crate::codebox::{at_col, clipboard_text, col_of, key_down, line_end, line_of, next_char, prev_char, swap_lines, whole_lines, Track};
 use crate::winutil::{hi_word, lo_word};
 
-pub const TITLE: &str = "Sort order and views";
+pub const TITLE: &str = "Folder rules";
 
 const BOX_PAD: f32 = 8.0;
 /// A problem's first line, and each line it wraps onto.
@@ -259,6 +266,8 @@ struct Here {
     text: String,
     /// The same in a few words (one column).
     short: String,
+    /// What the rules do there, in one plain sentence, for the line under it ([`in_effect`]).
+    does: String,
     link: Option<HereLink>,
     /// The line its words go to (from 1).
     line: Option<usize>,
@@ -269,7 +278,7 @@ struct Here {
 /// What the line's link does.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum HereLink {
-    /// Custom sort is off: turn it on.
+    /// Sort rules are off: turn them on.
     TurnOn,
     /// A column sorts the folder for now: back to the rules.
     UseRules,
@@ -278,7 +287,7 @@ enum HereLink {
 impl HereLink {
     fn label(self) -> &'static str {
         match self {
-            HereLink::TurnOn => "Turn it on",
+            HereLink::TurnOn => "Turn them on",
             HereLink::UseRules => "Use the rules",
         }
     }
@@ -305,6 +314,8 @@ struct Layout {
     start_from: Rect,
     guide_button: Rect,
     here: Rect,
+    /// The line under it: what the rules do there.
+    does: Rect,
     /// START FROM…'s question (empty when not asking), and its buttons.
     confirm: Rect,
     replace: Rect,
@@ -399,6 +410,8 @@ pub struct SortWindow {
     /// Suggestions' rows, as last drawn.
     suggestion_rects: Vec<Rect>,
     flips: kit::Flips,
+    /// How far the paired buttons lean where they meet, in the skin (for their exact shapes).
+    lean: f32,
 }
 
 /// The guide: an example first (lines starting with "|", shown as typed), then the words.
@@ -431,6 +444,15 @@ const GUIDE: &[&str] = &[
     "Ctrl+Space shows the words that fit where the cursor is.",
     "Ctrl+/ turns a line into a note and back. Alt+Up and Alt+Down move a line.",
 ];
+
+/// The words beside the switch (one column has room for its name only).
+fn switch_label(shape: Shape, on: bool) -> &'static str {
+    match (shape, on) {
+        (Shape::Compact, _) => "Sort rules",
+        (_, true) => "Sort rules are on",
+        (_, false) => "Off: the columns decide",
+    }
+}
 
 /// The GUIDE button's words: it shows the guide, or hides it.
 fn guide_label(app: &AppState) -> &'static str {
@@ -503,9 +525,10 @@ fn is_detached(hwnd: HWND) -> bool {
     unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_THICKFRAME.0 != 0 }
 }
 
-/// Where the editor goes when it's let go (screen pixels): where it was last on its own, if that's
-/// still on a screen; else a little off where it is (`now`), so it's seen to come away.
-fn detached_rect(remembered: Option<[i32; 4]>, now: RECT, scale: f32) -> RECT {
+/// Where the editor goes on its own (screen pixels): where it was last on its own, if that's still
+/// on a screen; else in the middle of the screen `near` is on, `want` wide (screen pixels, from
+/// [`wanted_width`]).
+fn detached_rect(remembered: Option<[i32; 4]>, near: RECT, scale: f32, want: i32) -> RECT {
     if let Some([x, y, w, h]) = remembered {
         let r = RECT { left: x, top: y, right: x + w, bottom: y + h };
         // SAFETY: a plain query.
@@ -513,14 +536,34 @@ fn detached_rect(remembered: Option<[i32; 4]>, now: RECT, scale: f32) -> RECT {
             return r;
         }
     }
-    let step = (24.0 * scale) as i32;
     let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
     // SAFETY: plain queries with a valid out-struct.
-    let work = unsafe { if GetMonitorInfoW(MonitorFromRect(&now, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() { info.rcWork } else { now } };
-    let (w, h) = (now.right - now.left, (now.bottom - now.top - 2 * step).max((MIN_H * scale) as i32));
-    let x = (now.left - step).clamp(work.left, (work.right - w).max(work.left));
-    let y = (now.top + step).clamp(work.top, (work.bottom - h).max(work.top));
+    let work = unsafe { if GetMonitorInfoW(MonitorFromRect(&near, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() { info.rcWork } else { near } };
+    in_the_middle(work, want, (MIN_H * scale) as i32)
+}
+
+/// A window `want` wide (at most 9/10 of the screen) and 4/5 of its height (at least `min_h`),
+/// in the middle of the screen whose free area is `work`.
+fn in_the_middle(work: RECT, want: i32, min_h: i32) -> RECT {
+    let (ww, wh) = (work.right - work.left, work.bottom - work.top);
+    let w = want.min(ww * 9 / 10).max(1);
+    let h = (wh * 4 / 5).max(min_h).min(wh.max(1));
+    let (x, y) = (work.left + (ww - w) / 2, work.top + (wh - h) / 2);
     RECT { left: x, top: y, right: x + w, bottom: y + h }
+}
+
+/// How wide the window must be (DIPs) for the longest line of `text` to show whole in the rules
+/// box with `shape`'s sizes, `char_w` a character's width (estimated before there is a window to
+/// measure in); at least the layout's own width.
+fn wanted_width(text: &str, shape: Shape, char_w: f32) -> f32 {
+    let s = Sizes::of(shape);
+    let longest = text.lines().map(|l| l.chars().count()).max().unwrap_or(0).max(1);
+    let digits = (text.matches('\n').count() + 1).to_string().len().max(2);
+    let gutter = GUTTER_MARK + digits as f32 * char_w + GUTTER_GAP;
+    // The text and the room after it (as `widest` has it), the gutter, the box's padding, the
+    // window's sides, the scrollbar down the side and the frame.
+    let w = longest as f32 * char_w + 48.0 + gutter + 2.0 * BOX_PAD + 2.0 * s.pad + 14.0 + 16.0;
+    w.ceil().max(s.width)
 }
 
 /// Makes the editor (hidden: show it with [`Job::Show`] once its state is kept), owned by `owner`
@@ -529,13 +572,16 @@ fn detached_rect(remembered: Option<[i32; 4]>, now: RECT, scale: f32) -> RECT {
 pub fn create(owner: HWND, app: &mut AppState) -> Option<SortWindow> {
     register_class();
     let title: Vec<u16> = TITLE.encode_utf16().chain(std::iter::once(0)).collect();
-    let detached = app.settings.sort_detached;
+    let detached = !app.settings.sort_docked;
     let shape = app.settings.sort_window;
     set_cells(shape);
     let docked = dock_rect(owner, Sizes::of(shape).width);
     // SAFETY: a plain query.
     let scale = unsafe { GetDpiForWindow(owner) }.max(96) as f32 / 96.0;
-    let r = if detached { detached_rect(app.settings.sort_bounds, docked, scale) } else { docked };
+    let text = app.settings.sort_recipe.clone().unwrap_or_else(|| sortrecipe::STARTER.to_string());
+    // (Monospaced: a character is at most about 0.6 of the text's size wide.)
+    let want = (wanted_width(&text, shape, Sizes::of(shape).mono * 0.6) * scale) as i32;
+    let r = if detached { detached_rect(app.settings.sort_bounds, docked, scale, want) } else { docked };
     // SAFETY: window creation and plain queries on our own windows.
     unsafe {
         let instance = GetModuleHandleW(None).ok()?;
@@ -558,13 +604,15 @@ pub fn create(owner: HWND, app: &mut AppState) -> Option<SortWindow> {
         let renderer = match Renderer::new(hwnd, dpi) {
             Ok(r) => r,
             Err(e) => {
-                log::error(&format!("The sort editor couldn't draw: {e}"));
+                log::error(&format!("Failed to draw Folder rules: {e}"));
                 let _ = DestroyWindow(hwnd);
                 return None;
             }
         };
         frame::init(hwnd);
-        let text = app.settings.sort_recipe.clone().unwrap_or_else(|| sortrecipe::STARTER.to_string());
+        // WM_NCCALCSIZE again now that it's handled: on its own, Windows' own title bar goes, as in
+        // Settings (without this it shows above Glint's own until the window is resized).
+        let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         let mut window = SortWindow {
             hwnd,
             renderer,
@@ -621,6 +669,7 @@ pub fn create(owner: HWND, app: &mut AppState) -> Option<SortWindow> {
             problem_rects: Vec::new(),
             suggestion_rects: Vec::new(),
             flips: kit::Flips::default(),
+            lean: 0.0,
         };
         window.apply_theme(&app.theme);
         let mut rc = RECT::default();
@@ -856,15 +905,73 @@ fn fix_text(m: &sortrecipe::Message, fix: &str) -> String {
 }
 
 /// Which rules sort the folder on screen in the main window, in words (with `recipe`, the rules as
-/// typed, so the lines it names are the ones on screen).
+/// typed, so the lines it names are the ones on screen), and what they do there.
 fn here(app: &AppState, recipe: &Recipe) -> Here {
+    Here { does: in_effect(app, recipe), ..sorted_by(app, recipe) }
+}
+
+/// A sort column's title, as the list shows it.
+fn column_name(key: folder::SortKey) -> &'static str {
+    use folder::SortKey as K;
+    match key {
+        K::Name => "Name",
+        K::Date => "Date modified",
+        K::Type => "Type",
+        K::Size => "Size",
+        K::Created => "Date created",
+        K::Folder => "Folder",
+        K::Dimensions => "Image dimensions",
+        K::Length => "Duration",
+    }
+}
+
+/// Whether what's on screen keeps an order no rules change (as `Tab::custom_here` has it): This
+/// PC's drives, Home, Disk space's page, and duplicates in their sets.
+fn keeps_its_order(tab: &Tab) -> bool {
+    let path = &tab.folder.path;
+    path.is_empty() || recent::is_recent(path) || diskspace::is_disk(path) || tab.search.as_ref().is_some_and(|s| s.is_dupes())
+}
+
+/// What the rules do for the folder on screen right now, in one plain sentence: "This folder:
+/// folders first, then newest first, shown as large icons." It's made from the rules as read
+/// (`recipe`: [`Recipe::summary`], [`Recipe::view_for`]), never from their text, and follows what
+/// the main window really does with them: with sort rules off, no rule for the folder, or a column
+/// picked there for now, a column sorts it, and it says which; a view is the rules' only while
+/// view rules are on, and one picked by hand in such a folder is "for now".
+fn in_effect(app: &AppState, recipe: &Recipe) -> String {
+    let tab = app.tab();
+    let path = tab.folder.path.as_str();
+    if keeps_its_order(tab) {
+        return "Sort rules don't apply here.".into();
+    }
+    let column = column_name(tab.sort);
+    let sorted = if !app.settings.custom_sort {
+        format!("sorted by the {column} column")
+    } else if tab.column_now {
+        format!("sorted by the {column} column for now")
+    } else {
+        // (Whose rules they are, the folder's own or the ones for every folder, is on the line above.)
+        recipe.summary(path).unwrap_or_else(|| format!("sorted by the {column} column"))
+    };
+    // (The Recycle Bin has no view from the rules: `Tab::view_ruled`.)
+    let ruled = if app.settings.custom_views && !recycle::is_bin(path) { recipe.view_for(path) } else { None };
+    let shown = match ruled {
+        Some(view) if view == tab.view_mode => format!(", shown as {}", view.name().to_lowercase()),
+        Some(_) => format!(", shown as {} for now", tab.view_mode.name().to_lowercase()),
+        None => String::new(),
+    };
+    format!("This folder: {sorted}{shown}.")
+}
+
+/// Which rules sort the folder on screen, in words, with the link that changes it.
+fn sorted_by(app: &AppState, recipe: &Recipe) -> Here {
     if !app.settings.custom_sort {
-        return Here { text: "Custom sort is off.".into(), short: "Custom sort is off.".into(), link: Some(HereLink::TurnOn), ..Here::default() };
+        return Here { text: "Sort rules are off.".into(), short: "Sort rules are off.".into(), link: Some(HereLink::TurnOn), ..Here::default() };
     }
     let tab = app.tab();
     let path = &tab.folder.path;
     let name = app.display_name(path);
-    if path.is_empty() {
+    if keeps_its_order(tab) {
         return Here { text: format!("On screen: {name}, which these rules don't sort."), short: format!("{name}: no rules sort it"), ..Here::default() };
     }
     if tab.column_now {
@@ -881,7 +988,7 @@ fn here(app: &AppState, recipe: &Recipe) -> Here {
             };
             let short = if own { format!("{name}: its own rules{at}") } else { format!("{name}: the rules for {label}{at}") };
             let marked = recipe.blocks.iter().filter(|b| starts.iter().any(|&s| b.start <= s && s <= b.end)).map(|b| (b.start, b.end)).collect();
-            Here { text, short, link: None, line, marked }
+            Here { text, short, does: String::new(), link: None, line, marked }
         }
         Source::Everywhere => Here { text: format!("On screen: {name}, sorted by the rules for every folder."), short: format!("{name}: the rules for every folder"), ..Here::default() },
         Source::Nothing => Here { text: format!("On screen: {name}. No rules here sort it, so its column does."), short: format!("{name}: its column (no rules for it)"), ..Here::default() },
@@ -1048,6 +1155,7 @@ impl SortWindow {
         self.renderer.set_font(&theme.font, 1.0);
         self.renderer.set_title_font(&theme.title_font);
         self.char_w = 0.0;
+        self.lean = theme.lean(ksize::BUTTON_LEAN);
         if CLASSIC.with(|c| c.replace(theme.era.classic())) != theme.era.classic() {
             // 98 / 2000's frame comes or goes: what's inside it changes size.
             let mut rc = RECT::default();
@@ -1129,12 +1237,14 @@ impl SortWindow {
             unsafe {
                 let _ = GetWindowRect(self.hwnd, &mut now);
             }
-            let r = detached_rect(app.settings.sort_bounds, now, self.scale());
+            let char_w = if self.char_w > 0.0 { self.char_w } else { self.s.mono * 0.6 };
+            let want = (wanted_width(&self.text, self.shape, char_w) * self.scale()) as i32;
+            let r = detached_rect(app.settings.sort_bounds, now, self.scale(), want);
             app.settings.sort_bounds = Some([r.left, r.top, r.right - r.left, r.bottom - r.top]);
         } else {
             self.remember_place(app);
         }
-        app.settings.sort_detached = detached;
+        app.settings.sort_docked = !detached;
         app.sort_caret = Some((self.caret, self.scroll.1));
         asks.push(Ask::Job(Job::Reopen));
         asks
@@ -1592,7 +1702,7 @@ impl SortWindow {
         }
     }
 
-    /// The link on the line above the rules box: custom sort on, with the rules as typed (which
+    /// The link on the line above the rules box: sort rules on, with the rules as typed (which
     /// also puts a folder sorted by a column for now back to them).
     fn use_rules(&mut self, app: &mut AppState) -> Vec<Ask> {
         self.flips.start("on", true, self.now(), kit::SWITCH_TIME);
@@ -1655,7 +1765,10 @@ impl SortWindow {
         }
         self.here_lines = lines;
         l.here = Rect::new(pad, y, w - 2.0 * pad, s.here_h * self.here_lines.len().max(1) as f32);
-        y += l.here.h + 6.0;
+        // Under it, what those rules do there: one line, under the words (drawn with "…" where
+        // it doesn't fit).
+        l.does = Rect::new(pad + bar_w, l.here.bottom(), w - 2.0 * pad - bar_w, s.here_h);
+        y = l.does.bottom() + 6.0;
         // START FROM…'s question, when it asks.
         if let Some(i) = self.confirm {
             let name = sortrecipe::PRESETS.get(i).map_or("", |p| p.0);
@@ -1791,12 +1904,12 @@ impl SortWindow {
             let th = self.s.title_h;
             let bar = Rect::new(0.0, 0.0, self.size.0, th);
             kit::title_bar(r, &theme, bar, self.active);
-            let (x, name) = match shape {
-                Shape::Wide => (kit::logo(r, &theme, bar) + 10.0, TITLE),
-                Shape::Slim => (crate::logo::draw_small(r, &theme, bar) + 10.0, TITLE),
-                Shape::Compact => (12.0, "Sort order"),
+            let x = match shape {
+                Shape::Wide => kit::logo(r, &theme, bar) + 10.0,
+                Shape::Slim => crate::logo::draw_small(r, &theme, bar) + 10.0,
+                Shape::Compact => 12.0,
             };
-            crate::retro::title(r, &theme, Rect::new(x, 0.0, (l.detach.x - x).max(0.0), th), name, self.active);
+            crate::retro::title(r, &theme, Rect::new(x, 0.0, (l.detach.x - x).max(0.0), th), TITLE, self.active);
             let detach = Look { hover: self.hover == Some(Hot::Detach), pressed: self.pressed == Some(Hot::Detach), focused: false, enabled: true };
             if shape == Shape::Wide {
                 kit::button(r, &theme, l.detach, if self.detached { "DOCK" } else { "DETACH" }, detach);
@@ -1817,31 +1930,29 @@ impl SortWindow {
         let flip = self.flips.at("on", on, now);
         let (undo_look, redo_look, more_look) =
             (Look { enabled: !self.undo.is_empty(), ..look(Hot::Undo, self) }, Look { enabled: !self.redo.is_empty(), ..look(Hot::Redo, self) }, look(Hot::More, self));
+        let end = self.words_end();
         {
             let r = &mut self.renderer;
             kit::toggle(r, &theme, l.switch, flip, switch_look);
-            let label = match (shape, on) {
-                (Shape::Compact, _) => "Custom sort",
-                (_, true) => "Custom sort is on",
-                (_, false) => "Off: the columns decide",
-            };
+            let label = switch_label(shape, on);
             // (Up to the first button right of it.)
             let x = l.switch.right() + if shape == Shape::Slim { 8.0 } else { 10.0 };
-            let end = [l.undo, l.guide_button].iter().find(|b| b.w > 0.0).map_or(self.size.0, |b| b.x - 8.0);
             r.text(label, Rect::new(x, l.switch.y - 4.0, (end - x).max(0.0), l.switch.h + 8.0), &TextStyle::new(theme.text));
             match shape {
                 Shape::Wide => {
-                    kit::button(r, &theme, l.start_from, "START FROM\u{2026}", start_look);
-                    kit::button(r, &theme, l.guide_button, guide_label(app), guide_look);
+                    // GUIDE and START FROM… side by side: they lean only where they meet.
+                    kit::button_beside(r, &theme, l.start_from, "START FROM\u{2026}", start_look, Beside::LEFT);
+                    kit::button_beside(r, &theme, l.guide_button, guide_label(app), guide_look, Beside::RIGHT);
                 }
                 Shape::Slim => {
-                    icon_face(r, &theme, l.guide_button, Glyph::Help, guide_look);
-                    icon_face(r, &theme, l.start_from, Glyph::Menu, start_look);
+                    icon_face(r, &theme, l.guide_button, Glyph::Help, guide_look, Beside::RIGHT);
+                    icon_face(r, &theme, l.start_from, Glyph::Menu, start_look, Beside::LEFT);
                 }
                 Shape::Compact => {
                     icon_button(r, &theme, l.undo, Glyph::Undo, undo_look);
                     icon_button(r, &theme, l.redo, Glyph::Redo, redo_look);
-                    icon_face(r, &theme, l.more, Glyph::More, more_look);
+                    // ⋯ is the only box in its row (undo and redo are bare icons), so straight.
+                    icon_face(r, &theme, l.more, Glyph::More, more_look, Beside::NONE);
                 }
             }
         }
@@ -1898,10 +2009,11 @@ impl SortWindow {
         let link_w = link.map_or(0.0, |t| r.measure(t, &link_style) + 4.0);
         let mut x = l.x;
         if !self.here.marked.is_empty() {
-            // (One column: a little thinner and shorter.)
+            // (One column: a little thinner and shorter.) It runs down past the line under the
+            // words too, which is about the same rules.
             let (bw, bh, gap) = if self.shape == Shape::Compact { (2.0, 11.0, 8.0) } else { (2.5, 12.0, 9.0) };
             let inset = ((s.here_h - bh) / 2.0).max(0.0);
-            r.fill_rect(Rect::new(x, l.y + inset, bw, l.h - 2.0 * inset), theme.accent);
+            r.fill_rect(Rect::new(x, l.y + inset, bw, self.lay.does.bottom() - l.y - 2.0 * inset), theme.accent);
             x += gap;
         }
         let hot = self.here.line.is_some() && self.hover == Some(Hot::Here);
@@ -1925,6 +2037,8 @@ impl SortWindow {
             }
             self.here_link = rect;
         }
+        // What the rules do there, in a plain sentence.
+        r.text(&self.here.does, self.lay.does, &here_style(theme.muted, s.here_font));
     }
 
     /// START FROM…'s question, when it asks: replace the rules, or keep them.
@@ -1940,8 +2054,8 @@ impl SortWindow {
         for (i, line) in self.confirm_lines.iter().enumerate() {
             r.text(line, Rect::new(l.confirm.x + 12.0, l.confirm.y + 10.0 + i as f32 * 18.0, l.confirm.w - 24.0, 18.0), &TextStyle::new(theme.text));
         }
-        kit::button(r, theme, l.keep, "KEEP MINE", keep);
-        kit::primary_button(r, theme, l.replace, "REPLACE", replace);
+        kit::button_beside(r, theme, l.keep, "KEEP MINE", keep, Beside::RIGHT);
+        kit::primary_button_beside(r, theme, l.replace, "REPLACE", replace, Beside::LEFT);
     }
 
     fn paint_editor(&mut self, theme: &Theme) {
@@ -2348,6 +2462,11 @@ impl SortWindow {
         Point::new((lparam.0 & 0xffff) as i16 as f32 / s - b, ((lparam.0 >> 16) & 0xffff) as i16 as f32 / s - b)
     }
 
+    /// Where the switch's words end: a little before the first button right of them.
+    fn words_end(&self) -> f32 {
+        [self.lay.undo, self.lay.guide_button].iter().find(|b| b.w > 0.0).map_or(self.size.0, |b| b.x - 8.0)
+    }
+
     fn hot_at(&self, p: Point) -> Option<Hot> {
         if let Some(k) = self.suggestion_rects.iter().position(|r| r.contains(p)) {
             let first = self.pick.saturating_sub(POPUP_MAX - 1).min(self.completion.items.len().saturating_sub(self.suggestion_rects.len()));
@@ -2365,21 +2484,23 @@ impl SortWindow {
                 return Some(hot);
             }
         }
-        // The buttons first: in a narrow window the switch's words reach under them.
-        if l.start_from.contains(p) {
+        // The buttons, in their exact shapes: the corner left empty by a slant isn't the button.
+        if crate::pathbar::box_contains_beside(l.start_from, self.lean, Beside::LEFT, p) {
             return Some(Hot::StartFrom);
         }
-        if l.guide_button.contains(p) {
+        if crate::pathbar::box_contains_beside(l.guide_button, self.lean, Beside::RIGHT, p) {
             return Some(Hot::Guide);
         }
-        if kit::toggle_contains(l.switch, p) || Rect::new(l.switch.right(), l.switch.y - 4.0, 180.0, l.switch.h + 8.0).contains(p) {
+        // Its words too, up to where they end: the corner a slanted button leaves empty isn't them.
+        let words = (self.words_end() - l.switch.right()).clamp(0.0, 180.0);
+        if kit::toggle_contains(l.switch, p) || Rect::new(l.switch.right(), l.switch.y - 4.0, words, l.switch.h + 8.0).contains(p) {
             return Some(Hot::Switch);
         }
         if self.confirm.is_some() {
-            if l.replace.contains(p) {
+            if crate::pathbar::box_contains_beside(l.replace, self.lean, Beside::LEFT, p) {
                 return Some(Hot::Replace);
             }
-            if l.keep.contains(p) {
+            if crate::pathbar::box_contains_beside(l.keep, self.lean, Beside::RIGHT, p) {
                 return Some(Hot::Keep);
             }
         }
@@ -2937,7 +3058,31 @@ impl SortWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::Settings;
+    use crate::settings::{Settings, ViewMode};
+
+    /// On its own at first: in the middle of the screen, wide enough for the longest line (the
+    /// starter's), never wider than the screen allows nor taller than it.
+    #[test]
+    fn opens_in_the_middle_wide_enough() {
+        let r = in_the_middle(RECT { left: 0, top: 0, right: 1920, bottom: 1040 }, 800, 320);
+        assert_eq!((r.left, r.right - r.left, r.top, r.bottom - r.top), (560, 800, 104, 832));
+        // A second screen to the left, and a width too big for it.
+        let r = in_the_middle(RECT { left: -1280, top: 0, right: 0, bottom: 1024 }, 5000, 320);
+        assert_eq!((r.left, r.right), (-1216, -64));
+        // A tiny screen.
+        let r = in_the_middle(RECT { left: 0, top: 0, right: 640, bottom: 300 }, 600, 320);
+        assert_eq!((r.top, r.bottom), (0, 300));
+        // The starter's longest line fits whole in the rules box, in every layout.
+        let longest = sortrecipe::STARTER.lines().map(|l| l.chars().count()).max().unwrap();
+        for shape in [Shape::Wide, Shape::Slim, Shape::Compact] {
+            let (s, cw) = (Sizes::of(shape), 7.0);
+            let room = wanted_width(sortrecipe::STARTER, shape, cw) - 2.0 * s.pad - 2.0 * BOX_PAD - (GUTTER_MARK + 2.0 * cw + GUTTER_GAP) - 30.0;
+            assert!(room >= longest as f32 * cw + 48.0, "{shape:?}");
+        }
+        // Short rules, or none: the layout's own width.
+        assert_eq!(wanted_width("-a_to_z\n", Shape::Wide, 7.0), 470.0);
+        assert_eq!(wanted_width("", Shape::Compact, 7.0), 360.0);
+    }
 
     #[test]
     fn ctrl_slash_makes_lines_notes_and_back() {
@@ -3030,6 +3175,23 @@ mod tests {
         assert_eq!(here(&app, &Recipe::parse("-a_to_z\nin C:\\t\\sub (\n-newest_first\n)")).short, "sub: its own rules (line 2)");
     }
 
+    /// The window is "Folder rules" in every layout; its switch is "Sort rules".
+    #[test]
+    fn the_window_and_its_switch_go_by_one_name() {
+        assert_eq!(TITLE, "Folder rules");
+        assert_eq!(switch_label(Shape::Compact, true), "Sort rules");
+        assert_eq!(switch_label(Shape::Compact, false), "Sort rules");
+        for shape in [Shape::Slim, Shape::Wide] {
+            assert_eq!(switch_label(shape, true), "Sort rules are on");
+            assert_eq!(switch_label(shape, false), "Off: the columns decide");
+        }
+        // Off: the line says so, with a link that agrees with it.
+        let app = AppState::for_tests(Settings { custom_sort: false, ..Default::default() });
+        let h = here(&app, &Recipe::parse("-a_to_z"));
+        assert_eq!((h.text.as_str(), h.short.as_str()), ("Sort rules are off.", "Sort rules are off."));
+        assert_eq!(h.link.map(HereLink::label), Some("Turn them on"));
+    }
+
     #[test]
     fn says_which_rules_sort_the_folder_on_screen() {
         let say = |on: bool, recipe: &str, column_now: bool| {
@@ -3039,7 +3201,7 @@ mod tests {
             here(&app, &Recipe::parse(recipe))
         };
         let h = say(false, "-a_to_z", false);
-        assert_eq!((h.text.as_str(), h.link), ("Custom sort is off.", Some(HereLink::TurnOn)));
+        assert_eq!((h.text.as_str(), h.link), ("Sort rules are off.", Some(HereLink::TurnOn)));
         assert_eq!(say(true, "-a_to_z", true).link, Some(HereLink::UseRules));
         assert_eq!(say(true, "-a_to_z", false).text, "On screen: sub, sorted by the rules for every folder.");
         assert!(say(true, "in C:\\elsewhere (\n-a_to_z\n)", false).text.ends_with("so its column does."));
@@ -3047,6 +3209,178 @@ mod tests {
         assert_eq!((h.text.as_str(), h.line, h.marked.as_slice()), ("On screen: sub, sorted by its own rules (line 2).", Some(2), &[(2, 4)][..]));
         let h = say(true, "in C:\\t (\n-and_subfolders\n-newest_first\n)", false);
         assert_eq!(h.text, "On screen: sub, sorted by the rules for C:\\t and the folders inside it (line 1).");
+    }
+
+    /// The main window's state with `text` as its rules and `path` on screen in its tab, shown
+    /// the way the main window shows that folder.
+    fn showing(path: &str, text: &str, sort_on: bool, views_on: bool) -> AppState {
+        let mut app = AppState::for_tests(Settings { custom_sort: sort_on, custom_views: views_on, sort_recipe: Some(text.into()), ..Default::default() });
+        let (custom, views) = (app.custom_order(), app.view_rules());
+        let t = &mut app.tabs[0];
+        t.folder.path = path.into();
+        t.custom = custom;
+        t.views = Some(views);
+        t.view_mode = t.view_for(path);
+        app
+    }
+
+    const RULES: &str = "-newest_first\n-folder_first\nin C:\\pics (\n-large_icons\n)\nin C:\\own (\n-z_to_a\n-list\n)\nin C:\\deep (\nand_subfolders\n-biggest_first\n-tree\n)";
+
+    /// The sentence under "On screen", pattern by pattern.
+    #[test]
+    fn says_what_the_rules_do_for_the_folder_on_screen() {
+        let said = |path: &str, text: &str, sort_on: bool, views_on: bool| in_effect(&showing(path, text, sort_on, views_on), &Recipe::parse(text));
+        // The rules for every folder; a folder's own, with its view; a folder above it's.
+        assert_eq!(said("C:\\t", RULES, true, true), "This folder: folders first, then newest first.");
+        assert_eq!(said("C:\\own", RULES, true, true), "This folder: Z to A, shown as list.");
+        assert_eq!(said("C:\\deep\\a\\b", RULES, true, true), "This folder: biggest first, shown as tree.");
+        // Only a view rule fits: sorted as every folder is, shown as the rule says.
+        assert_eq!(said("C:\\pics", RULES, true, true), "This folder: folders first, then newest first, shown as large icons.");
+        // ...and with no rules for every folder, its column sorts it.
+        let just_views = "in C:\\pics (\n-large_icons\n)";
+        assert_eq!(said("C:\\pics", just_views, true, true), "This folder: sorted by the Name column, shown as large icons.");
+        // No rule fits the folder: its column.
+        assert_eq!(said("C:\\t", just_views, true, true), "This folder: sorted by the Name column.");
+        assert_eq!(said("C:\\t", "", true, true), "This folder: sorted by the Name column.");
+        assert_eq!(said("C:\\t", "# a note\n-newest_frist", true, true), "This folder: sorted by the Name column.");
+        // Sort rules off: the column, whatever the rules say. A view rule still shows the folder its way.
+        assert_eq!(said("C:\\t", RULES, false, true), "This folder: sorted by the Name column.");
+        assert_eq!(said("C:\\own", RULES, false, true), "This folder: sorted by the Name column, shown as list.");
+        // View rules off: nothing about views.
+        assert_eq!(said("C:\\own", RULES, true, false), "This folder: Z to A.");
+        assert_eq!(said("C:\\pics", RULES, false, false), "This folder: sorted by the Name column.");
+        // A view for every folder.
+        assert_eq!(said("C:\\t", "-a_to_z\n-extra_large_icons", true, true), "This folder: A to Z, shown as extra large icons.");
+        assert_eq!(said("C:\\t", "-medium_icons", true, true), "This folder: sorted by the Name column, shown as medium icons.");
+        assert_eq!(said("C:\\t", "-details", false, true), "This folder: sorted by the Name column, shown as details.");
+        // The Recycle Bin is sorted by the rules, but keeps its own view.
+        assert_eq!(said(recycle::LOCATION, "-a_to_z\n-large_icons", true, true), "This folder: A to Z.");
+    }
+
+    /// A column clicked there sorts it "for now", and a view picked by hand under a view rule
+    /// shows "for now": the sentence says which column and which view.
+    #[test]
+    fn the_sentence_says_what_is_just_for_now() {
+        let rules = Recipe::parse(RULES);
+        let mut app = showing("C:\\own", RULES, true, true);
+        app.tabs[0].column_now = true;
+        app.tabs[0].sort = folder::SortKey::Size;
+        assert_eq!(in_effect(&app, &rules), "This folder: sorted by the Size column for now, shown as list.");
+        app.tabs[0].view_mode = ViewMode::ExtraLarge;
+        assert_eq!(in_effect(&app, &rules), "This folder: sorted by the Size column for now, shown as extra large icons for now.");
+        app.tabs[0].column_now = false;
+        assert_eq!(in_effect(&app, &rules), "This folder: Z to A, shown as extra large icons for now.");
+        // Without a view rule, a view picked by hand is the folder's: nothing to say.
+        let mut app = showing("C:\\t", RULES, true, true);
+        app.tabs[0].view_mode = ViewMode::Large;
+        assert_eq!(in_effect(&app, &rules), "This folder: folders first, then newest first.");
+        // Every column by the title the list gives it.
+        use folder::SortKey as K;
+        let titles = [(K::Name, "Name"), (K::Date, "Date modified"), (K::Type, "Type"), (K::Size, "Size"), (K::Created, "Date created"), (K::Folder, "Folder"), (K::Dimensions, "Image dimensions"), (K::Length, "Duration")];
+        for (key, title) in titles {
+            assert_eq!(column_name(key), title);
+            let mut app = showing("C:\\t", RULES, false, true);
+            app.tabs[0].sort = key;
+            assert_eq!(in_effect(&app, &rules), format!("This folder: sorted by the {title} column."));
+        }
+    }
+
+    /// This PC, Home, Disk space and duplicates keep an order of their own: both lines say that
+    /// no rules sort them, whatever the rules and switches are.
+    #[test]
+    fn places_with_their_own_order_say_no_rules_sort_them() {
+        let disk = diskspace::location("C:\\");
+        for path in ["", recent::LOCATION, disk.as_str()] {
+            for (sort_on, column_now) in [(true, false), (true, true), (false, false)] {
+                let mut app = showing(path, RULES, sort_on, true);
+                app.tabs[0].column_now = column_now;
+                let h = here(&app, &Recipe::parse(RULES));
+                assert_eq!(h.does, "Sort rules don't apply here.", "{path:?}");
+                if sort_on {
+                    assert!(h.text.ends_with(", which these rules don't sort."), "{}", h.text);
+                    assert!(h.short.ends_with(": no rules sort it"), "{}", h.short);
+                    assert_eq!((h.link, h.line, h.marked.len()), (None, None, 0));
+                } else {
+                    assert_eq!(h.text, "Sort rules are off.");
+                }
+                assert!(app.tab().custom_here().is_none() || diskspace::is_disk(path), "the main window agrees");
+            }
+        }
+        // Duplicates, in their sets: the folder is a real one, but its rules wait.
+        let mut app = showing("C:\\own", RULES, true, true);
+        let mut dupes = crate::search::test_search("C:\\own");
+        dupes.dupes = Some(Default::default());
+        app.tabs[0].search = Some(dupes);
+        let h = here(&app, &Recipe::parse(RULES));
+        assert_eq!((h.does.as_str(), h.short.as_str()), ("Sort rules don't apply here.", "own: no rules sort it"));
+        assert!(app.tab().custom_here().is_none());
+        // A search for names in the same folder is sorted by its rules as usual.
+        app.tabs[0].search = Some(crate::search::test_search("C:\\own"));
+        assert_eq!(here(&app, &Recipe::parse(RULES)).does, "This folder: Z to A, shown as list.");
+    }
+
+    /// The sentence follows what the main window really does with the rules: it speaks of the
+    /// rules exactly when they sort the tab (`Tab::custom_here`), of a column otherwise, and of a
+    /// view exactly when the view rules give the folder one (`Tab::view_ruled`).
+    #[test]
+    fn the_sentence_is_true_to_the_main_window() {
+        let texts = [RULES, "in C:\\pics (\n-large_icons\n)\nin C:\\own (\n-z_to_a\n-list\n)", "", "-large_icons", "-a_to_z", "# only a note"];
+        let paths = ["C:\\t", "C:\\pics", "C:\\own", "C:\\OWN\\", "C:\\own\\inside", "C:\\deep\\a", recycle::LOCATION];
+        let mut seen = 0;
+        for text in texts {
+            let rules = Recipe::parse(text);
+            for (sort_on, views_on) in [(true, true), (true, false), (false, true), (false, false)] {
+                for path in paths {
+                    for by_hand in [false, true] {
+                        let mut app = showing(path, text, sort_on, views_on);
+                        let sorted_by_rules = app.tab().custom_here().is_some();
+                        let ruled = app.tab().view_ruled();
+                        if by_hand {
+                            // A column clicked where the rules sorted, and another view picked.
+                            app.tabs[0].column_now = sorted_by_rules;
+                            app.tabs[0].view_mode = if app.tabs[0].view_mode == ViewMode::Medium { ViewMode::Details } else { ViewMode::Medium };
+                        }
+                        let said = in_effect(&app, &rules);
+                        let why = format!("{said:?} for {path} with {text:?} (sort {sort_on}, views {views_on}, by hand {by_hand})");
+                        assert!(said.starts_with("This folder: ") && said.ends_with('.') && !said.contains('\n'), "{why}");
+                        let t = app.tab();
+                        assert_eq!(said.contains(" column"), t.custom_here().is_none(), "{why}");
+                        assert_eq!(said.contains(" column for now"), by_hand && sorted_by_rules, "{why}");
+                        assert_eq!(said.contains(", shown as "), ruled, "{why}");
+                        assert_eq!(said.ends_with(" icons for now.") || said.ends_with("details for now."), by_hand && ruled, "{why}");
+                        if ruled {
+                            assert!(said.contains(&format!(", shown as {}", t.view_mode.name().to_lowercase())), "the view on screen: {why}");
+                        }
+                        // The same again: nothing in it depends on when it's asked.
+                        assert_eq!(in_effect(&app, &rules), said);
+                        seen += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(seen, 6 * 4 * 7 * 2);
+    }
+
+    /// Odd folder names, long paths and a great many rules: still one sentence, and a short one.
+    #[test]
+    fn the_sentence_copes_with_odd_names_and_many_rules() {
+        // An emoji, a #, a dotted I and an n with a tilde in the folder's name (quoted in the
+        // rules, as a # would start a note there).
+        let odd = "C:\\t\\\u{1f600} #1 \u{130}\u{f1}";
+        let text = format!("-a_to_z\nin \"{odd}\" (\n-biggest_first\n-folder_last\n-large_icons\n)");
+        assert_eq!(in_effect(&showing(odd, &text, true, true), &Recipe::parse(&text)), "This folder: folders last, then biggest first, shown as large icons.");
+        assert_eq!(in_effect(&showing("C:\\t", &text, true, true), &Recipe::parse(&text)), "This folder: A to Z.");
+        // A path 300 letters long.
+        let long = format!("C:\\{}", "a".repeat(300));
+        let text = format!("in {long} (\n-oldest\n-list\n)");
+        assert_eq!(in_effect(&showing(&long, &text, true, true), &Recipe::parse(&text)), "This folder: oldest first, shown as list.");
+        // Thousands of kinds: counted, not listed.
+        let many: String = (0..5000).map(|i| format!("-name_has_x{i}\n")).collect();
+        let said = in_effect(&showing("C:\\t", &many, true, true), &Recipe::parse(&many));
+        assert_eq!(said, "This folder: names with \"x0\" first, then 4999 more kinds, then A to Z.");
+        // The starter rules, as a new Glint has them.
+        let said = in_effect(&showing("C:\\t", sortrecipe::STARTER, true, true), &Recipe::parse(sortrecipe::STARTER));
+        assert_eq!(said, "This folder: folders first, then 4 more kinds, programs last, then newest first.");
     }
 
     #[test]

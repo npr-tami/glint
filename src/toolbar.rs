@@ -11,9 +11,10 @@
 //! - The filter box filters the list live as you type (several words, or a pattern like `*.pdf`;
 //!   the first match is selected and Enter opens it, Down goes to the list); Esc or its × clears
 //!   it. The switch at its right end (Ctrl+Shift+F) makes it search the subfolders too (search.rs).
-//! - SORT, VIEW and SETTINGS are word buttons in the skin's shape - slanted in AMD Radeon (both
-//!   sides lean the same way). With `buttons: liquid` they are glossy capsules with white words,
-//!   and the sidebar switch, back, forward, up and refresh are glass marbles with white signs.
+//! - SORT, VIEW and SETTINGS are word buttons in the skin's shape - slanted in AMD Radeon where
+//!   they meet (the sides between them lean the same way; SORT's left side and SETTINGS' right
+//!   side have nothing beside them and are straight). With `buttons: liquid` they are glossy
+//!   capsules with white words, and the sidebar switch, back, forward, up and refresh are glass marbles with white signs.
 //!   SORT opens a popup menu; VIEW a menu of the six views (Ctrl+Shift+1 to 6; list.rs, views.rs)
 //!   and the sidebar and status bar switches; SETTINGS opens the Settings window (settingswin.rs),
 //!   and right-clicking it opens a small menu of the quickest choices.
@@ -29,7 +30,7 @@ use windows::Win32::UI::Shell::{SHAutoComplete, SHACF_AUTOAPPEND_FORCE_OFF, SHAC
 use crate::app::{AppState, SortKey};
 use crate::settings::ViewMode;
 use crate::frame;
-use crate::pathbar::{box_contains, fill_box, fill_box_paint, fill_field, PathBar, PathHit};
+use crate::pathbar::{box_contains_beside, fill_box, fill_box_paint_beside, fill_field, Beside, PathBar, PathHit};
 use crate::render::{Align, Renderer, TextStyle};
 use crate::shell;
 use crate::textbox::{TextBox, TextEvent, TextEventKind};
@@ -38,6 +39,16 @@ use crate::retrotool::{self, Look, Tool};
 use crate::parts::{ToolButtons, P};
 use crate::theme::{size, ButtonStyle, Color, Era, Theme};
 use crate::ui::{Command, Component, Ctx, CursorKind, DropTarget, Effect, Menu, MenuItem, MouseButton, MouseEvent, Point, Rect};
+
+/// Which sides of SORT, VIEW or SETTINGS have another of them beside it: the sides between them
+/// lean, the two outer ones are straight.
+fn beside(part: Part) -> Beside {
+    match part {
+        Part::Sort => Beside::RIGHT,
+        Part::View => Beside::BOTH,
+        _ => Beside::LEFT,
+    }
+}
 
 /// Text box ids (100-199 belong to the toolbar).
 const PATH_BOX: u16 = 100;
@@ -167,8 +178,8 @@ pub struct Toolbar {
     /// The filter text the box shows, to notice when the tab's filter changes under us.
     shown_filter: String,
     shown_tab: u64,
-    /// Whether the filter box's grey hint says it searches subfolders.
-    hint_subfolders: bool,
+    /// The filter box's grey hint as it reads now (`search_hint`).
+    hint: &'static str,
     /// The paths behind the items of the last "…" popup (item id - 1).
     menu_paths: Vec<String>,
     /// The path the last menu was about (the path's right-click menu; SETTINGS > When Glint
@@ -196,7 +207,8 @@ impl Toolbar {
     /// Creates the toolbar and its (hidden) text boxes as children of the main window.
     pub fn new(hwnd: HWND) -> Toolbar {
         let filter_box = TextBox::new(hwnd, FILTER_BOX);
-        filter_box.set_hint("Search bar");
+        let hint = search_hint(false, "");
+        filter_box.set_hint(hint);
         // Window shortcuts (Ctrl+Shift+F, Ctrl+T...) work while typing in these boxes too.
         filter_box.pass_shortcuts();
         let path_box = TextBox::new(hwnd, PATH_BOX);
@@ -216,7 +228,7 @@ impl Toolbar {
             autocomplete: false,
             shown_filter: String::new(),
             shown_tab: 0,
-            hint_subfolders: false,
+            hint,
             menu_paths: Vec::new(),
             menu_target: String::new(),
             repaint_until: 0.0,
@@ -401,7 +413,7 @@ impl Toolbar {
 
     fn part_at(&self, p: Point, app: &AppState) -> Option<Part> {
         PARTS.into_iter().find(|&part| match part {
-            Part::Sort | Part::View | Part::Settings => box_contains(self.rect_of(part), self.lean, p),
+            Part::Sort | Part::View | Part::Settings => box_contains_beside(self.rect_of(part), self.lean, beside(part), p),
             Part::FilterClear => !app.tab().filter.is_empty() && self.rect_of(part).contains(p),
             _ => self.rect_of(part).contains(p),
         })
@@ -632,15 +644,15 @@ impl Toolbar {
                 key(7, "Date created", SortKey::Created),
                 key(3, "Type", SortKey::Type),
                 key(4, "Size", SortKey::Size),
-                key(10, "Picture size", SortKey::Dimensions),
-                key(11, "Length", SortKey::Length),
+                key(10, "Image dimensions", SortKey::Dimensions),
+                key(11, "Duration", SortKey::Length),
                 MenuItem::separator(),
                 MenuItem::new(5, "Ascending").checked(!t.descending && !here),
                 MenuItem::new(6, "Descending").checked(t.descending && !here),
                 MenuItem::separator(),
                 // (Not checked while a column sorts this folder for now: picking it brings the rules back.)
-                MenuItem::new(8, "Custom order").checked(custom && !t.column_now),
-                MenuItem::new(9, "Edit custom order\u{2026}"),
+                MenuItem::new(8, "Sort rules").checked(custom && !t.column_now),
+                MenuItem::new(9, "Edit folder rules\u{2026}"),
             ],
             right_aligned: false,
         })
@@ -661,8 +673,8 @@ impl Toolbar {
         items.push(MenuItem::new(VIEW_STATUS_BAR, "Status bar").checked(app.settings.show_status_bar));
         items.push(MenuItem::new(VIEW_SPLIT, "Split view\tCtrl+\\").checked(app.split.is_some()));
         items.push(MenuItem::separator());
-        items.push(MenuItem::new(VIEW_CUSTOM, "Custom views").checked(app.settings.custom_views));
-        items.push(MenuItem::new(VIEW_RULES, "Edit custom views\u{2026}"));
+        items.push(MenuItem::new(VIEW_CUSTOM, "View rules").checked(app.settings.custom_views));
+        items.push(MenuItem::new(VIEW_RULES, "Edit folder rules\u{2026}"));
         Effect::Menu(Menu { tag: MENU_VIEW, at: Point::new(b.x, b.bottom() + 2.0), items, right_aligned: false })
     }
 
@@ -751,7 +763,7 @@ impl Toolbar {
     /// The filter's words (or its grey hint) where Windows' box would show them.
     fn paint_filter_words(&self, r: &mut Renderer, theme: &Theme, app: &AppState) {
         let words = &app.tab().filter;
-        let (text, color) = if words.is_empty() { (if self.hint_subfolders { "Search subfolders" } else { "Search bar" }, theme.muted) } else { (words.as_str(), theme.text) };
+        let (text, color) = if words.is_empty() { (self.hint, theme.muted) } else { (words.as_str(), theme.text) };
         // (Where Windows' box puts its first letter: its font's edge sits 3 DIPs in.)
         let at = self.filter_edit_rect();
         r.text(text, Rect::new(at.x + 3.0, at.y, (at.w - 3.0).max(0.0), at.h), &TextStyle::new(color));
@@ -1023,14 +1035,15 @@ impl Component for Toolbar {
                 }
                 let paint = &if hot { theme.chip_hover_paint } else { theme.through(&theme.chip_paint) };
                 if hot {
-                    crate::pathbar::under_box(r, theme, b, self.lean, paint);
+                    crate::pathbar::under_box_beside(r, theme, b, self.lean, beside(part), paint);
                 }
                 if self.lean > 0.0 {
-                    fill_box_paint(r, theme, b, self.lean, paint);
+                    fill_box_paint_beside(r, theme, b, self.lean, beside(part), paint);
                 } else {
                     r.fill_paint(b, theme.button_corner(b.h), paint);
                 }
-                self.paint_face(r, b, part, label, &TextStyle::new(theme.button_text).semibold().align(Align::Center));
+                let middle = crate::pathbar::face(b, self.lean, beside(part));
+                self.paint_face(r, middle, part, label, &TextStyle::new(theme.button_text).semibold().align(Align::Center));
             }
         }
     }
@@ -1311,13 +1324,27 @@ impl Component for Toolbar {
             self.shown_tab = tab.id;
             self.filter_box.set_text(&self.shown_filter);
         }
-        // The grey hint says what the filter does: filter this folder, or search below it too.
-        let subfolders = app.subfolders && !tab.path.is_empty();
-        if subfolders != self.hint_subfolders {
-            self.hint_subfolders = subfolders;
-            self.filter_box.set_hint(if subfolders { "Search subfolders" } else { "Search bar" });
+        // The grey hint says what the filter does: filter this folder, search below it too, or
+        // search Home.
+        let hint = search_hint(app.subfolders, &tab.path);
+        if hint != self.hint {
+            self.hint = hint;
+            self.filter_box.set_hint(hint);
         }
         now < self.repaint_until
+    }
+}
+
+/// The search bar's grey hint in the place at `path`. On Home it says it searches Home, whatever
+/// the "Search subfolders" switch says (Home has no subfolders to search). Elsewhere it says
+/// whether subfolders are searched too; This PC ("") has its own search of every drive.
+fn search_hint(subfolders: bool, path: &str) -> &'static str {
+    if crate::recent::is_recent(path) {
+        "Search Home"
+    } else if subfolders && !path.is_empty() {
+        "Search subfolders"
+    } else {
+        "Search bar"
     }
 }
 
@@ -1376,6 +1403,27 @@ mod tests {
         assert!(cos > 0.95, "the head points along the circle, not across it ({cos})");
         // The opening is at the top right: the circle starts at the right and ends above it.
         assert!(arc[0].x > c.x && end.y < c.y && end.x > c.x);
+    }
+
+    /// On Home the search bar's hint says "Search Home", with "Search subfolders" on or off;
+    /// everywhere else it reads as it did.
+    #[test]
+    fn the_search_bar_hint_says_search_home_on_home() {
+        let home = crate::recent::LOCATION;
+        assert_eq!(search_hint(false, home), "Search Home");
+        assert_eq!(search_hint(true, home), "Search Home", "whatever the switch says");
+        assert_eq!(search_hint(true, &home.to_lowercase()), "Search Home", "capitals don't matter");
+        // Folders: the plain hint, or the one for subfolders.
+        let long = format!("C:\\{}", "long name \u{1F600} ".repeat(20));
+        for folder in ["C:\\t", "C:\\Home", "D:\\Fotos #1 \u{130}\u{f1} \u{1F600}", "\\\\server\\share", long.as_str()] {
+            assert_eq!(search_hint(false, folder), "Search bar", "{folder}");
+            assert_eq!(search_hint(true, folder), "Search subfolders", "{folder}");
+        }
+        // This PC, as before: never the subfolders hint.
+        assert_eq!((search_hint(false, ""), search_hint(true, "")), ("Search bar", "Search bar"));
+        // What only looks like Home isn't Home.
+        assert_eq!(search_hint(false, "Home"), "Search bar");
+        assert_eq!(search_hint(false, &format!("{home}\\sub")), "Search bar");
     }
 
     #[test]

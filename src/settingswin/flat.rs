@@ -159,7 +159,7 @@ fn button_style(color: Color) -> TextStyle {
     TextStyle::new(color).size(BUTTON_FONT).align(Align::Center)
 }
 
-/// A button's words: "RESET PAGE" as "Reset page".
+/// A button's words: "RESET THIS PAGE" as "Reset this page".
 pub fn button_text(label: &str) -> String {
     kit::sentence_case(label)
 }

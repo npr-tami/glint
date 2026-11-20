@@ -5,10 +5,10 @@ different rules for different folders. You write the rules as short lines of tex
 
 ## Where to find it
 
-- **SORT > Edit custom order…** opens the editor.
-- **SORT > Custom order** turns your order on or off (it's off until you switch it on).
-  The same switch is in **Settings > Files > Custom sort order**.
-- For views: **VIEW > Edit custom views…**, and **VIEW > Custom views** to switch them on or off
+- **SORT > Edit folder rules…** opens the editor.
+- **SORT > Sort rules** turns your order on or off (it's off until you switch it on).
+  The same switch is in **Settings > Files > Sort rules**.
+- For views: **VIEW > Edit folder rules…**, and **VIEW > View rules** to switch them on or off
   (they're on unless you switch them off).
 
 A folder that none of your rules apply to sorts by the column you click, as usual.

@@ -1,6 +1,6 @@
 [package]
 name = "glint"
-version = "26.11.4"
+version = "26.11.5"
 edition = "2021"
 description = "A fast, lightweight file explorer for Windows that draws everything itself"
 license = "MIT"
@@ -23,14 +23,19 @@ serde_json = "1.0.145"
 # the `windows` crate, so nothing new is downloaded or built.
 windows-core = "=0.62.2"
 # .zip files (archive.rs): browsing and unpacking (Deflate and Deflate64), and making them
-# (Compress to zip, with Deflate).
-zip = { version = "=9.0.3", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64"] }
+# (Compress to zip, with Deflate). "unreserved": files copied from one zip into another keep
+# every extra field they came with - without it, a change inside a zip made on Linux or a Mac
+# is refused (their files carry who owned them there, a field the crate won't write otherwise).
+zip = { version = "=9.0.3", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64", "unreserved"] }
 # The Deflate packer and unpacker the zip code uses: zlib-rs, a pure-Rust zlib (about twice as fast
 # as miniz_oxide both ways), using the fastest code this PC's processor can run.
 flate2 = { version = "=1.1.10", default-features = false, features = ["zlib-rs", "runtime_detection"] }
 # .7z files (archive.rs): browsing and unpacking (LZMA and LZMA2), and making them (Compress to 7z,
 # with LZMA2: "compress" adds the LZMA2 packer of the lzma-rust2 crate it already uses).
 sevenz-rust2 = { version = "=0.24.0", default-features = false, features = ["compress"] }
+# `regex:` in the search bar (folder.rs): a small regular expression engine that never takes long,
+# whatever the pattern.
+regex-lite = "=0.1.9"
 
 [dependencies.windows]
 version = "=0.62.2"

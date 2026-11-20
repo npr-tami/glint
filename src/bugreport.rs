@@ -1,4 +1,4 @@
-//! "Setup info" (Settings > About > COPY): a few lines about this Glint, Windows and the settings that
+//! "System info" (Settings > About > COPY): a few lines about this Glint, Windows and the settings that
 //! change how things behave, put on the clipboard to paste into a bug report. Never a file or
 //! folder name, a pinned place or a person's own skin's name: only Glint's own words and numbers.
 //!
@@ -49,8 +49,8 @@ pub fn text(values: &Map<String, Value>, skins: &[(String, String, String)], m: 
         crate::folder::SortKey::Type => "Type",
         crate::folder::SortKey::Size => "Size",
         crate::folder::SortKey::Created => "Date created",
-        crate::folder::SortKey::Dimensions => "Picture size",
-        crate::folder::SortKey::Length => "Length",
+        crate::folder::SortKey::Dimensions => "Image dimensions",
+        crate::folder::SortKey::Length => "Duration",
         crate::folder::SortKey::Folder => "Folder",
     };
     let order = if b("SortDescending", false) { "reversed" } else { "normal order" };
@@ -60,7 +60,7 @@ pub fn text(values: &Map<String, Value>, skins: &[(String, String, String)], m: 
         "off"
     };
     let startup = match s("Startup").as_str() {
-        "restore" => "Tabs from last time",
+        "restore" => "Previous tabs",
         "thispc" => "This PC",
         "folder" => "A specific folder",
         _ => "User folder",
@@ -74,12 +74,12 @@ pub fn text(values: &Map<String, Value>, skins: &[(String, String, String)], m: 
         format!("Glint {}", crate::log::VERSION),
         m.windows.clone(),
         format!("Screens: {}", m.screens),
-        format!("Portable: {}", if m.portable { "yes" } else { "no" }),
+        format!("Portable mode: {}", if m.portable { "yes" } else { "no" }),
         format!("Skin: {skin}, {theme}"),
         format!("View: {view}, sorted by {sort}, {order}"),
-        format!("Custom order: {custom}"),
-        format!("Custom views: {}", on(b("CustomViews", true))),
-        format!("Open Glint to: {startup}"),
+        format!("Sort rules: {custom}"),
+        format!("View rules: {}", on(b("CustomViews", true))),
+        format!("On startup, open: {startup}"),
         format!("Hidden files: {}", if b("ShowHidden", false) { "shown" } else { "hidden" }),
         format!("Default file explorer: {}", on(m.default_explorer)),
         format!("Win+E opens Glint: {}", on(m.win_e)),
@@ -197,9 +197,9 @@ mod tests {
         assert_eq!(lines[0], format!("Glint {}", crate::log::VERSION));
         assert!(lines.contains(&"Windows 11 24H2 (build 26100.2314)"), "{t}");
         assert!(lines.contains(&"Skin: Gunmetal, dark"), "{t}");
-        assert!(lines.contains(&"View: Details, sorted by Length, reversed"), "{t}");
-        assert!(lines.contains(&"Custom order: on, starter rules"), "{t}");
-        assert!(lines.contains(&"Open Glint to: Tabs from last time"), "{t}");
+        assert!(lines.contains(&"View: Details, sorted by Duration, reversed"), "{t}");
+        assert!(lines.contains(&"Sort rules: on, starter rules"), "{t}");
+        assert!(lines.contains(&"On startup, open: Previous tabs"), "{t}");
         assert!(lines.contains(&"Hidden files: shown"), "{t}");
         assert!(lines.contains(&"Default file explorer: on") && lines.contains(&"Win+E opens Glint: off"), "{t}");
         assert!(lines.contains(&"Errors logged: none"), "{t}");
@@ -217,7 +217,7 @@ mod tests {
         for secret in ["Moonbeam", "someone", "Secret", "Hidden stuff", "diary", "Videos", "Private", "x.txt", "src/"] {
             assert!(!t.contains(secret), "{secret} in:\n{t}");
         }
-        assert!(t.contains("Skin: their own") && t.contains("Custom order: on, own rules") && t.contains("Open Glint to: A specific folder"), "{t}");
+        assert!(t.contains("Skin: their own") && t.contains("Sort rules: on, own rules") && t.contains("On startup, open: A specific folder"), "{t}");
         assert!(t.contains("Errors logged: 2, newest 2026-11-12 16:05"), "{t}");
     }
 
@@ -225,7 +225,7 @@ mod tests {
     fn empty_settings_and_odd_logs_still_give_every_line() {
         let t = text(&Map::new(), &[], &machine());
         assert_eq!(t.split("\r\n").count(), 13, "{t}");
-        assert!(t.contains("Skin: AMD Radeon, as Windows") && t.contains("View: Details, sorted by Name, normal order") && t.contains("Custom order: off"), "{t}");
+        assert!(t.contains("Skin: AMD Radeon, as Windows") && t.contains("View: Details, sorted by Name, normal order") && t.contains("Sort rules: off"), "{t}");
         assert_eq!(errors_in(""), (0, None));
         assert_eq!(errors_in("nonsense\n2026-xx\n    at 2026-11-12 16:02:11  Glint"), (0, None));
         assert_eq!(errors_in("2026-11-12 16:02:11  Glint 1  error: a\n"), (1, Some("2026-11-12 16:02".into())));

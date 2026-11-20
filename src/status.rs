@@ -137,9 +137,11 @@ impl StatusBar {
             // Duplicates (dupes.rs): how many sets, and what deleting the extra copies would free.
             let (sets, extra) = tab.dupes_summary.unwrap_or_else(|| dupes_summary(&tab.folder.entries, &tab.view));
             let mut s = match sets {
-                0 if !search.done => "Looking for duplicates\u{2026}".to_string(),
-                0 => "No duplicates found".to_string(),
+                // Nothing to show so far, or none found: the list says the same words (dupes.rs).
+                0 if !search.done => crate::dupes::CHECKING.to_string(),
+                0 if tab.folder.entries.is_empty() => crate::dupes::NONE_FOUND.to_string(),
                 1 => "1 set of duplicates".to_string(),
+                // (0 of them: it found some, and the search bar hides them all.)
                 n => format!("{} sets of duplicates", format_count(n)),
             };
             if extra > 0 {
@@ -172,6 +174,11 @@ impl StatusBar {
         } else {
             format!("{} items", format_count(total))
         };
+        // The Recycle Bin: how much it holds, right after its items ("9 items  ·  185.2 MB in
+        // Recycle Bin"). Said once, here: the bin has no size of the list below.
+        if let Some(held) = tab.folder.bin.as_ref().and_then(|bin| bin.size_text()) {
+            s.push_str(&format!("  \u{00b7}  {held}"));
+        }
         let (n, bytes) = tab.selection_summary();
         if n > 0 && app.settings.status_selected {
             s.push_str(&format!("  \u{00b7}  {} selected", format_count(n)));
@@ -179,10 +186,12 @@ impl StatusBar {
                 s.push_str(&format!(" ({})", format_size(bytes)));
             }
         }
-        // The folder's total size (its files'; folders have no size here), when it's asked for.
-        if app.settings.status_total && tab.search.is_none() {
+        // The size of the files in the list right now, when it's asked for: what's inside folders
+        // isn't counted (folders have no size here), and it follows the list as the search bar
+        // narrows it or the tree view opens folders. Not in the Recycle Bin, which says what it holds.
+        if app.settings.status_total && tab.search.is_none() && !crate::recycle::is_bin(&tab.folder.path) {
             let sum: u64 = tab.view.iter().filter_map(|&i| tab.folder.entries.get(i as usize)).filter(|e| e.kind == crate::folder::EntryKind::File).map(|e| e.size).sum();
-            s.push_str(&format!("  \u{00b7}  Folder: {}", format_size(sum)));
+            s.push_str(&format!("  \u{00b7}  {}", format_size(sum)));
         }
         if tab.loading.is_some() && tab.path != tab.folder.path {
             s.push_str("  \u{00b7}  loading\u{2026}");
@@ -190,13 +199,8 @@ impl StatusBar {
         // (With the number of items left out, the first thing has no dot before it.)
         let s = s.strip_prefix("  \u{00b7}  ").map(str::to_string).unwrap_or(s);
         let mut s = s;
-        // The custom sort order decides (and for this folder, its own "in …" rules).
-        if let Some(recipe) = tab.custom_here() {
-            match recipe.folder_label(&tab.folder.path) {
-                Some(label) => s.push_str(&format!("  \u{00b7}  Custom sort ({label})")),
-                None => s.push_str("  \u{00b7}  Custom sort"),
-            }
-        } else if tab.column_now {
+        // (Where the folder rules sort the folder, nothing is said: the list shows it.)
+        if tab.column_now && tab.custom_here().is_none() {
             // A column picked here sorts it for now (the custom sort order comes back after).
             s.push_str("  \u{00b7}  Column for now");
         }
@@ -211,9 +215,9 @@ impl StatusBar {
             if let Some(space) = tab.folder.space.as_ref().filter(|_| app.settings.status_free) {
                 parts.push(format!("{} {} free", space.drive, format_size(space.free)));
             }
-            // The Recycle Bin: how much it holds.
-            if let Some(bin) = &tab.folder.bin {
-                parts.push(bin.size_text());
+            // An empty Recycle Bin says so (what a full one holds is on the left, after its items).
+            if let Some(empty) = tab.folder.bin.as_ref().and_then(|bin| bin.empty_text()) {
+                parts.push(empty.to_string());
             }
             if let Some(t) = tab.load_ms.filter(|_| app.settings.status_opened) {
                 parts.push(format!("opened in {}", ms(t)));
@@ -339,17 +343,161 @@ mod tests {
     use crate::settings::Settings;
 
     #[test]
-    fn says_custom_sort_where_it_decides() {
-        let text = |recipe: &str| {
+    fn never_says_folder_rules() {
+        let text = |recipe: &str, column_now: bool| {
             let mut app = AppState::for_tests(Settings { custom_sort: true, sort_recipe: Some(recipe.into()), ..Default::default() });
             app.tabs[0].folder.path = "C:\\t".into();
             app.tabs[0].custom = app.custom_order();
+            app.tabs[0].column_now = column_now;
             StatusBar::left_text(&app)
         };
-        assert!(text("-a_to_z").ends_with("Custom sort"), "{}", text("-a_to_z"));
-        assert!(text("in C:\\t (\n-newest_first\n)").ends_with("Custom sort (C:\\t)"));
+        assert_eq!(text("-a_to_z", false), "0 items");
+        assert_eq!(text("in C:\\t (\n-newest_first\n)", false), "0 items");
+        // Rules for a folder with odd letters in its name: nothing said either.
+        let odd = "C:\\t\\Fotos #1 \u{130}\u{f1} \u{1F600}";
+        let odd_text = |recipe: &str| {
+            let mut app = AppState::for_tests(Settings { custom_sort: true, sort_recipe: Some(recipe.into()), ..Default::default() });
+            app.tabs[0].folder.path = odd.into();
+            app.tabs[0].custom = app.custom_order();
+            StatusBar::left_text(&app)
+        };
+        assert_eq!(odd_text(&format!("in {odd} (\n-newest_first\n)")), "0 items");
         // Rules only for another folder: this one sorts by its column, and says nothing.
-        assert!(!text("in C:\\elsewhere (\n-newest_first\n)").contains("Custom sort"));
+        let elsewhere = text("in C:\\elsewhere (\n-newest_first\n)", false);
+        assert_eq!(elsewhere, "0 items");
+        // A column picked for now, in place of the rules: said as before.
+        assert_eq!(text("-a_to_z", true), "0 items  \u{00b7}  Column for now");
+        // The old words are gone everywhere.
+        for t in [text("-a_to_z", false), text("in C:\\t (\n-newest_first\n)", false), text("-a_to_z", true), elsewhere] {
+            assert!(!t.contains("Custom sort") && !t.contains("Folder rules"), "{t}");
+        }
+    }
+
+    fn entry(name: &str, kind: crate::folder::EntryKind, size: u64) -> crate::folder::Entry {
+        crate::folder::Entry {
+            name: name.into(),
+            lower: name.to_lowercase(),
+            kind,
+            size,
+            modified: 0,
+            created: 0,
+            attributes: 0,
+            ext: crate::folder::extension(name),
+            type_name: std::sync::Arc::from("File"),
+            target: None,
+            free: 0,
+        }
+    }
+
+    /// The state with one tab showing `entries` as the folder C:\t.
+    fn showing(settings: Settings, entries: Vec<crate::folder::Entry>) -> AppState {
+        let mut app = AppState::for_tests(settings);
+        app.tabs[0].path = "C:\\t".into();
+        crate::app::apply_listing(&mut app.tabs[0], crate::folder::Folder { path: "C:\\t".into(), entries, ..Default::default() });
+        app
+    }
+
+    /// The size on the status bar ("4 items  ·  9 KB", no label) is the size of the files in the list right now: what's in folders isn't
+    /// counted, and it shrinks as the search bar narrows the list. Only when it's asked for.
+    #[test]
+    fn the_size_is_the_size_of_the_files_in_the_list() {
+        use crate::folder::EntryKind::{File, Folder};
+        let entries = || vec![entry("a.txt", File, 4096), entry("b #1 \u{130}\u{f1} \u{1F600}.txt", File, 5120), entry("Sub", Folder, 0), entry("Sized", Folder, 1 << 30)];
+        let mut app = showing(Settings { status_total: true, ..Default::default() }, entries());
+        assert_eq!(StatusBar::left_text(&app), "4 items  \u{00b7}  9 KB");
+        // The search bar narrows the list, and the size with it.
+        app.tabs[0].filter = "a.txt".into();
+        app.tabs[0].rebuild_view();
+        assert_eq!(StatusBar::left_text(&app), "1 of 4 items  \u{00b7}  4 KB");
+        app.tabs[0].filter = "\u{1F600}".into();
+        app.tabs[0].rebuild_view();
+        assert_eq!(StatusBar::left_text(&app), "1 of 4 items  \u{00b7}  5 KB");
+        app.tabs[0].filter = "nothing like it".into();
+        app.tabs[0].rebuild_view();
+        assert_eq!(StatusBar::left_text(&app), "0 of 4 items  \u{00b7}  0 B");
+        // With what's selected before it, and without the number of items.
+        app.tabs[0].filter.clear();
+        app.tabs[0].rebuild_view();
+        app.tabs[0].selected[0] = true;
+        assert_eq!(StatusBar::left_text(&app), "4 items  \u{00b7}  1 selected (4 KB)  \u{00b7}  9 KB");
+        app.settings.status_count = false;
+        app.tabs[0].selected[0] = false;
+        assert_eq!(StatusBar::left_text(&app), "9 KB");
+        // Not asked for (as Glint starts out): not said. An empty folder holds nothing.
+        assert_eq!(StatusBar::left_text(&showing(Settings::default(), entries())), "4 items");
+        assert_eq!(StatusBar::left_text(&showing(Settings { status_total: true, ..Default::default() }, Vec::new())), "0 items  \u{00b7}  0 B");
+        // Search results have no such size, as before.
+        let mut app = showing(Settings { status_total: true, ..Default::default() }, entries());
+        let mut search = crate::search::test_search("C:\\t");
+        search.done = true;
+        app.tabs[0].search = Some(search);
+        assert_eq!(StatusBar::left_text(&app), "4 results");
+    }
+
+    /// The state with one tab showing the Recycle Bin, holding `sizes` (one item each).
+    fn bin_showing(settings: Settings, sizes: &[u64]) -> AppState {
+        let mut app = AppState::for_tests(settings);
+        let entries: Vec<_> = sizes.iter().enumerate().map(|(i, &size)| entry(&format!("deleted {i} \u{1F600}.txt"), crate::folder::EntryKind::File, size)).collect();
+        let listing = crate::recycle::Listing { items: vec![crate::recycle::BinItem::default(); entries.len()], total: sizes.iter().sum() };
+        app.tabs[0].path = crate::recycle::LOCATION.into();
+        let folder = crate::folder::Folder { path: crate::recycle::LOCATION.into(), entries, bin: Some(std::sync::Arc::new(listing)), ..Default::default() };
+        crate::app::apply_listing(&mut app.tabs[0], folder);
+        app
+    }
+
+    /// In the Recycle Bin: the items, then what the bin holds, once: "9 items  ·  185.2 MB in
+    /// Recycle Bin". Never the size of the list (or the older "Folder"), and not again on the right.
+    #[test]
+    fn the_recycle_bin_says_what_it_holds_once() {
+        // 185.2 MB in nine items.
+        let mut sizes = vec![1_048_576u64; 8];
+        sizes.push(194_196_275 - 8 * 1_048_576);
+        let quiet = Settings { status_free: false, status_opened: false, status_started: false, status_memory: false, ..Default::default() };
+        let app = bin_showing(quiet.clone(), &sizes);
+        assert_eq!(StatusBar::left_text(&app), "9 items  \u{00b7}  185.2 MB in Recycle Bin");
+        assert_eq!(StatusBar::right_text(&app), "", "the size isn't said twice");
+        // The size of the list asked for: the bin still says only what it holds.
+        let mut app = bin_showing(Settings { status_total: true, ..quiet.clone() }, &sizes);
+        assert_eq!(StatusBar::left_text(&app), "9 items  \u{00b7}  185.2 MB in Recycle Bin");
+        // What's selected comes after; the search bar narrows the items, not what the bin holds.
+        app.tabs[0].selected[0] = true;
+        assert_eq!(StatusBar::left_text(&app), "9 items  \u{00b7}  185.2 MB in Recycle Bin  \u{00b7}  1 selected (1.0 MB)");
+        app.tabs[0].selected[0] = false;
+        app.tabs[0].filter = "deleted 8".into();
+        app.tabs[0].rebuild_view();
+        assert_eq!(StatusBar::left_text(&app), "1 of 9 items  \u{00b7}  185.2 MB in Recycle Bin");
+        // One item.
+        let app = bin_showing(quiet.clone(), &[4096]);
+        assert_eq!(StatusBar::left_text(&app), "1 item  \u{00b7}  4 KB in Recycle Bin");
+        // The parts switched off stay off: no number of items, nothing about what's selected.
+        let mut app = bin_showing(Settings { status_count: false, status_selected: false, ..quiet.clone() }, &sizes);
+        app.tabs[0].selected[0] = true;
+        assert_eq!(StatusBar::left_text(&app), "185.2 MB in Recycle Bin");
+        // Every setting on, a huge bin, items of no size: said once, on the left only.
+        for sizes in [vec![u64::MAX / 4, 1], vec![0, 0, 0]] {
+            let app = bin_showing(Settings { status_total: true, ..Default::default() }, &sizes);
+            let (left, right) = (StatusBar::left_text(&app), StatusBar::right_text(&app));
+            assert_eq!(left.matches("in Recycle Bin").count(), 1, "{left}");
+            assert!(!right.contains("Recycle Bin"), "{right}");
+            assert_eq!(left.matches("  \u{00b7}  ").count(), 1, "the items, then what the bin holds: {left}");
+            assert!(!left.contains("Folder"), "{left}");
+        }
+    }
+
+    /// An empty Recycle Bin says so where it always did, and no size.
+    #[test]
+    fn an_empty_recycle_bin_says_so() {
+        let quiet = Settings { status_free: false, status_opened: false, status_started: false, status_memory: false, status_total: true, ..Default::default() };
+        let app = bin_showing(quiet, &[]);
+        assert_eq!(StatusBar::left_text(&app), "0 items");
+        assert_eq!(StatusBar::right_text(&app), "The Recycle Bin is empty.");
+        // A bin that couldn't be read holds nothing to tell: no size of any kind.
+        let mut app = AppState::for_tests(Settings { status_total: true, ..Default::default() });
+        app.tabs[0].path = crate::recycle::LOCATION.into();
+        let folder = crate::folder::Folder { path: crate::recycle::LOCATION.into(), error: Some("Failed to read the Recycle Bin.".into()), ..Default::default() };
+        crate::app::apply_listing(&mut app.tabs[0], folder);
+        assert_eq!(StatusBar::left_text(&app), "0 items");
+        assert!(!StatusBar::right_text(&app).contains("Recycle Bin"));
     }
 
     /// The status line of a duplicate search that is `done`, `capped` and skipped files under
@@ -402,7 +550,8 @@ mod tests {
         tab.filter = "nothing like it".into();
         tab.rebuild_view();
         assert_eq!(tab.dupes_summary, Some((0, 0)));
-        assert!(StatusBar::left_text(&app).starts_with("No duplicates found"));
+        // (It found some: the search bar hiding them all isn't "No duplicate files found.")
+        assert_eq!(StatusBar::left_text(&app), "0 sets of duplicates  \u{00b7}  Esc to go back");
         // The same as counting on the spot, whatever the view.
         let tab = &mut app.tabs[0];
         tab.filter.clear();
@@ -412,6 +561,35 @@ mod tests {
         tab.search = None;
         tab.rebuild_view();
         assert_eq!(tab.dupes_summary, None);
+    }
+
+    /// Nothing to show: "Checking for duplicate files…" while it runs, "No duplicate files found."
+    /// when it ended with none - the words the file list says too (dupes.rs keeps them for both).
+    #[test]
+    fn a_duplicate_search_with_nothing_to_show_says_what_the_list_says() {
+        assert_eq!(dupes_text(false, false, 0), "Checking for duplicate files\u{2026}  \u{00b7}  Esc to go back");
+        assert_eq!(dupes_text(true, false, 0), "No duplicate files found.  \u{00b7}  Esc to go back");
+        assert!(dupes_text(false, false, 0).starts_with(crate::dupes::CHECKING));
+        assert!(dupes_text(true, false, 0).starts_with(crate::dupes::NONE_FOUND));
+        // What it adds about a search that stopped early or skipped small files still follows.
+        assert_eq!(dupes_text(true, true, 0), "No duplicate files found.  \u{00b7}  showing the first 20,000 files  \u{00b7}  Esc to go back");
+        assert_eq!(dupes_text(true, false, 4096), "No duplicate files found.  \u{00b7}  files under 4 KB skipped  \u{00b7}  Esc to go back");
+        // The old words are gone.
+        for text in [dupes_text(false, false, 0), dupes_text(true, false, 0)] {
+            assert!(!text.contains("Looking for duplicates") && !text.contains("No duplicates found"), "{text}");
+        }
+        // Found some, the search bar hides them all, and it still runs: still checking.
+        let mut app = AppState::for_tests(Settings::default());
+        let mut search = crate::search::test_search("C:\\t");
+        search.dupes = Some(crate::dupes::Summary::default());
+        app.tabs[0].search = Some(search);
+        let tab = &mut app.tabs[0];
+        tab.folder.path = "C:\\t".into();
+        tab.folder.entries = vec![entry("a.txt", crate::folder::EntryKind::File, 10), entry("b.txt", crate::folder::EntryKind::File, 10)];
+        tab.selected = vec![false; 2];
+        tab.filter = "zzz".into();
+        tab.rebuild_view();
+        assert_eq!(StatusBar::left_text(&app), "Checking for duplicate files\u{2026}  \u{00b7}  Esc to go back");
     }
 
     #[test]

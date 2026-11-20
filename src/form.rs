@@ -8,15 +8,18 @@
 //! the text boxes' news (window.rs):
 //! - Enter in a box, or a click on the coloured button, says yes (when the preview says it can);
 //! - Esc, CANCEL, or a click outside the panel closes it;
-//! - Tab goes to the next box.
+//! - Tab goes to the next box;
+//! - the mouse wheel scrolls the preview's list (renaming many shows every new name, a few at a
+//!   time), and so does its scroll bar: drag the thumb, or click beside it for a page.
 
 use windows::Win32::Foundation::HWND;
 
 use crate::app::{Form, Preview};
 use crate::ask::Answer;
 use crate::kit::{self, Look};
-use crate::pathbar::{box_contains, fill_box};
+use crate::pathbar::{box_contains_beside, face, fill_box_beside, Beside};
 use crate::render::{Align, Renderer, TextStyle};
+use crate::retroctl::Hold;
 use crate::textbox::{TextBox, TextEvent, TextEventKind};
 use crate::theme::{Color, Theme};
 use crate::ui::{Point, Rect};
@@ -36,6 +39,17 @@ const FIELD_GAP: f32 = 8.0;
 const LINE: f32 = 19.0;
 /// A field's note line under its box.
 const NOTE_LINE: f32 = 18.0;
+/// How many lines of the preview's list show at once (the rest scroll into view).
+const LIST_ROWS: usize = 6;
+/// How many lines one notch of the mouse wheel scrolls the list.
+const WHEEL_ROWS: f32 = 3.0;
+/// Between an old name and its new one in the list.
+const ARROW: &str = "  \u{2192}  ";
+/// How much of a list line the new name may take when both names don't fit (the old one keeps
+/// the rest): the new name is what the list is for.
+const NEW_SHARE: f32 = 0.62;
+/// The gap between the list's lines and its scroll bar.
+const BAR_GAP: f32 = 4.0;
 const BUTTON_H: f32 = 30.0;
 const LEAN: f32 = 8.0;
 const BUTTON_GAP: f32 = 6.0;
@@ -61,6 +75,15 @@ pub struct FormBox {
     lean: f32,
     /// The preview allows yes (nothing in it is a problem).
     can: bool,
+    /// Where the preview's list is, and how far it's scrolled.
+    list: Rect,
+    scroll: kit::Scroller,
+    /// The skin's scroll bar, as the list's was last drawn.
+    bar: kit::Bar,
+    /// The list's scroll bar thumb is held, this far down it.
+    grab: Option<f32>,
+    /// The mouse is over that thumb.
+    over_thumb: bool,
 }
 
 impl FormBox {
@@ -81,6 +104,7 @@ impl FormBox {
         }
         self.used = 0;
         self.seen = 0;
+        (self.grab, self.over_thumb) = (None, false);
         // SAFETY: handing the keyboard to our own window.
         unsafe {
             let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(window));
@@ -95,6 +119,8 @@ impl FormBox {
         if fresh {
             self.seen = form.id;
             (self.hover, self.pressed) = (None, None);
+            self.scroll = kit::Scroller::default();
+            (self.grab, self.over_thumb) = (None, false);
             while self.boxes.len() < form.fields.len().min(MAX_FIELDS) {
                 let id = FIRST_ID + self.boxes.len() as u16;
                 self.boxes.push(TextBox::new(window, id));
@@ -114,7 +140,7 @@ impl FormBox {
 
         let w = WIDTH.min(area.w - 32.0).max(260.0);
         let inner = w - 2.0 * PAD;
-        let lines = preview.lines.len() + preview.problem.is_some() as usize;
+        let lines = preview.lines.len() + preview.list.len().min(LIST_ROWS) + preview.problem.is_some() as usize;
         let notes = form.fields.iter().take(self.used).filter(|f| !f.note.is_empty()).count();
         let fields_h = self.used as f32 * (FIELD_H + FIELD_GAP) + notes as f32 * NOTE_LINE;
         let h = 20.0 + TITLE_LINE + 12.0 + fields_h + 6.0 + lines as f32 * LINE + 22.0 + BUTTON_H + 20.0;
@@ -148,8 +174,11 @@ impl FormBox {
             b.show();
             line_y += FIELD_H + FIELD_GAP;
             // How to fill it in, faint, under the box.
+            // (One too long to fit under the box starts under the label instead, rather than be cut.)
             if !f.note.is_empty() {
-                r.text(f.note, Rect::new(field.x, line_y - FIELD_GAP + 2.0, field.w, NOTE_LINE), &TextStyle::new(theme.muted));
+                let note_style = TextStyle::new(theme.muted);
+                let from = if r.measure(f.note, &note_style) > field.w { x + PAD } else { field.x };
+                r.text(f.note, Rect::new(from, line_y - FIELD_GAP + 2.0, field.right() - from, NOTE_LINE), &note_style);
                 line_y += NOTE_LINE;
             }
         }
@@ -165,6 +194,30 @@ impl FormBox {
             r.text(l, Rect::new(x + PAD, line_y, inner, LINE), &faint);
             line_y += LINE;
         }
+        // The list: only the lines in view are drawn, however many items there are.
+        let shown = preview.list.len().min(LIST_ROWS);
+        self.list = Rect::new(x + PAD, line_y, inner, shown as f32 * LINE);
+        self.scroll.set_extent(preview.list.len() as f32 * LINE, self.list.h);
+        self.bar = kit::Bar::of(theme);
+        if shown > 0 {
+            let scrolls = self.scroll.max() > 0.0;
+            // (Room for the scroll bar, as wide as the skin's is.)
+            let row_w = inner - if scrolls { self.bar.place(self.list).lane.w + BAR_GAP } else { 0.0 };
+            r.push_clip(self.list);
+            for i in rows_in_view(preview.list.len(), self.scroll.offset, self.list.h) {
+                let row_y = self.list.y + i as f32 * LINE - self.scroll.offset;
+                let (old, new) = &preview.list[i];
+                let line = fit_row(old, new, row_w, &mut |t| r.measure(t, &faint));
+                r.text(&line, Rect::new(self.list.x, row_y, row_w, LINE), &faint);
+            }
+            r.pop_clip();
+            if scrolls {
+                kit::scrollbar(r, theme, self.bar.track(self.list), &self.scroll, self.over_thumb || self.grab.is_some(), Hold::None);
+            }
+            line_y += self.list.h;
+        } else {
+            (self.grab, self.over_thumb) = (None, false);
+        }
         if let Some(p) = &preview.problem {
             r.text(p, Rect::new(x + PAD, line_y, inner, LINE), &TextStyle::new(theme.accent).semibold());
         }
@@ -178,8 +231,8 @@ impl FormBox {
         self.yes = Rect::new(self.no.x + self.lean - BUTTON_GAP - yes_w, by, yes_w, BUTTON_H);
         if glass {
             let look = |b: Button, enabled: bool| Look { hover: self.hover == Some(b), pressed: self.pressed == Some(b) && self.hover == Some(b), focused: false, enabled };
-            kit::primary_button(r, theme, self.yes, form.yes, look(Button::Yes, self.can));
-            kit::button(r, theme, self.no, "CANCEL", look(Button::No, true));
+            kit::primary_button_beside(r, theme, self.yes, form.yes, look(Button::Yes, self.can), Beside::RIGHT);
+            kit::button_beside(r, theme, self.no, "CANCEL", look(Button::No, true), Beside::LEFT);
             return;
         }
         let yes_color = match (self.can, self.pressed, self.hover) {
@@ -188,17 +241,17 @@ impl FormBox {
             (_, _, Some(Button::Yes)) => theme.accent.with_alpha(0.88),
             _ => theme.accent,
         };
-        fill_box(r, theme, self.yes, self.lean, yes_color);
-        r.text(form.yes, self.yes, &label.color(theme.on_accent));
+        fill_box_beside(r, theme, self.yes, self.lean, Beside::RIGHT, yes_color);
+        r.text(form.yes, face(self.yes, self.lean, Beside::RIGHT), &label.color(theme.on_accent));
         let no_color = if self.hover == Some(Button::No) { theme.chip_hover } else { theme.chip };
-        fill_box(r, theme, self.no, self.lean, if self.pressed == Some(Button::No) && self.hover == Some(Button::No) { theme.button_pressed } else { no_color });
-        r.text("CANCEL", self.no, &label);
+        fill_box_beside(r, theme, self.no, self.lean, Beside::LEFT, if self.pressed == Some(Button::No) && self.hover == Some(Button::No) { theme.button_pressed } else { no_color });
+        r.text("CANCEL", face(self.no, self.lean, Beside::LEFT), &label);
     }
 
     fn button_at(&self, p: Point) -> Option<Button> {
-        if box_contains(self.yes, self.lean, p) {
+        if box_contains_beside(self.yes, self.lean, Beside::RIGHT, p) {
             Some(Button::Yes)
-        } else if box_contains(self.no, self.lean, p) {
+        } else if box_contains_beside(self.no, self.lean, Beside::LEFT, p) {
             Some(Button::No)
         } else {
             None
@@ -209,16 +262,57 @@ impl FormBox {
         if self.can { Answer::Yes } else { Answer::Nothing }
     }
 
+    /// The list's scroll bar thumb, while the list scrolls.
+    fn thumb(&self) -> Option<Rect> {
+        self.scroll.thumb(self.bar.track(self.list))
+    }
+
+    /// Whether the list's scroll bar thumb is being dragged (the window then keeps the mouse, so
+    /// the drag goes on outside it and ends wherever the button comes up).
+    pub fn dragging(&self) -> bool {
+        self.grab.is_some()
+    }
+
+    /// The drag ended without a mouse-up here (something else took the mouse).
+    pub fn let_go(&mut self) {
+        self.grab = None;
+    }
+
     pub fn mouse_move(&mut self, p: Point) -> Answer {
+        if let Some(grab) = self.grab {
+            // The thumb follows the mouse (as far as the list goes).
+            let track = self.bar.track(self.list);
+            let before = self.scroll.offset;
+            if let Some(thumb) = self.thumb() {
+                self.scroll.jump_to(self.scroll.offset_for_thumb(track, thumb.h, p.y - grab));
+            }
+            return if self.scroll.offset == before { Answer::Nothing } else { Answer::Redraw };
+        }
         let hover = self.button_at(p);
-        if hover != self.hover {
-            self.hover = hover;
+        // (The thumb is thin: a little either side of it counts too.)
+        let over_thumb = self.thumb().is_some_and(|t| t.inset(-3.0, 0.0).contains(p));
+        if hover != self.hover || over_thumb != self.over_thumb {
+            (self.hover, self.over_thumb) = (hover, over_thumb);
             return Answer::Redraw;
         }
         Answer::Nothing
     }
 
     pub fn mouse_down(&mut self, p: Point) -> Answer {
+        if let Some(thumb) = self.thumb() {
+            if thumb.inset(-3.0, 0.0).contains(p) {
+                self.grab = Some(p.y - thumb.y);
+                return Answer::Redraw;
+            }
+            let place = self.bar.place(self.list);
+            if place.lane.contains(p) {
+                // Beside the thumb: a page that way (a line, on an older Windows' arrow buttons).
+                let step = if p.y < place.track.y || p.y >= place.track.bottom() { LINE } else { (self.list.h - LINE).max(LINE) };
+                let way = if p.y < thumb.y { -1.0 } else { 1.0 };
+                self.scroll.jump_to(self.scroll.offset + way * step);
+                return Answer::Redraw;
+            }
+        }
         match self.button_at(p) {
             Some(b) => {
                 self.pressed = Some(b);
@@ -230,12 +324,27 @@ impl FormBox {
     }
 
     pub fn mouse_up(&mut self, p: Point) -> Answer {
+        if self.grab.take().is_some() {
+            // (Let go anywhere, a button or outside the panel too: only the drag ends.)
+            self.over_thumb = self.thumb().is_some_and(|t| t.inset(-3.0, 0.0).contains(p));
+            return Answer::Redraw;
+        }
         match (self.pressed.take(), self.button_at(p)) {
             (Some(Button::Yes), Some(Button::Yes)) => self.yes(),
             (Some(Button::No), Some(Button::No)) => Answer::No,
             (Some(_), _) => Answer::Redraw,
             _ => Answer::Nothing,
         }
+    }
+
+    /// The mouse wheel over the panel: the preview's list scrolls, three lines a notch.
+    pub fn wheel(&mut self, p: Point, notches: f32) -> Answer {
+        if !self.panel.contains(p) {
+            return Answer::Nothing;
+        }
+        let before = self.scroll.offset;
+        self.scroll.jump_to(before - notches * WHEEL_ROWS * LINE);
+        if self.scroll.offset == before { Answer::Nothing } else { Answer::Redraw }
     }
 
     /// A key that reached the window itself while the form is open (after a click on the panel).
@@ -265,5 +374,192 @@ impl FormBox {
             }
             TextEventKind::LostFocus | TextEventKind::Down => Answer::Nothing,
         })
+    }
+}
+
+/// One line of the list, "old  →  new", no wider than `width` (`measure`: how wide a text is).
+/// Where the two don't fit, the new name comes first: it keeps what it needs, up to `NEW_SHARE`
+/// of the line (more when the old name is short), and the old name gets the rest. A name too
+/// long for its part is cut in the middle, so its start and its end - the number, the
+/// extension - both still show.
+fn fit_row(old: &str, new: &str, width: f32, measure: &mut dyn FnMut(&str) -> f32) -> String {
+    let whole = format!("{old}{ARROW}{new}");
+    if measure(&whole) <= width {
+        return whole;
+    }
+    // (A pixel spare: the parts measured one by one can come out a hair narrower than together.)
+    let room = (width - measure(ARROW) - 1.0).max(0.0);
+    let (old_w, new_w) = (measure(old), measure(new));
+    let for_new = new_w.min((room - old_w).max(room * NEW_SHARE));
+    let for_old = (room - for_new).max(0.0);
+    format!("{}{ARROW}{}", fit_middle(old, for_old, measure), fit_middle(new, for_new, measure))
+}
+
+/// `text` no wider than `width`: as it is when it fits, else its start and its end with "…"
+/// between them, as much of both as fits.
+fn fit_middle(text: &str, width: f32, measure: &mut dyn FnMut(&str) -> f32) -> String {
+    if measure(text) <= width {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    // The end keeps one letter more than the start where they can't be the same.
+    let cut = |n: usize| {
+        let (head, tail) = (n / 2, n - n / 2);
+        format!("{}\u{2026}{}", chars[..head].iter().collect::<String>(), chars[chars.len() - tail..].iter().collect::<String>())
+    };
+    let (mut lo, mut hi) = (0usize, chars.len().saturating_sub(1));
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if measure(&cut(mid)) <= width {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    cut(lo)
+}
+
+/// Which of `len` lines (each `LINE` high) show in a list `view` high scrolled down by `offset`:
+/// the ones at least partly in view.
+fn rows_in_view(len: usize, offset: f32, view: f32) -> std::ops::Range<usize> {
+    let first = ((offset / LINE).floor().max(0.0) as usize).min(len);
+    let end = (((offset + view) / LINE).ceil().max(0.0) as usize).min(len);
+    first..end.max(first)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A form box whose list of `len` lines was laid out as `paint` lays it out.
+    fn laid_out(len: usize) -> FormBox {
+        let mut f = FormBox { panel: Rect::new(0.0, 0.0, 520.0, 400.0), ..Default::default() };
+        f.list = Rect::new(22.0, 200.0, 476.0, len.min(LIST_ROWS) as f32 * LINE);
+        f.scroll.set_extent(len as f32 * LINE, f.list.h);
+        f
+    }
+
+    #[test]
+    fn only_the_lines_in_view_are_drawn_however_many_there_are() {
+        let view = LIST_ROWS as f32 * LINE;
+        assert_eq!(rows_in_view(5000, 0.0, view), 0..6);
+        // Half a line down: the first is half hidden and the seventh half shows.
+        assert_eq!(rows_in_view(5000, LINE / 2.0, view), 0..7);
+        assert_eq!(rows_in_view(5000, 4994.0 * LINE, view), 4994..5000);
+        assert_eq!(rows_in_view(3, 0.0, 3.0 * LINE), 0..3);
+        assert_eq!(rows_in_view(0, 0.0, 0.0), 0..0);
+        // (Past the end, as it can be for a moment while the list shrinks: nothing out of range.)
+        assert_eq!(rows_in_view(4, 99.0 * LINE, view), 4..4);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_list_to_its_last_line_and_back() {
+        let mut f = laid_out(5000);
+        assert_eq!(f.wheel(Point::new(100.0, 210.0), -1.0), Answer::Redraw);
+        assert_eq!(f.scroll.offset, WHEEL_ROWS * LINE);
+        // A big spin ends at the last line, which then shows in full.
+        for _ in 0..2000 {
+            f.wheel(Point::new(100.0, 210.0), -1.0);
+        }
+        assert_eq!(f.scroll.offset, (5000 - LIST_ROWS) as f32 * LINE);
+        assert_eq!(rows_in_view(5000, f.scroll.offset, f.list.h).last(), Some(4999));
+        assert_eq!(f.wheel(Point::new(100.0, 210.0), -1.0), Answer::Nothing, "nothing further to go");
+        f.wheel(Point::new(100.0, 210.0), 1.0e6);
+        assert_eq!(f.scroll.offset, 0.0);
+        // Outside the panel the wheel does nothing.
+        f.wheel(Point::new(900.0, 900.0), -1.0);
+        assert_eq!(f.scroll.offset, 0.0);
+    }
+
+    /// Every letter one unit wide (and the arrow five), as the tests' ruler.
+    fn chars(t: &str) -> f32 {
+        t.chars().count() as f32
+    }
+
+    #[test]
+    fn a_line_too_long_shows_the_new_name_first() {
+        let fit = |old: &str, new: &str, w: f32| fit_row(old, new, w, &mut chars);
+        // Both fit: as they are.
+        assert_eq!(fit("a.jpg", "Photo 1.jpg", 40.0), "a.jpg  \u{2192}  Photo 1.jpg");
+        assert_eq!(chars("a.jpg  \u{2192}  Photo 1.jpg"), 21.0);
+        assert_eq!(fit("a.jpg", "Photo 1.jpg", 21.0), "a.jpg  \u{2192}  Photo 1.jpg");
+        // A long old name: the new one stays whole, the old one keeps its start and its end.
+        let old = format!("IMG_{}_0042.jpg", "x".repeat(80));
+        let line = fit(&old, "Holiday 12.jpg", 60.0);
+        assert!(line.ends_with("  \u{2192}  Holiday 12.jpg"), "{line}");
+        assert!(line.starts_with("IMG_") && line.contains("\u{2026}") && line.contains("42.jpg  "), "{line}");
+        assert!(chars(&line) <= 60.0, "{line}");
+        // Both long: the new one gets most of the line, cut in the middle, so its number shows.
+        let new = format!("Holiday {} 12.jpg", "y".repeat(80));
+        let line = fit(&old, &new, 60.0);
+        let (o, n) = line.split_once("  \u{2192}  ").unwrap();
+        assert!(chars(n) > chars(o) && n.starts_with("Holiday ") && n.ends_with(" 12.jpg"), "{line}");
+        assert!(o.starts_with("IMG_") && o.ends_with(".jpg") && chars(&line) <= 60.0, "{line}");
+        // A short old name gives the new one the rest of the line.
+        let line = fit("a.jpg", &new, 60.0);
+        assert!(line.starts_with("a.jpg  \u{2192}  Holiday ") && line.ends_with(" 12.jpg") && chars(&line) <= 60.0, "{line}");
+        assert!(chars(&line) >= 58.0, "the room is used: {line}");
+        // Odd letters are cut whole, and no width is too small.
+        let odd = "\u{1f389}\u{130}\u{f1}#".repeat(30);
+        for w in [0.0, 1.0, 5.0, 6.0, 7.0, 12.0, 33.0, 1.0e9, -4.0, f32::NAN] {
+            let line = fit(&odd, &odd, w);
+            assert!(line.contains("\u{2192}"), "{w}: {line}");
+            assert!(w.is_nan() || w < 7.0 || chars(&line) <= w, "{w}: {line}");
+        }
+        assert_eq!(fit("", "", 0.0), "  \u{2192}  ");
+        assert_eq!(fit_middle("abcdefghij", 6.0, &mut chars), "ab\u{2026}hij");
+        assert_eq!(fit_middle("abcdefghij", 10.0, &mut chars), "abcdefghij");
+        assert_eq!(fit_middle("abcdefghij", 0.0, &mut chars), "\u{2026}");
+        assert_eq!(fit_middle("", 0.0, &mut chars), "");
+    }
+
+    #[test]
+    fn the_scroll_bar_is_dragged_and_clicked() {
+        let mut f = laid_out(5000);
+        let thumb = f.thumb().expect("a list this long scrolls");
+        let mid = Point::new(thumb.x + thumb.w / 2.0, thumb.y + thumb.h / 2.0);
+        // Over the thumb it lights up; pressed there it is held.
+        assert_eq!(f.mouse_move(mid), Answer::Redraw);
+        assert!(f.over_thumb);
+        assert_eq!(f.mouse_down(mid), Answer::Redraw);
+        assert!(f.dragging());
+        // Dragged down to the end of the list, and past it: the last line shows.
+        assert_eq!(f.mouse_move(Point::new(mid.x, mid.y + 40.0)), Answer::Redraw);
+        assert!(f.scroll.offset > 0.0 && f.scroll.offset < f.scroll.max());
+        f.mouse_move(Point::new(-500.0, 9000.0));
+        assert_eq!(f.scroll.offset, f.scroll.max());
+        assert_eq!(rows_in_view(5000, f.scroll.offset, f.list.h).last(), Some(4999));
+        // Let go outside the panel: the drag ends and the form stays open.
+        assert_eq!(f.mouse_up(Point::new(-500.0, 9000.0)), Answer::Redraw);
+        assert!(!f.dragging() && !f.over_thumb);
+        assert_eq!(f.mouse_move(Point::new(100.0, 100.0)), Answer::Nothing);
+        assert_eq!(f.scroll.offset, f.scroll.max(), "it no longer follows the mouse");
+        // Back up to the top.
+        let thumb = f.thumb().unwrap();
+        f.mouse_down(Point::new(thumb.x + 1.0, thumb.y + 1.0));
+        f.mouse_move(Point::new(thumb.x, -9000.0));
+        assert_eq!(f.scroll.offset, 0.0);
+        f.let_go();
+        assert!(!f.dragging());
+        // A click beside the thumb goes a page that way.
+        let lane = f.bar.place(f.list).lane;
+        assert_eq!(f.mouse_down(Point::new(lane.x + lane.w / 2.0, lane.bottom() - 8.0)), Answer::Redraw);
+        assert_eq!(f.scroll.offset, (LIST_ROWS - 1) as f32 * LINE);
+        assert!(!f.dragging());
+        f.mouse_up(Point::new(lane.x + lane.w / 2.0, lane.bottom() - 8.0));
+        // A list that fits has no bar to hold: a press there is a press on the panel.
+        let mut f = laid_out(LIST_ROWS);
+        assert!(f.thumb().is_none());
+        assert_eq!(f.mouse_down(Point::new(f.list.right() - 4.0, f.list.y + 4.0)), Answer::Nothing);
+        assert!(!f.dragging());
+    }
+
+    #[test]
+    fn a_list_that_fits_doesnt_scroll() {
+        let mut f = laid_out(LIST_ROWS);
+        assert_eq!(f.wheel(Point::new(100.0, 210.0), -1.0), Answer::Nothing);
+        assert_eq!(f.scroll.offset, 0.0);
+        let mut f = laid_out(0);
+        assert_eq!(f.wheel(Point::new(100.0, 210.0), -1.0), Answer::Nothing);
     }
 }

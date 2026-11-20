@@ -40,7 +40,7 @@ Nothing to install, and it opens instantly.
 - Copy, move, rename and delete the Windows way, so the Recycle Bin still works.
 - **Undo and redo** (Ctrl+Z, Ctrl+Y).
 - **Copy queue** you can pause.
-- **Filter as you type**, in subfolders too, or across all your drives.
+- **Search as you type**, in subfolders too, or across all your drives.
 - **Rename many** (F2 with several files selected).
 - **Find duplicates** (right-click empty space).
 
@@ -108,7 +108,7 @@ Click **More info**, then **Run anyway**.
 
 **Going online:** Glint only checks GitHub for updates. You can turn that off in **Settings > About**.
 
-**Portable:** turn on **Settings > About > Portable**. Glint then keeps everything next to
+**Portable:** turn on **Settings > About > Portable mode**. Glint then keeps everything next to
 `Glint.exe`, so it can live on a USB stick.
 
 **To remove Glint:**
@@ -118,13 +118,13 @@ Click **More info**, then **Run anyway**.
 
 ## Keyboard shortcuts
 
-The ones you'll use most:
+The ones you'll use most. You can change them in **Settings > Keyboard shortcuts**.
 
 | Keys | What they do |
 |---|---|
 | Ctrl+T, Ctrl+W | New tab, close tab |
 | Space | Preview |
-| Ctrl+F | Filter |
+| Ctrl+F | Search bar |
 | Ctrl+Z, Ctrl+Y | Undo, redo |
 | Ctrl+U | Command box |
 | Ctrl+, | Settings |
@@ -138,7 +138,7 @@ The ones you'll use most:
 | Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+1…9 | Next tab, previous tab, go to a tab |
 | Alt+Left / Alt+Right, Alt+Up, Backspace | Back / forward, up a folder |
 | Ctrl+L (or F4, Alt+D) | Type a path |
-| Ctrl+F (or F3), Ctrl+Shift+F | Filter, search subfolders too |
+| Ctrl+F (or F3), Ctrl+Shift+F | Search bar, search subfolders too |
 | Ctrl+C, Ctrl+X, Ctrl+V, Ctrl+A | Copy, cut, paste, select all |
 | Ctrl+Z, Ctrl+Y | Undo, redo |
 | Del, Shift+Del, F2 | Delete, delete for good, rename |
@@ -153,7 +153,7 @@ The ones you'll use most:
 | Ctrl+\\, F6 | Split view, go to the other side |
 | Shift+right-click | Windows' full right-click menu |
 | Ctrl+U | Command box |
-| Ctrl+N, Ctrl+Q | New window, quit Glint |
+| Ctrl+N, Ctrl+Q | New window, exit Glint |
 | Ctrl+, | Settings |
 
 </details>

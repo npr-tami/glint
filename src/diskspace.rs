@@ -104,18 +104,19 @@ impl Kind {
         }
     }
 
-    /// The small line under the name: what counts as this kind.
+    /// The small line under the name: what counts as this kind, as `Zone` and `of_extension` decide
+    /// it (the folder first: a game's DLLs are Games, not Apps).
     pub fn examples(self) -> &'static str {
         match self {
-            Kind::Videos => "mp4, mkv, mov",
-            Kind::Games => "Steam, Epic, Xbox",
-            Kind::Apps => "exe, dll, msi",
-            Kind::Windows => "system files",
-            Kind::Pictures => "jpg, png, gif",
-            Kind::Music => "mp3, flac, wav",
-            Kind::Documents => "pdf, Word, Excel, txt",
-            Kind::Archives => "zip, 7z, iso",
-            Kind::Other => "everything else",
+            Kind::Videos => "Files ending in .mp4, .mkv, .mov and similar",
+            Kind::Games => "Every file, DLLs too, in the game folders of Steam, Epic, Xbox, Riot, GOG, EA, Ubisoft and Battle.net",
+            Kind::Apps => "Files ending in .exe, .dll, .msi and similar",
+            Kind::Windows => "Everything in the Windows folder, whatever the file",
+            Kind::Pictures => "Files ending in .jpg, .png, .gif and similar",
+            Kind::Music => "Files ending in .mp3, .flac, .wav and similar",
+            Kind::Documents => "Files ending in .pdf, .docx, .xlsx, .txt and similar",
+            Kind::Archives => "Files ending in .zip, .7z, .iso and similar",
+            Kind::Other => "Files that fit no other type",
         }
     }
 
@@ -137,6 +138,12 @@ impl Kind {
     }
 }
 
+/// The folders the game shops keep their games in (lower case), wherever on the drive they are:
+/// Steam's, Epic's, Xbox's, Riot's, GOG's, EA's, Ubisoft's and Battle.net's, as `Kind::examples`
+/// names them. A folder of games that someone made themselves isn't one: its files count by
+/// their extensions.
+const GAME_FOLDERS: [&str; 8] = ["steamapps", "epic games", "xboxgames", "riot games", "gog galaxy", "ea games", "ubisoft game launcher", "battle.net"];
+
 /// Which part of the drive a folder is in: inside Windows' folder or a game library, everything
 /// counts as that kind whatever its extension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,7 +163,7 @@ impl Zone {
         if depth == 1 && n == "windows" {
             return Zone::Windows;
         }
-        if matches!(n.as_str(), "steamapps" | "epic games" | "xboxgames" | "riot games" | "gog galaxy" | "ea games" | "ubisoft game launcher" | "battle.net") {
+        if GAME_FOLDERS.contains(&n.as_str()) {
             return Zone::Games;
         }
         Zone::Any
@@ -563,6 +570,42 @@ mod tests {
         assert_eq!(pick_remembered(r(100), r(10), 100 + day).map(|x| x.at), Some(100));
         assert_eq!(pick_remembered(r(100), None, 160).map(|x| x.at), Some(100));
         assert_eq!(pick_remembered(None, None, 160), None);
+    }
+
+    #[test]
+    fn each_kinds_line_says_the_rule_that_really_decides_it() {
+        // Every ending a line names is that kind's.
+        for k in Kind::ALL {
+            let line = k.examples();
+            let endings: Vec<&str> = line.split([' ', ',']).filter_map(|w| w.strip_prefix('.')).collect();
+            for e in &endings {
+                assert_eq!(Kind::of_extension(e), k, "{line}");
+            }
+            assert_eq!(endings.is_empty(), matches!(k, Kind::Games | Kind::Windows | Kind::Other), "{line}");
+        }
+        // The game folders named are game folders, wherever they are; their DLLs are Games.
+        for name in ["steamapps", "Epic Games", "XboxGames", "Riot Games", "GOG Galaxy", "EA Games", "Ubisoft Game Launcher", "Battle.net"] {
+            assert_eq!(Zone::Any.inside(name, 3), Zone::Games, "{name}");
+        }
+        // Each shop the Games line names has its folder, and the line names no other.
+        let games = Kind::Games.examples();
+        for (shop, folder) in [("Steam", "steamapps"), ("Epic", "epic games"), ("Xbox", "xboxgames"), ("Riot", "riot games"), ("GOG", "gog galaxy"), ("EA", "ea games"), ("Ubisoft", "ubisoft game launcher"), ("Battle.net", "battle.net")] {
+            assert!(games.contains(shop) && GAME_FOLDERS.contains(&folder), "{shop}");
+        }
+        assert_eq!(GAME_FOLDERS.len(), 8);
+        // Steam's own folder, and a folder of games someone made, aren't game folders: what's in
+        // them counts by its extension (a DLL there is Apps), as the lines say.
+        assert_eq!(Zone::Any.inside("Program Files (x86)", 1).inside("Steam", 2), Zone::Any);
+        assert_eq!(Zone::Any.inside("Games", 1).inside("My game", 2), Zone::Any);
+        assert_eq!(Kind::of_extension("dll"), Kind::Apps);
+        assert_eq!(Zone::Games.inside("bin", 5), Zone::Games, "everything inside");
+        // The Windows folder is the one at the top of the drive, and everything in it is Windows.
+        assert_eq!(Zone::Any.inside("Windows", 1), Zone::Windows);
+        assert_eq!(Zone::Any.inside("Windows", 2), Zone::Any);
+        assert_eq!(Zone::Windows.inside("steamapps", 4), Zone::Windows, "the folder met first wins");
+        // Anything else falls to Other.
+        assert_eq!(Kind::of_extension(""), Kind::Other);
+        assert_eq!(Kind::of_extension("xyz"), Kind::Other);
     }
 
     #[test]

@@ -35,6 +35,11 @@ pub const ROW_H: f32 = 48.0;
 /// The date column's width (left out when the list is narrow).
 const DATE_W: f32 = 180.0;
 const PILL_H: f32 = 30.0;
+/// The line saying why the list has no rows.
+const NOTE_H: f32 = 24.0;
+/// The link after the words saying the search bar's text matches nothing on Home: it empties the
+/// search bar.
+const CLEAR_SEARCH: &str = "Clear search";
 
 /// What is at a place on the page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +53,8 @@ pub enum Spot {
     /// The "Recent" and "Favourites" pills.
     Recent,
     Favorites,
+    /// "Clear search", after the words saying the search bar's text matches nothing on Home.
+    ClearSearch,
 }
 
 /// Where everything goes, in page coordinates (0 at the top of the page, before scrolling).
@@ -56,6 +63,9 @@ pub struct Layout {
     pub spots: Vec<(Spot, Rect)>,
     /// Where the column titles are (when the list shows).
     pub columns: Option<Rect>,
+    /// Where the line saying why the list has no rows goes (`note`): under the column titles, or
+    /// under the pills while the lists are folded.
+    pub note: Rect,
     /// How tall the whole page is.
     pub height: f32,
 }
@@ -132,8 +142,10 @@ pub fn layout(width: f32, parts: Parts, count: usize, home: &Home, shown: impl F
     l.spots.push((Spot::Recent, Rect::new(PAD + 24.0, pill_y, 96.0, PILL_H)));
     l.spots.push((Spot::Favorites, Rect::new(PAD + 128.0, pill_y, 110.0, PILL_H)));
     y += HEAD_H + 6.0;
+    l.note = Rect::new(PAD + 12.0, y, inner - 24.0, NOTE_H);
     if home.lists_open {
         l.columns = Some(Rect::new(PAD, y, inner, COLUMNS_H));
+        l.note.y = y + COLUMNS_H + 8.0;
         y += COLUMNS_H + 2.0;
         let range = if home.favorites { parts.favorites..count } else { parts.recent..parts.favorites.min(count) };
         for i in range.filter(|&i| shown(i)) {
@@ -143,6 +155,62 @@ pub fn layout(width: f32, parts: Parts, count: usize, home: &Home, shown: impl F
     }
     l.height = y + 16.0;
     l
+}
+
+/// What Home says where its list has no rows to show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Note {
+    /// The search bar's text matches nothing on Home (no tile, no recent file, no favourite): said
+    /// with the "Clear search" link after it.
+    NoMatch(String),
+    /// The list really is empty: how things get there.
+    Empty(&'static str),
+}
+
+impl Note {
+    fn words(&self) -> &str {
+        match self {
+            Note::NoMatch(words) => words,
+            Note::Empty(words) => words,
+        }
+    }
+}
+
+/// What to say where the list on show (`favorites`, or Recent) has no rows; None when it has rows,
+/// and when nothing needs saying.
+///
+/// A list emptied by the search bar isn't an empty list: when nothing on Home matches, that is
+/// said (with a way to clear the search bar); when something else on Home still matches (a tile,
+/// say), the tiles speak for themselves. How things get there is only said about a list that
+/// would be empty with nothing typed.
+pub fn note(tab: &Tab, parts: Parts, favorites: bool) -> Option<Note> {
+    if tab.folder.error.is_some() {
+        return None;
+    }
+    let typed = !tab.filter.trim().is_empty();
+    if typed && tab.view.is_empty() {
+        return Some(Note::NoMatch(format!("No items on Home match \u{201c}{}\u{201d}.", tab.filter)));
+    }
+    let count = tab.folder.entries.len();
+    let mut range = if favorites { parts.favorites..count } else { parts.recent..parts.favorites.min(count) };
+    if range.clone().any(|i| tab.row_of(i).is_some()) {
+        return None;
+    }
+    if typed && range.any(|i| tab.folder.entries[i].is_visible(tab.show_hidden, tab.show_system)) {
+        return None;
+    }
+    Some(Note::Empty(if favorites { "Right-click a file or folder and pick Add to Favourites to see it here." } else { "Files you open show up here." }))
+}
+
+/// Puts "Clear search" on the page, right after words `words_w` wide on the note's line (cut
+/// short when the line is too narrow for both, so the link always shows), and makes the page tall
+/// enough for the line. Returns how much room the words get.
+pub fn place_clear_search(l: &mut Layout, words_w: f32, link_w: f32) -> f32 {
+    let line = l.note;
+    let words_w = words_w.min(line.w - link_w - 8.0).max(0.0);
+    l.spots.push((Spot::ClearSearch, Rect::new(line.x + words_w + 8.0, line.y, link_w, line.h)));
+    l.height = l.height.max(line.bottom() + 16.0);
+    words_w
 }
 
 /// The item to move to from `from` with an arrow key: `dx`/`dy` is -1, 0 or 1. Up and down go to
@@ -199,13 +267,24 @@ pub fn paint(r: &mut Renderer, theme: &Theme, app: &AppState, tab: &Tab, home: &
     home.columns = app.settings.home_columns as usize;
     home.tiles = app.settings.home_tiles;
     home.layout = layout(area.w - 8.0, parts, tab.folder.entries.len(), home, |i| tab.row_of(i).is_some());
+    // (The renderer makes every text the skin's size: these are sizes of the standard one.)
+    let font = size::FONT;
+    // What the list says when it has no rows. That the search bar matches nothing is said with the
+    // lists folded too (under the pills), and has its link right after the words.
+    let said = note(tab, parts, home.favorites).filter(|n| home.lists_open || matches!(n, Note::NoMatch(_)));
+    let note_style = TextStyle::new(theme.muted).size(font).align(Align::Left);
+    // (As the sort editor's links: in the accent colour, a little heavier than the words before.)
+    let link_style = TextStyle::new(theme.accent).size(font + 0.5).semibold();
+    let mut said_w = home.layout.note.w;
+    if let Some(Note::NoMatch(words)) = &said {
+        let (words_w, link_w) = (r.measure(words, &note_style).ceil() + 2.0, r.measure(CLEAR_SEARCH, &link_style).ceil() + 4.0);
+        said_w = place_clear_search(&mut home.layout, words_w, link_w);
+    }
     let l = &home.layout;
     let at = |rc: Rect| Rect::new(area.x + rc.x, area.y + rc.y - scroll, rc.w, rc.h);
     let hover = mouse.filter(|p| area.contains(*p)).and_then(|p| l.spot_at(Point::new(p.x - area.x, p.y - area.y + scroll)));
     let user = std::env::var("USERPROFILE").unwrap_or_default();
     let cut = app.cut_names(&tab.folder.path);
-    // (The renderer makes every text the skin's size: these are sizes of the standard one.)
-    let font = size::FONT;
     // 98 / 2000 wrote nothing smaller than their 8 pt, the skin's text size.
     let small = if theme.era.classic() { font } else { font - 1.0 };
     let hide_ext = app.settings.hide_known_extensions;
@@ -253,6 +332,14 @@ pub fn paint(r: &mut Renderer, theme: &Theme, app: &AppState, tab: &Tab, home: &
                     "Favourites"
                 };
                 r.text(label, Rect::new(b.x + 32.0, b.y, b.w - 36.0, b.h), &TextStyle::new(ink).size(font).semibold());
+            }
+            Spot::ClearSearch => {
+                // Under the mouse: in the text's own colour, underlined.
+                let ink = if hovered { theme.text_strong } else { theme.accent };
+                r.text(CLEAR_SEARCH, b, &link_style.color(ink));
+                if hovered {
+                    r.fill_rect(Rect::new(b.x, b.bottom() - 4.0, b.w - 4.0, 1.0), ink);
+                }
             }
             Spot::Item(i) => {
                 let Some(e) = tab.folder.entries.get(i) else { continue };
@@ -348,12 +435,12 @@ pub fn paint(r: &mut Renderer, theme: &Theme, app: &AppState, tab: &Tab, home: &
             }
             r.fill_rect(Rect::new(b.x, b.bottom(), b.w, 1.0), theme.line);
         }
-        // Nothing in the list: say how things get there.
-        let empty = !l.spots.iter().any(|&(s, rc)| matches!(s, Spot::Item(_)) && rc.y > c.y);
-        if empty && tab.folder.error.is_none() {
-            let text = if home.favorites { "Right-click a file or folder and pick Add to Favourites to see it here." } else { "Files you open show up here." };
-            r.text(text, Rect::new(b.x + 12.0, b.bottom() + 8.0, b.w - 24.0, 24.0), &TextStyle::new(theme.muted).size(font).align(Align::Left));
-        }
+    }
+    // No rows in the list: how things get there, or that the search bar matches nothing on Home
+    // (its "Clear search" link is drawn with the other spots).
+    if let Some(said) = &said {
+        let line = at(l.note);
+        r.text(said.words(), Rect::new(line.x, line.y, said_w, line.h), &note_style);
     }
 }
 
@@ -389,7 +476,7 @@ fn paint_era_spot(r: &mut Renderer, theme: &Theme, home: &Home, spot: Spot, b: R
                 crate::retrolist::list_switch(r, theme, rect, "Favourites", on, hovered, &star);
             }
         }
-        Spot::Item(_) => return false,
+        Spot::Item(_) | Spot::ClearSearch => return false,
     }
     true
 }
@@ -451,6 +538,168 @@ mod tests {
         assert_eq!(short_folder("C:\\Users\\me", user), "C:\\Users\\me");
         // The user folder's length falls inside a character here.
         assert_eq!(short_folder("D:\\文档\\报告", user), "D:\\文档\\报告");
+    }
+
+    fn entry(name: &str, folder: bool) -> Entry {
+        Entry {
+            name: name.into(),
+            lower: name.to_lowercase(),
+            kind: if folder { folder::EntryKind::Folder } else { folder::EntryKind::File },
+            size: 1,
+            modified: 0,
+            created: 0,
+            attributes: 0,
+            ext: folder::extension(name),
+            type_name: std::sync::Arc::from("File"),
+            target: Some(format!("C:\\Users\\YourName\\{name}")),
+            free: 0,
+        }
+    }
+
+    /// A tab showing Home: the six standard folders and a pinned one as tiles, then `recent`, then
+    /// `favorites`.
+    fn home_tab(recent: &[&str], favorites: &[&str]) -> (Tab, Parts) {
+        let mut entries: Vec<Entry> = ["Desktop", "Downloads", "Documents", "Pictures", "Music", "Videos", "Projects"].iter().map(|n| entry(n, true)).collect();
+        entries.extend(recent.iter().chain(favorites).map(|n| entry(n, false)));
+        let parts = Parts { pinned: 6, recent: 7, favorites: 7 + recent.len() };
+        let mut tab = Tab::new(1, crate::recent::LOCATION.into());
+        let listing = folder::Folder { path: crate::recent::LOCATION.into(), entries, home: Some(Box::new(parts)), ..Default::default() };
+        crate::app::apply_listing(&mut tab, listing);
+        (tab, parts)
+    }
+
+    fn typed(tab: &mut Tab, text: &str) {
+        tab.filter = text.into();
+        tab.rebuild_view();
+    }
+
+    const RECENT: [&str; 2] = ["notes.txt", "photo #1 \u{130}\u{f1} \u{1F600}.jpg"];
+    const FAVORITES: [&str; 1] = ["budget.xlsx"];
+
+    /// The search bar matching nothing on Home says so, in both lists - not that files you open
+    /// show up here, as if Home were empty.
+    #[test]
+    fn a_search_that_matches_nothing_on_home_says_so() {
+        let (mut tab, parts) = home_tab(&RECENT, &FAVORITES);
+        assert_eq!((note(&tab, parts, false), note(&tab, parts, true)), (None, None), "rows to show: nothing to say");
+        typed(&mut tab, "test");
+        assert!(tab.view.is_empty());
+        let said = Some(Note::NoMatch("No items on Home match \u{201c}test\u{201d}.".into()));
+        assert_eq!(note(&tab, parts, false), said);
+        assert_eq!(note(&tab, parts, true), said);
+        assert_eq!(said.as_ref().map(Note::words), Some("No items on Home match \u{201c}test\u{201d}."));
+        // The search bar emptied (by the link, Esc or by hand), and typed into again: back and forth.
+        for _ in 0..2 {
+            typed(&mut tab, "");
+            assert_eq!((note(&tab, parts, false), note(&tab, parts, true)), (None, None));
+            typed(&mut tab, "test");
+            assert_eq!(note(&tab, parts, false), said);
+        }
+        // Whatever was typed shows as typed, between curly quotes.
+        let long = "long \u{1F600} ".repeat(50);
+        for odd in ["#9", "\u{130}\u{f1}x", "\u{1F600}\u{1F600}", "say \"cheese\"", "*.nothing", " spaced out ", long.as_str()] {
+            typed(&mut tab, odd);
+            assert!(tab.view.is_empty(), "{odd}");
+            assert_eq!(note(&tab, parts, false), Some(Note::NoMatch(format!("No items on Home match \u{201c}{odd}\u{201d}."))));
+        }
+        // Only spaces is nothing typed: everything still shows.
+        typed(&mut tab, "   ");
+        assert_eq!((tab.view.len(), note(&tab, parts, false)), (10, None));
+    }
+
+    /// Something on Home still matches: nothing is said about no matches, and a list the search
+    /// bar emptied isn't called empty either.
+    #[test]
+    fn a_search_that_matches_something_on_home_says_nothing() {
+        let (mut tab, parts) = home_tab(&RECENT, &FAVORITES);
+        // A tile matches, no row does.
+        typed(&mut tab, "docu");
+        assert_eq!(tab.view.len(), 1);
+        assert_eq!((note(&tab, parts, false), note(&tab, parts, true)), (None, None));
+        // A recent file matches (by its odd letters): Recent has a row; Favourites is only hidden.
+        typed(&mut tab, "#1 \u{130}\u{f1} \u{1F600}");
+        assert_eq!(tab.view.len(), 1);
+        assert_eq!((note(&tab, parts, false), note(&tab, parts, true)), (None, None));
+        // A favourite matches: the same the other way round.
+        typed(&mut tab, "budget");
+        assert_eq!((note(&tab, parts, false), note(&tab, parts, true)), (None, None));
+    }
+
+    /// A list that really is empty still says how things get there - with something typed too,
+    /// as long as something else on Home matches.
+    #[test]
+    fn a_list_that_really_is_empty_says_how_things_get_there() {
+        let recent = Some(Note::Empty("Files you open show up here."));
+        let favorites = Some(Note::Empty("Right-click a file or folder and pick Add to Favourites to see it here."));
+        let (mut tab, parts) = home_tab(&[], &[]);
+        assert_eq!((note(&tab, parts, false), note(&tab, parts, true)), (recent.clone(), favorites.clone()));
+        typed(&mut tab, "docu");
+        assert_eq!((note(&tab, parts, false), note(&tab, parts, true)), (recent.clone(), favorites.clone()));
+        // Nothing at all matches: that is what's said.
+        typed(&mut tab, "test");
+        assert_eq!(note(&tab, parts, true), Some(Note::NoMatch("No items on Home match \u{201c}test\u{201d}.".into())));
+        // Recent files but no favourites: only Favourites is empty.
+        let (tab, parts) = home_tab(&RECENT, &[]);
+        assert_eq!((note(&tab, parts, false), note(&tab, parts, true)), (None, favorites));
+        // Hidden files that aren't shown leave the list empty, as before.
+        let (mut tab, parts) = home_tab(&RECENT, &[]);
+        for e in &mut tab.folder.entries[7..] {
+            e.attributes = 0x2;
+        }
+        tab.show_hidden = false;
+        tab.rebuild_view();
+        assert_eq!(note(&tab, parts, false), recent);
+        // Home couldn't be read: the error is what shows, nothing else.
+        let (mut tab, parts) = home_tab(&[], &[]);
+        tab.folder.error = Some("Failed to read Home.".into());
+        assert_eq!((note(&tab, parts, false), note(&tab, parts, true)), (None, None));
+        // Parts that don't fit the entries (never seen, but never a panic).
+        let (tab, _) = home_tab(&RECENT, &FAVORITES);
+        for parts in [Parts { pinned: 99, recent: 99, favorites: 99 }, Parts { pinned: 0, recent: 9, favorites: 3 }, Parts::default()] {
+            let _ = (note(&tab, parts, false), note(&tab, parts, true));
+        }
+    }
+
+    /// The line for those words sits under the column titles, or under the pills while the lists
+    /// are folded; "Clear search" goes right after the words and always fits on the line.
+    #[test]
+    fn clear_search_sits_right_after_the_words() {
+        let parts = Parts { pinned: 6, recent: 7, favorites: 9 };
+        let mut home = Home::default();
+        let mut l = layout(900.0, parts, 10, &home, |_| false);
+        let columns = l.columns.expect("the lists are open");
+        assert_eq!((l.note.x, l.note.y, l.note.w), (PAD + 12.0, columns.bottom() + 8.0, columns.w - 24.0));
+        let tall = l.height;
+        assert_eq!(place_clear_search(&mut l, 200.0, 80.0), 200.0);
+        let link = l.spots.iter().find(|(s, _)| *s == Spot::ClearSearch).map(|&(_, rc)| rc).expect("on the page");
+        assert_eq!((link.x, link.y, link.w, link.h), (l.note.x + 208.0, l.note.y, 80.0, l.note.h));
+        assert_eq!(l.spot_at(Point::new(link.x + 40.0, link.y + 12.0)), Some(Spot::ClearSearch));
+        assert_eq!(l.spot_at(Point::new(l.note.x + 100.0, link.y + 12.0)), None, "the words aren't the link");
+        assert!(l.height >= l.note.bottom() && l.height >= tall, "the page reaches down to the line");
+        // It isn't an item: the arrow keys and the items' order don't know it.
+        assert_eq!(l.items().count(), 0);
+        assert_eq!(step(&l, None, 0, 1), None);
+        // Words too long for the line are cut short, so the link still shows whole.
+        let mut l = layout(900.0, parts, 10, &home, |_| false);
+        let room = place_clear_search(&mut l, 5000.0, 80.0);
+        let link = l.spots.last().unwrap().1;
+        assert_eq!(room, l.note.w - 88.0);
+        assert!((link.right() - l.note.right()).abs() < 0.01, "{link:?} in {:?}", l.note);
+        // The lists folded: under the pills, where the column titles would be.
+        home.lists_open = false;
+        let mut l = layout(900.0, parts, 10, &home, |_| false);
+        let pills = l.spots.iter().find(|(s, _)| *s == Spot::Recent).unwrap().1;
+        assert!(l.columns.is_none() && l.note.y > pills.bottom(), "{:?} under {pills:?}", l.note);
+        place_clear_search(&mut l, 200.0, 80.0);
+        assert!(l.height >= l.note.bottom());
+        // No room at all, or sizes that make no sense: never a panic, never a negative width.
+        for width in [0.0, 1.0, 40.0, 1e9] {
+            for (words, link) in [(0.0, 0.0), (300.0, 80.0), (f32::MAX, 80.0), (-5.0, 80.0), (300.0, 1e9)] {
+                let mut l = layout(width, parts, 10, &home, |_| false);
+                let room = place_clear_search(&mut l, words, link);
+                assert!(room >= 0.0, "{width} {words} {link}: {room}");
+            }
+        }
     }
 
     /// Settings' HomeColumns and HomeTiles: four small tiles to a line when there's room, and

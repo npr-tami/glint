@@ -2,8 +2,9 @@
 //! drive's name and how full it is, SCAN AGAIN, then three tabs:
 //! - Biggest: the biggest folders, each with a bar; clicking one goes into it (or opens it when
 //!   nothing big is inside), and the path above goes back up;
-//! - Changes: the folders that grew or shrank most since the last scan;
-//! - By type: how much videos, games, pictures and so on take;
+//! - Changes: the folders that grew or shrank most since the last scan (a folder inside another
+//!   one listed sits under it, pushed in);
+//! - By type: how much videos, games, pictures and so on take, and what counts as each;
 //! and at the bottom the space no folder shows (Recycle Bin, hibernation and page files, the rest).
 //!
 //! The look itself is diskspace.rs; the app keeps one per drive (app/disk.rs).
@@ -31,6 +32,14 @@ const BUTTON_W: f32 = 112.0;
 const BUTTON_H: f32 = 28.0;
 /// One wheel notch scrolls this far.
 const NOTCH: f32 = 48.0;
+/// How far a folder in Changes is pushed in under the folder it's in.
+const INDENT: f32 = 22.0;
+/// Deeper than this, folders aren't pushed in further (the name keeps its room).
+const MAX_INDENT: usize = 4;
+/// Said once over By type's rows (diskspace.rs counts each file in one kind, the folder first).
+const ONE_TYPE_EACH: &str = "Each file counts in one type only: by its folder for Windows and Games, by how its name ends for the rest.";
+/// The height of one more line of it, where the list is too narrow for it in one.
+const NOTE_LINE: f32 = 18.0;
 
 const GREW: Color = Color::hex(0xf0b44c);
 const SHRANK: Color = Color::hex(0x5fb4f0);
@@ -88,6 +97,8 @@ struct Row {
     size: String,
     size_color: Option<Color>,
     click: Click,
+    /// How many steps it's pushed in (Changes: a folder inside another one listed).
+    indent: usize,
 }
 
 /// What the page remembers between frames.
@@ -299,7 +310,17 @@ impl DiskPage {
                         }
                         grew_rows(grew)
                     }
-                    Page::Types => types(look),
+                    Page::Types => {
+                        // On as many lines as it needs: a narrow list (one half of split view)
+                        // still says the whole rule.
+                        let style = TextStyle::new(theme.muted).size(font);
+                        for line in kit::wrap(r, ONE_TYPE_EACH, &style, w).iter().take(4) {
+                            r.text(line, Rect::new(x, top + y, w, SUB_H + 6.0), &style);
+                            y += NOTE_LINE;
+                        }
+                        y += SUB_H + 10.0 - NOTE_LINE;
+                        types(look)
+                    }
                 };
                 for row in rows {
                     let rect = Rect::new(x, top + y, w, ROW_H);
@@ -357,9 +378,11 @@ impl DiskPage {
         let bar_w = (b.w * 0.34).clamp(80.0, 300.0);
         let size_x = b.right() - SIZE_W - 8.0;
         let bar_x = size_x - 16.0 - bar_w;
-        let text_w = (bar_x - b.x - 24.0).max(40.0);
-        r.text(&row.name, Rect::new(b.x + 10.0, b.y + 4.0, text_w, 20.0), &TextStyle::new(theme.text_strong).size(font));
-        r.text(&row.sub, Rect::new(b.x + 10.0, b.y + 22.0, text_w, 16.0), &TextStyle::new(theme.muted).size(font - 1.0));
+        let indent = row.indent.min(MAX_INDENT) as f32 * INDENT;
+        let text_w = (bar_x - b.x - 24.0 - indent).max(40.0);
+        let text_x = b.x + 10.0 + indent;
+        r.text(&row.name, Rect::new(text_x, b.y + 4.0, text_w, 20.0), &TextStyle::new(theme.text_strong).size(font));
+        r.text(&row.sub, Rect::new(text_x, b.y + 22.0, text_w, 16.0), &TextStyle::new(theme.muted).size(font - 1.0));
         let track = Rect::new(bar_x, b.y + (b.h - BAR_H) / 2.0, bar_w, BAR_H);
         r.fill_round_rect(track, BAR_H / 2.0, theme.chip);
         if row.part > 0.0 {
@@ -378,7 +401,7 @@ impl DiskPage {
         }
         let b = Rect::new(x, top + y, w, 58.0);
         r.fill_round_rect(b, theme.radius.min(6.0), theme.chip);
-        let head = format!("{} no folder shows", folder::format_size(h.total()));
+        let head = other_usage(h.total());
         r.text(&head, Rect::new(b.x + 14.0, b.y + 8.0, b.w - 28.0, 20.0), &TextStyle::new(theme.text_strong).size(size::FONT).semibold());
         let mut parts = Vec::new();
         for (name, bytes) in [("Recycle Bin", h.recycle_bin), ("Hibernation file", h.hibernation), ("Page file", h.page_file), ("Restore points and system files", h.other)] {
@@ -389,6 +412,11 @@ impl DiskPage {
         r.text(&parts.join(" \u{b7} "), Rect::new(b.x + 14.0, b.y + 30.0, b.w - 28.0, 18.0), &TextStyle::new(theme.muted).size(size::FONT - 1.0));
         y + b.h
     }
+}
+
+/// The bottom box's heading: the space no folder shows.
+fn other_usage(bytes: u64) -> String {
+    format!("System and other disk usage: {}", folder::format_size(bytes))
 }
 
 /// A folder inside `drive` ("C:\\") as a real path.
@@ -423,22 +451,47 @@ fn biggest(look: &Look, at: &str) -> Vec<Row> {
                 size: folder::format_size(k.size),
                 size_color: None,
                 click: if k.kids.is_empty() { Click::Open(rel) } else { Click::Into(rel) },
+                indent: 0,
             }
         })
         .collect();
     let rest = node.rest();
     if rest > 0 {
         let name = if at.is_empty() { "Files on the drive itself and small folders".to_string() } else { "Files here and small folders".to_string() };
-        rows.push(Row { name, sub: "Open the folder to see them".into(), part: rest as f32 / top, bar: Some(Color::hex(0x5a5a5a)), size: folder::format_size(rest), size_color: None, click: Click::Open(at.to_string()) });
+        rows.push(Row { name, sub: "Open the folder to see them".into(), part: rest as f32 / top, bar: Some(Color::hex(0x5a5a5a)), size: folder::format_size(rest), size_color: None, click: Click::Open(at.to_string()), indent: 0 });
     }
     rows
 }
 
+/// The order Changes shows `changes` in (they come biggest change first): each folder with the
+/// listed folders inside it right under it, in the same order, so one growth doesn't look like two.
+/// Gives each one's place in `changes` and how deep it is under other listed folders.
+fn nested(changes: &[diskspace::Change]) -> Vec<(usize, usize)> {
+    // (Lower case: a folder that's gone is remembered only in lower case.)
+    let lower: Vec<String> = changes.iter().map(|c| c.rel.to_lowercase()).collect();
+    // Each one's nearest listed folder it's inside.
+    let parent: Vec<Option<usize>> = (0..changes.len())
+        .map(|i| (0..changes.len()).filter(|&j| j != i && lower[i].len() > lower[j].len() && lower[i].starts_with(&lower[j]) && lower[i][lower[j].len()..].starts_with('\\')).max_by_key(|&j| lower[j].len()))
+        .collect();
+    let mut out = Vec::with_capacity(changes.len());
+    fn add(i: usize, depth: usize, parent: &[Option<usize>], out: &mut Vec<(usize, usize)>) {
+        out.push((i, depth));
+        for k in (0..parent.len()).filter(|&k| parent[k] == Some(i)) {
+            add(k, depth + 1, parent, out);
+        }
+    }
+    for i in (0..changes.len()).filter(|&i| parent[i].is_none()) {
+        add(i, 0, &parent, &mut out);
+    }
+    out
+}
+
 fn grew_rows(changes: &[diskspace::Change]) -> Vec<Row> {
     let top = changes.iter().map(|c| c.change.unsigned_abs()).max().unwrap_or(1).max(1) as f32;
-    changes
-        .iter()
-        .map(|c| {
+    nested(changes)
+        .into_iter()
+        .map(|(i, indent)| {
+            let c = &changes[i];
             let (name, parent) = match c.rel.rfind('\\') {
                 Some(i) => (c.rel[i + 1..].to_string(), c.rel[..i].to_string()),
                 None => (c.rel.clone(), String::new()),
@@ -454,6 +507,7 @@ fn grew_rows(changes: &[diskspace::Change]) -> Vec<Row> {
                 size: format!("{sign}{}", folder::format_size(c.change.unsigned_abs())),
                 size_color: Some(color),
                 click: Click::Open(c.rel.clone()),
+                indent,
             }
         })
         .collect()
@@ -464,7 +518,7 @@ fn types(look: &Look) -> Vec<Row> {
     let top = kinds.first().map(|k| k.1).unwrap_or(1).max(1) as f32;
     kinds
         .into_iter()
-        .map(|(k, bytes)| Row { name: k.name().into(), sub: k.examples().into(), part: bytes as f32 / top, bar: Some(kind_color(k)), size: folder::format_size(bytes), size_color: None, click: Click::Nothing })
+        .map(|(k, bytes)| Row { name: k.name().into(), sub: k.examples().into(), part: bytes as f32 / top, bar: Some(kind_color(k)), size: folder::format_size(bytes), size_color: None, click: Click::Nothing, indent: 0 })
         .collect()
 }
 
@@ -524,4 +578,79 @@ mod tests {
         assert!(rows[1].size.starts_with('\u{2212}'));
         assert_eq!(rows[1].sub, "On the drive itself");
     }
+
+    fn change(rel: &str, gb: i64) -> diskspace::Change {
+        diskspace::Change { rel: rel.into(), change: gb * GB as i64 }
+    }
+
+    /// Changes' rows as "name, pushed in how far" (and they come biggest first, as grew() gives them).
+    fn shown(changes: &[diskspace::Change]) -> Vec<(String, usize)> {
+        grew_rows(changes).into_iter().map(|r| (r.name, r.indent)).collect()
+    }
+
+    fn owned(rows: &[(&str, usize)]) -> Vec<(String, usize)> {
+        rows.iter().map(|&(n, i)| (n.to_string(), i)).collect()
+    }
+
+    #[test]
+    fn a_folder_inside_a_listed_one_sits_under_it_pushed_in() {
+        // Games +10 and Games\Steam +5 used to be two lines of their own, with Videos between them.
+        let changes = [change("Games", 10), change("Users\\me\\Videos", 8), change("Games\\Steam", 5), change("Temp", 3), change("Games\\Epic", 2)];
+        assert_eq!(shown(&changes), owned(&[("Games", 0), ("Steam", 1), ("Epic", 1), ("Videos", 0), ("Temp", 0)]));
+        // Every folder still shows once, and a click opens the same folder as before.
+        let rows = grew_rows(&changes);
+        assert_eq!(rows.len(), changes.len());
+        assert_eq!(rows[1].click, Click::Open("Games\\Steam".into()));
+        assert_eq!((rows[1].sub.as_str(), rows[1].size.as_str()), ("Games", "+5.0 GB"));
+        // Bars still compare with the biggest change.
+        assert_eq!((rows[0].part, rows[1].part), (1.0, 0.5));
+    }
+
+    #[test]
+    fn a_folder_whose_parent_isnt_listed_stays_at_the_left() {
+        // Users isn't listed, so Users\me\Videos has nothing to sit under.
+        assert_eq!(shown(&[change("Users\\me\\Videos", 8), change("Games", 4)]), owned(&[("Videos", 0), ("Games", 0)]));
+        // A name that only starts the same isn't inside it.
+        assert_eq!(shown(&[change("Games", 4), change("Games2", 3), change("Games old\\x", 2)]), owned(&[("Games", 0), ("Games2", 0), ("x", 0)]));
+        assert!(shown(&[]).is_empty());
+    }
+
+    #[test]
+    fn deep_chains_step_in_once_a_level_under_the_nearest_listed_folder() {
+        let changes = [change("a", 9), change("a\\b\\c\\d", 7), change("a\\b", 6), change("x", 5), change("a\\b\\c\\d\\e", 4), change("a\\b\\c", 3)];
+        // a\b\c\d is under a\b\c (its nearest listed folder), though it changed more.
+        assert_eq!(shown(&changes), owned(&[("a", 0), ("b", 1), ("c", 2), ("d", 3), ("e", 4), ("x", 0)]));
+        // Very deep: pushed in no further than MAX_INDENT steps when drawn, every one still listed.
+        let deep: Vec<diskspace::Change> = (1..=12).map(|n| change(&vec!["f"; n].join("\\"), 20 - n as i64)).collect();
+        let rows = shown(&deep);
+        assert_eq!(rows.len(), 12);
+        assert_eq!(rows.iter().map(|r| r.1).collect::<Vec<_>>(), (0..12).collect::<Vec<_>>());
+        assert!(rows[11].1.min(MAX_INDENT) as f32 * INDENT < 200.0);
+    }
+
+    #[test]
+    fn equal_and_shrinking_changes_keep_their_order_under_their_folder() {
+        // As grew() sorts them: by how much changed (either way), then by name.
+        let changes = [change("Games", -12), change("Games\\b", -5), change("Users", 5), change("Games\\a", 3), change("Games\\c", 3)];
+        assert_eq!(shown(&changes), owned(&[("Games", 0), ("b", 1), ("a", 1), ("c", 1), ("Users", 0)]));
+        let rows = grew_rows(&changes);
+        assert!(rows[0].size.starts_with('\u{2212}') && rows[1].size.starts_with('\u{2212}') && rows[2].size.starts_with('+'));
+        // A folder that's gone is remembered in lower case: it still sits under its folder.
+        assert_eq!(shown(&[change("Games", -9), change("games\\old game", -8)]), owned(&[("Games", 0), ("old game", 1)]));
+        // Odd names.
+        assert_eq!(shown(&[change("\u{130}stanbul \u{1f389}", 4), change("\u{130}stanbul \u{1f389}\\#1 a\u{f1}o", 2)]), owned(&[("\u{130}stanbul \u{1f389}", 0), ("#1 a\u{f1}o", 1)]));
+    }
+
+    #[test]
+    fn the_space_no_folder_shows_and_what_each_type_is_are_said_plainly() {
+        assert_eq!(other_usage(828 * GB / 10), format!("System and other disk usage: {}", folder::format_size(828 * GB / 10)));
+        assert!(other_usage(0).starts_with("System and other disk usage: "));
+        // By type's rows carry each kind's line.
+        let mut l = look();
+        l.kinds[Kind::ALL.iter().position(|&k| k == Kind::Games).unwrap()] = 5 * GB;
+        let rows = types(&l);
+        assert_eq!(rows[0].sub, "Every file, DLLs too, in the game folders of Steam, Epic, Xbox, Riot, GOG, EA, Ubisoft and Battle.net");
+        assert!(ONE_TYPE_EACH.ends_with('.'));
+    }
 }
+

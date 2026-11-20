@@ -83,9 +83,10 @@ dependencies = [
 
 [[package]]
 name = "glint"
-version = "26.11.4"
+version = "26.11.5"
 dependencies = [
  "flate2",
+ "regex-lite",
  "serde",
  "serde_json",
  "sevenz-rust2",
@@ -187,6 +188,12 @@ checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "regex-lite"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "rustversion"

@@ -73,6 +73,10 @@ pub enum Job {
     /// Unpack the .zip or .7z `archive` into its own folder (Extract here), or into a new folder
     /// named after it there (`own_folder`: Extract to "Name"). Never replaces anything.
     Extract { archive: String, own_folder: bool },
+    /// Extract selected… / Extract all… while looking inside the .zip or .7z `archive`, at its
+    /// folder `at`: these items there (paths inside it), or none for the whole archive `at` is in,
+    /// go into the real folder `dest`. Never replaces anything.
+    ExtractInto { archive: String, at: String, items: Vec<String>, dest: String },
     /// Pack these items (all of one folder) into a new .zip or .7z next to them (Compress to zip).
     Compress { paths: Vec<String>, format: crate::archive::Format },
     /// Change what's inside the .zip or .7z `archive` (archive.rs), in the copy queue. `recycle`:
@@ -112,6 +116,7 @@ impl Job {
                 | Job::MoveEach { .. }
                 | Job::Restore { .. }
                 | Job::Extract { .. }
+                | Job::ExtractInto { .. }
                 | Job::Compress { .. }
                 | Job::ArchiveChange { .. }
                 | Job::PasteIntoArchive { .. }
@@ -239,6 +244,7 @@ fn run(job: Job) -> Outcome {
         Job::RenameMany { pairs } => rename_many(&pairs),
         Job::Restore { paths } => crate::recycle::restore_paths(&paths),
         Job::Extract { archive, own_folder } => extract(&archive, own_folder),
+        Job::ExtractInto { archive, at, items, dest } => extract_into(&archive, &at, &items, &dest),
         Job::Compress { paths, format } => compress(&paths, format),
         Job::ArchiveChange { archive, change, recycle } => archive_change(&archive, &change, &recycle),
         Job::PasteIntoArchive { archive, into } => paste_into_archive(&archive, &into),
@@ -531,6 +537,52 @@ fn extract(archive: &str, own_folder: bool) -> Outcome {
     Outcome { ok: result.is_ok(), changed: vec![dir.clone()], created: Some((dir, names)), undo, note: Some(note), ..Default::default() }
 }
 
+/// Extract selected… / Extract all… inside an archive (see [`Job::ExtractInto`]), in the copy
+/// queue as Extract here is: names taken in `dest` get the next free one, a cancel removes what was
+/// made, and Ctrl+Z sends what it made to the Recycle Bin.
+fn extract_into(archive: &str, at: &str, items: &[String], dest: &str) -> Outcome {
+    // What's extracted, in words: the archive on screen (an archive in the archive, when `at` goes
+    // through one), or the items.
+    let shown = at.split('\\').rev().find(|p| crate::archive::is_archive_name(p)).unwrap_or_else(|| file_name(archive));
+    let what = if items.is_empty() { format!("\u{201c}{shown}\u{201d}") } else { items_text(items) };
+    let to = if file_name(dest).is_empty() { dest } else { file_name(dest) };
+    let cancelled_note = format!("Cancelled: {what} {} extracted.", if items.len() > 1 { "weren't" } else { "wasn't" });
+    if !exists(archive) || is_folder(archive) {
+        return Outcome::note(format!("\u{201c}{}\u{201d} isn't there any more.", file_name(archive)));
+    }
+    if !is_folder(dest) {
+        return Outcome::note(format!("Failed to extract: \u{201c}{to}\u{201d} isn't there any more."));
+    }
+    let ticket = crate::copyqueue::Ticket::join(format!("Extracting {what}"));
+    // (Its speed is the archive read through, as Extract here's: when all of it is extracted.
+    // Some items only read part of it, and an archive inside it is another file, so no speed is
+    // shown for those.)
+    if items.is_empty() && !at.split('\\').any(crate::archive::is_archive_name) {
+        ticket.set_total(std::fs::metadata(archive).map(|m| m.len()).unwrap_or(0));
+    }
+    if !ticket.wait_turn() {
+        return Outcome::note(cancelled_note);
+    }
+    let mut made = Vec::new();
+    let result = if items.is_empty() { crate::archive::extract_whole(archive, at, dest, &mut made) } else { crate::archive::extract_some(archive, items, dest, &mut made) };
+    let cancelled = ticket.cancel_flag().load(std::sync::atomic::Ordering::SeqCst);
+    drop(ticket);
+    if cancelled {
+        remove_made(&made);
+        return Outcome { changed: vec![dest.to_string()], note: Some(cancelled_note), ..Default::default() };
+    }
+    // After a problem, folders left empty go again.
+    made.retain(|p| exists(p) && !(result.is_err() && is_folder(p) && std::fs::remove_dir(p).is_ok()));
+    let names: Vec<String> = made.iter().map(|p| file_name(p).to_string()).collect();
+    let undo = (!made.is_empty()).then(|| crate::undo::Step::Made { paths: made.clone(), what: "extract" });
+    let note = match &result {
+        Ok(()) if made.is_empty() => format!("{what} is empty."),
+        Ok(()) => format!("Extracted {what} to \u{201c}{to}\u{201d}."),
+        Err(why) => why.clone(),
+    };
+    Outcome { ok: result.is_ok(), changed: vec![dest.to_string()], created: Some((dest.to_string(), names)), undo, note: Some(note), ..Default::default() }
+}
+
 /// Compress to zip / 7z (see [`Job::Compress`]), in the copy queue: one new archive next to the
 /// first item, named after it (or after its folder, for several), numbered when that's taken.
 fn compress(paths: &[String], format: crate::archive::Format) -> Outcome {
@@ -629,7 +681,7 @@ fn archive_change(archive: &str, change: &crate::archive::Change, recycle: &[Str
         changed,
         created: done.made.map(|(dir, names)| (in_archive(archive, &dir), names)),
         rename_new: matches!(change, crate::archive::Change::New { .. }),
-        note: Some(format!("{did} {what} {to} \u{201c}{name}\u{201d}")),
+        note: Some(format!("{did} {what} {to} \u{201c}{name}\u{201d}.")),
         ..Default::default()
     };
     // (A rename says nothing, as on the disk. Tabs inside a renamed folder follow it: app/files.rs.)
@@ -644,10 +696,10 @@ fn archive_change(archive: &str, change: &crate::archive::Change, recycle: &[Str
         if let Some(crate::undo::Step::Recycled { paths }) = gone.undo {
             recycled = paths;
         }
-        out.note = Some(format!("Moved {what} into \u{201c}{name}\u{201d}"));
+        out.note = Some(format!("Moved {what} into \u{201c}{name}\u{201d}."));
         if !gone.ok || recycled.len() < recycle.len() {
             out.ok = false;
-            out.note = Some(format!("Added {what} to \u{201c}{name}\u{201d}, but some of them couldn't be removed from where they were."));
+            out.note = Some(format!("Added {what} to \u{201c}{name}\u{201d}, but failed to remove some of them from where they were."));
         }
     }
     let stamps = (archive_stamp(archive), archive_stamp(&done.backup));
@@ -717,14 +769,14 @@ fn take_out(archive: &str, items: &[String], dest: &str) -> Outcome {
             let stamps = (archive_stamp(archive), archive_stamp(&done.backup));
             out.undo = Some(crate::undo::Step::ArchiveChanged { archive: archive.to_string(), other: done.backup, recycled: Vec::new(), made, what: format!("moving {}", items_text(&arrived)), stamps });
             if out.ok {
-                out.note = Some(format!("Moved {} out of \u{201c}{name}\u{201d}", items_text(&arrived)));
+                out.note = Some(format!("Moved {} out of \u{201c}{name}\u{201d}.", items_text(&arrived)));
             }
         }
         Ok(None) => {}
         Err(why) => {
             out.ok = false;
             out.undo = Some(crate::undo::Step::Made { paths: made, what: "copy" });
-            out.note = Some(format!("Copied {} out, but couldn't remove {} from \u{201c}{name}\u{201d}: {why}", items_text(&arrived), if arrived.len() == 1 { "it" } else { "them" }));
+            out.note = Some(format!("Copied {} out, but failed to remove {} from \u{201c}{name}\u{201d}: {why}", items_text(&arrived), if arrived.len() == 1 { "it" } else { "them" }));
         }
     }
     out
@@ -1522,7 +1574,8 @@ impl Engine {
 /// (made by another system) is one Windows' copy engine never can: renaming it works (`rename`).
 fn cant_open(name: &str) -> String {
     if name.ends_with('.') || name.ends_with(' ') {
-        format!("Windows can't open \u{201c}{name}\u{201d}: its name ends in a {}. Rename it (F2) first.", if name.ends_with('.') { "dot" } else { "space" })
+        let then = crate::keymap::say_with(&crate::keymap::keys_now(crate::keymap::Action::Rename), "Rename it ({keys}) first.", "Rename it first.");
+        format!("Windows can't open \u{201c}{name}\u{201d}: its name ends in a {}. {then}", if name.ends_with('.') { "dot" } else { "space" })
     } else {
         format!("Windows can't open \u{201c}{name}\u{201d}.")
     }
@@ -2068,6 +2121,71 @@ mod tests {
         back.sort();
         assert_eq!(back, ["a (2).txt", "inner (2)"]);
         assert!(!extract(&join(&dir, "missing.zip"), false).ok);
+    }
+
+    #[test]
+    fn extract_selected_and_all_put_things_in_the_folder_picked() {
+        use crate::archive::Format;
+        let dir = scratch("extract-into");
+        let docs = join(&dir, "Docs");
+        std::fs::create_dir_all(join(&docs, "inner")).unwrap();
+        std::fs::write(join(&docs, "a.txt"), b"alpha").unwrap();
+        std::fs::write(join(&join(&docs, "inner"), "b.txt"), b"beta").unwrap();
+        assert!(compress(&[docs.clone()], Format::Zip).ok);
+        let zip = join(&dir, "Docs.zip");
+        let dest = join(&dir, "Out #1");
+        std::fs::create_dir(&dest).unwrap();
+        // One file.
+        let one = extract_into(&zip, "Docs", &["Docs\\a.txt".to_string()], &dest);
+        assert!(one.ok, "{:?}", one.note);
+        assert_eq!(one.note.as_deref(), Some("Extracted \u{201c}a.txt\u{201d} to \u{201c}Out #1\u{201d}."));
+        assert_eq!(one.created, Some((dest.clone(), vec!["a.txt".to_string()])));
+        assert_eq!(one.undo, Some(crate::undo::Step::Made { paths: vec![join(&dest, "a.txt")], what: "extract" }));
+        // A file and a folder, the file's name taken by now.
+        let two = extract_into(&zip, "Docs", &["Docs\\a.txt".to_string(), "Docs\\inner".to_string()], &dest);
+        assert_eq!(two.note.as_deref(), Some("Extracted 2 items to \u{201c}Out #1\u{201d}."));
+        assert_eq!(two.created, Some((dest.clone(), vec!["a (2).txt".to_string(), "inner".to_string()])));
+        assert_eq!(std::fs::read(join(&join(&dest, "inner"), "b.txt")).unwrap(), b"beta");
+        assert_eq!(std::fs::read(join(&dest, "a.txt")).unwrap(), b"alpha", "nothing is replaced");
+        // Everything, from a folder inside it.
+        let all = extract_into(&zip, "Docs\\inner", &[], &dest);
+        assert_eq!(all.note.as_deref(), Some("Extracted \u{201c}Docs.zip\u{201d} to \u{201c}Out #1\u{201d}."));
+        assert_eq!(all.created, Some((dest.clone(), vec!["Docs".to_string()])));
+        // The folder picked, or the archive, gone meanwhile.
+        let gone = extract_into(&zip, "", &[], &join(&dir, "gone"));
+        assert!(!gone.ok);
+        assert_eq!(gone.note.as_deref(), Some("Failed to extract: \u{201c}gone\u{201d} isn't there any more."));
+        let missing = extract_into(&join(&dir, "missing.zip"), "", &[], &dest);
+        assert_eq!(missing.note.as_deref(), Some("\u{201c}missing.zip\u{201d} isn't there any more."));
+        // Something no longer in the archive: an error, nothing made.
+        let not_in = extract_into(&zip, "Docs", &["Docs\\nope.txt".to_string()], &dest);
+        assert!(!not_in.ok && not_in.undo.is_none());
+        assert_eq!(not_in.note.as_deref(), Some("\u{201c}Docs\\nope.txt\u{201d} isn't in this archive."));
+    }
+
+    #[test]
+    fn an_extract_selected_cancelled_while_it_waits_makes_nothing() {
+        use crate::archive::Format;
+        let dir = scratch("extract-into-cancel");
+        let docs = join(&dir, "Cancel me");
+        std::fs::create_dir_all(&docs).unwrap();
+        // (A name no other test extracts: the copy queue is shared, so the cancel finds only this job.)
+        std::fs::write(join(&docs, "wait here.txt"), b"alpha").unwrap();
+        assert!(compress(&[docs.clone()], Format::SevenZ).ok);
+        let dest = join(&dir, "dest");
+        std::fs::create_dir(&dest).unwrap();
+        let running = crate::copyqueue::Ticket::join("extract-into-cancel: the job before".into());
+        assert!(running.wait_turn());
+        let job = {
+            let (archive, dest) = (join(&dir, "Cancel me.7z"), dest.clone());
+            std::thread::spawn(move || extract_into(&archive, "Cancel me", &["Cancel me\\wait here.txt".to_string()], &dest))
+        };
+        crate::copyqueue::cancel(listed("Extracting \u{201c}wait here.txt\u{201d}"));
+        let out = job.join().unwrap();
+        drop(running);
+        assert!(!out.ok && out.undo.is_none());
+        assert_eq!(out.note.as_deref(), Some("Cancelled: \u{201c}wait here.txt\u{201d} wasn't extracted."));
+        assert!(names_in(&dest).unwrap().is_empty());
     }
 
     #[test]

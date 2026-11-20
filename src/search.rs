@@ -19,10 +19,16 @@
 //! list shows them with a Folder column), so the window never waits and isn't flooded either. Each search has a cancel flag: typing more, switching Subfolders off,
 //! leaving the folder or closing the tab stops it at once (dropping the [`Search`] does it).
 //!
+//! A search of a whole drive (from its root, or This PC) answers from the drive's index first
+//! (searchindex.rs), at once, and the walk then runs as usual: what it finds again replaces the
+//! index's answer, what it finds new is added, and what the index gave but the walk didn't find
+//! goes (after a walk that stopped at LIMIT: what isn't on the disk any more). A walk that got
+//! everywhere leaves a new index for next time.
+//!
 //! The results are ordinary entries whose `target` is their full path (folder.rs), so opening,
 //! copying, deleting and the right-click menus act on the very file found, wherever it is.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -34,6 +40,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 
 use crate::folder::{self, Entry, Folder, NameFilter};
+use crate::searchindex::{self, Tap};
 use crate::shell::{self, ComGuard};
 
 /// The most results one search shows.
@@ -131,8 +138,14 @@ pub fn odd_names_work(dir: &std::path::Path) -> bool {
 }
 
 /// Results the search thread found since the last batch.
+#[derive(Default)]
 pub struct Batch {
     pub entries: Vec<Entry>,
+    /// Results the index gave (searchindex.rs) as the walk found them again: each takes the place
+    /// of the one with the same path.
+    pub changed: Vec<Entry>,
+    /// The paths of results the index gave that the walk didn't find: gone since.
+    pub gone: Vec<String>,
     /// The search is over (everything searched, or LIMIT reached).
     pub done: bool,
     pub capped: bool,
@@ -208,12 +221,12 @@ pub fn start(ask: Ask, listing: Folder, mut send: impl FnMut(Batch) -> bool + Se
                     if capped {
                         stop.store(true, Ordering::SeqCst); // the rest isn't looked for
                     }
-                    send(Batch { entries: found, done: true, capped, summary });
+                    send(Batch { entries: found, done: true, capped, summary, ..Default::default() });
                     return;
                 }
                 if !found.is_empty() && last_sent.elapsed() >= BATCH_EVERY {
                     last_sent = Instant::now();
-                    if !send(Batch { entries: std::mem::take(&mut found), done: false, capped: false, summary: None }) {
+                    if !send(Batch { entries: std::mem::take(&mut found), ..Default::default() }) {
                         stop.store(true, Ordering::SeqCst);
                         return;
                     }
@@ -239,26 +252,75 @@ pub fn start(ask: Ask, listing: Folder, mut send: impl FnMut(Batch) -> bool + Se
         }
         let roots = if dir.is_empty() { drive_roots() } else { vec![dir] };
         let filter = NameFilter::new(&text);
-        let mut found = Vec::new();
-        let mut last_sent = Instant::now();
-        let outcome = walk(roots, &filter, show_hidden, show_system, deep, &flag, &mut |e| {
-            if let Some(e) = e {
-                found.push(e);
+        // A whole drive (or This PC): its index answers first (not for words in quotes, which are
+        // looked for in the files themselves), and the walk then brings it up to date.
+        let places: Vec<searchindex::Place> = if deep { roots.iter().filter_map(|r| searchindex::place_for(r)).collect() } else { Vec::new() };
+        let mut earlier: HashSet<String> = HashSet::new();
+        if filter.inside().is_empty() && !places.is_empty() {
+            let mut first: Vec<Entry> = Vec::new();
+            for p in &places {
+                let room = LIMIT - first.len();
+                first.extend(searchindex::answer(p, &filter, show_hidden, show_system, &flag, room).unwrap_or_default());
             }
-            if !found.is_empty() && last_sent.elapsed() >= BATCH_EVERY {
+            if flag.load(Ordering::SeqCst) {
+                return;
+            }
+            earlier = first.iter().filter_map(|e| e.target.clone()).collect();
+            if !first.is_empty() && !send(Batch { entries: first, ..Default::default() }) {
+                return;
+            }
+        }
+        let recorder = searchindex::Recorder::start(places);
+        let mut shown = earlier.len();
+        // New finds while the list is full of the index's answer: kept, since some of that answer
+        // may be gone (the walk itself stops at LIMIT, so this stays below it).
+        let mut held: Vec<Entry> = Vec::new();
+        let (mut found, mut changed) = (Vec::new(), Vec::new());
+        let mut last_sent = Instant::now();
+        let outcome = walk(roots, &filter, show_hidden, show_system, deep, recorder.as_ref().map(|r| r.tap()), &flag, &mut |e| {
+            if let Some(e) = e {
+                if e.target.as_ref().is_some_and(|t| earlier.remove(t)) {
+                    changed.push(e);
+                } else if shown < LIMIT {
+                    shown += 1;
+                    found.push(e);
+                } else {
+                    held.push(e);
+                }
+            }
+            if (!found.is_empty() || !changed.is_empty()) && last_sent.elapsed() >= BATCH_EVERY {
                 last_sent = Instant::now();
-                return send(Batch { entries: std::mem::take(&mut found), done: false, capped: false, summary: None });
+                return send(Batch { entries: std::mem::take(&mut found), changed: std::mem::take(&mut changed), ..Default::default() });
             }
             true
         });
+        // Only a walk that went everywhere makes the new index.
+        if let Some(r) = recorder {
+            r.finish(outcome == Some(false));
+        }
         if let Some(capped) = outcome {
-            send(Batch { entries: found, done: true, capped, summary: None });
+            let gone = gone_since(earlier, capped, &flag);
+            // Room left once those are gone: the new finds held back fill it (all of them when the
+            // walk got everywhere, as it found at most LIMIT).
+            let room = LIMIT.saturating_sub(shown - gone.len());
+            found.extend(held.into_iter().take(room));
+            send(Batch { entries: found, changed, gone, done: true, capped, summary: None });
         }
     });
     if !started {
         return Err(listing);
     }
     Ok(Search { root, query, generation, cancel, fresh: false, done: false, capped: false, started: Instant::now(), listing, dupes: None, deep })
+}
+
+/// What the index gave that the walk didn't find again (`left`): gone since. When the walk
+/// stopped at LIMIT before it got everywhere, only those that aren't on the disk any more (the
+/// rest may be in what it didn't get to).
+fn gone_since(left: HashSet<String>, capped: bool, cancel: &AtomicBool) -> Vec<String> {
+    if !capped {
+        return left.into_iter().collect();
+    }
+    left.into_iter().take_while(|_| !cancel.load(Ordering::SeqCst)).filter(|p| crate::fileops::attributes(p).is_none()).collect()
 }
 
 /// The drives a search of This PC goes through: the local and removable ones that are ready (not
@@ -360,6 +422,7 @@ fn walk(
     show_hidden: bool,
     show_system: bool,
     deep: bool,
+    tap: Option<&Tap>,
     cancel: &Arc<AtomicBool>,
     found: &mut dyn FnMut(Option<Entry>) -> bool,
 ) -> Option<bool> {
@@ -373,14 +436,14 @@ fn walk(
     let (tx, rx) = channel::<Entry>();
     let mut running = 0;
     for _ in 0..threads {
-        let (work, cancel, tx, filter) = (work.clone(), cancel.clone(), tx.clone(), filter.clone());
-        if shell::background("search subfolders", move || search_folders(&work, &filter, show_hidden, show_system, deep, &cancel, &tx)) {
+        let (work, cancel, tx, filter, tap) = (work.clone(), cancel.clone(), tx.clone(), filter.clone(), tap.cloned());
+        if shell::background("search subfolders", move || search_folders(&work, &filter, show_hidden, show_system, deep, tap.as_ref(), &cancel, &tx)) {
             running += 1;
         }
     }
     if running == 0 {
         // No thread could be had: this one goes through the folders itself.
-        search_folders(&work, filter, show_hidden, show_system, deep, cancel, &tx);
+        search_folders(&work, filter, show_hidden, show_system, deep, tap, cancel, &tx);
     }
     drop(tx);
     let stop = |work: &Work| {
@@ -406,7 +469,8 @@ fn walk(
 
 /// One of a search's threads: takes folders from `work` until there are none left, sending each
 /// match to `tx`.
-fn search_folders(work: &Work, filter: &NameFilter, show_hidden: bool, show_system: bool, deep: bool, cancel: &AtomicBool, tx: &Sender<Entry>) {
+#[allow(clippy::too_many_arguments)]
+fn search_folders(work: &Work, filter: &NameFilter, show_hidden: bool, show_system: bool, deep: bool, tap: Option<&Tap>, cancel: &AtomicBool, tx: &Sender<Entry>) {
     // Type names ("Text Document") come from the shell, which needs COM.
     let _com = ComGuard::init();
     let mut types: HashMap<String, Arc<str>> = HashMap::new();
@@ -415,6 +479,9 @@ fn search_folders(work: &Work, filter: &NameFilter, show_hidden: bool, show_syst
         let mut next = Some(first);
         while let Some(dir) = next {
             let mut subs = Vec::new();
+            // Everything in the folder, hidden or not, for the drive's new index (searchindex.rs).
+            let record = tap.filter(|t| t.wants(&dir));
+            let mut items = Vec::new();
             let go_on = list(&dir, cancel, &mut |data: &WIN32_FIND_DATAW| {
                 if work.halt.load(Ordering::Relaxed) {
                     return false;
@@ -422,7 +489,15 @@ fn search_folders(work: &Work, filter: &NameFilter, show_hidden: bool, show_syst
                 let attrs = data.dwFileAttributes;
                 let len = data.cFileName.iter().position(|&c| c == 0).unwrap_or(data.cFileName.len());
                 let name = String::from_utf16_lossy(&data.cFileName[..len]);
-                if name == "." || name == ".." || !folder::visible(attrs, show_hidden, show_system) {
+                if name == "." || name == ".." {
+                    return true;
+                }
+                if record.is_some() {
+                    let size = if attrs & ATTR_DIRECTORY != 0 { 0 } else { ((data.nFileSizeHigh as u64) << 32) | data.nFileSizeLow as u64 };
+                    let modified = ((data.ftLastWriteTime.dwHighDateTime as u64) << 32) | data.ftLastWriteTime.dwLowDateTime as u64;
+                    items.push(searchindex::Item { name: name.clone(), attributes: attrs, size, modified });
+                }
+                if !folder::visible(attrs, show_hidden, show_system) {
                     return true;
                 }
                 if deep && attrs & ATTR_DIRECTORY != 0 && !is_link(data) {
@@ -430,6 +505,11 @@ fn search_folders(work: &Work, filter: &NameFilter, show_hidden: bool, show_syst
                 }
                 let lower = name.to_lowercase();
                 if !filter.keeps(&lower, || folder::join(&dir, &name)) {
+                    return true;
+                }
+                let Some(mut e) = folder::entry_from(data, &mut types) else { return true };
+                // `size:` and `date:` words (before reading inside, which takes longer).
+                if !filter.fits(&e) {
                     return true;
                 }
                 // Words in quotes: only files that have them inside.
@@ -441,7 +521,6 @@ fn search_folders(work: &Work, filter: &NameFilter, show_hidden: bool, show_syst
                 {
                     return true;
                 }
-                let Some(mut e) = folder::entry_from(data, &mut types) else { return true };
                 e.target = Some(folder::join(&dir, &name));
                 // Several threads find things at once; the count makes sure no more than LIMIT go out.
                 if work.count.fetch_add(1, Ordering::SeqCst) >= LIMIT {
@@ -458,6 +537,10 @@ fn search_folders(work: &Work, filter: &NameFilter, show_hidden: bool, show_syst
                 work.halt.store(true, Ordering::SeqCst);
                 work.idle();
                 return;
+            }
+            // Before its subfolders are handed on, so a folder always comes before the ones in it.
+            if let Some(t) = record {
+                t.send(searchindex::Block { dir: dir.clone(), items: std::mem::take(&mut items) });
             }
             // Nearer folders first: the new ones go to the back of the shared list, and only what
             // doesn't fit there is gone through by this thread before it takes the next.
@@ -749,6 +832,213 @@ mod tests {
         assert_eq!(found, vec![format!("{root}\\a\\b\\report-2023.pdf")]);
         let (found, _) = search(&root, "b");
         assert_eq!(found, vec![format!("{root}\\a\\b")]);
+    }
+
+    #[test]
+    fn size_date_minus_and_regex_words_work_in_subfolders() {
+        let t = Tree::new("words", &["a/IMG_2024.jpg", "a/b/IMG_12.jpg", "a/b/draft İ 🌉 #1.txt", "a/b/big.bin", "a/cache.tmp"]);
+        let root = t.path();
+        std::fs::create_dir_all(t.0.join("big folder")).unwrap();
+        write(&t, "a/b/big.bin", &vec![0; 3000]);
+        write(&t, "a/b/draft İ 🌉 #1.txt", b"hello there");
+        assert_eq!(search_in(&root, "size:>2kb", true), ["big.bin"], "files only, deep down too");
+        assert_eq!(search_in(&root, "big size:<2kb", true), Vec::<String>::new(), "a folder has no size here");
+        assert_eq!(search_in(&root, "BIG", true), ["big folder", "big.bin"]);
+        assert_eq!(search_in(&root, "date:today *.jpg", true), ["IMG_12.jpg", "IMG_2024.jpg"]);
+        assert_eq!(search_in(&root, "date:<2000", true), Vec::<String>::new());
+        assert_eq!(search_in(&root, r"regex:^img_\d{4}\.jpe?g$", true), ["IMG_2024.jpg"]);
+        assert_eq!(search_in(&root, "regex:[", true), Vec::<String>::new(), "a broken pattern finds nothing");
+        assert_eq!(search_in(&root, "-*.jpg -big", true), ["a", "b", "cache.tmp", "draft İ 🌉 #1.txt"]);
+        assert_eq!(search_in(&root, "\"hello\" -cache size:<1kb", true), ["draft İ 🌉 #1.txt"], "with words inside files");
+        assert_eq!(search_in(&root, "\"hello\" size:>1kb", true), Vec::<String>::new());
+    }
+
+    /// Every batch of a search, until its last.
+    fn batches(root: &str, query: &str, show_hidden: bool) -> Vec<Batch> {
+        let (tx, rx) = channel();
+        let s = start(Ask { show_hidden, ..ask(root, query, false) }, Folder::default(), move |b| tx.send(b).is_ok());
+        assert!(s.is_ok());
+        let mut all = Vec::new();
+        loop {
+            let b = rx.recv_timeout(Duration::from_secs(20)).expect("the search ends");
+            let done = b.done;
+            all.push(b);
+            if done {
+                return all;
+            }
+        }
+    }
+
+    /// The paths a batch brings, sorted.
+    fn paths(entries: &[Entry]) -> Vec<String> {
+        let mut v: Vec<String> = entries.iter().map(|e| e.target.clone().unwrap_or_default()).collect();
+        v.sort();
+        v
+    }
+
+    /// The results as the list ends up with them (app.rs `take_results`): new ones added, changed
+    /// ones put in place of the old, gone ones taken away.
+    fn shown_after(batches: &[Batch]) -> Vec<String> {
+        let mut shown: Vec<String> = Vec::new();
+        for b in batches {
+            for e in &b.changed {
+                assert!(shown.contains(e.target.as_ref().unwrap()), "changed is only for what is shown");
+            }
+            shown.retain(|p| !b.gone.contains(p));
+            shown.extend(b.entries.iter().map(|e| e.target.clone().unwrap()));
+        }
+        shown.sort();
+        shown
+    }
+
+    /// A tree of its own with an index of its own (in a cache folder beside it), as a drive has.
+    fn indexed_tree(name: &str, files: &[&str]) -> (Tree, searchindex::Place) {
+        let t = Tree::new(name, files);
+        let cache = std::env::temp_dir().join(format!("glint-search-test-{name}-{}-cache", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache);
+        let place = searchindex::Place { root: t.path(), volume: 42, file: crate::settings::search_index_file(&cache, 'T') };
+        searchindex::TEST_PLACES.lock().unwrap().push(place.clone());
+        (t, place)
+    }
+
+    /// Waits for the index file to be there and different from `old` (it is written once the walk's
+    /// threads have all stopped, a moment after the last batch).
+    fn new_index(place: &searchindex::Place, old: &Option<Vec<u8>>) -> Vec<u8> {
+        let start = Instant::now();
+        loop {
+            let now = std::fs::read(&place.file).ok();
+            if now.is_some() && now != *old {
+                return now.unwrap();
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "the index is written");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Whether the index has an item of that name.
+    fn index_has(place: &searchindex::Place, name: &str) -> bool {
+        let mut has = false;
+        let _ = searchindex::read(place, &AtomicBool::new(false), &mut |_, items| has |= items.iter().any(|it| it.name == name));
+        has
+    }
+
+    #[test]
+    fn a_drive_search_answers_from_its_index_and_then_brings_it_up_to_date() {
+        let (t, place) = indexed_tree("index", &["a/report 1.txt", "a/b/report 2.txt", "a/b/c/notes.txt", "report 3.md", "x/İstanbul 🌉 #1 report.txt"]);
+        let root = t.path();
+        // The first search walks, as before, and leaves an index.
+        let first = batches(&root, "report", false);
+        assert!(first.iter().all(|b| b.changed.is_empty() && b.gone.is_empty()));
+        let walked = shown_after(&first);
+        assert_eq!(walked.len(), 4);
+        let index = new_index(&place, &None);
+        // The next answers from the index at once (its first batch), and the walk finds the same.
+        let again = batches(&root, "report", false);
+        assert_eq!(paths(&again[0].entries), walked, "the index's answer is what a walk finds");
+        assert!(again.iter().skip(1).all(|b| b.entries.is_empty() && b.gone.is_empty()), "nothing new, nothing gone");
+        assert_eq!(paths(&again.iter().flat_map(|b| b.changed.clone()).collect::<Vec<_>>()), walked, "each one as the walk saw it");
+        assert_eq!(shown_after(&again), walked);
+        // Other words from the same index: the same as a walk.
+        for query in ["*.txt", "notes", "size:<1kb -notes", "regex:^report\\s\\d"] {
+            let b = batches(&root, query, false);
+            assert_eq!(paths(&b[0].entries), shown_after(&b), "{query}");
+        }
+        // A file deleted and one made since: the index's answer has the old state, the walk fixes it.
+        std::fs::remove_file(t.0.join("a/b/report 2.txt")).unwrap();
+        std::fs::write(t.0.join("a/b/c/report 4.txt"), b"x").unwrap();
+        let later = batches(&root, "report", false);
+        assert_eq!(paths(&later[0].entries), walked, "the old state first");
+        let now = shown_after(&later);
+        assert!(!now.contains(&format!("{root}\\a\\b\\report 2.txt")), "deleted: gone");
+        assert!(now.contains(&format!("{root}\\a\\b\\c\\report 4.txt")), "new: there");
+        assert_eq!(now.len(), 4);
+        assert_eq!(later.last().unwrap().gone, [format!("{root}\\a\\b\\report 2.txt")]);
+        // And the index has caught up: the next answer is right at once.
+        let start = Instant::now();
+        while !index_has(&place, "report 4.txt") {
+            assert!(start.elapsed() < Duration::from_secs(10), "the index is written");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_ne!(std::fs::read(&place.file).ok(), Some(index));
+        let next = batches(&root, "report", false);
+        assert_eq!(paths(&next[0].entries), now);
+        assert!(next.iter().all(|b| b.entries.is_empty() || std::ptr::eq(b, &next[0])) && next.iter().all(|b| b.gone.is_empty()));
+        // Words in quotes read the files themselves: no answer from the index.
+        let inside = batches(&root, "\"x\" report", false);
+        assert!(inside.iter().all(|b| b.changed.is_empty()));
+        assert_eq!(shown_after(&inside).len(), 4);
+        let _ = std::fs::remove_dir_all(place.file.parent().unwrap());
+    }
+
+    /// What the index gave and the walk didn't find: all gone after a walk that got everywhere;
+    /// after one that stopped at LIMIT, only what isn't on the disk any more.
+    #[test]
+    fn index_results_not_found_again_go_when_they_are_gone() {
+        let t = Tree::new("gone-since", &["a/still.txt"]);
+        let root = t.path();
+        let (still, deleted) = (format!("{root}\\a\\still.txt"), format!("{root}\\a\\deleted.txt"));
+        let left: HashSet<String> = [still.clone(), deleted.clone()].into();
+        let mut all = gone_since(left.clone(), false, &AtomicBool::new(false));
+        all.sort();
+        assert_eq!(all, [deleted.clone(), still.clone()]);
+        assert_eq!(gone_since(left.clone(), true, &AtomicBool::new(false)), [deleted.clone()]);
+        // Stopped (the search isn't wanted any more): nothing is looked at.
+        assert!(gone_since(left, true, &AtomicBool::new(true)).is_empty());
+    }
+
+    #[test]
+    fn a_search_stopped_halfway_leaves_the_old_index() {
+        let (t, place) = indexed_tree("index-stop", &["a/1.txt", "a/2.txt", "b/3.txt"]);
+        let root = t.path();
+        batches(&root, "txt", false);
+        let index = new_index(&place, &None);
+        std::fs::write(t.0.join("b/4.txt"), b"x").unwrap();
+        // The window takes nothing more after the index's answer: the walk stops.
+        let s = start(ask(&root, "txt", false), Folder::default(), |_| false);
+        assert!(s.is_ok());
+        // Cancelled at once (typing more, leaving the folder).
+        drop(start(ask(&root, "1", false), Folder::default(), |_| true).ok());
+        // Cancelled once the walk is under way and its new index has started: the index's answer
+        // comes, the search is dropped, and only then does the walk go on (and stop).
+        let (tx, rx) = channel();
+        let (go, wait_go) = channel::<()>();
+        let mut answered = false;
+        let s = start(ask(&root, "txt", false), Folder::default(), move |b| {
+            let sent = tx.send(b).is_ok();
+            if !answered {
+                answered = true;
+                let _ = wait_go.recv_timeout(Duration::from_secs(5));
+            }
+            sent
+        });
+        let answer = rx.recv_timeout(Duration::from_secs(10)).expect("the index answers");
+        assert_eq!(answer.entries.len(), 3, "the index's answer");
+        drop(s);
+        let _ = go.send(());
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(std::fs::read(&place.file).unwrap(), index, "the old index is still there, whole");
+        let names: Vec<String> = std::fs::read_dir(place.file.parent().unwrap()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["search-index-T.dat"], "no half-written file left");
+        let _ = std::fs::remove_dir_all(place.file.parent().unwrap());
+    }
+
+    #[test]
+    fn hidden_items_from_the_index_only_when_hidden_files_show() {
+        let (t, place) = indexed_tree("index-hidden", &["Secret/report a.txt", "report b.txt"]);
+        let root = t.path();
+        let hide = |p: &std::path::Path| {
+            let w = folder::wide_path(&p.to_string_lossy().replace('/', "\\"));
+            // SAFETY: `w` is NUL-terminated and outlives the call.
+            unsafe { windows::Win32::Storage::FileSystem::SetFileAttributesW(PCWSTR(w.as_ptr()), windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN) }.unwrap();
+        };
+        hide(&t.0.join("Secret"));
+        // Indexed with hidden files shown: the hidden folder's items are in it.
+        batches(&root, "report", true);
+        new_index(&place, &None);
+        let hidden_off = batches(&root, "report", false);
+        assert_eq!(paths(&hidden_off[0].entries), [format!("{root}\\report b.txt")], "nothing from inside a hidden folder");
+        assert_eq!(shown_after(&hidden_off), [format!("{root}\\report b.txt")]);
+        let _ = std::fs::remove_dir_all(place.file.parent().unwrap());
     }
 
     #[test]

@@ -1055,7 +1055,7 @@ fn show_properties(owner: HWND, paths: &[String]) {
         None => false,
     };
     if !done && !(paths.len() > 1 && multi_properties(paths)) {
-        shell::tell(owner, "Windows couldn't show the properties.".to_string());
+        shell::tell(owner, "Failed to show the properties.".to_string());
     }
 }
 
