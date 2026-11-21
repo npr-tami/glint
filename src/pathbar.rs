@@ -683,35 +683,25 @@ pub fn outline_box(r: &mut Renderer, theme: &Theme, rect: Rect, lean: f32, width
     }
 }
 
-/// A ring right round the outside of a box drawn in `rect` (no gap), `width` DIPs thick, in the
-/// box's own shape: sides leaning by `lean` as the box's do, or corners as round as its `radius`
-/// (and a little rounder, so the ring keeps the same distance all the way round).
+/// A ring on the edge of a box drawn in `rect`, `width` DIPs thick, in the box's own shape: sides
+/// leaning by `lean` as the box's do, or corners as round as its `radius`. The line's middle runs
+/// along the box's edge, half of it over the box, so nothing behind ever shows between the two.
 pub fn ring_around(r: &mut Renderer, rect: Rect, lean: f32, radius: f32, width: f32, color: Color) {
     ring_around_beside(r, rect, lean, Beside::BOTH, radius, width, color);
 }
 
-/// The same round a button that leans only on the sides with a button `beside` it.
+/// The same on a button that leans only on the sides with a button `beside` it.
 pub fn ring_around_beside(r: &mut Renderer, rect: Rect, lean: f32, beside: Beside, radius: f32, width: f32, color: Color) {
-    let d = width / 2.0; // the line's middle: its inside edge lies on the box's edge
     if lean > 0.0 && rect.h > 0.0 && beside != Beside::NONE {
-        // Each side moved out by d, the slanted ones along their slant.
-        let (left, right) = beside.leans(lean);
-        let (kl, kr) = (left / rect.h, right / rect.h);
-        let (sl, sr) = (d * (1.0 + kl * kl).sqrt(), d * (1.0 + kr * kr).sqrt());
-        let (top, bottom) = (rect.y - d, rect.bottom() + d);
-        let mut ring = vec![
-            Point::new(rect.x - sl + kl * (rect.h + d), top),
-            Point::new(rect.right() + sr + kr * d, top),
-            Point::new(rect.right() + sr - kr * (rect.h + d), bottom),
-            Point::new(rect.x - sl - kl * d, bottom),
-        ];
+        // Along the very edges the box is filled to (`fill_box_beside`).
+        let mut ring = points_beside(sharp(r, rect, beside), lean, beside).to_vec();
         ring.push(ring[0]);
         ring.push(ring[1]); // round the first corner too
         r.polyline(&ring, width, color);
     } else if radius > 0.0 {
-        r.stroke_round_rect(rect.inset(-d, -d), radius + d, width, color);
+        r.stroke_round_rect(rect, radius, width, color);
     } else {
-        r.stroke_rect(rect.inset(-width, -width), width, color);
+        r.stroke_rect(rect.inset(-width / 2.0, -width / 2.0), width, color);
     }
 }
 

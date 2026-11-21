@@ -42,8 +42,8 @@ use std::time::Instant;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, GetMonitorInfoW, InvalidateRect, MonitorFromWindow, RedrawWindow, ScreenToClient,
-    SetBkColor, SetTextColor, ValidateRect, COLOR_WINDOW, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, RDW_ALLCHILDREN,
+    CreateSolidBrush, DeleteObject, GetMonitorInfoW, InvalidateRect, MonitorFromRect, MonitorFromWindow, RedrawWindow, ScreenToClient,
+    SetBkColor, SetTextColor, ValidateRect, COLOR_WINDOW, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, RDW_ALLCHILDREN,
     RDW_INVALIDATE, RDW_UPDATENOW,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
@@ -64,7 +64,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindow, IsIconic, KillTimer, LoadCursorW, LoadIconW, PostMessageW, RegisterClassExW, 
     SetTimer, SetWindowPos, ShowWindow, CS_DBLCLKS, GW_OWNER,
-    HTCLIENT, IDC_ARROW, MINMAXINFO, SIZE_MINIMIZED, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE, SW_SHOW, WA_INACTIVE, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_CHAR,
+    HTCAPTION, HTCLIENT, IDC_ARROW, MINMAXINFO, SIZE_MINIMIZED, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE, SW_SHOW, WA_INACTIVE, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_CHAR,
     WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_KEYDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT,
     WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CLIPCHILDREN, WS_SYSMENU,
@@ -152,6 +152,34 @@ const MIN_W: f32 = 780.0;
 const MIN_H: f32 = 540.0;
 /// The window's layout's message to itself: the layout changed, so dock it again at its width.
 const WM_APP_DOCK: u32 = WM_APP + 83;
+
+/// Popped out (the pop-out button left of x): its own big window, anywhere, with pages down the
+/// left and the settings in boxes, three to a line. How big it opens, and how small it can get.
+const POP_W: f32 = 1000.0;
+const POP_H: f32 = 600.0;
+const POP_MIN_W: f32 = 720.0;
+/// The pages down the left: how wide, a page's row, and the title bar's small buttons.
+const NAV_W: f32 = 138.0;
+const NAV_ROW: f32 = 30.0;
+const TOP_BTN_W: f32 = 38.0;
+/// The search in the title bar while it's open.
+const POP_SEARCH_W: f32 = 260.0;
+/// The undo and redo buttons at the bottom of the pages.
+const POP_UNDO_W: f32 = 30.0;
+const POP_UNDO_H: f32 = 26.0;
+/// The Skins page: the room for the skin's name and what it is, over its buttons.
+const POP_ABOUT_H: f32 = 96.0;
+
+/// The popped-out window's pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PopPage {
+    Skins,
+    Colours,
+    Shapes,
+    Wallpaper,
+}
+
+const POP_PAGES: [(PopPage, &str); 4] = [(PopPage::Skins, "Skins"), (PopPage::Colours, "Colours"), (PopPage::Shapes, "Shapes"), (PopPage::Wallpaper, "Wallpaper")];
 
 /// Sizes that differ between the window's layouts (the SkinsWindow setting).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -341,6 +369,47 @@ impl Metrics {
                 place_h: 106.0,
                 ..small
             },
+        }
+    }
+}
+
+impl Metrics {
+    /// Popped out: small rows in boxes, three boxes to a line (the pages' column is `list_w`, so
+    /// the page starts right of it; no header: the title bar has the search).
+    fn popped() -> Metrics {
+        Metrics {
+            width: POP_W,
+            min_width: POP_MIN_W,
+            list_w: NAV_W,
+            header_h: 0.0,
+            pad_x: 12.0,
+            gutter: 12.0,
+            min_card_w: 100.0,
+            first_y: 12.0,
+            heading_h: 26.0,
+            heading_gap: 4.0,
+            card_gap: 10.0,
+            row_h: 26.0,
+            row_note_h: 26.0,
+            row_pad: 8.0,
+            swatch: 14.0,
+            hex_w: 76.0,
+            hex_h: 20.0,
+            clear_w: 20.0,
+            clear_h: 18.0,
+            dropdown_w: 124.0,
+            field_h: 22.0,
+            logo_w: 110.0,
+            browse_w: 86.0,
+            picture_w: 120.0,
+            slider_w: 120.0,
+            value_gap: 4.0,
+            // ("100%" whole, in a wide font: Chrome's Verdana)
+            value_w: 50.0,
+            value_h: 22.0,
+            toggle_w: 30.0,
+            toggle_h: 16.0,
+            ..Metrics::of(Layout::Slim)
         }
     }
 }
@@ -788,6 +857,11 @@ thread_local! {
     static MIN_WIDTH: Cell<f32> = const { Cell::new(MIN_W) };
     /// The folded sections, kept while Glint runs (None: as at first).
     static FOLDED: RefCell<Option<Vec<&'static str>>> = const { RefCell::new(None) };
+    /// Popped out: where it goes when it's shown (screen pixels, None: docked), for Job::Show.
+    static POPPED_AT: Cell<Option<RECT>> = const { Cell::new(None) };
+    /// Popped out: the title bar's height, where its buttons start and the search's ends (DIPs),
+    /// for WM_NCHITTEST: the rest of the title bar moves the window. None: docked.
+    static DRAG_BAR: Cell<Option<(f32, f32, f32, f32)>> = const { Cell::new(None) };
 }
 
 /// Windows' colour picker remembers 16 colours of the person's ("custom colours") while Glint runs.
@@ -875,6 +949,8 @@ enum Part {
     Main,
     Hex,
     Clear,
+    /// Popped out: a colour's pencil (Windows' colour picker, as its swatch).
+    Pen,
     /// One of the wallpaper's 3x3 squares (0 the top left, 8 the bottom right).
     Grid(u8),
     /// One of the pictures next to the skin.
@@ -975,6 +1051,13 @@ pub(crate) enum Glyph {
     /// ? (GUIDE) and ☰ (START FROM…).
     Help,
     Menu,
+    /// The popped-out window's pages: colours, shapes, a picture.
+    Palette,
+    Shapes,
+    Picture,
+    /// Pop out (a box with an arrow out of its corner) and put back (a window with a panel).
+    PopOut,
+    PopIn,
 }
 
 fn glyph_of(b: Btn) -> Glyph {
@@ -1004,6 +1087,12 @@ enum Hot {
     PageThumb,
     /// A section's heading, which folds it (one column).
     Fold(&'static str),
+    /// The pop-out button left of x (docked), and popped out: the put-back button, the search
+    /// button and a page down the left.
+    PopOut,
+    PopIn,
+    Find,
+    Nav(PopPage),
 }
 
 /// What has the keyboard.
@@ -1014,6 +1103,8 @@ enum Spot {
     Ctl(Ctl, Part),
     /// A section's heading (one column): Space or Enter folds it.
     Fold(&'static str),
+    /// Popped out: a page down the left.
+    Nav(PopPage),
 }
 
 /// What the one-line text box is for while it's shown.
@@ -1119,6 +1210,8 @@ pub enum Job {
     Place(RECT),
     /// Docked beside the main window again, this wide (pixels): its layout changed.
     Dock(i32),
+    /// Popped out: put here (screen pixels, the part you can see).
+    Float(RECT),
     Close,
 }
 
@@ -1195,12 +1288,14 @@ enum Block {
     Fold(Rect, &'static str, bool),
     Card(Rect),
     Line(Rect),
+    /// Popped out: a box with its title in a bar along its top.
+    Box(Rect, &'static str),
 }
 
 impl Block {
     fn rect(&self) -> Rect {
         match self {
-            Block::Heading(r, _) | Block::Fold(r, _, _) | Block::Card(r) | Block::Line(r) => *r,
+            Block::Heading(r, _) | Block::Fold(r, _, _) | Block::Card(r) | Block::Line(r) | Block::Box(r, _) => *r,
         }
     }
 }
@@ -1307,6 +1402,14 @@ pub struct SkinWindow {
     folded: Vec<&'static str>,
     /// The skins' drop-down or the menu of the rest, while it's open.
     pop: Option<Pop>,
+    /// Popped out (its own big window), and its page.
+    popped: bool,
+    pop_page: PopPage,
+    /// Where the mouse is (for a cut-short name's whole text over it).
+    mouse: Option<Point>,
+    /// The search in the title bar was open when the search button was pressed (the press itself
+    /// ends typing in it).
+    find_was_open: bool,
 }
 
 /// Registers the window class (once; registering again just fails harmlessly).
@@ -1330,8 +1433,9 @@ fn register_class() {
 }
 
 /// Makes the customiser (hidden: show it with [`Job::Show`] once its state is kept), owned by
-/// `owner`, beside it, laid out as `layout`. None if Windows can't make it.
-pub fn create(owner: HWND, theme: &Theme, layout: Layout) -> Option<SkinWindow> {
+/// `owner`, beside it, laid out as `layout` - or popped out (`popped`), where it was last
+/// (`bounds`, screen pixels). None if Windows can't make it.
+pub fn create(owner: HWND, theme: &Theme, layout: Layout, popped: bool, bounds: Option<[i32; 4]>) -> Option<SkinWindow> {
     register_class();
     let title: Vec<u16> = TITLE.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: window creation and plain queries on our own windows; all structs are valid.
@@ -1339,8 +1443,13 @@ pub fn create(owner: HWND, theme: &Theme, layout: Layout) -> Option<SkinWindow> 
         let scale = GetDpiForWindow(owner).max(96) as f32 / 96.0;
         // As tall as the main window, beside it (`beside`).
         let metrics = Metrics::of(layout);
-        MIN_WIDTH.with(|m| m.set(metrics.min_width));
-        let (x, y, w, h) = beside(owner, (metrics.width * scale) as i32);
+        let popped = popped.then(|| pop_rect(owner, bounds, scale));
+        MIN_WIDTH.with(|m| m.set(if popped.is_some() { POP_MIN_W } else { metrics.min_width }));
+        POPPED_AT.with(|p| p.set(popped));
+        let (x, y, w, h) = match popped {
+            Some(r) => (r.left, r.top, r.right - r.left, r.bottom - r.top),
+            None => beside(owner, (metrics.width * scale) as i32),
+        };
         let instance = GetModuleHandleW(None).ok()?;
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -1429,6 +1538,10 @@ pub fn create(owner: HWND, theme: &Theme, layout: Layout) -> Option<SkinWindow> 
             layout,
             folded: FOLDED.with(|f| f.borrow().clone()).unwrap_or_else(first_folded),
             pop: None,
+            popped: popped.is_some(),
+            pop_page: PopPage::Colours,
+            mouse: None,
+            find_was_open: false,
         };
         window.apply_theme(theme);
         let mut rc = RECT::default();
@@ -1448,8 +1561,11 @@ pub fn run_job(hwnd: HWND, scale: f32, job: Job, show_menu: fn(HWND, &Menu, f32)
             Job::Show => {
                 frame::cloak(hwnd, true);
                 let _ = ShowWindow(hwnd, SW_SHOW);
-                // Flush against the main window now that Windows knows its borders.
-                if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
+                // Flush against the main window now that Windows knows its borders (popped out:
+                // where it goes).
+                if let Some(r) = POPPED_AT.with(Cell::get) {
+                    place_visible(hwnd, (r.left, r.top, r.right - r.left, r.bottom - r.top));
+                } else if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
                     let r = visible_rect(hwnd);
                     place_visible(hwnd, beside(owner, r.right - r.left));
                 }
@@ -1483,6 +1599,12 @@ pub fn run_job(hwnd: HWND, scale: f32, job: Job, show_menu: fn(HWND, &Menu, f32)
                 if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
                     place_visible(hwnd, beside(owner, w));
                 }
+            }
+            Job::Float(r) => {
+                if IsIconic(hwnd).as_bool() {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                }
+                place_visible(hwnd, (r.left, r.top, r.right - r.left, r.bottom - r.top));
             }
             Job::Close => {
                 // The main window gets the focus back (not whatever Windows would pick).
@@ -1668,8 +1790,30 @@ fn beside(owner: HWND, w: i32) -> (i32, i32, i32, i32) {
     (x, y, w, h)
 }
 
-/// WM_NCHITTEST: the edges resize, the rest is ours. The title bar doesn't move the window: it
-/// stays docked to the main window (`follow_owner`).
+/// Where the popped-out window goes (screen pixels): where it was last, if that's still on a
+/// screen; else POP_W x POP_H in the middle of the main window's screen (smaller on a small one).
+fn pop_rect(owner: HWND, bounds: Option<[i32; 4]>, scale: f32) -> RECT {
+    if let Some([x, y, w, h]) = bounds {
+        let r = RECT { left: x, top: y, right: x + w, bottom: y + h };
+        // SAFETY: a plain query.
+        if w > 0 && h > 0 && !unsafe { MonitorFromRect(&r, MONITOR_DEFAULTTONULL) }.is_invalid() {
+            return r;
+        }
+    }
+    let main = visible_rect(owner);
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    // SAFETY: plain queries with a valid out-struct.
+    let work = unsafe { if GetMonitorInfoW(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() { info.rcWork } else { main } };
+    let (ww, wh) = (work.right - work.left, work.bottom - work.top);
+    let w = ((POP_W * scale) as i32).min(ww * 19 / 20).max(1);
+    let h = ((POP_H * scale) as i32).min(wh * 19 / 20).max(1);
+    let (x, y) = (work.left + (ww - w) / 2, work.top + (wh - h) / 2);
+    RECT { left: x, top: y, right: x + w, bottom: y + h }
+}
+
+/// WM_NCHITTEST: the edges resize, the rest is ours. Docked, the title bar doesn't move the
+/// window: it stays docked to the main window (`follow_owner`). Popped out, the title bar moves
+/// it, outside its buttons and its search.
 fn hit_test(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if let Some(edge) = frame::resize_edge(hwnd, wparam, lparam) {
         return LRESULT(edge as isize);
@@ -1683,7 +1827,12 @@ fn hit_test(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         GetDpiForWindow(hwnd).max(96) as f32 / 96.0
     };
     let (x, y, w) = (pt.x as f32 / scale, pt.y as f32 / scale, rc.right as f32 / scale);
-    let _ = (x, y, w);
+    if let Some((title_h, buttons, s0, s1)) = DRAG_BAR.with(Cell::get) {
+        let _ = w;
+        if (0.0..title_h).contains(&y) && x < buttons && !(s0..=s1).contains(&x) {
+            return LRESULT(HTCAPTION as isize);
+        }
+    }
     LRESULT(HTCLIENT as isize)
 }
 
@@ -2053,6 +2202,10 @@ fn slider(r: &mut Renderer, theme: &Theme, area: Rect, share: f32, standard: f32
 impl SkinWindow {
     /// Docked beside the main window again (it moved or changed size, or the customiser did).
     pub fn follow_owner(&mut self) {
+        // (Popped out it goes where it's put.)
+        if self.popped {
+            return;
+        }
         // SAFETY: plain queries and a move of our own window.
         unsafe {
             let Ok(owner) = GetWindow(self.hwnd, GW_OWNER) else { return };
@@ -2221,13 +2374,144 @@ impl SkinWindow {
 
     /// The sizes of the window's layout.
     fn m(&self) -> Metrics {
-        Metrics::of(self.layout)
+        if self.popped {
+            Metrics::popped()
+        } else {
+            Metrics::of(self.layout)
+        }
+    }
+
+    /// The wide layout's controls (NONE and BROWSE… as words), docked.
+    fn wide(&self) -> bool {
+        self.layout == Layout::Wide && !self.popped
+    }
+
+    /// The pop-out button left of x (docked), and popped out: the put-back and search buttons.
+    fn pop_out_rect(&self) -> Rect {
+        Rect::new(self.size.0 - ksize::CLOSE_W - TOP_BTN_W, 0.0, TOP_BTN_W, size::TITLE_H)
+    }
+
+    fn find_rect(&self) -> Rect {
+        Rect::new(self.size.0 - ksize::CLOSE_W - 2.0 * TOP_BTN_W, 0.0, TOP_BTN_W, size::TITLE_H)
+    }
+
+    /// Popped out: the search shows in the title bar (while typed in, or while it has words).
+    fn search_shown(&self) -> bool {
+        self.popped && (matches!(self.editing, Some(Editing::Search(_))) || !self.colour_search.is_empty())
+    }
+
+    /// Popped out: a page's row down the left.
+    fn nav_rect(&self, page: PopPage) -> Rect {
+        let n = POP_PAGES.iter().position(|(p, _)| *p == page).unwrap_or(0) as f32;
+        Rect::new(0.0, size::TITLE_H + 10.0 + n * (NAV_ROW + 2.0), NAV_W, NAV_ROW)
+    }
+
+    /// Popped out: undo and redo, side by side at the bottom of the pages.
+    fn pop_undo_rect(&self, b: Btn) -> Rect {
+        let x = if b == Btn::Undo { 10.0 } else { 10.0 + POP_UNDO_W - 3.0 };
+        Rect::new(x, self.size.1 - 10.0 - POP_UNDO_H, POP_UNDO_W, POP_UNDO_H)
+    }
+
+    /// Popped out, the Skins page: the box with the skins in it, and the one about the skin in use.
+    fn pop_skin_boxes(&self) -> (Rect, Rect) {
+        let page = self.page_rect();
+        let w = ((page.w - 24.0 - 10.0) / 2.0).max(120.0);
+        let (x, y) = (page.x + 12.0, page.y + 12.0);
+        let left = Rect::new(x, y, w, (page.h - 24.0).max(80.0));
+        let right = Rect::new(x + w + 10.0, y, w, (26.0 + 10.0 + POP_ABOUT_H + 4.0 * ksize::BUTTON_H + 3.0 * BUTTON_GAP + 14.0).min(left.h));
+        (left, right)
+    }
+
+    /// The buttons the popped-out Skins page has (undo and redo are at the bottom of the pages).
+    fn pop_buttons(&self) -> &'static [(Btn, &'static str)] {
+        &BUTTONS[2..]
+    }
+
+    /// Pops out (its own big window, where it was last) or puts it back beside the main window.
+    fn toggle_pop(&mut self, app: &mut AppState) -> Vec<Ask> {
+        let _ = self.end_editing(app, true);
+        self.pop = None;
+        self.hover = None;
+        self.pressed = None;
+        self.list.jump_to(0.0);
+        self.page.jump_to(0.0);
+        self.layout_dirty = true;
+        self.edit_at = None;
+        // SAFETY: a plain query on our own window.
+        let owner = unsafe { GetWindow(self.hwnd, GW_OWNER) }.unwrap_or_default();
+        if self.popped {
+            self.remember_pop_place(app);
+            self.popped = false;
+            app.settings.skins_popped = false;
+            POPPED_AT.with(|p| p.set(None));
+            DRAG_BAR.with(|d| d.set(None));
+            MIN_WIDTH.with(|w| w.set(Metrics::of(self.layout).min_width));
+            self.focus = Spot::List;
+            self.invalidate();
+            // As wide as it opens docked: made that wide, its invisible borders are inside it (Dock
+            // takes the part you can see).
+            let mut whole = RECT::default();
+            // SAFETY: a plain query on our own window with a valid out-struct.
+            let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(self.hwnd, &mut whole) };
+            let seen = visible_rect(self.hwnd);
+            let borders = ((whole.right - whole.left) - (seen.right - seen.left)).max(0);
+            let w = (Metrics::of(self.layout).width * self.scale()) as i32 - borders;
+            return vec![Ask::Job(Job::Dock(w.max(1)))];
+        }
+        let r = pop_rect(owner, app.settings.skins_bounds, self.scale());
+        self.popped = true;
+        app.settings.skins_popped = true;
+        app.settings.skins_bounds = Some([r.left, r.top, r.right - r.left, r.bottom - r.top]);
+        POPPED_AT.with(|p| p.set(Some(r)));
+        MIN_WIDTH.with(|w| w.set(POP_MIN_W));
+        self.focus = Spot::Nav(self.pop_page);
+        self.invalidate();
+        vec![Ask::Job(Job::Float(r))]
+    }
+
+    /// Popped out, moved or resized: remembered for next time (the part you can see).
+    fn remember_pop_place(&mut self, app: &mut AppState) {
+        // SAFETY: a plain query on our own window.
+        if !self.popped || unsafe { IsIconic(self.hwnd).as_bool() } || frame::zoomed(self.hwnd) {
+            return;
+        }
+        let r = visible_rect(self.hwnd);
+        if r.right > r.left && r.bottom > r.top {
+            app.settings.skins_bounds = Some([r.left, r.top, r.right - r.left, r.bottom - r.top]);
+            POPPED_AT.with(|p| p.set(Some(r)));
+        }
+    }
+
+    /// The search button: opens the search in the title bar, or (open) empties and closes it.
+    fn find_pressed(&mut self, was_open: bool, app: &mut AppState) -> Vec<Ask> {
+        if was_open {
+            let _ = self.end_editing(app, true);
+            self.search_colours(String::new());
+            return Vec::new();
+        }
+        self.activate(Ctl::Search, Part::Main, app)
+    }
+
+    /// Popped out: another page.
+    fn set_pop_page(&mut self, page: PopPage) {
+        if self.pop_page != page {
+            self.pop_page = page;
+            self.page.jump_to(0.0);
+            self.layout_dirty = true;
+            self.edit_at = None;
+            self.hover = None;
+        }
+        self.invalidate();
     }
 
     /// Another layout (the SkinsWindow setting changed): laid out again, then docked again at its
     /// width (once this message is done).
     fn set_layout(&mut self, layout: Layout) {
         self.layout = layout;
+        // (Popped out, it stays as it is: the layout is for when it's put back.)
+        if self.popped {
+            return;
+        }
         MIN_WIDTH.with(|w| w.set(Metrics::of(layout).min_width));
         self.layout_dirty = true;
         self.edit_at = None;
@@ -2244,6 +2528,14 @@ impl SkinWindow {
 
     /// The list of skins (its visible part, on screen; none in one column).
     fn list_rect(&self) -> Rect {
+        if self.popped {
+            if self.pop_page != PopPage::Skins {
+                return Rect::new(0.0, size::TITLE_H, 0.0, 0.0);
+            }
+            let (b, _) = self.pop_skin_boxes();
+            let h = self.m().heading_h;
+            return Rect::new(b.x + 1.0, b.y + h, (b.w - 2.0).max(0.0), (b.h - h - 1.0).max(0.0));
+        }
         let buttons = match self.layout {
             Layout::Wide => 5.0 * ksize::BUTTON_H + 4.0 * BUTTON_GAP + 2.0 * BUTTONS_PAD,
             Layout::Slim => 8.0 + 2.0 * ICON + 2.0 + 8.0,
@@ -2277,6 +2569,11 @@ impl SkinWindow {
 
     /// The search for any setting at the top (the smaller layouts; the wide one's is a row).
     fn search_rect(&self) -> Rect {
+        if self.popped {
+            // In the middle of the title bar (not over the logo or the buttons).
+            let w = POP_SEARCH_W.min((self.size.0 - 2.0 * (ksize::CLOSE_W + 2.0 * TOP_BTN_W) - 20.0).max(120.0));
+            return Rect::new(((self.size.0 - w) / 2.0).round(), ((size::TITLE_H - 24.0) / 2.0).round(), w, 24.0);
+        }
         let h = self.header_rect();
         match self.layout {
             Layout::Slim => Rect::new(h.right() - 16.0 - 190.0, h.y + 13.0, 190.0, 26.0),
@@ -2303,6 +2600,27 @@ impl SkinWindow {
     }
 
     fn button_rect(&self, b: Btn) -> Rect {
+        if self.popped {
+            if matches!(b, Btn::Undo | Btn::Redo) {
+                return self.pop_undo_rect(b);
+            }
+            // Two to a line under what the skin is, OPEN SKINS FOLDER on its own.
+            let (_, about) = self.pop_skin_boxes();
+            let full = (about.w - 24.0).min(2.0 * 150.0 + BUTTON_GAP);
+            let half = (full - BUTTON_GAP) / 2.0;
+            let (row, col, whole) = match b {
+                Btn::New => (0, 0, false),
+                Btn::Duplicate => (0, 1, false),
+                Btn::Rename => (1, 0, false),
+                Btn::Delete => (1, 1, false),
+                Btn::Import => (2, 0, false),
+                Btn::Export => (2, 1, false),
+                _ => (3, 0, true),
+            };
+            let y = about.y + self.m().heading_h + 10.0 + POP_ABOUT_H + row as f32 * (ksize::BUTTON_H + BUTTON_GAP);
+            let x = about.x + 12.0 + col as f32 * (half + BUTTON_GAP);
+            return Rect::new(x, y, if whole { full } else { half }, ksize::BUTTON_H);
+        }
         let list = self.list_rect();
         let full = LIST_W - 2.0 * BUTTONS_PAD;
         let half = (full - BUTTON_GAP) / 2.0;
@@ -2360,9 +2678,19 @@ impl SkinWindow {
     /// Where a control's parts are, in page coordinates.
     fn part_rect(&self, row: &Row, part: Part) -> Option<Rect> {
         let m = self.m();
-        let wide = self.layout == Layout::Wide;
+        let wide = self.wide();
         let right = row.rect.right() - m.row_pad;
         let mid = |h: f32| row.rect.y + ((row.rect.h - h) / 2.0).round();
+        if self.popped {
+            // A colour: its square at the left, then its name; its #code and the pencil at the right.
+            match (row.ctl, part) {
+                (Ctl::Colour(_), Part::Main) => return Some(Rect::new(row.rect.x + m.row_pad + 1.0, mid(m.swatch), m.swatch, m.swatch)),
+                (Ctl::Colour(_), Part::Pen) => return Some(Rect::new(right - m.clear_w, mid(m.clear_h), m.clear_w, m.clear_h)),
+                (Ctl::Colour(_), Part::Hex) => return Some(Rect::new(right - m.clear_w - 6.0 - m.hex_w, mid(m.hex_h), m.hex_w, m.hex_h)),
+                (Ctl::Colour(_), Part::Clear) | (_, Part::Pen) => return None,
+                _ => {}
+            }
+        }
         match (row.ctl, part) {
             // A colour: NONE, the swatch and its box - or, smaller, the swatch, its box and a small x.
             (Ctl::Colour(_), Part::Hex) if wide => Some(Rect::new(right - m.hex_w, mid(m.hex_h), m.hex_w, m.hex_h)),
@@ -2373,7 +2701,10 @@ impl SkinWindow {
             (Ctl::Colour(_), Part::Main) => Some(Rect::new(right - m.clear_w - 2.0 - m.hex_w - 6.0 - m.swatch, mid(m.swatch), m.swatch, m.swatch)),
             (Ctl::Part(p), Part::Main) if crate::parts::is_flag(p) => Some(Rect::new(right - m.toggle_w, mid(m.toggle_h), m.toggle_w, m.toggle_h)),
             (Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::RowEdge | Ctl::SidebarEdge | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Era | Ctl::Icons | Ctl::Logo | Ctl::Fit | Ctl::Area | Ctl::Part(_) | Ctl::Font | Ctl::SidebarRow | Ctl::ScrollWidth, Part::Main) => {
-                Some(Rect::new(right - m.dropdown_w, mid(m.field_h), m.dropdown_w, m.field_h))
+                // Popped out, the wallpaper's boxes are wide: its drop-downs get room for their
+                // longest choice ("Window size, in middle"), not "Middle, stays...".
+                let w = if self.popped && self.pop_page == PopPage::Wallpaper && row.rect.w >= 380.0 { 170.0 } else { m.dropdown_w };
+                Some(Rect::new(right - w, mid(m.field_h), w, m.field_h))
             }
             (Ctl::LogoText, Part::Main) => Some(Rect::new(right - m.logo_w, mid(m.field_h), m.logo_w, m.field_h)),
             (Ctl::Search, Part::Main) => Some(Rect::new(right - SEARCH_W, mid(m.field_h), SEARCH_W, m.field_h)),
@@ -2470,20 +2801,26 @@ impl SkinWindow {
     fn layout(&mut self, app: &AppState) {
         self.layout_dirty = false;
         self.refresh_colours(app);
+        // Popped out, the search finds settings: from the Skins page it goes to the colours.
+        if self.popped && self.pop_page == PopPage::Skins && !self.colour_search.trim().is_empty() {
+            self.pop_page = PopPage::Colours;
+            self.page.jump_to(0.0);
+        }
         let m = self.m();
+        let (item_x, item_w) = if self.popped { (self.list_rect().x, self.list_rect().w) } else { (0.0, m.list_w) };
         // The list: the built-in skins, then the person's own (one column has no list, but the
         // keyboard and the skins' drop-down go by these).
         let mut items = Vec::new();
         let mut y = m.list_top + m.group_h;
         let entries = app.skins.entries();
         for e in entries.iter().filter(|e| e.built_in()) {
-            items.push(Item { id: e.id.clone(), name: app.skins.shown_name(e), rect: Rect::new(0.0, y, m.list_w, m.item_h) });
+            items.push(Item { id: e.id.clone(), name: app.skins.shown_name(e), rect: Rect::new(item_x, y, item_w, m.item_h) });
             y += m.item_h;
         }
         y += m.group_gap + m.group_h;
         let own_top = y;
         for e in entries.iter().filter(|e| !e.built_in()) {
-            items.push(Item { id: e.id.clone(), name: app.skins.shown_name(e), rect: Rect::new(0.0, y, m.list_w, m.item_h) });
+            items.push(Item { id: e.id.clone(), name: app.skins.shown_name(e), rect: Rect::new(item_x, y, item_w, m.item_h) });
             y += m.item_h;
         }
         if y == own_top {
@@ -2491,6 +2828,9 @@ impl SkinWindow {
         }
         self.items = items;
         self.list.set_page(y, 10.0, self.list_rect().h);
+        if self.popped {
+            return self.layout_popped(app, &m);
+        }
 
         // The controls: shapes, style, then the colours in groups.
         let page = self.page_rect();
@@ -2592,6 +2932,90 @@ impl SkinWindow {
         }
     }
 
+    /// Popped out: the page's boxes, as many to a line as fit (three; two for the wallpaper),
+    /// each going under the shortest line so far. The Skins page has its own two boxes.
+    fn layout_popped(&mut self, app: &AppState, m: &Metrics) {
+        let _ = app;
+        let page = self.page_rect();
+        let typed = self.colour_search.trim().to_lowercase();
+        let hints: Vec<String> = self.colours.iter().map(|c| c.hint.clone()).collect();
+        let mut blocks = Vec::new();
+        let mut rows = Vec::new();
+        if self.pop_page != PopPage::Skins {
+            let room = page.w - 2.0 * m.pad_x - m.gutter;
+            let mut cols: usize = if self.pop_page == PopPage::Wallpaper { 2 } else { 3 };
+            let col_w = |n: usize| (room - (n as f32 - 1.0) * 10.0) / n as f32;
+            while cols > 1 && col_w(cols) < if self.pop_page == PopPage::Wallpaper { 340.0 } else { 230.0 } {
+                cols -= 1;
+            }
+            let w = col_w(cols).max(160.0).floor();
+            let mut tops = vec![m.first_y; cols];
+            let page_kind = self.pop_page;
+            // The wallpaper's page has two boxes side by side: where the picture sits (the
+            // preview and the sliders) on the left, the picture and the see-through rows on the
+            // right.
+            let mut groups = Vec::new();
+            for (title, ctls) in cards(&hints) {
+                if page_kind == PopPage::Wallpaper && title == "Wallpaper" {
+                    let (place, rest): (Vec<_>, Vec<_>) = ctls.into_iter().partition(|(c, _, _)| matches!(c, Ctl::Place | Ctl::Slide(_)));
+                    groups.push(("Position", title, place));
+                    groups.push(("Picture", title, rest));
+                } else {
+                    groups.push((title, title, ctls));
+                }
+            }
+            for (heading, title, ctls) in groups {
+                let shown: Vec<_> = ctls
+                    .into_iter()
+                    .filter(|(c, _, _)| pop_page_has(page_kind, title, *c))
+                    .filter(|(c, t, _)| {
+                        typed.is_empty()
+                            || found_by(title, &typed)
+                            || found_by(t, &typed)
+                            || matches!(c, Ctl::Colour(i) if COLOURS.get(*i).is_some_and(|(key, full)| found_by(full, &typed) || found_by(key, &typed)))
+                            || matches!(c, Ctl::Part(p) if found_by(crate::parts::SPECS[*p as usize].key, &typed))
+                    })
+                    .collect();
+                if shown.is_empty() {
+                    continue;
+                }
+                let h_of = |c: Ctl| match c {
+                    Ctl::Place => m.place_h,
+                    Ctl::Thumbs => m.thumbs_h,
+                    _ => m.row_h,
+                };
+                let height = m.heading_h + 2.0 * m.heading_gap + shown.iter().map(|(c, _, _)| h_of(*c)).sum::<f32>();
+                let col = (0..cols).min_by(|a, b| tops[*a].total_cmp(&tops[*b])).unwrap_or(0);
+                let x = page.x + m.pad_x + col as f32 * (w + 10.0);
+                let top = tops[col];
+                blocks.push(Block::Box(Rect::new(x, top, w, height), heading));
+                let mut y = top + m.heading_h + m.heading_gap;
+                for (ctl, t, n) in shown {
+                    let h = h_of(ctl);
+                    rows.push(Row { ctl, rect: Rect::new(x + 1.0, y, w - 2.0, h), title: t, note: n });
+                    y += h;
+                }
+                tops[col] = top + height + m.card_gap;
+            }
+        }
+        let end = blocks.iter().map(Block::rect).map(|r| r.bottom()).fold(0.0, f32::max);
+        self.rows = rows;
+        self.blocks = blocks;
+        self.page.set_page(if end > 0.0 { end + 2.0 } else { 0.0 }, 10.0, page.h);
+        // The keyboard can't stay on something that's gone.
+        let gone = match self.focus {
+            Spot::Ctl(Ctl::Search, _) => false,
+            Spot::Ctl(c, _) => !self.rows.iter().any(|r| r.ctl == c),
+            Spot::Fold(_) => true,
+            Spot::List | Spot::Button(Btn::New | Btn::Duplicate | Btn::Rename | Btn::Delete | Btn::Import | Btn::Export | Btn::Folder) => self.pop_page != PopPage::Skins,
+            Spot::Button(Btn::Skin | Btn::More) => true,
+            _ => false,
+        };
+        if gone {
+            self.focus = Spot::Nav(self.pop_page);
+        }
+    }
+
     // ------------------------------------------------------------ painting
 
     fn paint(&mut self, app: &mut AppState) {
@@ -2628,18 +3052,23 @@ impl SkinWindow {
         // 98 / 2000: everything inside the window's frame.
         let b = self.border();
         self.renderer.set_origin(b, b);
-        // The list of skins on the sidebar's colour (a gradient running down the whole window).
-        let below = Rect::new(0.0, size::TITLE_H, self.size.0, (self.size.1 - size::TITLE_H).max(0.0));
-        self.renderer.fill_paint(below, 0.0, &theme.sidebar_paint);
-        let list = self.list_rect();
-        if list.w > 0.0 {
-            kit::page_list_well(&mut self.renderer, &theme, list);
+        if self.popped {
+            self.paint_popped(&theme, app);
+        } else {
+            DRAG_BAR.with(|d| d.set(None));
+            // The list of skins on the sidebar's colour (a gradient running down the whole window).
+            let below = Rect::new(0.0, size::TITLE_H, self.size.0, (self.size.1 - size::TITLE_H).max(0.0));
+            self.renderer.fill_paint(below, 0.0, &theme.sidebar_paint);
+            let list = self.list_rect();
+            if list.w > 0.0 {
+                kit::page_list_well(&mut self.renderer, &theme, list);
+            }
+            self.paint_caption(&theme);
+            self.paint_list(&theme, app);
+            self.paint_header(&theme, app);
+            self.paint_page(&theme, app);
+            self.paint_tip(&theme);
         }
-        self.paint_caption(&theme);
-        self.paint_list(&theme, app);
-        self.paint_header(&theme, app);
-        self.paint_page(&theme, app);
-        self.paint_tip(&theme);
         if let Some((id, skin_id)) = &self.asking {
             let name = app.skins.find(skin_id).map_or_else(|| skin_id.clone(), |e| e.name.clone());
             let area = Rect::new(0.0, size::TITLE_H, self.size.0, (self.size.1 - size::TITLE_H).max(0.0));
@@ -2668,25 +3097,207 @@ impl SkinWindow {
 
     fn paint_caption(&mut self, theme: &Theme) {
         let close = self.close_rect();
+        let pop = self.pop_out_rect();
         let r = &mut self.renderer;
         let bar = Rect::new(0.0, 0.0, self.size.0, size::TITLE_H);
         kit::title_bar(r, theme, bar, self.active);
         let x = kit::logo(r, theme, bar);
-        crate::retro::title(r, theme, Rect::new(x + 10.0, 0.0, (self.size.0 - x - 10.0 - ksize::CLOSE_W).max(0.0), size::TITLE_H), "Skins", self.active);
+        crate::retro::title(r, theme, Rect::new(x + 10.0, 0.0, (self.size.0 - x - 10.0 - ksize::CLOSE_W - TOP_BTN_W).max(0.0), size::TITLE_H), "Skins", self.active);
         let hot = self.hover == Some(Hot::Close);
         kit::close_button(r, theme, close, hot, hot && self.pressed == Some(Hot::Close), self.active);
+        let hot = self.hover == Some(Hot::PopOut);
+        caption_icon(r, theme, pop, Glyph::PopOut, hot, hot && self.pressed == Some(Hot::PopOut), self.active);
+    }
+
+    /// Popped out: everything. The title bar (the logo, SKINS or the search in the middle, the
+    /// search, put-back and close buttons), the pages down the left with undo and redo at their
+    /// bottom, and the page.
+    fn paint_popped(&mut self, theme: &Theme, app: &mut AppState) {
+        let (w, h) = self.size;
+        let body = Rect::new(0.0, size::TITLE_H, w, (h - size::TITLE_H).max(0.0));
+        self.renderer.fill_paint(body, 0.0, &theme.window_paint);
+        // The pages, on the sidebar's colour, a thin line on their right.
+        let nav = Rect::new(0.0, size::TITLE_H, NAV_W, body.h);
+        self.renderer.fill_paint(nav, 0.0, &theme.sidebar_paint);
+        kit::page_list_well(&mut self.renderer, theme, nav);
+        self.renderer.fill_rect(Rect::new(NAV_W - 1.0, nav.y, 1.0, nav.h), theme.line);
+        let panels = kit::panels(theme);
+        for (page, name) in POP_PAGES {
+            let rect = self.nav_rect(page);
+            let selected = self.pop_page == page;
+            let look = Look { hover: self.hover == Some(Hot::Nav(page)), focused: self.cues && self.focus == Spot::Nav(page), ..Look::enabled() };
+            kit::nav_item_inset(&mut self.renderer, theme, rect, name, selected, look, 38.0);
+            let ink = match () {
+                _ if selected && panels => theme.sidebar_selection_text,
+                _ if selected => theme.selection_text,
+                _ => theme.sidebar_text,
+            };
+            let icon = match page {
+                PopPage::Skins => Glyph::Menu,
+                PopPage::Colours => Glyph::Palette,
+                PopPage::Shapes => Glyph::Shapes,
+                PopPage::Wallpaper => Glyph::Picture,
+            };
+            glyph(&mut self.renderer, icon, Rect::new(rect.x + 12.0, rect.y, 18.0, rect.h), ink);
+        }
+        for (b, beside) in [(Btn::Undo, crate::pathbar::Beside::RIGHT), (Btn::Redo, crate::pathbar::Beside::LEFT)] {
+            let (rect, look) = (self.pop_undo_rect(b), self.button_look(b, app));
+            icon_face(&mut self.renderer, theme, rect, glyph_of(b), look, beside);
+        }
+        self.paint_pop_caption(theme);
+        if self.pop_page == PopPage::Skins {
+            self.paint_pop_skins(theme, app);
+        } else {
+            self.paint_page(theme, app);
+            if self.rows.is_empty() {
+                let typed = self.colour_search.trim();
+                let words = if typed.is_empty() { "Nothing here.".to_string() } else { format!("Nothing here matches \u{201c}{typed}\u{201d}.") };
+                let page = self.page_rect();
+                self.renderer.text(&words, Rect::new(page.x, page.y + 24.0, page.w, 20.0), &TextStyle::new(theme.muted).align(Align::Center));
+            }
+        }
+        self.paint_pop_tip(theme, app);
+    }
+
+    fn paint_pop_caption(&mut self, theme: &Theme) {
+        let (close, find, back) = (self.close_rect(), self.find_rect(), self.pop_out_rect());
+        let shown = self.search_shown();
+        let search = self.search_rect();
+        let search_look = self.look_of(Ctl::Search, Part::Main, true);
+        let editing_search = matches!(self.editing, Some(Editing::Search(_)));
+        let b = self.border();
+        DRAG_BAR.with(|d| d.set(Some((size::TITLE_H + b, find.x + b, if shown { search.x + b } else { -2.0 }, if shown { search.right() + b } else { -1.0 }))));
+        let r = &mut self.renderer;
+        let bar = Rect::new(0.0, 0.0, self.size.0, size::TITLE_H);
+        kit::title_bar(r, theme, bar, self.active);
+        let _ = kit::logo(r, theme, bar);
+        if shown {
+            kit::field(r, theme, search, None, editing_search, search_look);
+            glyph(r, Glyph::Search, Rect::new(search.x + 3.0, search.y, 18.0, search.h), theme.muted);
+            if !editing_search {
+                r.text(&self.colour_search, Rect::new(search.x + 24.0, search.y, (search.w - 30.0).max(0.0), search.h), &TextStyle::new(theme.text));
+            }
+        } else {
+            let style = TextStyle::new(theme.text).size(13.0).bold();
+            let tw = r.measure("SKINS", &style).ceil() + 12.0;
+            crate::retro::title(r, theme, Rect::new(((self.size.0 - tw) / 2.0).round(), 0.0, tw, size::TITLE_H), "SKINS", self.active);
+        }
+        let hot = |h: Hot| (self.hover == Some(h), self.hover == Some(h) && self.pressed == Some(h));
+        let (fh, fp) = hot(Hot::Find);
+        caption_icon(r, theme, find, Glyph::Search, fh || shown, fp, self.active);
+        let (bh, bp) = hot(Hot::PopIn);
+        caption_icon(r, theme, back, Glyph::PopIn, bh, bp, self.active);
+        let (ch, cp) = hot(Hot::Close);
+        kit::close_button(r, theme, close, ch, cp, self.active);
+    }
+
+    /// Popped out, the Skins page: the skins in one box, and the skin in use with its buttons in
+    /// the other.
+    fn paint_pop_skins(&mut self, theme: &Theme, app: &AppState) {
+        let (list_box, about) = self.pop_skin_boxes();
+        let m = self.m();
+        pop_box(&mut self.renderer, theme, list_box, "Skins", m.heading_h);
+        let entry = app.skins.find(&app.settings.skin);
+        let name = entry.map_or_else(|| app.settings.skin.clone(), |e| e.name.clone());
+        let unsaved = app.skins.unsaved(&app.settings.skin) || self.save_due.iter().any(|id| id.eq_ignore_ascii_case(&app.settings.skin));
+        pop_box(&mut self.renderer, theme, about, &name, m.heading_h);
+        let description = entry.and_then(|e| skin::value_in(&e.text, "description")).map(|d| d.trim().to_string()).unwrap_or_default();
+        let note = match entry {
+            Some(e) if e.built_in() => "A default skin. Changes go into your own copy.",
+            Some(_) if unsaved => "Not saved yet.",
+            Some(_) => "",
+            None => "Its file is missing, so AMD Radeon is shown.",
+        };
+        let x = about.x + 12.0;
+        let tw = (about.w - 24.0).max(0.0);
+        let mut y = about.y + m.heading_h + 10.0;
+        let r = &mut self.renderer;
+        r.text(&name, Rect::new(x, y, tw, 22.0), &TextStyle::new(theme.text_strong).size(15.0).semibold());
+        y += 24.0;
+        let muted = TextStyle::new(theme.muted).size(ksize::NOTE_FONT);
+        let mut lines = if description.is_empty() { Vec::new() } else { kit::wrap(r, &description, &muted, tw) };
+        lines.truncate(2);
+        if !note.is_empty() {
+            lines.push(note.to_string());
+        }
+        for line in lines.iter().take(3) {
+            r.text(line, Rect::new(x, y, tw, NOTE_LINE), &muted);
+            y += NOTE_LINE;
+        }
+        if let Some((said, problem)) = &self.status {
+            let style = if *problem { TextStyle::new(theme.accent).size(ksize::NOTE_FONT).semibold() } else { TextStyle::new(theme.text).size(ksize::NOTE_FONT) };
+            let room = about.y + m.heading_h + 10.0 + POP_ABOUT_H - 4.0;
+            if y + NOTE_LINE <= room + 0.5 {
+                r.text(said, Rect::new(x, y, tw, NOTE_LINE), &style);
+            }
+        }
+        self.paint_list(theme, app);
+    }
+
+    /// Popped out: a setting's whole name (and its note) over it, when the mouse is on a name that
+    /// is cut short or has a note.
+    fn paint_pop_tip(&mut self, theme: &Theme, app: &AppState) {
+        let _ = app;
+        let Some(p) = self.mouse.filter(|_| self.asking.is_none() && self.pressed.is_none() && self.sliding.is_none()) else { return };
+        let Some(text) = self.pop_tip_at(p) else { return };
+        let r = &mut self.renderer;
+        let style = TextStyle::new(theme.text).size(ksize::NOTE_FONT);
+        let w = (r.measure(&text, &style) + 16.0).ceil().min(self.size.0 - 8.0);
+        let x = (p.x + 12.0).min(self.size.0 - w - 4.0).max(4.0);
+        let y = if p.y + 20.0 + 24.0 < self.size.1 { p.y + 20.0 } else { p.y - 28.0 };
+        let tip = Rect::new(x, y, w, 22.0);
+        r.fill_rect(tip, theme.panel);
+        r.stroke_rect(tip, 1.0, theme.line);
+        r.text(&text, tip.inset(8.0, 0.0), &style);
+    }
+
+    /// The text of the tip at `p` (see `paint_pop_tip`).
+    fn pop_tip_at(&mut self, p: Point) -> Option<String> {
+        if !self.popped || self.pop_page == PopPage::Skins || !self.page_rect().contains(p) {
+            return None;
+        }
+        let m = self.m();
+        let row = self.rows.iter().find(|r| self.on_page(r.rect).contains(p))?.clone();
+        let rect = self.on_page(row.rect);
+        let (x, w) = self.pop_title_room(&row, rect, &m);
+        if p.x < x || p.x > x + w {
+            return None;
+        }
+        let note = match row.ctl {
+            Ctl::Colour(c) if row.note == FOLLOWS => self.colours.get(c).map_or(String::new(), |s| s.hint.clone()),
+            _ => row.note.to_string(),
+        };
+        let cut = self.renderer.measure(row.title, &TextStyle::new(Color::hex(0))) > w + 0.5;
+        match (cut, note.is_empty()) {
+            (_, false) => Some(format!("{} ({note})", row.title)),
+            (true, true) => Some(row.title.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Popped out: where a row's name goes (from, how wide), on screen for `rect`.
+    fn pop_title_room(&self, row: &Row, rect: Rect, m: &Metrics) -> (f32, f32) {
+        match row.ctl {
+            Ctl::Colour(_) => {
+                let x = rect.x + m.row_pad + 1.0 + m.swatch + 8.0;
+                (x, (rect.right() - m.row_pad - m.clear_w - 6.0 - m.hex_w - 6.0 - x).max(20.0))
+            }
+            Ctl::Thumbs => (rect.x + m.row_pad, m.thumbs_title - 8.0),
+            Ctl::Place => (rect.x + m.row_pad, (rect.w - 2.0 * m.row_pad - (3.0 * GRID_CELL + 2.0 * GRID_GAP + 22.0 + self.pad_w()) - 8.0).max(20.0)),
+            _ => (rect.x + m.row_pad, (rect.w - 2.0 * m.row_pad - controls_w(m, row.ctl) - 8.0).max(20.0)),
+        }
     }
 
     fn paint_list(&mut self, theme: &Theme, app: &AppState) {
-        if self.layout == Layout::Compact {
+        if self.layout == Layout::Compact && !self.popped {
             return;
         }
         let m = self.m();
         let list = self.list_rect();
         let dy = list.y - self.list.offset;
         self.renderer.push_clip(list);
-        let heading = TextStyle::new(if theme.era.old() { theme.sidebar_text } else { theme.muted }).size(m.group_font).semibold();
-        let (hx, hw) = (m.item_x, m.list_w - m.item_x - 8.0);
+        let heading = TextStyle::new(if theme.era.old() && !self.popped { theme.sidebar_text } else { theme.muted }).size(m.group_font).semibold();
+        let (hx, hw) = if self.popped { (list.x + m.item_x, list.w - m.item_x - 8.0) } else { (m.item_x, m.list_w - m.item_x - 8.0) };
         self.renderer.text("DEFAULT", Rect::new(hx, m.list_top + dy, hw, m.group_text_h), &heading);
         let own_heading_y = self.items.iter().filter(|i| !i.id.starts_with(skin::FILE_PREFIX)).map(|i| i.rect.bottom()).fold(m.list_top + m.group_h, f32::max) + m.group_gap;
         self.renderer.text("YOUR SKINS", Rect::new(hx, own_heading_y + dy, hw, m.group_text_h), &heading);
@@ -2717,7 +3328,14 @@ impl SkinWindow {
         let hover = matches!(self.hover, Some(Hot::ListThumb)) || matches!(self.drag, Some((Hot::ListThumb, _)));
         let track = self.list_track();
         kit::scrollbar(&mut self.renderer, theme, track, &self.list, hover, self.holding.hold_of(0));
-        // The buttons (slim: small icons).
+        // The buttons (slim: small icons; popped out: in the other box).
+        if self.popped {
+            for (b, label) in self.pop_buttons() {
+                let (rect, look) = (self.button_rect(*b), self.button_look(*b, app));
+                kit::button_beside(&mut self.renderer, theme, rect, label, look, beside_of(*b));
+            }
+            return;
+        }
         if self.layout == Layout::Slim {
             for (b, _) in ICONS {
                 let (rect, look) = (self.icon_rect(b), self.button_look(b, app));
@@ -2734,7 +3352,7 @@ impl SkinWindow {
     /// Slim: the name of the icon button under the mouse, in a small box over it (on top of all).
     fn paint_tip(&mut self, theme: &Theme) {
         let Some(Hot::Button(b)) = self.hover else { return };
-        let Some((_, name)) = ICONS.iter().find(|(x, _)| *x == b).filter(|_| self.layout == Layout::Slim && self.asking.is_none()) else { return };
+        let Some((_, name)) = ICONS.iter().find(|(x, _)| *x == b).filter(|_| self.layout == Layout::Slim && !self.popped && self.asking.is_none()) else { return };
         let (at, top) = (self.icon_rect(b), self.icon_rect(ICONS[0].0).y - 6.0 - 22.0);
         let r = &mut self.renderer;
         let style = TextStyle::new(theme.text).size(ksize::NOTE_FONT);
@@ -2857,7 +3475,9 @@ impl SkinWindow {
 
     fn paint_page(&mut self, theme: &Theme, app: &AppState) {
         let m = self.m();
-        let wide = self.layout == Layout::Wide;
+        let wide = self.wide();
+        let popped = self.popped;
+        let hover_row = self.mouse.filter(|p| popped && self.page_rect().contains(*p) && self.asking.is_none()).and_then(|p| self.rows.iter().position(|r| self.on_page(r.rect).contains(p)));
         let page = self.page_rect();
         let dy = page.y - self.page.offset;
         let shift = |r: Rect| Rect::new(r.x, r.y + dy, r.w, r.h);
@@ -2889,6 +3509,7 @@ impl SkinWindow {
                     _ => kit::card(r, theme, shift(*rect)),
                 },
                 Block::Line(rect) => kit::separator(r, theme, rect.x, rect.y + dy, rect.w),
+                Block::Box(rect, title) => pop_box(r, theme, shift(*rect), title, m.heading_h),
             }
         }
         let has_picture = !app.theme.wallpaper.is_empty();
@@ -2922,7 +3543,15 @@ impl SkinWindow {
                 Ctl::Colour(c) if row.note == FOLLOWS => self.colours.get(c).map_or("", |s| s.hint.as_str()),
                 _ => row.note,
             };
-            if row.note.is_empty() {
+            if popped {
+                // One line: the row under the mouse lit, its name (its note shows over it, by the
+                // mouse).
+                if hover_row == Some(i) {
+                    self.renderer.fill_paint(rect, 0.0, &theme.hover_paint);
+                }
+                let (tx, tw) = self.pop_title_room(&row, rect, &m);
+                self.renderer.text(row.title, Rect::new(tx, rect.y + ((rect.h - 19.0) / 2.0).round(), tw, 19.0), &title_style);
+            } else if row.note.is_empty() {
                 self.renderer.text(row.title, Rect::new(x, rect.y + ((rect.h - 19.0) / 2.0).round(), text_w, 19.0), &title_style);
             } else if wide {
                 self.renderer.text(row.title, Rect::new(x, rect.y + 9.0, text_w, 19.0), &title_style);
@@ -2953,12 +3582,57 @@ impl SkinWindow {
                     _ => false,
                 };
             let clear_look = self.look_of(row.ctl, Part::Clear, clear_on);
+            let pen = self.part_rect(&row, Part::Pen).map(shift);
+            let pen_look = self.look_of(row.ctl, Part::Pen, enabled);
             let label = self.choice_label(row.ctl, &app.theme);
             let extra: Vec<(Part, Rect, Look)> = self.extra_parts(&row).into_iter().filter_map(|part| Some((part, shift(self.part_rect(&row, part)?), self.look_of(row.ctl, part, enabled)))).collect();
             let place_drag = self.sliding.as_ref().is_some_and(|d| d.pad);
             let pad_wall = if row.ctl == Ctl::Place { main.and_then(|m| self.pad_wallpaper(app, m)) } else { None };
             let r = &mut self.renderer;
             match row.ctl {
+                Ctl::Colour(i) if popped => {
+                    let Some(c) = self.colours.get(i) else { continue };
+                    if let Some(s) = main {
+                        swatch(r, theme, s, &c.paint, main_look);
+                    }
+                    if let Some(hx) = hex {
+                        let editing = matches!(self.editing, Some(Editing::Hex(j, _)) if j == i);
+                        if editing {
+                            kit::field(r, theme, hx, None, true, hex_look);
+                        } else {
+                            // Its #code, in capitals ("None", "Gradient"); faint while it follows
+                            // another colour. Under the mouse it's a box to type in.
+                            let words = match c.text.as_str() {
+                                "none" => "None".to_string(),
+                                t if t.contains(',') => "Gradient".to_string(),
+                                t => t.to_uppercase(),
+                            };
+                            let ink = if c.follows.is_some() { theme.muted.with_alpha(theme.muted.a * 0.75) } else { theme.muted };
+                            let ink = if hex_look.hover && hex_look.enabled { theme.text } else { ink };
+                            let size = 10.5;
+                            let cw = r.mono_char_width(size);
+                            let tw = (words.chars().count() as f32 * cw).min(hx.w);
+                            let line = 14.0;
+                            r.mono_text(&words, Rect::new(hx.right() - tw - 2.0, hx.y + ((hx.h - line) / 2.0).round(), tw + 2.0, line), size, ink);
+                            if hex_look.focused {
+                                kit::focus_ring(r, theme, hx, 0.0);
+                            }
+                        }
+                    }
+                    if let Some(pen) = pen {
+                        let lit = pen_look.enabled && (pen_look.hover || pen_look.pressed);
+                        r.fill_paint(pen, theme.corner(pen.h).min(4.0), if lit { &theme.accent_paint } else { &theme.chip_paint });
+                        let ink = match () {
+                            _ if !pen_look.enabled => theme.muted.with_alpha(theme.muted.a * 0.45),
+                            _ if lit => theme.on_accent,
+                            _ => theme.button_text,
+                        };
+                        glyph(r, Glyph::Rename, pen, ink);
+                        if pen_look.focused {
+                            kit::focus_ring(r, theme, pen, 0.0);
+                        }
+                    }
+                }
                 Ctl::Colour(i) => {
                     let Some(c) = self.colours.get(i) else { continue };
                     if let Some(n) = clear {
@@ -3162,7 +3836,7 @@ impl SkinWindow {
             Some(Editing::Hex(i, _)) => self.rows.iter().find(|r| r.ctl == Ctl::Colour(*i)).and_then(|r| self.part_rect(r, Part::Hex)).map(|r| self.on_page(r)),
             Some(Editing::LogoText(_)) => self.rows.iter().find(|r| r.ctl == Ctl::LogoText).and_then(|r| self.part_rect(r, Part::Main)).map(|r| self.on_page(r)),
             // (The smaller layouts' search is at the top: the box goes right of its magnifier.)
-            Some(Editing::Search(_)) if self.layout != Layout::Wide => {
+            Some(Editing::Search(_)) if self.layout != Layout::Wide || self.popped => {
                 let s = self.search_rect();
                 Some(Rect::new(s.x + 16.0, s.y, (s.w - 16.0).max(20.0), s.h))
             }
@@ -3170,16 +3844,18 @@ impl SkinWindow {
             Some(Editing::Picture(_)) => self.rows.iter().find(|r| r.ctl == Ctl::Picture).and_then(|r| self.part_rect(r, Part::Hex)).map(|r| self.on_page(r)),
             Some(Editing::Number(s, _)) => self.rows.iter().find(|r| r.ctl == Ctl::Slide(*s)).and_then(|r| self.part_rect(r, Part::Hex)).map(|r| self.on_page(r)),
             // (One column: over the skin's drop-down.)
-            Some(Editing::Rename(_)) if self.layout == Layout::Compact => Some(self.skin_box()),
+            Some(Editing::Rename(_)) if self.layout == Layout::Compact && !self.popped => Some(self.skin_box()),
             Some(Editing::Rename(id)) => self.items.iter().find(|i| i.id == *id).map(|i| self.item_on_screen(i.rect).inset(6.0, 3.0)),
             None => None,
         };
         let top = match self.editing {
-            Some(Editing::Rename(_)) => self.layout == Layout::Compact,
-            Some(Editing::Search(_)) => self.layout != Layout::Wide,
+            Some(Editing::Rename(_)) => self.layout == Layout::Compact && !self.popped,
+            Some(Editing::Search(_)) => self.layout != Layout::Wide || self.popped,
             _ => false,
         };
-        let area = if top {
+        let area = if top && self.popped {
+            Rect::new(0.0, 0.0, self.size.0, size::TITLE_H)
+        } else if top {
             self.header_rect()
         } else if matches!(self.editing, Some(Editing::Rename(_))) {
             self.list_rect()
@@ -3218,7 +3894,13 @@ impl SkinWindow {
     // ------------------------------------------------------------ the mouse
 
     fn target_at(&self, p: Point) -> Option<Hot> {
+        if self.popped {
+            return self.target_popped(p);
+        }
         if p.y < size::TITLE_H {
+            if self.pop_out_rect().contains(p) {
+                return Some(Hot::PopOut);
+            }
             return self.close_rect().contains(p).then_some(Hot::Close);
         }
         if p.x < self.m().list_w {
@@ -3247,6 +3929,44 @@ impl SkinWindow {
         if self.layout != Layout::Wide && self.search_rect().contains(p) {
             return Some(Hot::Ctl(Ctl::Search, Part::Main));
         }
+        self.target_on_page(p)
+    }
+
+    /// Popped out: what is at `p`.
+    fn target_popped(&self, p: Point) -> Option<Hot> {
+        if p.y < size::TITLE_H {
+            return match () {
+                _ if self.close_rect().contains(p) => Some(Hot::Close),
+                _ if self.pop_out_rect().contains(p) => Some(Hot::PopIn),
+                _ if self.find_rect().contains(p) => Some(Hot::Find),
+                _ if self.search_shown() && self.search_rect().contains(p) => Some(Hot::Ctl(Ctl::Search, Part::Main)),
+                _ => None,
+            };
+        }
+        if p.x < NAV_W {
+            if let Some((page, _)) = POP_PAGES.iter().find(|(pg, _)| self.nav_rect(*pg).contains(p)) {
+                return Some(Hot::Nav(*page));
+            }
+            // Their exact shapes: they lean where they meet.
+            let beside = |b: Btn| if b == Btn::Undo { crate::pathbar::Beside::RIGHT } else { crate::pathbar::Beside::LEFT };
+            return [Btn::Undo, Btn::Redo].into_iter().find(|b| crate::pathbar::box_contains_beside(self.pop_undo_rect(*b), self.lean, beside(*b), p)).map(Hot::Button);
+        }
+        if self.pop_page == PopPage::Skins {
+            if let Some(thumb) = self.list.thumb(self.list_track()) {
+                if thumb.inset(-4.0, 0.0).contains(p) {
+                    return Some(Hot::ListThumb);
+                }
+            }
+            if self.list_rect().contains(p) {
+                return self.items.iter().position(|i| self.item_on_screen(i.rect).contains(p)).map(Hot::Item);
+            }
+            return self.pop_buttons().iter().find(|(b, _)| crate::pathbar::box_contains_beside(self.button_rect(*b), self.lean, beside_of(*b), p)).map(|(b, _)| Hot::Button(*b));
+        }
+        self.target_on_page(p)
+    }
+
+    /// What is at `p` in the scrolling page.
+    fn target_on_page(&self, p: Point) -> Option<Hot> {
         if !self.page_rect().contains(p) {
             return None;
         }
@@ -3262,8 +3982,9 @@ impl SkinWindow {
                 }
             }
         }
+        let wide = self.wide();
         for row in &self.rows {
-            for part in [Part::Clear, Part::Main, Part::Hex].into_iter().chain(self.extra_parts(row)) {
+            for part in [Part::Clear, Part::Main, Part::Hex, Part::Pen].into_iter().chain(self.extra_parts(row)) {
                 let Some(r) = self.part_rect(row, part).map(|r| self.on_page(r)) else { continue };
                 let hit = match (row.ctl, part) {
                     (Ctl::Dark | Ctl::Grip, _) => kit::toggle_contains(r, p),
@@ -3272,8 +3993,8 @@ impl SkinWindow {
                     (Ctl::Place, Part::Main) => r.inset(-8.0, -8.0).contains(p),
                     (Ctl::Place | Ctl::Thumbs, _) => r.contains(p),
                     // Wide: the wallpaper's NONE and BROWSE… lean where they meet (their exact shapes).
-                    (Ctl::Picture, Part::Clear) if self.layout == Layout::Wide => crate::pathbar::box_contains_beside(r, self.lean, crate::pathbar::Beside::RIGHT, p),
-                    (Ctl::Picture, Part::Main) if self.layout == Layout::Wide => crate::pathbar::box_contains_beside(r, self.lean, crate::pathbar::Beside::LEFT, p),
+                    (Ctl::Picture, Part::Clear) if wide => crate::pathbar::box_contains_beside(r, self.lean, crate::pathbar::Beside::RIGHT, p),
+                    (Ctl::Picture, Part::Main) if wide => crate::pathbar::box_contains_beside(r, self.lean, crate::pathbar::Beside::LEFT, p),
                     (_, Part::Clear) | (Ctl::Picture, Part::Main) => kit::button_contains(r, p),
                     _ => r.contains(p),
                 };
@@ -3291,6 +4012,17 @@ impl SkinWindow {
     }
 
     fn mouse_move(&mut self, p: Point, app: &mut AppState) -> Vec<Ask> {
+        if self.popped {
+            // The row under the mouse is lit, and a cut-short name shows whole: drawn again when
+            // the mouse goes to another row (or off the rows).
+            let row_at = |w: &Self, q: Option<Point>| q.and_then(|q| w.rows.iter().position(|r| w.page_rect().contains(q) && w.on_page(r.rect).contains(q)));
+            let before = row_at(self, self.mouse);
+            let tip_before = self.mouse.and_then(|q| self.pop_tip_at(q));
+            self.mouse = Some(p);
+            if before != row_at(self, self.mouse) || tip_before != self.pop_tip_at(p) || tip_before.is_some() {
+                self.invalidate();
+            }
+        }
         if !self.tracking {
             let mut tme = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: self.hwnd, dwHoverTime: 0 };
             // SAFETY: a valid struct for our own window.
@@ -3344,6 +4076,7 @@ impl SkinWindow {
             return Vec::new();
         }
         let target = self.target_at(p);
+        self.find_was_open = self.search_shown();
         // A click anywhere ends typing in the one-line box (what was typed is kept).
         if self.editing.is_some() && !matches!(target, Some(Hot::Ctl(_, Part::Hex))) {
             self.end_editing(app, true);
@@ -3378,6 +4111,11 @@ impl SkinWindow {
             Some(Hot::Button(Btn::Skin)) => self.focus = Spot::List,
             Some(Hot::Button(b)) => self.focus = Spot::Button(b),
             Some(Hot::Fold(t)) => self.focus = Spot::Fold(t),
+            Some(Hot::Nav(page)) => {
+                // Like the skins: on the way down.
+                self.focus = Spot::Nav(page);
+                self.set_pop_page(page);
+            }
             // A slider: its knob jumps to the click, and follows the mouse while it's held.
             // The pad: the dot jumps to the click and follows the mouse; a double-click puts it back.
             Some(Hot::Ctl(Ctl::Place, Part::Main)) if double => {
@@ -3456,6 +4194,11 @@ impl SkinWindow {
         }
         match was {
             Some(Hot::Close) => vec![Ask::Job(Job::Close)],
+            Some(Hot::PopOut | Hot::PopIn) => self.toggle_pop(app),
+            Some(Hot::Find) => {
+                let open = self.find_was_open;
+                self.find_pressed(open, app)
+            }
             Some(Hot::Button(b)) => self.press(b, app),
             Some(Hot::Ctl(Ctl::Slide(_) | Ctl::Place, Part::Main)) => Vec::new(),
             Some(Hot::Ctl(c, part)) => self.activate(c, part, app),
@@ -3607,7 +4350,8 @@ impl SkinWindow {
 
     fn wheel(&mut self, p: Point, notches: f32) {
         let now = self.now();
-        let moved = if p.x < self.m().list_w { self.list.scroll_by(-notches * WHEEL_STEP, now) } else { self.page.scroll_by(-notches * WHEEL_STEP, now) };
+        let on_list = if self.popped { self.list_rect().contains(p) } else { p.x < self.m().list_w };
+        let moved = if on_list { self.list.scroll_by(-notches * WHEEL_STEP, now) } else { self.page.scroll_by(-notches * WHEEL_STEP, now) };
         if moved {
             self.invalidate();
         }
@@ -3618,9 +4362,15 @@ impl SkinWindow {
     /// The places that can have the keyboard, in Tab order.
     fn spots(&self, app: &AppState) -> Vec<Spot> {
         let own = app.skins.find(&app.settings.skin).is_some_and(|e| !e.built_in());
-        // (One column: the skin's drop-down is the list's place.)
-        let mut spots = vec![Spot::List];
+        // (One column: the skin's drop-down is the list's place. Popped out: the pages first, the
+        // skins and their buttons only on their page.)
+        let mut spots = if self.popped { POP_PAGES.iter().map(|(p, _)| Spot::Nav(*p)).collect() } else { vec![Spot::List] };
         let buttons: Vec<Btn> = match self.layout {
+            _ if self.popped && self.pop_page == PopPage::Skins => {
+                spots.push(Spot::List);
+                self.pop_buttons().iter().map(|(b, _)| *b).chain([Btn::Undo, Btn::Redo]).collect()
+            }
+            _ if self.popped => vec![Btn::Undo, Btn::Redo],
             Layout::Wide => BUTTONS.iter().map(|(b, _)| *b).collect(),
             Layout::Slim => ICONS.iter().map(|(b, _)| *b).collect(),
             Layout::Compact => vec![Btn::Undo, Btn::Redo, Btn::More],
@@ -3630,7 +4380,7 @@ impl SkinWindow {
                 spots.push(Spot::Button(b));
             }
         }
-        if self.layout != Layout::Wide {
+        if self.layout != Layout::Wide || self.popped {
             spots.push(Spot::Ctl(Ctl::Search, Part::Main));
         }
         // In the page's order: the sections' headings (one column), and the rows when there's
@@ -3649,9 +4399,23 @@ impl SkinWindow {
                 }
                 if matches!(row.ctl, Ctl::Colour(_) | Ctl::Picture) {
                     placed.push((y, Spot::Ctl(row.ctl, Part::Hex)));
-                    placed.push((y, Spot::Ctl(row.ctl, Part::Clear)));
+                    placed.push((y, Spot::Ctl(row.ctl, if self.popped && row.ctl != Ctl::Picture { Part::Pen } else { Part::Clear })));
                 }
             }
+        }
+        // (Popped out: box by box, left to right along the lines, then down each box.)
+        if self.popped {
+            let boxes: Vec<Rect> = self.blocks.iter().map(Block::rect).collect();
+            let at = |y: f32, s: &Spot| match s {
+                Spot::Ctl(c, _) => self.rows.iter().find(|r| r.ctl == *c).and_then(|r| boxes.iter().position(|b| b.contains(Point::new(r.rect.x + 2.0, r.rect.y + 1.0)))).map_or((f32::MAX, y), |i| (boxes[i].y * 10_000.0 + boxes[i].x, y)),
+                _ => (f32::MAX, y),
+            };
+            placed.sort_by(|a, b| {
+                let (ka, kb) = (at(a.0, &a.1), at(b.0, &b.1));
+                ka.0.total_cmp(&kb.0).then(ka.1.total_cmp(&kb.1))
+            });
+            spots.extend(placed.into_iter().map(|(_, s)| s));
+            return spots;
         }
         placed.sort_by(|a, b| a.0.total_cmp(&b.0));
         spots.extend(placed.into_iter().map(|(_, s)| s));
@@ -3771,6 +4535,8 @@ impl SkinWindow {
             _ if ctrl && shift && vk == 'L' as u16 => asks.push(Ask::Command(Command::ToggleTheme)),
             _ if ctrl && vk == 'Z' as u16 => asks.extend(self.undo_step(app, shift)),
             _ if ctrl && vk == 'Y' as u16 => asks.extend(self.undo_step(app, true)),
+            // Popped out: Ctrl+F opens the search in the title bar.
+            _ if ctrl && vk == 'F' as u16 && self.popped => asks.extend(self.activate(Ctl::Search, Part::Main, app)),
             _ if is(VK_TAB) => self.move_focus(if shift { -1 } else { 1 }, app),
             _ if self.focus == Spot::List && (is(VK_UP) || is(VK_DOWN) || is(VK_HOME) || is(VK_END)) => {
                 let at = self.items.iter().position(|i| i.id.eq_ignore_ascii_case(&app.settings.skin));
@@ -3801,7 +4567,7 @@ impl SkinWindow {
                     Spot::Ctl(Ctl::Shape | Ctl::Slant | Ctl::RowHeight | Ctl::FontSize | Ctl::TabLine | Ctl::ToolbarLine | Ctl::RowEdge | Ctl::SidebarEdge | Ctl::Buttons | Ctl::Caption | Ctl::Tabs | Ctl::Sidebar | Ctl::Era | Ctl::Icons | Ctl::Logo | Ctl::Fit | Ctl::Area | Ctl::Part(_) | Ctl::Font | Ctl::SidebarRow | Ctl::ScrollWidth, _)
                 );
                 // (One column: the skin's drop-down and the menu of the rest open as drop-downs do.)
-                let dropdown = dropdown || (self.layout == Layout::Compact && matches!(self.focus, Spot::List | Spot::Button(Btn::More)));
+                let dropdown = dropdown || (self.layout == Layout::Compact && !self.popped && matches!(self.focus, Spot::List | Spot::Button(Btn::More)));
                 if dropdown && (is(VK_SPACE) || is(VK_RETURN)) {
                     // Opened when the key's character has come (it would close the menu again).
                     self.act_on_char = Some(self.focus);
@@ -3829,7 +4595,11 @@ impl SkinWindow {
                 self.toggle_fold(t);
                 Vec::new()
             }
-            Spot::List if self.layout == Layout::Compact => self.press(Btn::Skin, app),
+            Spot::Nav(page) => {
+                self.set_pop_page(page);
+                Vec::new()
+            }
+            Spot::List if self.layout == Layout::Compact && !self.popped => self.press(Btn::Skin, app),
             Spot::List => Vec::new(),
         }
     }
@@ -3996,8 +4766,9 @@ impl SkinWindow {
         let t = app.theme.clone();
         let styles = |labels: &[(&str, bool)]| labels.iter().enumerate().map(|(n, (l, on))| MenuItem::new(n as u32 + 1, l).checked(*on)).collect::<Vec<_>>();
         match (ctl, part) {
-            // A gradient's swatch: the picker changes its first colour.
-            (Ctl::Colour(i), Part::Main) => {
+            // A gradient's swatch: the picker changes its first colour. (Popped out the pencil
+            // opens it too.)
+            (Ctl::Colour(i), Part::Main | Part::Pen) => {
                 self.dialog_for = Some(app.settings.skin.clone());
                 vec![Ask::Job(Job::Colour { at: i, initial: self.colour(app, i).paint.first().to_colorref() })]
             }
@@ -4147,6 +4918,7 @@ impl SkinWindow {
                 Vec::new()
             }
             (Ctl::Picture, Part::Clear) => self.set_picture(app, ""),
+            (Ctl::Picture, Part::Pen) => Vec::new(),
             (Ctl::Picture, Part::Main) => {
                 self.dialog_for = Some(app.settings.skin.clone());
                 vec![Ask::Job(Job::Picture(Some(self.picture_dir(app))))]
@@ -4426,6 +5198,11 @@ impl SkinWindow {
             }
             Btn::Rename => {
                 let Some(e) = current.filter(|e| !e.built_in()) else { return Vec::new() };
+                // (Popped out, the name's box goes on the Skins page.)
+                if self.popped && self.pop_page != PopPage::Skins {
+                    self.set_pop_page(PopPage::Skins);
+                    self.layout(app);
+                }
                 if let Some(item) = self.items.iter().find(|i| i.id == e.id) {
                     let rect = item.rect;
                     self.list.reveal(rect.y, rect.bottom(), 4.0, self.now());
@@ -4746,6 +5523,8 @@ impl SkinWindow {
             WM_SIZE if wparam.0 == SIZE_MINIMIZED as usize => Some(LRESULT(0)),
             // Resized from an edge: docked again (its new width stays).
             WM_EXITSIZEMOVE => {
+                // (Popped out: where it was put is remembered.)
+                self.remember_pop_place(app);
                 self.follow_owner();
                 Some(LRESULT(0))
             }
@@ -4783,6 +5562,9 @@ impl SkinWindow {
             }
             WM_MOUSELEAVE => {
                 self.tracking = false;
+                if self.mouse.take().is_some() && self.popped {
+                    self.invalidate();
+                }
                 if self.drag.is_none() && self.hover.take().is_some() {
                     self.invalidate();
                 }
@@ -4881,6 +5663,7 @@ impl SkinWindow {
                 asks.extend(self.take_results(app));
                 Some(LRESULT(0))
             }
+            WM_APP_DOCK if self.popped => Some(LRESULT(0)),
             WM_APP_DOCK => {
                 asks.push(Ask::Job(Job::Dock((self.m().width * self.scale()).round() as i32)));
                 Some(LRESULT(0))
@@ -4978,6 +5761,35 @@ pub(crate) fn glyph(r: &mut Renderer, g: Glyph, at: Rect, ink: Color) {
             r.polyline(&[p(-3.0 * s, 1.5 * s), p(-3.0 * s, -3.0 * s), p(1.5 * s, -3.0 * s)], w, ink);
         }
         Glyph::Help => r.text("?", at, &TextStyle::new(ink).size(13.0).bold().align(Align::Center)),
+        Glyph::Palette => {
+            // A round palette with three dabs of paint.
+            r.stroke_ellipse(c, 5.5, 5.5, w, ink);
+            for (x, y) in [(-2.2, -1.8), (1.6, -2.6), (-2.6, 1.8)] {
+                r.fill_ellipse(p(x, y), 1.1, 1.1, ink);
+            }
+        }
+        Glyph::Shapes => {
+            r.stroke_rect(Rect::new(c.x - 6.0, c.y - 6.0, 7.5, 7.5), 1.0, ink);
+            r.stroke_ellipse(p(2.0, 2.0), 3.8, 3.8, w, ink);
+        }
+        Glyph::Picture => {
+            // A frame with hills and a sun in it.
+            r.stroke_rect(Rect::new(c.x - 6.5, c.y - 5.0, 13.0, 10.0), 1.0, ink);
+            r.polyline(&[p(-5.5, 4.0), p(-2.0, 0.0), p(0.5, 2.5), p(2.5, 0.5), p(5.5, 4.0)], w, ink);
+            r.fill_ellipse(p(2.5, -2.2), 1.1, 1.1, ink);
+        }
+        Glyph::PopOut => {
+            // A box with an arrow out of its top right corner.
+            r.polyline(&[p(1.0, -3.5), p(-5.5, -3.5), p(-5.5, 5.5), p(3.5, 5.5), p(3.5, -1.0)], w, ink);
+            r.line(p(-1.0, 1.0), p(5.5, -5.5), w, ink);
+            r.polyline(&[p(1.5, -5.5), p(5.5, -5.5), p(5.5, -1.5)], w, ink);
+        }
+        Glyph::PopIn => {
+            // A window with a panel on its right and an arrow into it.
+            r.stroke_rect(Rect::new(c.x - 6.0, c.y - 6.0, 12.0, 12.0), 1.0, ink);
+            r.line(p(2.5, -6.0), p(2.5, 6.0), 1.0, ink);
+            r.polyline(&[p(-0.5, -2.5), p(-3.0, 0.0), p(-0.5, 2.5)], w, ink);
+        }
         Glyph::Menu => {
             for y in [-4.0, 0.0, 4.0] {
                 r.line(p(-5.5, y), p(5.5, y), w, ink);
@@ -5009,6 +5821,48 @@ pub(crate) fn icon_face(r: &mut Renderer, theme: &Theme, at: Rect, g: Glyph, loo
     kit::button_beside(r, theme, at, "", look, beside);
     let ink = if look.enabled { theme.text } else { theme.muted.with_alpha(theme.muted.a * 0.45) };
     glyph(r, g, crate::pathbar::face(at, theme.lean(ksize::BUTTON_LEAN), beside), ink);
+}
+
+/// Popped out: whether page `page` has the row `ctl` of the card `title`: every colour on Colours,
+/// the wallpaper's other rows on Wallpaper, everything else on Shapes.
+fn pop_page_has(page: PopPage, title: &str, ctl: Ctl) -> bool {
+    let colour = matches!(ctl, Ctl::Colour(_));
+    match page {
+        PopPage::Skins => false,
+        PopPage::Colours => colour,
+        PopPage::Wallpaper => title == "Wallpaper" && !colour,
+        PopPage::Shapes => title != "Wallpaper" && !colour,
+    }
+}
+
+/// Popped out: a box, its title in the middle of a bar along its top (`bar` tall), in the skin's
+/// panel and heading colours.
+fn pop_box(r: &mut Renderer, theme: &Theme, rect: Rect, title: &str, bar: f32) {
+    kit::card(r, theme, rect);
+    let head = Rect::new(rect.x, rect.y, rect.w, bar.min(rect.h));
+    // A gradient runs down the bar itself (as the sidebar's panel headers), the same on every box
+    // whatever its shape; the bar reaches on below, out of sight, so only its top corners are round.
+    let radius = theme.corner(rect.h);
+    r.push_clip(head);
+    r.fill_paint_down(Rect::new(rect.x + 1.0, rect.y + 1.0, (rect.w - 2.0).max(0.0), head.h - 1.0 + radius), radius, &theme.panel_header, head.y + 1.0, head.bottom());
+    r.pop_clip();
+    r.fill_rect(Rect::new(rect.x + 1.0, head.bottom() - 1.0, (rect.w - 2.0).max(0.0), 1.0), theme.line);
+    let ink = if theme.panel_header_text.a > 0.0 { theme.panel_header_text } else { theme.text_strong };
+    r.text(title, Rect::new(rect.x + 8.0, head.y, (rect.w - 16.0).max(0.0), head.h), &TextStyle::new(ink).semibold().align(Align::Center));
+}
+
+/// A small button on a title bar (pop out, put back, search): its icon, on the window buttons'
+/// hover colour under the mouse.
+fn caption_icon(r: &mut Renderer, theme: &Theme, rect: Rect, g: Glyph, hover: bool, pressed: bool, active: bool) {
+    if hover {
+        r.fill_rect(rect, if pressed { theme.caption_pressed } else { theme.caption_hover });
+    }
+    let ink = match () {
+        _ if hover => theme.text,
+        _ if active => theme.muted,
+        _ => theme.muted.with_alpha(0.6),
+    };
+    glyph(r, g, rect, ink);
 }
 
 /// A section's heading that folds it (one column): a small triangle (pointing right while it's
@@ -5561,6 +6415,20 @@ mod tests {
         // Very near the default: exactly it; a bit further: where it was dragged.
         assert_eq!(pan_place((0.0, 0.0), (29.6, 0.0), (60.0, 40.0), d), (50.0, 0.0));
         assert_eq!(pan_place((0.0, 0.0), (28.8, 0.0), (60.0, 40.0), d), (48.0, 0.0));
+    }
+
+    /// Popped out, every setting is on exactly one page.
+    #[test]
+    fn popped_out_every_setting_is_on_one_page() {
+        let hints = vec![String::new(); COLOURS.len()];
+        for (title, rows) in cards(&hints) {
+            for (ctl, name, _) in rows {
+                let on: Vec<_> = POP_PAGES.iter().filter(|(p, _)| pop_page_has(*p, title, ctl)).map(|(_, n)| *n).collect();
+                assert_eq!(on.len(), 1, "{title} > {name} is on {on:?}");
+            }
+        }
+        let m = Metrics::popped();
+        assert_eq!((m.width, m.min_width, m.list_w, m.header_h), (POP_W, POP_MIN_W, NAV_W, 0.0));
     }
 
     /// The three layouts: the wide one is as it always was; one column is 420 wide with no list and

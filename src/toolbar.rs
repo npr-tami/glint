@@ -82,9 +82,11 @@ const VIEW_SPLIT: u32 = 23;
 const VIEW_RULES: u32 = 22;
 const VIEW_CUSTOM: u32 = 24;
 
-/// The SETTINGS button's right-click menu: what the Settings window doesn't have, and a shortcut to
-/// its About page.
+/// The SETTINGS button's right-click menu: what the Settings window doesn't have, the Skins window
+/// and Folder rules a click away, and a shortcut to its About page.
 const SET_WINDOW: u32 = 80;
+const SET_SKINS: u32 = 81;
+const SET_RULES: u32 = 82;
 const SET_ABOUT: u32 = 50;
 const SET_QUIT: u32 = 95;
 /// SORT and SETTINGS lean this far in AMD Radeon (their top edge sits this many DIPs right of the
@@ -687,8 +689,10 @@ impl Toolbar {
             at: Point::new(b.right(), b.bottom() + 2.0),
             right_aligned: true,
             items: vec![
-                MenuItem::new(SET_WINDOW, "Settings\u{2026}\tCtrl+,"),
-                MenuItem::new(SET_ABOUT, "About Glint\u{2026}"),
+                MenuItem::new(SET_WINDOW, "Settings\tCtrl+,"),
+                MenuItem::new(SET_SKINS, "Edit skins"),
+                MenuItem::new(SET_RULES, "Edit folder rules"),
+                MenuItem::new(SET_ABOUT, "About Glint"),
                 MenuItem::separator(),
                 MenuItem::new(SET_QUIT, "Exit Glint\tCtrl+Q"),
             ],
@@ -698,6 +702,8 @@ impl Toolbar {
     fn settings_pick(&mut self, item: u32) -> Effect {
         match item {
             SET_WINDOW => Effect::Command(Command::OpenSettings(None)),
+            SET_SKINS => Effect::Command(Command::OpenSkinEditor),
+            SET_RULES => Effect::Command(Command::OpenSortEditor),
             SET_ABOUT => Effect::Command(Command::OpenSetting(crate::settingswin::ABOUT, crate::settingswin::ABOUT_ROW.to_string())),
             SET_QUIT => Effect::Command(Command::Quit),
             _ => Effect::None,

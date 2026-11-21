@@ -50,6 +50,9 @@ pub struct AskBox {
     /// The question last shown (a new one starts with the yes button in focus again).
     seen: u64,
     focus: Button,
+    /// Whether the keyboard has moved between the buttons (Tab or an arrow): only then does the
+    /// focused one get its outline, as in Windows' own boxes.
+    keyed: bool,
     hover: Option<Button>,
     pressed: Option<Button>,
     panel: Rect,
@@ -61,7 +64,7 @@ pub struct AskBox {
 
 impl Default for AskBox {
     fn default() -> Self {
-        AskBox { seen: 0, focus: Button::Yes, hover: None, pressed: None, panel: Rect::default(), lean: LEAN, yes: Rect::default(), no: Rect::default() }
+        AskBox { seen: 0, focus: Button::Yes, keyed: false, hover: None, pressed: None, panel: Rect::default(), lean: LEAN, yes: Rect::default(), no: Rect::default() }
     }
 }
 
@@ -178,7 +181,7 @@ impl AskBox {
         self.yes = Rect::new(self.no.x + self.lean - BUTTON_GAP - yes_w, by, yes_w, BUTTON_H);
 
         if glass {
-            let look = |b: Button| Look { hover: self.hover == Some(b), pressed: self.pressed == Some(b) && self.hover == Some(b), focused: self.focus == b, enabled: true };
+            let look = |b: Button| Look { hover: self.hover == Some(b), pressed: self.pressed == Some(b) && self.hover == Some(b), focused: self.keyed && self.focus == b, enabled: true };
             kit::primary_button_beside(r, theme, self.yes, yes, look(Button::Yes), Beside::RIGHT);
             kit::button_beside(r, theme, self.no, "CANCEL", look(Button::No), Beside::LEFT);
             return;
@@ -194,9 +197,12 @@ impl AskBox {
         fill_box_beside(r, theme, self.no, self.lean, Beside::LEFT, if self.pressed == Some(Button::No) && self.hover == Some(Button::No) { theme.button_pressed } else { no_color });
         r.text("CANCEL", face(self.no, self.lean, Beside::LEFT), &label_style);
 
-        // The keyboard's button gets a thin outline (Enter or Space presses it).
-        let (focused, beside) = if self.focus == Button::Yes { (self.yes, Beside::RIGHT) } else { (self.no, Beside::LEFT) };
-        kit::focus_ring_beside(r, theme, focused, self.lean, beside);
+        // Once the keyboard has moved between them, its button gets a thin outline right on its
+        // edge (Enter or Space presses it).
+        if self.keyed {
+            let (focused, beside) = if self.focus == Button::Yes { (self.yes, Beside::RIGHT) } else { (self.no, Beside::LEFT) };
+            kit::focus_ring_beside(r, theme, focused, self.lean, beside);
+        }
     }
 
     pub fn mouse_move(&mut self, p: Point) -> Answer {
@@ -235,6 +241,7 @@ impl AskBox {
             v if v == VK_ESCAPE.0 => Answer::No,
             v if v == VK_TAB.0 || v == VK_LEFT.0 || v == VK_RIGHT.0 => {
                 self.focus = if self.focus == Button::Yes { Button::No } else { Button::Yes };
+                self.keyed = true;
                 Answer::Redraw
             }
             _ => Answer::Nothing,

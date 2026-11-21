@@ -832,7 +832,7 @@ fn about(f: &Facts) -> Vec<Item> {
     vec![
         Item::Heading("Glint"),
         Item::Card(vec![
-            Row::new("@About", &format!("Glint {}", crate::log::VERSION), Some("A light file explorer for Windows. This is a beta: some things may not work yet."), Ctl::None),
+            Row::new("@About", &format!("Glint {}", crate::log::VERSION), Some("A light file explorer for Windows."), Ctl::None),
             Row::new("@Update", ABOUT_ROW, Some(&f.update_said), Ctl::Button(if f.update_busy { "CHECKING\u{2026}".into() } else { "CHECK FOR UPDATES".into() }, Act::Update)).needs("@UpdateReady"),
             toggle("CheckForUpdates", "Check for updates automatically", None).indent(),
             toggle("UpdateAutomatically", "Install updates automatically", f.info_open.filter(|k| *k == "UpdateAutomatically").map(|_| UPDATE_AUTOMATICALLY)).indent().needs("CheckForUpdates").info(),

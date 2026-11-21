@@ -7,7 +7,7 @@
 //! - GitHub is asked for its recent releases (`api.github.com/repos/<owner>/<name>/releases`), over
 //!   HTTPS with WinHTTP: the system's proxy settings, HTTPS certificates always checked, and a time
 //!   limit on every step. Drafts are left out. Releases marked pre-release are left out too, unless
-//!   Glint is a beta itself ("1.0.12-beta.1"): a beta follows the betas.
+//!   this Glint is an old beta itself ("1.0.12-beta.1"): a beta follows the betas.
 //! - The highest tag (a leading "v" left out) is compared with Glint's own version (`Version`,
 //!   semver: 1.0.12-beta.2 comes after 1.0.12-beta.1, and 1.0.12 after both).
 //!   Newer: the CHANGELOG.md sections since Glint's own version (the file as it is at that tag) go

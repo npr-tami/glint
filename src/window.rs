@@ -975,7 +975,8 @@ fn open_skins(hwnd: HWND, ptr: *mut Window) {
         }
         let theme = (*ptr).app.theme.clone();
         let layout = (*ptr).app.settings.skins_window;
-        let Some(win) = skinwin::create(hwnd, &theme, layout) else {
+        let (popped, bounds) = ((*ptr).app.settings.skins_popped, (*ptr).app.settings.skins_bounds);
+        let Some(win) = skinwin::create(hwnd, &theme, layout, popped, bounds) else {
             BUSY.with(|b| b.set(true));
             (*ptr).app.say("Failed to open Skins. Try again.");
             (*ptr).invalidate();

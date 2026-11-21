@@ -1,6 +1,13 @@
-# What changed in Glint
+# Changelog
 
-The newest version is at the top.
+## 26.11.6 · 21/11/2026 18:46
+
+- Added a pop-out Skins window
+- Added Edit skins and Edit folder rules to the Settings button's right-click menu
+- Changed Glint out of beta
+- Changed folders with only hidden files to say they're empty
+- Updated the readme
+- Some other improvements and bugfixes
 
 ## 26.11.5 · 20/11/2026 08:56
 
@@ -48,10 +55,10 @@ The newest version is at the top.
 
 ## 1.0.25-beta.1 · 14/11/2026 03:37
 
-- Added Update automatically in Settings > About
+- Added installing updates automatically
 - Added a download bar to the update window
-- Changed Esc and × in the update window to stop a download
-- Fixed a portable Glint losing its settings after an update
+- Changed Esc and × to stop an update download
+- Fixed portable Glint losing settings after an update
 - Fixed closing Glint during an update
 - Improved update safety
 - Improved update checks
@@ -59,345 +66,252 @@ The newest version is at the top.
 
 ## 1.0.24-beta.5 · 12/11/2026 20:05
 
-- Added searching inside files: type words in quotes in the search bar, like "hello world"
-- Added showing which program has a file open, when renaming it fails
-- Added Setup info in Settings > About: copies your Glint and Windows versions and settings for bug reports
-- Added Temp Win+E Fix in Settings > General
-- Changed the update window to say "Hotfix" for quick fixes
-- Fixed sorting by Length or Picture size while that column is hidden
+- Added searching inside files
+- Added showing which program is using a file
+- Added System info in Settings > About
+- Added Temp Win+E fix in Settings > General
+- Changed quick fixes to show as Hotfix
+- Fixed sorting by a hidden column
 - Fixed Win+E after moving Glint's folder
 - Some other improvements and bugfixes
 
 ## 1.0.24-beta.4 · 12/11/2026 10:44
 
-- Added changing what's inside zip and 7z files: delete, rename, new folders and text files, paste or drag files in, and cut them out, all undoable with Ctrl+Z
-- Added dropping files onto a zip or 7z file to put them in it
-- Fixed files whose names end in a dot or a space: they can be renamed and zipped now
+- Added editing inside zip and 7z files
+- Added dropping files onto a zip or 7z file
+- Fixed names ending in a dot or a space
 - Some other improvements and bugfixes
 
 ## 1.0.24-beta.3 · 08/11/2026 18:56
 
-- Changed the bars on Disk space's Biggest tab to your skin's colour
+- Changed Disk space bars to the skin's colour
 
 ## 1.0.24-beta.2 · 07/11/2026 21:27
 
-- Added Disk space to a drive's right-click menu in the sidebar
-- Added a setting for opening Disk space by clicking a drive's usage bar, in Settings > General
+- Added Disk space to a drive's right-click menu
+- Added a setting for clicking a drive's usage bar
 - Some other improvements and bugfixes
 
 ## 1.0.24-beta.1 · 06/11/2026 15:03
 
-- Added Disk space (Ctrl+Shift+U): the biggest folders, what changed since your last scan, and space by type
-- Added opening Disk space by clicking a drive's usage bar in the sidebar
-- Added LATER and SKIP THIS VERSION buttons to the update window
-- Changed Portable mode to move Glint's files right away
+- Added Disk space (Ctrl+Shift+U)
+- Added opening Disk space from a drive's usage bar
+- Added LATER and SKIP THIS VERSION to updates
+- Changed Portable mode to move files right away
 - Changed messages across Glint to be clearer
-- Fixed deleting in a very long folder path skipping the Recycle Bin without asking
-- Fixed a delete after Try Again not being undoable
-- Fixed the skin customiser's Logo text keeping only the first letter
-- Fixed a path typed in other capitals showing those capitals instead of the real names
-- Fixed two skins with the same name looking the same in the skin list
-- Improved many tabs: the tab row scrolls with the wheel, and the current tab and + stay in sight
-- Improved pinned tabs: they keep their Back and Forward places after a restart
+- Fixed long-path deletes skipping the Recycle Bin
+- Fixed undo after Try Again on a delete
+- Fixed logo text keeping only the first letter
+- Fixed typed paths showing the wrong capitals
+- Fixed two skins with one name looking alike
+- Improved scrolling through many tabs
+- Improved pinned tabs keeping Back and Forward
 - Some other improvements and bugfixes
 
 ## 1.0.23-beta.1 · 31/10/2026 01:52
 
-- Added choices for how Settings looks, in Settings > Appearance > Settings window
-- Added a search box, a dot on changed settings and a Reset page button to Settings
-- Changed Settings to a small window, like File Explorer's Folder Options
-- Changed drop-downs and the SORT, VIEW and SETTINGS menus to open right under their buttons
-- Changed the built-in skins' text and the skin guide to be easier to read
-- Renamed Settings > Mouse & keys to Keys, with a list of every shortcut
+- Added choices for how Settings looks
+- Added a search box and Reset page to Settings
+- Added dots on changed settings
+- Added a list of every shortcut
+- Changed Settings to a small window
+- Changed menus to open right under their buttons
+- Changed skin text to be easier to read
+- Renamed Mouse & keys to Keys
 - Some other improvements and bugfixes
 
 ## 1.0.22-beta.1 · 25/10/2026 04:09
 
-- Added a Wallpaper section to the skin customiser
-- Changed new wallpapers to sit in the middle, at 50% opacity
-- Fixed a skin renamed to "X (Light)" not becoming X's light version
+- Added a Wallpaper section to the Skins window
+- Changed new wallpapers to sit in the middle
+- Fixed renaming a skin into a light version
 - Some other improvements and bugfixes
 
 ## 1.0.21-beta.1 · 18/10/2026 21:23
 
-- Updated the README with pictures and a short tour
+- Updated the readme with pictures and a short tour
 - Fixed Settings tabs going onto two rows
 - Removed the .bat files
 - Some other improvements and bugfixes
 
 ## 1.0.20-beta.1 · 17/10/2026 00:14
 
-- Added a settings search to the command box (Ctrl+U)
-- Added more wallpaper options for skins: blur, fade, zoom and size
+- Added settings search to the Command box
+- Added wallpaper blur, fade, zoom and size
 - Changed the skin list into groups
-- Fixed pictures flickering in the big preview
-- Fixed phone photos showing sideways as a wallpaper
-- Fixed slow start-up when a network drive is switched off
-- Fixed USB sticks showing as hard disks with older icons
+- Fixed pictures flickering in the preview
+- Fixed phone photos turned sideways as wallpaper
+- Fixed slow start-up with a network drive off
+- Fixed USB sticks showing as hard disks
 - Fixed videos playing twice in the preview
-- Fixed Rename many mixing up names
+- Fixed Rename all mixing up names
 - Fixed imported skins missing their pictures
-- Improved 7z packing: about 7 times faster
+- Improved 7z packing, about 7 times faster
 - Improved zip speed, start-up and scrolling
 - Some other improvements and bugfixes
 
 ## 1.0.19-beta.2 · 15/10/2026 18:19
 
-- Fixed Home not scrolling with the mouse wheel or the scroll bar
+- Fixed Home not scrolling
 
-## 1.0.19-beta.1 · 15/10/2026
+## 1.0.19-beta.1 · 15/10/2026 17:15
 
-- Added undo and redo: Ctrl+Z undoes your last move, copy, rename, new folder or delete, Ctrl+Y brings it back
-- Added a command box: press Ctrl+U and type what you want to do, a folder to go to, or a word to search for (type ? for help)
-- Added Find duplicates: right-click the empty space in a folder
-- Added Rename many: select several files and press F2 to number them or swap words in their names
-- Added folder sizes in the Size column
-- Added Picture size and Length columns for pictures, videos and songs (right-click the column titles)
-- Added colour tags: right-click > Tag. Type tag:red in the filter to see only red ones
-- Added searching every drive at once: type in the filter on This PC
-- Added a copy queue: big copies run one at a time, in a list with Pause and Cancel
+- Added undo and redo (Ctrl+Z, Ctrl+Y)
+- Added the Command box (Ctrl+U)
+- Added Find duplicates
+- Added Rename all (F2)
+- Added folder sizes
+- Added Picture size and Length columns
+- Added colour tags
+- Added searching every drive at once
+- Added a copy queue with Pause and Cancel
 - Added opening zip and 7z files like folders
-- Added Extract and Compress to zip or 7z in the right-click menu
-- Added pinned tabs and saved sets of tabs (right-click a tab)
-- Added dragging a tab to move it
-- Added split view: VIEW > Split view (Ctrl+\) shows two folders side by side
-- Added Ctrl + scroll wheel to change the view, like File Explorer (Settings > Mouse and keyboard)
-- Added Report a bug in Settings > About
-- Added a second logo and a choice of zip icon in Settings > Appearance
-- Improved searching subfolders: Glint now looks in several folders at once, so results come in faster
-- Changed VIEW > Views for folders… to VIEW > Edit custom views…, and VIEW > Custom views turns them on or off
-- Changed double-clicking a program in the Recycle Bin: Glint asks you to restore it first
-- Changed Glint to stop saving a speed-test log in Windows' temp folder (the old one is deleted)
-- Fixed Glint closing when a broken or huge GIF was previewed
-- Fixed Glint closing when typing AltGr letters (like @)
-- Fixed Home crashing on folder names with Chinese, Japanese or accented letters
-- Fixed two Glint windows erasing each other's settings
-- Fixed settings being lost while a virus scanner was checking them
-- Fixed pinned folders past 200, and tabs past 100, being lost after a restart
-- Fixed Glint saying files went to the Recycle Bin when Windows deleted them for good
-- Fixed deleting a skin removing it for good without asking when the Recycle Bin is off
-- Fixed Delete, Copy and Move saying everything worked when one item failed
-- Fixed dropping files from two drives moving them instead of copying
-- Fixed a video in the preview stopping you deleting, renaming or moving it
+- Added Extract and Compress to the right-click menu
+- Added pinned tabs and saved tab sets
+- Added dragging tabs
+- Added split view (Ctrl+\)
+- Added Ctrl+scroll wheel to change the view
+- Added reporting a bug from Settings > About
+- Added a second logo and a zip icon choice
+- Changed custom views to have their own switch
+- Changed Recycle Bin programs to need restoring first
+- Changed Glint to stop saving a speed log in Temp
+- Fixed Glint closing on broken or huge GIFs
+- Fixed Glint closing on AltGr letters
+- Fixed Home crashing on accented or Asian names
+- Fixed two windows erasing each other's settings
+- Fixed settings lost during a virus scan
+- Fixed lost pins past 200 and tabs past 100
+- Fixed wrong Recycle Bin messages
+- Fixed skins deleted for good without asking
+- Fixed "done" messages when one item failed
+- Fixed files from two drives being moved, not copied
+- Fixed a previewed video blocking delete and move
 - Fixed the right-click menu sometimes not opening
-- Fixed Home opening slowly when a network drive is offline
-- Fixed pinned drives not showing in Home
-- Fixed Settings opening off-screen after unplugging a monitor
+- Fixed Home opening slowly with a network drive off
+- Fixed pinned drives missing from Home
+- Fixed Settings opening off-screen
+- Improved subfolder search speed
 - Some other improvements and bugfixes
 
-## 1.0.18-beta.2 (2026-10-13): Quick fix
+## 1.0.18-beta.2 · 14/10/2026 00:19
 
-### Fixes
-- The skins and Settings windows no longer look stretched after you resize them or Glint.
+- Fixed stretched Skins and Settings windows
 
-## 1.0.18-beta.1 (2026-10-13): Settings beside Glint
+## 1.0.18-beta.1 · 13/10/2026 23:53
 
-### New
-- Settings now opens beside Glint, docked like the sort window, so your files stay in view.
-- Pick how it opens: Settings > Appearance > Settings opens (Docked, Small in the middle, Tab or Last position).
-- The skin editor's text view now works like a code editor: line numbers, coloured settings and a colour square by each colour.
-- Start typing a setting and a list shows what fits, then what it can be. Tab or Enter takes one.
-- The line you're on says what it does, or what's wrong with it. Click a problem to jump to its line.
-- GUIDE under the text shows a short how-to with an example.
-- Skin colours are now grouped: Main colours, Title bar, Tabs, Toolbar, Sidebar, File list and more.
-- Wallpaper zoom: wallpaper-zoom: 100 zooms in, -100 zooms out (-500 to 500, 0 is normal).
-- wallpaper-position can now also say top, middle or bottom, like: right bottom.
+- Added a choice of how Settings opens
+- Added line numbers and colours to skin text
+- Added suggestions while typing skin settings
+- Added a short guide to the Skins window
+- Added wallpaper zoom
+- Added top, middle and bottom wallpaper positions
+- Changed Settings to open beside Glint
+- Changed skin colours into groups
+- Fixed wide wallpapers being cut off
+- Fixed a gap beside the Skins window
+- Fixed Light or dark for skins without a light version
+- Fixed arrow keys popping up suggestions
 
-### Fixes
-- wallpaper-fit: whole now always shows the entire picture, whatever its size, instead of cutting off wide pictures.
-- The skins window now sits right against Glint, with no gap.
-- "Light or dark" is greyed out for skins that have no light or dark version.
-- Moving with the arrow keys in the sort and skin editors no longer pops up suggestions.
+## 1.0.17-beta.1 · 12/10/2026 21:47
 
-## 1.0.17-beta.1 (2026-10-12): wallpaper support for skins
+- Added wallpapers for skins
+- Added wallpaper opacity, position and fit
+- Added skins in folders, with their pictures
 
-### New
-- Wallpaper support: a skin can now show a picture behind your files and Home.
-- Choose how strongly it shows, which side stays in view, and whether it fills the list or sits whole at one side.
-- A skin can live in a folder of its own, with its pictures next to it. Drop the folder into the skins folder and the skin shows up.
+## 1.0.16-beta.1 · 12/10/2026 16:09
 
-### How to add a wallpaper
-- Open SETTINGS > Appearance > CUSTOMISE… and pick your skin (for a built-in one, click Duplicate first).
-- Click Open skins folder and put your picture in it.
-- Tick Show as text and add a line with the picture's name, like: wallpaper: my picture.png
-- Optional: wallpaper-opacity: 50 (0 to 100), wallpaper-position: left, middle or right, and wallpaper-fit: whole to show the whole picture at one side.
+- Added a new Home like File Explorer's
+- Added Add to Favourites to the right-click menu
+- Added a setting to keep the old Home
+- Added GIFs and videos in the preview
+- Added picture and video details in the preview
+- Added a saved view for each folder
+- Added older Windows looks for skins
+- Added Detach and Dock to Folder rules
+- Added line numbers and mistake marks to Folder rules
+- Added one-click fixes for bracket mistakes
+- Added path suggestions in Folder rules
+- Added rules that cover subfolders too
+- Added undo and redo to Folder rules
+- Added a right-click menu to Folder rules
+- Changed column clicks to sort only that folder
+- Fixed USB and network deletes not asking first
+- Fixed typing to jump to a file after no match
+- Fixed Folder rules after renaming or moving a folder
+- Fixed START FROM replacing your rules without asking
 
-## 1.0.16-beta.1 (2026-10-12): new Home, video preview, and an easier sort window
+## 1.0.15-beta.1 · 12/10/2026 00:00
 
-### New
-- Home looks like File Explorer's: your folders at the top, then Recent files and Favorites.
-- Right-click any file or folder and pick Add to Favorites to put it on Home.
-- Prefer the old Home? SETTINGS > Home opens can switch it back to your user folder.
-- Space preview now plays GIFs, and videos too (press play).
-- Videos start with the sound fading in, and Glint remembers your volume.
-- The "i" button in the preview shows a picture's or video's details.
-- Each folder remembers its view, like File Explorer. Even after a restart.
-- Skins can now look like older Windows (98, 2000, XP or 7), with icons from that time.
+- Added one set of rules for several folders
 
-### Sort order window
-- DETACH lets it float as its own window. DOCK puts it back.
-- Line numbers, with a red dot on any line that has a mistake.
-- Every mistake is listed in full. Click one to jump to its line.
-- Clear tips for bracket mistakes, most with a one-click Fix.
-- Faint words after your line say what it does.
-- Add and_subfolders to a folder's rules so folders inside it follow them too.
-- Start typing a folder name and it suggests the full path.
-- Clicking a column sorts only that folder, until you leave it.
-- The window shows which rules sort the folder you're in.
-- Ctrl+Z / Ctrl+Y undo and redo, even after closing the window.
-- Right-click for cut, copy, paste and more. Ctrl+/ turns lines into notes.
-- Alt+Up and Alt+Down move lines.
+## 1.0.14-beta.1 · 11/10/2026 19:00
 
-### Fixes
-- Deleting on a USB stick or network drive now asks first (there's no Recycle Bin there).
-- Typing letters to jump to a file keeps working when nothing matches.
-- Renaming or moving a folder in Glint updates its sort rules.
-- START FROM asks before replacing your own rules.
+- Changed the Folder rules guide to show when asked
+- Removed the Folder rules preview
 
-## 1.0.15-beta.1 (2026-10-11): the same rules for several folders
+## 1.0.13-beta.1 · 11/10/2026 18:06
 
-- **One set of rules for several folders**: in the custom sort order (SORT > Edit custom
-  order..., or VIEW > Views for folders...), start with `in = (`, put each folder's full path on
-  a line of its own, then the rules, and end with `)`. For example:
+- Added a view for each folder in Folder rules
 
-  ```
-  in = (
-  C:\Users\me\Pictures\Wallpapers
-  ~\Documents\Photos
-  large_icons
-  newest_first
-  )
-  ```
+## 1.0.12-beta.1 · 11/10/2026 02:56
 
-  Every folder listed gets those rules, so they don't have to be written out again for each one.
-  Paths can start with `~` (your home folder), use `/` or `\`, and have spaces. Typing a path
-  suggests the folders in it, and the guide (GUIDE) has a line about it. `in Downloads (` and the
-  other rules work as before.
+- Changed version numbers to 1.0.x-beta.x
 
-## 1.0.14-beta.1 (2026-10-11): a simpler sort order window
+## 0.11.0 · 10/10/2026 15:33
 
-- **The sort order window is simpler** (SORT > Edit custom order..., or VIEW > Views for
-  folders...): the preview is gone, since the folder beside it already shows the result as you
-  type, so the rules box gets the whole window. The guide stays hidden until you click GUIDE; it
-  then shows at the bottom, starting with an example.
+- Added brackets for a folder's own rules
+- Changed Folder rules to keep the order you write
+- Changed folders without rules to sort by their column
+- Fixed empty WinRAR submenus in the Windows 11 menu
 
-## 1.0.13-beta.1 (2026-10-11): a view for each folder
+## 0.10.4 · 10/10/2026 02:01
 
-- **Folders can have a view of their own**: in the custom sort order (VIEW > Views for folders...,
-  or SORT > Edit custom order...), put a view in a folder's rules, and that folder always opens
-  that way, while the others keep the view you picked with VIEW. For example, a line
-  `in Pictures (`, then `-large_icons` on the next line, then `)` on a line of its own shows
-  Pictures with large icons.
-  The views are `-details`, `-list`, `-tree`, `-medium_icons`, `-large_icons` and
-  `-extra_large_icons` (spaces work too: `large icons`). A view written outside any folder's rules
-  is for every folder without a view of its own. A folder's subfolders don't get its view. Views
-  work even with the custom sort order switched off, since they don't sort anything.
-- **Picking a view with VIEW in such a folder** is just for now: the folder's own view comes back
-  the next time you open it. Elsewhere, VIEW changes the tab's view as before.
+- Added undo and redo to the Skins window
+- Added NONE for skin colours
+- Changed Glint's files to live in one folder
+- Changed Portable mode to move files, not copy them
+- Fixed Glint closing on letters like ñ in Folder rules
+- Fixed column clicks sorting backwards
+- Fixed Forward after typing a file's path
+- Fixed mouse Back and Forward during a question
+- Fixed the list jumping after a row size change
+- Fixed small right-drags not showing the menu
+- Fixed Copy path emptying the clipboard
+- Fixed undo in the Skins window
 
-## 1.0.12-beta.1 (2026-10-11): new version numbers
+## 0.9.3 · 10/10/2026 01:51
 
-- **Version numbers have a new form**: 1.0.12-beta.1 is the release after 0.11.0. Every new
-  release raises the 12 by one (1.0.13-beta.1 next); a quick fix to the same release only raises
-  the beta number (1.0.12-beta.2). Settings > About shows the whole number.
+- Fixed empty submenus for apps listed twice
 
-## 0.11.0 (2026-10-10): the sort order you write, WinRAR's submenu in Windows 11 menu mode
+## 0.9.2 · 10/10/2026 01:32
 
-- **WinRAR's submenu is no longer empty** when WinRAR uses its Windows 11 context menu. The same
-  goes for other apps whose Windows 11 menu items have a submenu.
-- **The custom sort order keeps the order you write**: each thing goes on the first line that fits
-  it. A line like `-updated` or `-png` no longer pulls things out of a line above it, so with
-  `-image` above `-updated`, a picture changed today stays with the pictures (and with
-  `-folder_first` above `-hidden_last`, hidden folders stay with the folders). Glint points out a
-  line that can't get anything because the lines above take it all.
-- **Lines stacked under a `_first` line go up with it**, in their order: with `-image`, then
-  `-folder_first` and `-updated` right under it, folders come first and `-updated` second. Lines
-  under a `_last` line go down with it, and Glint points them out. A blank line ends the stack (a
-  line of notes doesn't): in an order written before, a blank line after the `_first` or `_last`
-  line keeps the lines under it where they were.
-- **A folder the custom sort order has no rules for sorts by its column**: with only `in …` rules
-  (say for Downloads), other folders keep the column and direction you pick instead of A to Z, and
-  clicking a column there no longer turns the custom order off for Downloads. Folders first in
-  Settings can be changed while the custom order is on, since it still counts in those folders.
-- **A folder's own rules go in brackets**: `in Downloads (`, its rules, then `)` on a line of its
-  own. The lines after the `)` are for every folder again. `in Downloads:` still works and runs to
-  the next `in` or the end. A missing, extra or misplaced bracket is marked, with a fix. A folder
-  written twice gets the rules of both (before, the second was left out).
+- Fixed other apps' submenus on slower PCs
 
-## 0.10.4 (2026-10-10): undo in the skin editor, one folder for Glint's files
+## 0.9.1 · 10/10/2026 01:10
 
-- **Undo and redo in the skin editor**: UNDO and REDO buttons, or Ctrl+Z and Ctrl+Y.
-- **Colours can be set to none**: each colour has a NONE button.
-- **All of Glint's files are in one folder**: `%APPDATA%\Glint` (settings, skins, cache and logs),
-  or `Glint data` next to Glint.exe when portable. Files from older versions move there by
-  themselves.
-- **Portable moves the files** from one place to the other when Glint next starts, instead of
-  copying them and leaving `.old` and `config.off` copies behind (and works while Glint has its
-  settings open, which it always does).
-- About says Glint is a beta. The timing log in the temp folder starts again once it reaches 1 MB.
+- Fixed updates picking an older release
+- Fixed other apps' right-click commands
 
-Fixes:
+## 0.9.0 · 10/10/2026 00:32
 
-- Typing a letter like "ñ" or "ö" near the start of a line in the sort order window no longer
-  closes Glint, and neither does a sort rule on a name whose extension has letters like "İ".
-- A column clicked while the custom sort order is on sorts A to Z (or newest/biggest first), not
-  backwards. The right-click menu's "Sort by" no longer checks a column then.
-- Typing a file's path in the path bar keeps the Forward button working.
-- The mouse's Back and Forward buttons wait while a question (like "Delete permanently?") is open.
-- A row size picked in Settings keeps the same rows on screen.
-- Alt+P says when the window is too narrow for the details panel.
-- Right-dragging files a little within their own folder shows the menu ("Create shortcuts here").
-- Copy path in This PC with nothing selected no longer empties the clipboard.
-- Skin editor: undoing after a rename keeps the new name; undoing the Dark skin switch also
-  switches "Light or dark" back; a new skin doesn't get a deleted skin's undo steps; UNDO is
-  greyed out for a skin whose file is gone.
+- Added the Chrome and Gunmetal skins
+- Added gradients and glossy buttons to skins
+- Added every colour to the Skins window
+- Added the logo choice to the Skins window
+- Renamed the Slanted box logo to Box
+- Fixed Open skins folder closing the Skins window
 
-## 0.9.3 (2026-10-10): apps listed twice in the right-click menu
+## 0.8.0 · 09/10/2026 20:33
 
-- **WinRAR (and other apps) in Windows 11 menu mode work again.** Such apps can show up twice in
-  Windows' menu, and only one copy has its submenu filled; Glint now keeps that one instead of
-  always the first.
-- The log notes which menu items were left out and what each submenu had when it opened.
-
-## 0.9.2 (2026-10-10): right-click submenus
-
-- **Submenus from other apps open again on slower PCs** (WinRAR ›, Send to ›, Give access to ›…).
-  Glint now waits longer for Windows to fill a submenu, and one slow submenu no longer stops all
-  the others in the same menu from opening.
-
-## 0.9.1 (2026-10-10): fixes
-
-- **Updates**: Glint now finds the newest release by its version number, even when GitHub still
-  marks an older one as "latest".
-- **Right-click menus**: Windows' commands from other apps (WinRAR, Send to and the like) may
-  finish their work after the click, as they can in File Explorer, and Glint keeps what they need
-  a little longer.
-- Glint notes in its log which of Windows' menu commands ran, to help find problems.
-
-## 0.9.0 (2026-10-09): Chrome and Gunmetal
-
-- **Two new skins: Chrome and Gunmetal.** Year 2000 chrome: shiny silver-blue (or dark
-  gunmetal) bars, glass marbles for minimise, maximise and close, glossy liquid buttons, rounded
-  tabs and sidebar panels. "Light or dark" switches between the two.
-- **Skins can do more**: gradients for any colour, liquid buttons, marble window buttons, pill
-  tabs, sidebar panels and a chrome scrollbar. Your own skins can use all of it.
-- **Every colour is in the skin customiser** now, in one list with clear names, plus the line
-  widths and a Style group.
-- **Logo** can also be chosen in the skin customiser. "Slanted box" is now just "Box".
-- OPEN SKINS FOLDER no longer closes the skin customiser.
-
-## 0.8.0 (2026-10-09): first public beta
-
-- **A fast, lightweight file explorer** that draws everything itself: a single Glint.exe with
-  nothing to install, and a portable mode.
-- **Tabs** that come back next time, a **sidebar** (Quick access, pinned folders, drives), a path
-  you can click or type into, and a filter that can search subfolders too.
-- **The details panel** (Alt+P) and the **Space preview** for pictures, text files and more.
-- **Views**: extra large, large and medium icons with thumbnails, list, details and a tree.
-- **Working with files** through Windows' own copy engine: copy, cut, paste, rename, delete, the
-  Recycle Bin, drag and drop, and right-click menus with other apps' items.
-- **Skins**: AMD Radeon, NVIDIA and their light versions, and your own, made in the skin customiser.
-- **Custom sort order** with suggestions as you type and a live preview.
-- **Default file explorer and Win+E**, if you want them, and a **background mode** with a tray
-  icon and Start with Windows.
-- **Updates** from GitHub Releases, when you say so.
+- Added Glint: one Glint.exe, nothing to install
+- Added tabs, sidebar, path bar and search
+- Added the details panel and Space preview
+- Added icon, list, details and tree views
+- Added copy, move, rename and delete the Windows way
+- Added drag and drop and Windows' right-click menus
+- Added AMD Radeon, NVIDIA and your own skins
+- Added Folder rules for your own sort order
+- Added default file explorer and Win+E
+- Added background mode and portable mode
+- Added updates from GitHub

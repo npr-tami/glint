@@ -661,7 +661,7 @@ pub fn swap_menu(items: &mut [crate::ui::MenuItem], map: &KeyMap) {
 }
 
 /// The shortcuts this Glint has now, for the messages that name one but have no settings at hand
-/// (a folder's "Only hidden items are here" line, what a file job says). None until the window has
+/// (what a file job says, the Recycle Bin's "refresh and try again"). None until the window has
 /// set them: the defaults.
 static NOW: Mutex<Option<KeyMap>> = Mutex::new(None);
 

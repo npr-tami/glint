@@ -1094,6 +1094,10 @@ pub struct Settings {
     pub settings_skins: SettingsSkins,
     /// How the Skins window is laid out.
     pub skins_window: SkinsWindow,
+    /// The Skins window is popped out (its own big window, not beside the main window), and
+    /// where it was last: left, top, width, height in screen pixels.
+    pub skins_popped: bool,
+    pub skins_bounds: Option<[i32; 4]>,
     pub settings_search: bool,
     pub settings_dots: bool,
     pub settings_reset: bool,
@@ -1316,6 +1320,8 @@ impl Default for Settings {
             settings_show: SettingsShow::All,
             settings_skins: SettingsSkins::List,
             skins_window: SkinsWindow::Compact,
+            skins_popped: false,
+            skins_bounds: None,
             settings_search: true,
             settings_dots: true,
             settings_reset: true,
@@ -1663,6 +1669,9 @@ impl Settings {
         }
         if self.sort_bounds.is_some_and(|[_, _, w, h]| !((200..=20000).contains(&w) && (150..=20000).contains(&h))) {
             self.sort_bounds = None;
+        }
+        if self.skins_bounds.is_some_and(|[_, _, w, h]| !((200..=20000).contains(&w) && (150..=20000).contains(&h))) {
+            self.skins_bounds = None;
         }
         // The side pane's widths: 0 (standard) or a sane width.
         for w in [&mut self.details_width, &mut self.preview_width] {

@@ -455,8 +455,6 @@ pub struct ListView {
     /// Where the wallpaper is laid out (`wallpaper-area`, set by window.rs): None: as the
     /// background (`middle-shrinks`).
     pic_area: Option<Rect>,
-    /// SHOW THEM after "Only protected system files are here." (at the last frame), when it shows.
-    show_system_at: Option<Rect>,
     /// How media.rs tells this list's asks from the other half's (split view), and what this list
     /// last asked it for (Image dimensions and Duration).
     media_id: u32,
@@ -467,8 +465,6 @@ pub struct ListView {
 }
 
 /// What the list says when everything left to show is a protected system file, and its button.
-const SYSTEM_ONLY: &str = "Only protected system files are here.";
-const SHOW_SYSTEM: &str = "SHOW THEM";
 
 /// Numbers for the lists, for media.rs.
 static NEXT_LIST: AtomicU32 = AtomicU32::new(1);
@@ -569,7 +565,6 @@ impl ListView {
             disk: crate::diskpage::DiskPage::default(),
             wall_area: None,
             pic_area: None,
-            show_system_at: None,
             media_id: NEXT_LIST.fetch_add(1, Ordering::Relaxed),
             media: MediaRead::default(),
             archived: (String::new(), false),
@@ -1667,19 +1662,9 @@ impl ListView {
         r.pop_clip();
 
         // A message instead of items: errors, empty folders, no filter matches.
-        self.show_system_at = None;
         if let Some(m) = Self::message(tab, waiting) {
             let line = Rect::new(area.x + ROW_PAD + size::ICON + 8.0, area.y + 6.0, area.w - 60.0, size::ROW_H);
-            let style = TextStyle::new(theme.muted);
-            r.text(&m, line, &style);
-            // Only protected system files: a button right after the words shows them.
-            if m == SYSTEM_ONLY {
-                let w = crate::kit::button_width(r, SHOW_SYSTEM);
-                let h = crate::kit::size::BUTTON_H;
-                let at = Rect::new(line.x + r.measure(&m, &style).ceil() + 12.0, line.y + (line.h - h) / 2.0, w, h);
-                crate::kit::button(r, theme, at, SHOW_SYSTEM, crate::kit::Look::enabled());
-                self.show_system_at = Some(at);
-            }
+            r.text(&m, line, &TextStyle::new(theme.muted));
         }
 
         if let Some(thumb) = self.thumb(tab).filter(|_| self.bar_shown()) {
@@ -1732,12 +1717,9 @@ impl ListView {
         } else if tab.view.is_empty() && !tab.filter.is_empty() {
             Some(format!("No items match \u{201c}{}\u{201d}.", tab.filter))
         } else if tab.view.is_empty() && tab.folder.path == tab.path {
-            // Everything here is hidden (see Tab::rebuild_view).
-            Some(if tab.show_hidden {
-                SYSTEM_ONLY.to_string()
-            } else {
-                crate::keymap::say_with(&crate::keymap::keys_now(crate::keymap::Action::HiddenFiles), "Only hidden items are here. {keys} shows them.", "Only hidden items are here.")
-            })
+            // Everything here is hidden (see Tab::rebuild_view): hidden items and protected system
+            // files are a Settings matter only, so the folder just reads as empty.
+            Some("This folder is empty.".to_string())
         } else {
             None
         }
@@ -2703,11 +2685,6 @@ impl Component for ListView {
                 return Effect::Redraw;
             }
         }
-        // SHOW THEM, when only protected system files are here: they show from then on.
-        if e.button == MouseButton::Left && self.show_system_at.is_some_and(|b| crate::kit::button_contains(b, e.pos)) {
-            app.set_show_system(true);
-            return Effect::Redraw;
-        }
         // Home: its chevrons fold a section; its pills pick Recent or Favorites.
         if self.home_on && e.button == MouseButton::Left && !self.near_track(e.pos) {
             let at = self.home_point(app.tab(), e.pos);
@@ -3383,6 +3360,30 @@ mod tests {
     }
 
     /// A tab on a search of C:\\t (`dupes`: for duplicate files) that has found `found` so far.
+    /// A folder where everything is hidden reads as empty: hidden items and protected system files
+    /// are never offered there (they only show through Settings).
+    #[test]
+    fn hidden_items_are_never_offered() {
+        // (Windows' hidden and system attributes.)
+        let (hidden, protected) = (0x2, 0x2 | 0x4);
+        let said = |items: &[(&str, u32)], show_hidden: bool| {
+            let mut tab = Tab::new(1, "C:\\t".into());
+            tab.folder.path = "C:\\t".into();
+            tab.folder.entries = items.iter().map(|(n, a)| Entry { attributes: *a, ..file(n) }).collect();
+            tab.selected = vec![false; items.len()];
+            tab.show_hidden = show_hidden;
+            tab.rebuild_view();
+            ListView::message(&tab, false)
+        };
+        let ini = [("desktop.ini", protected)];
+        assert_eq!(said(&ini, true).as_deref(), Some("This folder is empty."));
+        assert_eq!(said(&ini, false).as_deref(), Some("This folder is empty."));
+        let both = [("desktop.ini", protected), ("notes.txt", hidden)];
+        assert_eq!(said(&both, false).as_deref(), Some("This folder is empty."));
+        assert_eq!(said(&both, true), None, "the hidden one shows");
+        assert_eq!(said(&[("notes.txt", hidden)], false).as_deref(), Some("This folder is empty."));
+    }
+
     fn searching(dupes: bool, done: bool, found: &[&str]) -> Tab {
         let mut tab = Tab::new(1, "C:\\t".into());
         tab.folder.path = "C:\\t".into();

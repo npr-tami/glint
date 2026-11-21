@@ -840,7 +840,7 @@ pub fn sentence_case(label: &str) -> String {
 }
 
 /// How thick the outline round the control that has the keyboard is.
-const FOCUS_W: f32 = 1.5;
+const FOCUS_W: f32 = 2.0;
 
 /// The thin outline round the control that has the keyboard, right against it and in its shape
 /// (`lean`: how far it leans in this skin, `Theme::lean`; else the skin's round corners).
