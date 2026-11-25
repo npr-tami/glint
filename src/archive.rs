@@ -1,5 +1,10 @@
-//! Looking inside .zip and .7z files as if they were folders (read-only), unpacking them, and
-//! making new ones.
+//! Looking inside .zip, .7z and .rar files as if they were folders, unpacking them, and making
+//! new zip and 7z files (with a password too). Glint never makes or changes .rar files.
+//!
+//! Passwords: an archive whose items (or, for a 7z or rar, its list of names too) are locked with
+//! a password says so with an error, and [`take_ask`] then tells the window which archive wants
+//! one. The window asks for it, hands it to [`set_password`] and tries again. Passwords are kept in
+//! memory only, until Glint closes, so an archive is asked about once.
 //!
 //! A path like `C:\x\a.zip\sub\b.txt` is an archive file plus a path inside it ([`split`]). [`read`]
 //! lists one folder inside, [`extract`] copies items out to a real folder, [`extract_all`] unpacks a
@@ -41,9 +46,13 @@ const ATTR_DIRECTORY: u32 = 0x10;
 /// The id 7z gives its AES coder: a block packed with it needs a password.
 const SEVENZ_AES: [u8; 4] = [0x06, 0xF1, 0x07, 0x01];
 
-const PASSWORD: &str = "Glint can't open password-protected archives.";
 const DAMAGED_ZIP: &str = "This zip file is damaged or uses a kind of packing Glint can't read.";
 const DAMAGED_7Z: &str = "This 7z file is damaged or uses a kind of packing Glint can't read.";
+const DAMAGED_RAR: &str = "This rar file is damaged or uses a kind of packing Glint can't read.";
+/// A locked file of at most this size is unpacked once, to check the password, before anything is
+/// written: a zip's own check passes 1 wrong password in 256 (ZipCrypto), and a 7z or rar4 has
+/// none, so a wrong one would only show partway, with half the files written.
+const CHECK_AT_MOST: u64 = 32 * 1024 * 1024;
 /// What unpacking or packing says when CANCEL was clicked in the copy queue's list.
 const CANCELLED: &str = "Cancelled.";
 /// How much a 7z packs into one solid block (more packs smaller; less unpacks one file faster).
@@ -52,27 +61,144 @@ const SOLID_BLOCK: u64 = 64 * 1024 * 1024;
 const ZIP64_FROM: u64 = 0xFFFF_0000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Kind {
+pub(crate) enum Kind {
     Zip,
     SevenZ,
+    /// Read only: Glint unpacks rar files but never makes or changes them.
+    Rar,
 }
 
-fn kind_of(name: &str) -> Option<Kind> {
+pub(crate) fn kind_of(name: &str) -> Option<Kind> {
+    // (A part of a zip or 7z cut into parts, "Holiday.7z.002", is that zip or 7z.)
+    let name = split_base(name).unwrap_or(name);
     match folder::extension(name).as_str() {
         "zip" => Some(Kind::Zip),
         "7z" => Some(Kind::SevenZ),
+        "rar" => Some(Kind::Rar),
         _ => None,
     }
 }
 
-/// Whether a file name has an archive extension Glint opens (zip, 7z).
+/// A part of a zip or 7z file cut into parts ("Holiday.7z.002", numbered from .001): the whole
+/// file's name ("Holiday.7z"). None for every other name.
+pub(crate) fn split_base(name: &str) -> Option<&str> {
+    let i = name.rfind('.')?;
+    let digits = &name[i + 1..];
+    let base = &name[..i];
+    (digits.len() >= 3 && digits.bytes().all(|b| b.is_ascii_digit()) && matches!(folder::extension(base).as_str(), "zip" | "7z")).then_some(base)
+}
+
+/// An archive file as it's read: one file, or all the parts of a zip or 7z cut into parts
+/// (Holiday.7z.001, Holiday.7z.002...), one after another as if they were one file.
+pub(crate) struct Source {
+    /// Each part, and where in the whole it starts.
+    parts: Vec<(File, u64)>,
+    len: u64,
+    pos: u64,
+    /// The part whose own position is where `pos` is (no seek is needed to read on from it).
+    ready: Option<usize>,
+}
+
+/// Opens `archive` as [`Source::open`] does, with what went wrong in words: for a file cut into
+/// parts, the first part missing when there's a later one ("“Holiday.7z.002” is missing.").
+fn open_source(archive: &str) -> Result<Source, String> {
+    if let Some(base) = split_base(archive) {
+        let width = archive.len() - base.len() - 1;
+        let part = |n: usize| format!("{base}.{n:0width$}");
+        let there = |n: usize| folder::is_file(&part(n));
+        // The last part there (looking past up to 3 missing ones), and the first one missing
+        // before it.
+        let mut last = 0;
+        let mut n = 1;
+        while n < MOST_PARTS && n <= last + 4 {
+            if there(n) {
+                last = n;
+            }
+            n += 1;
+        }
+        if let Some(gap) = (1..last).find(|&n| !there(n)) {
+            return Err(format!("\u{201c}{}\u{201d} is missing.", folder::file_name(&part(gap))));
+        }
+    }
+    Source::open(archive).map_err(|e| open_error(&e))
+}
+
+/// What Glint says about a zip or 7z cut into parts that can't be read.
+const DAMAGED_SPLIT: &str = "This split file is damaged, or one of its parts is missing.";
+
+impl Source {
+    /// Opens `path`; for a part of a file cut into parts, every part from .001 on that's there
+    /// (whichever part was named).
+    pub(crate) fn open(path: &str) -> io::Result<Source> {
+        let Some(base) = split_base(path) else {
+            let file = File::open(path)?;
+            let len = file.metadata()?.len();
+            return Ok(Source { parts: vec![(file, 0)], len, pos: 0, ready: Some(0) });
+        };
+        let width = path.len() - base.len() - 1;
+        let mut parts = Vec::new();
+        let mut len = 0;
+        for n in 1..=MOST_PARTS {
+            let file = match File::open(format!("{base}.{n:0width$}")) {
+                Ok(f) => f,
+                Err(e) if n == 1 => return Err(e),
+                Err(_) => break,
+            };
+            let size = file.metadata()?.len();
+            parts.push((file, len));
+            len += size;
+        }
+        Ok(Source { parts, len, pos: 0, ready: Some(0) })
+    }
+}
+
+impl Read for Source {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.len || buf.is_empty() {
+            return Ok(0);
+        }
+        let i = self.parts.partition_point(|&(_, start)| start <= self.pos).saturating_sub(1);
+        let end = self.parts.get(i + 1).map_or(self.len, |p| p.1);
+        let (file, start) = &mut self.parts[i];
+        if self.ready != Some(i) {
+            file.seek(io::SeekFrom::Start(self.pos - *start))?;
+            self.ready = Some(i);
+        }
+        let n = buf.len().min(usize::try_from(end - self.pos).unwrap_or(usize::MAX));
+        let got = file.read(&mut buf[..n])?;
+        self.pos += got as u64;
+        // (At a part's end the next read starts the next part from its beginning.)
+        if self.pos == end {
+            self.ready = None;
+        }
+        Ok(got)
+    }
+}
+
+impl Seek for Source {
+    fn seek(&mut self, to: io::SeekFrom) -> io::Result<u64> {
+        let pos = match to {
+            io::SeekFrom::Start(n) => Some(n),
+            io::SeekFrom::End(d) => self.len.checked_add_signed(d),
+            io::SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+        }
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek before the start"))?;
+        if pos != self.pos {
+            self.ready = None;
+        }
+        self.pos = pos;
+        Ok(pos)
+    }
+}
+
+/// Whether a file name has an archive extension Glint opens (zip, 7z, rar).
 pub fn is_archive_name(name: &str) -> bool {
     kind_of(name).is_some()
 }
 
 /// Splits a path like `C:\x\a.zip\sub\b.txt` into the archive file and the path inside it (`\`
 /// separators, "" for the archive's root), when some part of the path is an existing file named
-/// .zip or .7z. None for everything else. Ordinary paths cost only a look at the names: the file
+/// .zip, .7z or .rar. None for everything else. Ordinary paths cost only a look at the names: the file
 /// system is asked only about parts with an archive extension.
 pub fn split(path: &str) -> Option<(String, String)> {
     let mut start = 0;
@@ -189,31 +315,42 @@ fn under<'a>(item: &'a Item, want: &[&str]) -> Option<Vec<&'a str>> {
 /// An archive file opened and read once: what [`list`] made of it, kept so that unpacking from it
 /// doesn't read its central directory or header again.
 enum Opened {
-    Zip(zip::ZipArchive<BufReader<File>>),
-    SevenZ(sevenz_rust2::Archive, BufReader<File>),
+    Zip(zip::ZipArchive<BufReader<Source>>),
+    SevenZ(sevenz_rust2::Archive, BufReader<Source>),
+    Rar(Box<RarSet>),
 }
 
 fn list(archive: &str) -> Result<(Opened, Vec<Item>), String> {
+    // (A zip or 7z cut into parts that reads as damaged may just be missing its last part.)
+    let split = |e: String| if split_base(archive).is_some() && (e == DAMAGED_ZIP || e == DAMAGED_7Z) { DAMAGED_SPLIT.to_string() } else { e };
+    list_one(archive).map_err(split)
+}
+
+fn list_one(archive: &str) -> Result<(Opened, Vec<Item>), String> {
     match kind_of(archive) {
         Some(Kind::Zip) => list_zip(archive).map(|(zip, items)| (Opened::Zip(zip), items)),
         Some(Kind::SevenZ) => open_7z(archive).map(|(a, source)| {
             let items = list_7z(&a);
             (Opened::SevenZ(a, source), items)
         }),
-        None => Err("This isn't a zip or 7z file.".to_string()),
+        Some(Kind::Rar) => open_rar(archive).map(|a| {
+            let items = list_rar(&a);
+            (Opened::Rar(Box::new(a)), items)
+        }),
+        None => Err("This isn't a zip, 7z or rar file.".to_string()),
     }
 }
 
-fn open_zip(archive: &str) -> Result<zip::ZipArchive<BufReader<File>>, String> {
-    let file = File::open(archive).map_err(|e| open_error(&e))?;
+fn open_zip(archive: &str) -> Result<zip::ZipArchive<BufReader<Source>>, String> {
+    let file = open_source(archive)?;
     zip::ZipArchive::new(BufReader::new(file)).map_err(|e| match e {
         zip::result::ZipError::Io(e) if e.kind() != io::ErrorKind::UnexpectedEof => open_error(&e),
-        zip::result::ZipError::UnsupportedArchive(m) if m == zip::result::ZipError::PASSWORD_REQUIRED => PASSWORD.to_string(),
+        zip::result::ZipError::UnsupportedArchive(m) if m == zip::result::ZipError::PASSWORD_REQUIRED => "Glint can't open zip files whose list of names is locked.".to_string(),
         _ => DAMAGED_ZIP.to_string(),
     })
 }
 
-fn list_zip(archive: &str) -> Result<(zip::ZipArchive<BufReader<File>>, Vec<Item>), String> {
+fn list_zip(archive: &str) -> Result<(zip::ZipArchive<BufReader<Source>>, Vec<Item>), String> {
     let zip = open_zip(archive)?;
     let mut items = Vec::with_capacity(zip.len());
     // Where each entry the zip library knows starts, and the item for it.
@@ -272,8 +409,8 @@ struct Hidden {
 /// Every entry of the zip's central directory in order, when some aren't among the zip library's
 /// (`known`, by where they start). None when there are none such, or the directory doesn't read
 /// as expected (then the library's list is used as it is).
-fn central_records(archive: &str, zip: &zip::ZipArchive<BufReader<File>>, known: &HashMap<u64, Item>) -> Option<Vec<Record>> {
-    let mut file = BufReader::new(File::open(archive).ok()?);
+fn central_records(archive: &str, zip: &zip::ZipArchive<BufReader<Source>>, known: &HashMap<u64, Item>) -> Option<Vec<Record>> {
+    let mut file = BufReader::new(open_source(archive).ok()?);
     let offset = zip.offset();
     // The directory starts here (counted from the file's start, or from where the zip starts in it).
     let start = [zip.central_directory_start(), zip.central_directory_start() + offset].into_iter().find(|&at| {
@@ -354,11 +491,26 @@ fn zip_name(raw: &[u8]) -> String {
     String::from_utf16_lossy(&wide)
 }
 
-fn open_7z(archive: &str) -> Result<(sevenz_rust2::Archive, BufReader<File>), String> {
-    let file = File::open(archive).map_err(|e| open_error(&e))?;
+fn open_7z(archive: &str) -> Result<(sevenz_rust2::Archive, BufReader<Source>), String> {
+    let file = open_source(archive)?;
     let mut source = BufReader::new(file);
-    let a = sevenz_rust2::Archive::read(&mut source, &sevenz_rust2::Password::empty()).map_err(|e| sevenz_error(&e))?;
-    Ok((a, source))
+    // A 7z can hide its list of names behind the password too: then it can't even be listed
+    // without one. (A password given for one that doesn't hide them is simply not needed here.)
+    let password = password_for(archive);
+    let given = password.as_deref().map_or_else(sevenz_rust2::Password::empty, sevenz_rust2::Password::new);
+    match sevenz_rust2::Archive::read(&mut source, &given) {
+        Ok(a) => Ok((a, source)),
+        Err(sevenz_rust2::Error::PasswordRequired) if password.is_none() => Err(needs_password(archive, false)),
+        Err(e) if password.is_some() => {
+            // Wrong password, or damaged? Read without one: a 7z that hides its names says so.
+            let _ = source.seek(io::SeekFrom::Start(0));
+            match sevenz_rust2::Archive::read(&mut source, &sevenz_rust2::Password::empty()) {
+                Err(sevenz_rust2::Error::PasswordRequired) => Err(needs_password(archive, true)),
+                _ => Err(sevenz_error(&e)),
+            }
+        }
+        Err(e) => Err(sevenz_error(&e)),
+    }
 }
 
 fn list_7z(a: &sevenz_rust2::Archive) -> Vec<Item> {
@@ -381,6 +533,266 @@ fn list_7z(a: &sevenz_rust2::Archive) -> Vec<Item> {
     }
     number_alike(&mut items);
     items
+}
+
+/// Opens a .rar file and reads its list of names (with the password typed for it, when it hides
+/// them behind one).
+/// A rar file split into parts (game.part1.rar, game.part2.rar...) is read from its first part
+/// on, whichever part was opened, with all the parts after it that are there.
+fn open_rar(archive: &str) -> Result<RarSet, String> {
+    let password = password_for(archive);
+    let read = |path: &str| -> Result<rars::Archive, String> {
+        let file = File::open(path).map_err(|e| open_error(&e))?;
+        let options = rars::ArchiveReadOptions::with_optional_password(password.as_deref().map(str::as_bytes));
+        rars::ArchiveReader::read_reader_with_options(BufReader::new(file), options).map_err(|e| rar_error(archive, &e))
+    };
+    let opened = read(archive)?;
+    if !opened.is_volume() {
+        let members = opened.members().collect();
+        return Ok(RarSet { parts: vec![opened], members, missing: None });
+    }
+    let (first_path, first) = if opened.is_first_volume() == Some(false) {
+        let path = first_part(archive).filter(|p| folder::is_file(p)).ok_or_else(|| "This is a later part of a split rar file. Glint can't find its first part.".to_string())?;
+        let first = read(&path)?;
+        (path, first)
+    } else {
+        (archive.to_string(), opened)
+    };
+    let mut parts = vec![first];
+    for index in 1..MOST_PARTS {
+        let Some(next) = parts[0].volume_path(Path::new(&first_path), index) else { break };
+        let next = next.to_string_lossy().into_owned();
+        if !folder::is_file(&next) {
+            // The last part there says more come after it (or ends partway through a file): the
+            // files in the missing ones would just not show, so it's said instead.
+            let last = parts.last();
+            if last.is_some_and(more_parts) || last.and_then(|p| p.members().last()).is_some_and(|m| m.meta.is_split_after) {
+                return Err(format!("\u{201c}{}\u{201d} is missing.", folder::file_name(&next)));
+            }
+            break;
+        }
+        parts.push(read(&next)?);
+    }
+    let members = if parts.len() == 1 { parts[0].members().collect() } else { rars::volume_members(&parts).map_err(|e| rar_error(archive, &e))? };
+    Ok(RarSet { parts, members, missing: None })
+}
+
+/// Whether a part of a split rar says another part comes after it.
+fn more_parts(part: &rars::Archive) -> bool {
+    match part {
+        rars::Archive::Rar50Plus(a) => a.blocks.iter().any(|b| matches!(b, rars::rar50::Block::End(end) if end.has_next_volume())),
+        rars::Archive::Rar15To40(a) => a.blocks.iter().any(|b| matches!(b, rars::rar15_40::Block::End(end) if end.has_next_volume())),
+        _ => false,
+    }
+}
+
+/// At most this many parts of a split rar are read.
+const MOST_PARTS: usize = 10_000;
+
+/// The first part of a split rar named by parts ("game.part3.rar" gives "game.part1.rar", or
+/// "game.part01.rar" when the numbers have two digits).
+fn first_part(path: &str) -> Option<String> {
+    let stem = path.len().checked_sub(4).filter(|&n| path.is_char_boundary(n) && path[n..].eq_ignore_ascii_case(".rar")).map(|n| &path[..n])?;
+    let digits = stem.bytes().rev().take_while(u8::is_ascii_digit).count();
+    let at = stem.len() - digits;
+    if digits == 0 || !stem[..at].to_ascii_lowercase().ends_with(".part") {
+        return None;
+    }
+    Some(format!("{}{:0width$}.rar", &stem[..at], 1, width = digits))
+}
+
+/// A rar file, or all the parts there are of one split into parts, with the files in it (a file
+/// that runs over several parts is one).
+struct RarSet {
+    parts: Vec<rars::Archive>,
+    members: Vec<rars::ArchiveMember>,
+    /// The next part's file name, when the last part there ends partway through a file and the
+    /// next one isn't there.
+    missing: Option<String>,
+}
+
+/// What to do with a file of a rar as the unpacker gets to it.
+enum RarStep {
+    /// Unpack it into this.
+    Take(Box<dyn Write>),
+    Skip,
+    /// Stop here: nothing more is wanted.
+    Stop,
+}
+
+impl RarSet {
+    /// Whether it's packed solid: then the files before the one wanted have to be unpacked (and
+    /// thrown away) to get to it. (The first file of a solid rar isn't marked solid itself, so
+    /// a file that isn't marked can't be skipped either.)
+    fn solid(&self) -> bool {
+        self.members.iter().any(rars::ArchiveMember::is_solid)
+    }
+
+    /// Each name, with where it comes (in order) among the files: the unpacker names the file
+    /// it's at, and this says which one that is, even when a name comes twice.
+    fn names(&self) -> HashMap<Vec<u8>, std::collections::VecDeque<usize>> {
+        let mut names: HashMap<Vec<u8>, std::collections::VecDeque<usize>> = HashMap::new();
+        for (index, m) in self.members.iter().enumerate() {
+            names.entry(m.meta.name.clone()).or_default().push_back(index);
+        }
+        names
+    }
+
+    /// The error for a wanted file that runs on into a part that isn't there.
+    fn cut_off(&self, item: &Item) -> Option<String> {
+        if !self.members.get(item.index).is_some_and(|m| m.meta.is_split_after) {
+            return None;
+        }
+        Some(match &self.missing {
+            Some(part) => format!("\u{201c}{part}\u{201d} is missing."),
+            None => format!("\u{201c}{}\u{201d} goes on in a part of this rar file that Glint can't find.", folder::file_name(&item.path)),
+        })
+    }
+
+    /// Runs the unpacker over it, from the start: `decide` says what to do with each file (by its
+    /// place in `members`) as it gets to it.
+    fn run(&self, password: Option<&str>, decide: &mut dyn FnMut(usize) -> RarStep) -> rars::Result<()> {
+        let mut names = self.names();
+        let options = rars::ArchiveReadOptions::with_optional_password(password.map(str::as_bytes)).with_threads(1);
+        if self.parts.len() == 1 {
+            let solid = self.solid();
+            return self.parts[0]
+                .extract_with_control(options, |m| {
+                    use rars::ExtractionDecision as D;
+                    let Some(index) = names.get_mut(&m.meta.name).and_then(std::collections::VecDeque::pop_front) else { return Ok(D::Skip) };
+                    Ok(match decide(index) {
+                        RarStep::Take(out) => D::Extract(out),
+                        RarStep::Stop => D::Stop,
+                        RarStep::Skip if solid => D::Extract(Box::new(io::sink())),
+                        RarStep::Skip => D::Skip,
+                    })
+                })
+                .map(|_| ());
+        }
+        // Parts: every file is unpacked as it comes (thrown away when not wanted), up to the last
+        // one wanted.
+        let mut stopped = false;
+        let result = rars::extract_volumes_to_with_options(&self.parts, options, |meta| {
+            let Some(index) = names.get_mut(&meta.name).and_then(std::collections::VecDeque::pop_front) else { return Ok(Box::new(io::sink()) as Box<dyn Write>) };
+            match decide(index) {
+                RarStep::Take(out) => Ok(out),
+                RarStep::Skip => Ok(Box::new(io::sink())),
+                RarStep::Stop => {
+                    stopped = true;
+                    Err(rars::Error::InvalidHeader("stopped"))
+                }
+            }
+        });
+        match result {
+            Err(_) if stopped => Ok(()),
+            r => r,
+        }
+    }
+}
+
+fn list_rar(set: &RarSet) -> Vec<Item> {
+    let mut items = Vec::new();
+    for (index, m) in set.members.iter().enumerate() {
+        // (Links and the rest of a file begun in an earlier part aren't files of their own here.)
+        if m.meta.is_redirection || m.meta.is_split_before {
+            continue;
+        }
+        let Ok(raw) = m.decoded_name(None) else { continue };
+        let Some(path) = clean_name(&zip_name(&raw)) else { continue };
+        let is_dir = m.meta.is_directory;
+        let modified = m.meta.modification_time().map_or(0, |t| unix_to_filetime(t.unix_seconds(), t.nanoseconds()));
+        items.push(Item { path, is_dir, size: if is_dir { 0 } else { m.meta.unpacked_size }, modified, locked: m.meta.is_encrypted, index, hidden: None });
+    }
+    number_alike(&mut items);
+    items
+}
+
+/// A FILETIME from Unix time.
+fn unix_to_filetime(seconds: i64, nanos: u32) -> u64 {
+    const FROM_1601: i64 = 11_644_473_600;
+    let ticks = (seconds + FROM_1601).saturating_mul(10_000_000).saturating_add(i64::from(nanos / 100));
+    u64::try_from(ticks).unwrap_or(0)
+}
+
+fn rar_error(archive: &str, e: &rars::Error) -> String {
+    use rars::ErrorKind as K;
+    match e.kind() {
+        K::PasswordRequired => needs_password(archive, false),
+        K::BadPassword => needs_password(archive, true),
+        K::UnsupportedFeature | K::UnsupportedFormat => "This rar file uses a kind of packing Glint can't read yet.".to_string(),
+        K::Io => match e.root_cause() {
+            rars::Error::Io(io) if io.kind == io::ErrorKind::PermissionDenied => "Glint isn't allowed to open this archive.".to_string(),
+            _ => DAMAGED_RAR.to_string(),
+        },
+        _ => DAMAGED_RAR.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------- passwords
+
+/// An archive Glint needs a password for before it can go on: the window asks for it and tries
+/// again ([`take_ask`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ask {
+    /// The archive file the password is for (for an archive inside another one, its copy in
+    /// Glint's temporary folder).
+    pub archive: String,
+    /// Its name, as shown.
+    pub name: String,
+    /// The password typed for it was wrong.
+    pub wrong: bool,
+}
+
+/// Passwords typed while Glint runs, by archive file (in lower case). Only ever in memory.
+static PASSWORDS: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+/// How many archives' passwords are kept at most (the oldest goes).
+const PASSWORDS_KEPT: usize = 32;
+
+thread_local! {
+    /// The archive the last error on this thread wanted a password for.
+    static ASKED: RefCell<Option<Ask>> = const { RefCell::new(None) };
+}
+
+/// Keeps `password` for the archive file `archive` until Glint closes.
+pub fn set_password(archive: &str, password: &str) {
+    let key = archive.to_lowercase();
+    let Ok(mut known) = PASSWORDS.lock() else { return };
+    known.retain(|(k, _)| *k != key);
+    if known.len() >= PASSWORDS_KEPT {
+        known.remove(0);
+    }
+    known.push((key, password.to_string()));
+}
+
+fn password_for(archive: &str) -> Option<String> {
+    let key = archive.to_lowercase();
+    PASSWORDS.lock().ok()?.iter().find(|(k, _)| *k == key).map(|(_, p)| p.clone())
+}
+
+fn forget_password(archive: &str) {
+    let key = archive.to_lowercase();
+    if let Ok(mut known) = PASSWORDS.lock() {
+        known.retain(|(k, _)| *k != key);
+    }
+}
+
+/// Which archive the last error on this thread (of reading, extracting, opening an item...) wanted
+/// a password for, if that was why it failed. Taking it clears it: call it after each call to this
+/// module that can fail.
+pub fn take_ask() -> Option<Ask> {
+    ASKED.with(|a| a.borrow_mut().take())
+}
+
+/// The error for an archive that needs a password (`wrong`: the one typed is wrong, and forgotten),
+/// noted for [`take_ask`].
+fn needs_password(archive: &str, wrong: bool) -> String {
+    if wrong {
+        forget_password(archive);
+    }
+    let name = folder::file_name(archive).to_string();
+    let text = if wrong { format!("Wrong password for \u{201c}{name}\u{201d}.") } else { format!("\u{201c}{name}\u{201d} has a password.") };
+    ASKED.with(|a| *a.borrow_mut() = Some(Ask { archive: archive.to_string(), name, wrong }));
+    text
 }
 
 /// Gives every file a path of its own. An archive can hold the same name twice in one folder (a
@@ -434,6 +846,10 @@ pub fn read(archive: &str, inner: &str, full_path: &str) -> Folder {
         // (What `change` would refuse there, noted for the menus and keys.)
         let why = if real != archive {
             Some(NESTED_NOTE)
+        } else if kind_of(&real) == Some(Kind::Rar) {
+            Some(edit::RAR)
+        } else if split_base(&real).is_some() {
+            Some(edit::SPLIT)
         } else if items.iter().any(|i| i.locked) {
             Some(edit::LOCKED)
         } else {
@@ -446,6 +862,7 @@ pub fn read(archive: &str, inner: &str, full_path: &str) -> Folder {
         Ok(entries) => f.entries = entries,
         Err(msg) => f.error = Some(msg),
     }
+    f.ask = take_ask().filter(|_| f.error.is_some());
     f.read_ms = start.elapsed().as_secs_f64() * 1000.0;
     f
 }
@@ -853,9 +1270,15 @@ fn unpack_free(archive: &str, opened: &mut Opened, items: &[Item], keep: &[Optio
 /// Writes the planned items (index in `items`, where it goes): folders first, then the files. A
 /// file already there is never replaced: that's an error instead.
 fn unpack(archive: &str, opened: &mut Opened, items: &[Item], plan: &[(usize, PathBuf)], meter: &Meter) -> Result<(), String> {
-    if plan.iter().any(|(i, _)| items[*i].locked && !items[*i].is_dir) {
-        return Err(PASSWORD.to_string());
-    }
+    // Locked files need the password typed for the archive, and it's checked before anything is
+    // written, so a wrong one leaves nothing half done.
+    let password = if plan.iter().any(|(i, _)| items[*i].locked && !items[*i].is_dir) {
+        let password = password_for(archive).ok_or_else(|| needs_password(archive, false))?;
+        check_password(archive, opened, items, plan, &password)?;
+        Some(password)
+    } else {
+        None
+    };
     // Folders first (empty ones too), and every file's folder.
     for (i, out) in plan {
         let dir = if items[*i].is_dir { Some(out.as_path()) } else { out.parent() };
@@ -864,9 +1287,11 @@ fn unpack(archive: &str, opened: &mut Opened, items: &[Item], plan: &[(usize, Pa
         }
     }
     let files: Vec<(&Item, &Path)> = plan.iter().filter(|(i, _)| !items[*i].is_dir).map(|(i, out)| (&items[*i], out.as_path())).collect();
+    let password = password.as_deref();
     match opened {
-        Opened::Zip(zip) => extract_zip(archive, zip, &files, meter)?,
-        Opened::SevenZ(a, source) => extract_7z(a, source, &files, meter)?,
+        Opened::Zip(zip) => extract_zip(archive, zip, &files, password, meter)?,
+        Opened::SevenZ(a, source) => extract_7z(archive, a, source, &files, password, meter)?,
+        Opened::Rar(a) => extract_rar(archive, a, &files, password, meter)?,
     }
     // Folders get the times they had in the archive, now that nothing more is written into them.
     for (i, out) in plan.iter().filter(|(i, _)| items[*i].is_dir) {
@@ -890,9 +1315,16 @@ fn free_name(name: &str, is_dir: bool, taken: impl Fn(&str) -> bool) -> String {
 /// The folder Extract to puts an archive's contents in: the archive's name without .zip or .7z
 /// ("Photos.zip" -> "Photos"), numbered when `taken` says it's in use ("Photos (2)").
 pub fn extract_folder_name(archive_name: &str, taken: impl Fn(&str) -> bool) -> String {
+    // (A part of a zip or 7z cut into parts: "Holiday.7z.001" is extracted to "Holiday".)
+    let archive_name = split_base(archive_name).unwrap_or(archive_name);
     let stem = match archive_name.rfind('.') {
         Some(i) if i > 0 && is_archive_name(archive_name) => &archive_name[..i],
         _ => archive_name,
+    };
+    // A part of a split rar ("game.part1.rar") is extracted to the set's name ("game").
+    let stem = match stem.to_ascii_lowercase().rfind(".part") {
+        Some(i) if archive_name.to_ascii_lowercase().ends_with(".rar") && i > 0 && stem.len() > i + 5 && stem[i + 5..].bytes().all(|b| b.is_ascii_digit()) => &stem[..i],
+        _ => stem,
     };
     let stem = stem.trim().trim_end_matches(['.', ' ']);
     crate::fileops::unique_name(if stem.is_empty() { "Extracted" } else { stem }, "", taken)
@@ -912,37 +1344,42 @@ fn inside(dest: &str, parts: &[&str]) -> Result<PathBuf, String> {
     Ok(out)
 }
 
-fn extract_zip(archive: &str, zip: &mut zip::ZipArchive<BufReader<File>>, files: &[(&Item, &Path)], meter: &Meter) -> Result<(), String> {
+fn extract_zip(archive: &str, zip: &mut zip::ZipArchive<BufReader<Source>>, files: &[(&Item, &Path)], password: Option<&str>, meter: &Meter) -> Result<(), String> {
     // For entries the library has no index for: the file, read from each one's own header.
-    let mut direct: Option<BufReader<File>> = None;
+    let mut direct: Option<BufReader<Source>> = None;
     for (item, out) in files {
         let name = folder::file_name(&item.path);
         let unreadable = |e: zip::result::ZipError| match e {
             zip::result::ZipError::CompressionMethodNotSupported(_) => format!("\u{201c}{name}\u{201d} is packed in a way Glint can't unpack yet."),
-            zip::result::ZipError::UnsupportedArchive(m) if m == zip::result::ZipError::PASSWORD_REQUIRED => PASSWORD.to_string(),
-            zip::result::ZipError::InvalidPassword => PASSWORD.to_string(),
+            zip::result::ZipError::UnsupportedArchive(m) if m == zip::result::ZipError::PASSWORD_REQUIRED => needs_password(archive, false),
+            zip::result::ZipError::InvalidPassword => needs_password(archive, true),
             zip::result::ZipError::Io(e) => format!("Failed to read \u{201c}{name}\u{201d} from the archive ({e})."),
             _ => format!("\u{201c}{name}\u{201d} is damaged in this zip file."),
         };
+        let key = password.filter(|_| item.locked).map(str::as_bytes);
         let Some(at) = item.hidden else {
-            let mut reader = zip.by_index(item.index).map_err(unreadable)?;
-            copy_out(&mut reader, out, item.modified, name, meter)?;
+            let opened = match key {
+                Some(key) => zip.by_index_decrypt(item.index, key),
+                None => zip.by_index(item.index),
+            };
+            let mut reader = opened.map_err(unreadable)?;
+            copy_item(&mut reader, out, item, archive, meter)?;
             continue;
         };
         if direct.is_none() {
-            direct = Some(BufReader::new(File::open(archive).map_err(|e| open_error(&e))?));
+            direct = Some(BufReader::new(open_source(archive)?));
         }
         let Some(source) = direct.as_mut() else { continue };
         source.seek(io::SeekFrom::Start(at.header)).map_err(|e| unreadable(e.into()))?;
         // (The central directory's sizes and checksum: right even when the header leaves them out.)
-        let options = zip::ZipReadOptions::new().override_compressed_size(at.compressed).override_uncompressed_size(at.size).override_crc(at.crc);
+        let options = zip::ZipReadOptions::new().override_compressed_size(at.compressed).override_uncompressed_size(at.size).override_crc(at.crc).password(key);
         let mut reader = zip::read::read_zipfile_from_stream_with_options(source, options).map_err(unreadable)?.ok_or_else(|| format!("\u{201c}{name}\u{201d} is damaged in this zip file."))?;
-        copy_out(&mut reader, out, item.modified, name, meter)?;
+        copy_item(&mut reader, out, item, archive, meter)?;
     }
     Ok(())
 }
 
-fn extract_7z(a: &sevenz_rust2::Archive, source: &mut BufReader<File>, files: &[(&Item, &Path)], meter: &Meter) -> Result<(), String> {
+fn extract_7z(archive: &str, a: &sevenz_rust2::Archive, source: &mut BufReader<Source>, files: &[(&Item, &Path)], password: Option<&str>, meter: &Meter) -> Result<(), String> {
     let mut wanted: HashMap<usize, (&Item, &Path)> = HashMap::new();
     // Each block that holds a wanted file, with the last wanted file in it.
     let mut blocks: BTreeMap<usize, usize> = BTreeMap::new();
@@ -958,8 +1395,10 @@ fn extract_7z(a: &sevenz_rust2::Archive, source: &mut BufReader<File>, files: &[
         }
     }
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(4)) as u32;
-    let password = sevenz_rust2::Password::empty();
+    let password = password.map_or_else(sevenz_rust2::Password::empty, sevenz_rust2::Password::new);
     for (b, last_wanted) in blocks {
+        // (In a locked block, a file that fails to unpack means a wrong password.)
+        let locked = a.blocks[b].coders.iter().any(|c| c.encoder_method_id() == SEVENZ_AES);
         // A block is one packed stream holding its files back to back: everything before a wanted
         // file has to be unpacked (and thrown away) to get to it.
         let first = a.stream_map.block_first_file_index.get(b).copied().unwrap_or(0);
@@ -971,14 +1410,14 @@ fn extract_7z(a: &sevenz_rust2::Archive, source: &mut BufReader<File>, files: &[
             index += 1;
             match wanted.get(&this) {
                 Some((item, out)) => {
-                    if let Err(e) = copy_out(reader, out, item.modified, folder::file_name(&item.path), meter) {
+                    if let Err(e) = copy_item(reader, out, item, archive, meter) {
                         failed = Some(e);
                         return Ok(false);
                     }
                 }
                 None => {
                     if let Err(e) = io::copy(reader, &mut io::sink()) {
-                        failed = Some(read_error_7z(&e));
+                        failed = Some(if locked { needs_password(archive, true) } else { read_error_7z(&e) });
                         return Ok(false);
                     }
                 }
@@ -988,11 +1427,198 @@ fn extract_7z(a: &sevenz_rust2::Archive, source: &mut BufReader<File>, files: &[
         if let Some(msg) = failed {
             return Err(msg);
         }
-        result.map_err(|e| sevenz_error(&e))?;
+        result.map_err(|e| if locked { needs_password(archive, true) } else { sevenz_error(&e) })?;
         // (The block ended before a wanted file: never say it's out when it isn't.)
         if index <= last_wanted {
             return Err("This 7z file is laid out in a way Glint can't read yet.".to_string());
         }
+    }
+    Ok(())
+}
+
+/// [`copy_out`] for an item: when it's locked, data that fails to unpack means a wrong password.
+fn copy_item(reader: &mut dyn Read, out: &Path, item: &Item, archive: &str, meter: &Meter) -> Result<(), String> {
+    let name = folder::file_name(&item.path);
+    if !item.locked {
+        return copy_out(reader, out, item.modified, name, meter);
+    }
+    /// Notes whether reading failed (rather than writing, or CANCEL).
+    struct Watch<'a> {
+        inner: &'a mut dyn Read,
+        failed: bool,
+    }
+    impl Read for Watch<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let r = self.inner.read(buf);
+            self.failed |= r.as_ref().is_err_and(|e| e.kind() != io::ErrorKind::Interrupted);
+            r
+        }
+    }
+    let mut watch = Watch { inner: reader, failed: false };
+    copy_out(&mut watch, out, item.modified, name, meter).map_err(|e| if watch.failed { needs_password(archive, true) } else { e })
+}
+
+/// Checks `password` before anything locked is unpacked: one locked file of the plan (the
+/// quickest to get to) is unpacked to nowhere, when that's at most [`CHECK_AT_MOST`] bytes. A
+/// wrong password is the error; anything else is left for the unpacking itself to say.
+fn check_password(archive: &str, opened: &mut Opened, items: &[Item], plan: &[(usize, PathBuf)], password: &str) -> Result<(), String> {
+    let locked: Vec<&Item> = plan.iter().map(|(i, _)| &items[*i]).filter(|i| i.locked && !i.is_dir).collect();
+    let wrong = || Err(needs_password(archive, true));
+    match opened {
+        Opened::Zip(zip) => {
+            let Some(item) = locked.iter().filter(|i| i.hidden.is_none()).min_by_key(|i| i.size) else { return Ok(()) };
+            let mut reader = match zip.by_index_decrypt(item.index, password.as_bytes()) {
+                Ok(r) => r,
+                Err(zip::result::ZipError::InvalidPassword) => return wrong(),
+                Err(_) => return Ok(()),
+            };
+            if item.size <= CHECK_AT_MOST && io::copy(&mut reader, &mut io::sink()).is_err() {
+                return wrong();
+            }
+            Ok(())
+        }
+        Opened::SevenZ(a, source) => {
+            let block_of = |index: usize| a.stream_map.file_block_index.get(index).copied().flatten().filter(|&b| b < a.blocks.len());
+            // What getting to each locked file costs: everything before it in its block, and it.
+            let cost = |item: &Item| -> Option<(u64, usize)> {
+                let b = block_of(item.index)?;
+                let first = a.stream_map.block_first_file_index.get(b).copied().unwrap_or(0);
+                Some((a.files.get(first..=item.index)?.iter().map(|f| f.size).sum(), b))
+            };
+            let Some((bytes, b, target)) = locked.iter().filter_map(|i| cost(i).map(|(c, b)| (c, b, i.index))).min_by_key(|x| x.0) else { return Ok(()) };
+            if bytes > CHECK_AT_MOST {
+                return Ok(());
+            }
+            let first = a.stream_map.block_first_file_index.get(b).copied().unwrap_or(0);
+            let mut index = first;
+            let key = sevenz_rust2::Password::new(password);
+            let decoder = sevenz_rust2::BlockDecoder::new(1, b, a, &key, source);
+            let result = decoder.for_each_entries(&mut |_entry, reader: &mut dyn Read| {
+                io::copy(reader, &mut io::sink())?;
+                index += 1;
+                Ok(index <= target)
+            });
+            if result.is_err() || index <= target {
+                return wrong();
+            }
+            Ok(())
+        }
+        Opened::Rar(a) => {
+            let Some(item) = locked.iter().min_by_key(|i| i.size) else { return Ok(()) };
+            if item.size > CHECK_AT_MOST {
+                return Ok(());
+            }
+            if a.cut_off(item).is_some() {
+                return Ok(()); // (said when unpacking)
+            }
+            let target = item.index;
+            let result = a.run(Some(password), &mut |index| match index {
+                i if i == target => RarStep::Take(Box::new(io::sink())),
+                i if i > target => RarStep::Stop,
+                _ => RarStep::Skip,
+            });
+            match result.map_err(|e| e.kind()) {
+                Err(rars::ErrorKind::BadPassword | rars::ErrorKind::ChecksumMismatch | rars::ErrorKind::PasswordRequired) => wrong(),
+                _ => Ok(()),
+            }
+        }
+    }
+}
+
+/// Where a rar's file is unpacked to, as the unpacker hands it the data. Counts for the copy
+/// queue (and stops at CANCEL); gives the file its time once it's whole.
+struct RarOut {
+    file: File,
+    path: PathBuf,
+    modified: u64,
+    size: u64,
+    written: u64,
+    meter: std::rc::Rc<Meter>,
+    /// The files unpacked whole so far.
+    whole: std::rc::Rc<RefCell<HashSet<PathBuf>>>,
+}
+
+impl Write for RarOut {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Err(e) = self.file.write_all(buf) {
+            self.meter.problem.replace(Some(write_error(&self.path, &e)));
+            return Err(io::Error::other("stopped"));
+        }
+        self.written += buf.len() as u64;
+        if !self.meter.add(buf.len() as u64) {
+            self.meter.problem.replace(Some(CANCELLED.to_string()));
+            return Err(io::Error::other("stopped"));
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Drop for RarOut {
+    fn drop(&mut self) {
+        if self.written == self.size {
+            if let Some(t) = filetime_to_system(self.modified) {
+                let _ = self.file.set_modified(t);
+            }
+            self.whole.borrow_mut().insert(self.path.clone());
+        }
+    }
+}
+
+fn extract_rar(archive: &str, a: &RarSet, files: &[(&Item, &Path)], password: Option<&str>, meter: &Meter) -> Result<(), String> {
+    let wanted: HashMap<usize, (&Item, &Path)> = files.iter().map(|&(item, out)| (item.index, (item, out))).collect();
+    let Some(&last) = wanted.keys().max() else { return Ok(()) };
+    // A file that runs on into a part that isn't there: said before anything is written.
+    if let Some(why) = files.iter().find_map(|(item, _)| a.cut_off(item)) {
+        return Err(why);
+    }
+    let local = std::rc::Rc::new(Meter { total: meter.total, done: Cell::new(meter.done.get()), problem: RefCell::new(None) });
+    let whole: std::rc::Rc<RefCell<HashSet<PathBuf>>> = std::rc::Rc::default();
+    let mut made: Vec<(usize, PathBuf)> = Vec::new();
+    let mut failed: Option<String> = None;
+    let result = a.run(password, &mut |index| {
+        if index > last {
+            return RarStep::Stop;
+        }
+        match wanted.get(&index) {
+            Some(&(item, out)) => match File::create_new(out) {
+                Ok(file) => {
+                    made.push((index, out.to_path_buf()));
+                    RarStep::Take(Box::new(RarOut { file, path: out.to_path_buf(), modified: item.modified, size: item.size, written: 0, meter: local.clone(), whole: whole.clone() }))
+                }
+                Err(e) => {
+                    failed = Some(write_error(out, &e));
+                    RarStep::Stop
+                }
+            },
+            None => RarStep::Skip,
+        }
+    });
+    meter.done.set(local.done.get());
+    // A file begun but not finished (an error, CANCEL) goes again; after an error, so does the last
+    // one begun, even when it's all there (a rar4 file checks its data only once it's all out).
+    let whole = whole.borrow();
+    let last_begun = made.last().map(|(_, p)| p.clone()).filter(|_| result.is_err());
+    let half = made.iter().filter(|(_, p)| !whole.contains(p) || last_begun.as_ref() == Some(p));
+    let mut half_locked = false;
+    for (index, path) in half {
+        half_locked |= wanted.get(index).is_some_and(|(item, _)| item.locked);
+        let _ = std::fs::remove_file(path);
+    }
+    if let Some(why) = local.problem.take().or(failed) {
+        return Err(why);
+    }
+    if let Err(e) = result {
+        return Err(match e.kind() {
+            rars::ErrorKind::ChecksumMismatch if half_locked => needs_password(archive, true),
+            _ => rar_error(archive, &e),
+        });
+    }
+    if let Some((_, (item, _))) = wanted.iter().find(|(i, _)| !made.iter().any(|(m, _)| m == *i)) {
+        return Err(format!("Failed to unpack \u{201c}{}\u{201d} from this rar file.", folder::file_name(&item.path)));
     }
     Ok(())
 }
@@ -1026,6 +1652,181 @@ fn copy_out(reader: &mut dyn Read, out: &Path, modified: u64, name: &str, meter:
         let _ = file.set_modified(t);
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------- reading one file
+
+/// Hands the unpacked data of the file at `path` (a path inside an archive, like
+/// `C:\x\a.zip\sub\b.txt`; inside an archive in the archive too) to `take`, a piece at a time,
+/// without writing it anywhere: for its fingerprint. `take` returning false stops it (the error is
+/// then "Cancelled."). The archive's own check of the data (its CRC, or a locked zip's AES code) is
+/// made, so data that fails it ends in an error. A locked file needs its password typed already:
+/// otherwise the error asks for it ([`take_ask`]).
+pub fn read_file(path: &str, take: &mut (dyn FnMut(&[u8]) -> bool + Send)) -> Result<(), String> {
+    let (archive, inner) = split(path).ok_or_else(|| "This file isn't inside a zip, 7z or rar file.".to_string())?;
+    let mut parts = inner_parts(&inner);
+    let name = parts.pop().ok_or_else(|| "This is the archive itself, not a file inside it.".to_string())?.to_string();
+    let (real, at) = resolve(&archive, &parts.join("\\"))?;
+    let inner = if at.is_empty() { name } else { format!("{at}\\{name}") };
+    let (mut opened, items) = list(&real)?;
+    let want = fold(&inner);
+    let item = items.iter().find(|i| !i.is_dir && fold(&i.path) == want).ok_or_else(|| format!("\u{201c}{inner}\u{201d} isn't in this archive."))?;
+    let password = if item.locked { Some(password_for(&real).ok_or_else(|| needs_password(&real, false))?) } else { None };
+    let archive = real.as_str();
+    let name = folder::file_name(&item.path);
+    let mut feed = Pour { take, stopped: false };
+    // A failed read of a locked file's data means a wrong password; CANCEL is said as such.
+    let failed = |feed: &Pour, e: &io::Error| {
+        if feed.stopped {
+            CANCELLED.to_string()
+        } else if item.locked {
+            needs_password(archive, true)
+        } else {
+            unpack_error(name, e)
+        }
+    };
+    match &mut opened {
+        Opened::Zip(zip) => {
+            let key = password.as_deref().map(str::as_bytes);
+            let unreadable = |e: zip::result::ZipError| match e {
+                zip::result::ZipError::CompressionMethodNotSupported(_) => format!("\u{201c}{name}\u{201d} is packed in a way Glint can't unpack yet."),
+                zip::result::ZipError::InvalidPassword => needs_password(archive, true),
+                zip::result::ZipError::Io(e) => format!("Failed to read \u{201c}{name}\u{201d} from the archive ({e})."),
+                _ => format!("\u{201c}{name}\u{201d} is damaged in this zip file."),
+            };
+            match item.hidden {
+                None => {
+                    let mut reader = match key {
+                        Some(key) => zip.by_index_decrypt(item.index, key),
+                        None => zip.by_index(item.index),
+                    }
+                    .map_err(unreadable)?;
+                    io::copy(&mut reader, &mut feed).map_err(|e| failed(&feed, &e))?;
+                }
+                Some(at) => {
+                    let mut source = BufReader::new(open_source(archive)?);
+                    source.seek(io::SeekFrom::Start(at.header)).map_err(|e| unreadable(e.into()))?;
+                    let options = zip::ZipReadOptions::new().override_compressed_size(at.compressed).override_uncompressed_size(at.size).override_crc(at.crc).password(key);
+                    let mut reader = zip::read::read_zipfile_from_stream_with_options(&mut source, options).map_err(unreadable)?.ok_or_else(|| format!("\u{201c}{name}\u{201d} is damaged in this zip file."))?;
+                    io::copy(&mut reader, &mut feed).map_err(|e| failed(&feed, &e))?;
+                }
+            }
+        }
+        Opened::SevenZ(a, source) => {
+            let Some(b) = a.stream_map.file_block_index.get(item.index).copied().flatten().filter(|&b| b < a.blocks.len()) else {
+                return Ok(()); // no data stored: an empty file
+            };
+            // Without its CRC, a wrong password would give wrong data that nothing catches.
+            if item.locked && !a.files.get(item.index).is_some_and(|f| f.has_crc) {
+                return Err(format!("Glint can't check the data of \u{201c}{name}\u{201d} in this 7z file."));
+            }
+            let first = a.stream_map.block_first_file_index.get(b).copied().unwrap_or(0);
+            let mut index = first;
+            let mut problem: Option<String> = None;
+            let key = password.as_deref().map_or_else(sevenz_rust2::Password::empty, sevenz_rust2::Password::new);
+            let decoder = sevenz_rust2::BlockDecoder::new(1, b, a, &key, source);
+            let result = decoder.for_each_entries(&mut |_entry, reader: &mut dyn Read| {
+                let this = index;
+                index += 1;
+                // Everything before it in its block is unpacked (and thrown away) to get to it.
+                let copied = if this == item.index { io::copy(reader, &mut feed) } else { io::copy(reader, &mut io::sink()) };
+                if let Err(e) = copied {
+                    problem = Some(failed(&feed, &e));
+                    return Ok(false);
+                }
+                Ok(this < item.index)
+            });
+            if let Some(why) = problem {
+                return Err(why);
+            }
+            result.map_err(|e| if item.locked { needs_password(archive, true) } else { sevenz_error(&e) })?;
+            if index <= item.index {
+                return Err("This 7z file is laid out in a way Glint can't read yet.".to_string());
+            }
+        }
+        Opened::Rar(a) => {
+            if let Some(why) = a.cut_off(item) {
+                return Err(why);
+            }
+            read_rar(archive, a, item, password.as_deref(), &mut feed)?;
+        }
+    }
+    Ok(())
+}
+
+/// [`read_file`] for a rar: the unpacker wants a writer of its own (`'static`), so the data goes
+/// to `feed` through a short queue, `feed` taking it on a thread of its own.
+fn read_rar(archive: &str, a: &RarSet, item: &Item, password: Option<&str>, feed: &mut Pour) -> Result<(), String> {
+    /// Sends what the unpacker writes to the queue; fails once nobody takes it any more.
+    struct Pipe(std::sync::mpsc::SyncSender<Vec<u8>>);
+    impl Write for Pipe {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.send(buf.to_vec()).map_err(|_| io::Error::other("stopped"))?;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let target = item.index;
+    let (send, receive) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+    let (result, taken) = std::thread::scope(|s| {
+        let taker = s.spawn(move || {
+            let mut bytes = 0u64;
+            for piece in receive {
+                if feed.write_all(&piece).is_err() {
+                    return None; // (dropping `receive` stops the unpacker)
+                }
+                bytes += piece.len() as u64;
+            }
+            Some(bytes)
+        });
+        let mut send = Some(send);
+        let result = a.run(password, &mut |index| match index {
+            i if i == target => match send.take() {
+                Some(send) => RarStep::Take(Box::new(Pipe(send))),
+                None => RarStep::Stop,
+            },
+            i if i > target => RarStep::Stop,
+            _ => RarStep::Skip,
+        });
+        drop(send);
+        (result, taker.join().ok().flatten())
+    });
+    let stopped = taken.is_none();
+    if stopped {
+        return Err(CANCELLED.to_string());
+    }
+    if let Err(e) = result {
+        return Err(match e.kind() {
+            rars::ErrorKind::ChecksumMismatch if item.locked => needs_password(archive, true),
+            _ => rar_error(archive, &e),
+        });
+    }
+    if taken != Some(item.size) {
+        return Err(format!("Failed to unpack \u{201c}{}\u{201d} from this rar file.", folder::file_name(&item.path)));
+    }
+    Ok(())
+}
+
+/// Where [`read_file`] puts the data: `take`, until it says stop.
+struct Pour<'a> {
+    take: &'a mut (dyn FnMut(&[u8]) -> bool + Send),
+    stopped: bool,
+}
+
+impl Write for Pour<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.stopped || !(self.take)(buf) {
+            self.stopped = true;
+            return Err(io::Error::other("stopped"));
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------- making archives
@@ -1168,13 +1969,21 @@ fn on_disk(path: &Path) -> PathBuf {
 /// Makes the archive `out` (a new file: nothing is ever replaced) from `plan`, with each file's
 /// time. Reports to the copy queue as it goes. When it fails or is cancelled, the half-made file
 /// is removed again.
+#[cfg(test)]
 pub fn pack(plan: &Packing, out: &str, format: Format) -> Result<(), String> {
+    pack_with(plan, out, format, None)
+}
+
+/// [`pack`], locked with `password` when there is one: a zip's files with AES-256 (its names stay
+/// readable, as zip has no way to hide them), a 7z's files and its list of names with AES-256.
+pub fn pack_with(plan: &Packing, out: &str, format: Format, password: Option<&str>) -> Result<(), String> {
     let path = Path::new(out);
     let file = File::create_new(path).map_err(|e| write_error(path, &e))?;
     let meter = Meter::new(plan.total);
+    let password = password.filter(|p| !p.is_empty());
     let result = match format {
-        Format::Zip => pack_zip(plan, file, path, &meter),
-        Format::SevenZ => pack_7z(plan, file, path, &meter),
+        Format::Zip => pack_zip(plan, file, path, password, &meter),
+        Format::SevenZ => pack_7z(plan, file, path, password, &meter),
     };
     if result.is_err() {
         let _ = std::fs::remove_file(path);
@@ -1191,7 +2000,81 @@ pub fn pack(plan: &Packing, out: &str, format: Format) -> Result<(), String> {
     result
 }
 
-fn pack_zip(plan: &Packing, file: File, out: &Path, meter: &Meter) -> Result<(), String> {
+/// The names of the parts a file cut into `n` parts gets: "Holiday.7z.001", "Holiday.7z.002"...
+pub fn part_names(name: &str, n: u32) -> Vec<String> {
+    (1..=n).map(|i| format!("{name}.{i:03}")).collect()
+}
+
+/// Cuts the finished archive `path` into `n` parts of the same size (the last one may be a few
+/// bytes smaller): `path.001`, `path.002`... (see [`part_names`]), which 7-Zip and Glint read as
+/// one file again. Done in place, from the end, so it needs room for only one part more. Returns
+/// the parts' paths. On a failure the parts made so far are put back, so `path` is whole again.
+pub fn cut_into_parts(path: &str, n: u32) -> Result<Vec<String>, String> {
+    let len = std::fs::metadata(path).map_err(|e| write_error(Path::new(path), &e))?.len();
+    let n = u64::from(n.max(1)).min(len.max(1));
+    cut(path, len.div_ceil(n).max(1))
+}
+
+/// The most parts a file is cut into (their numbers have three digits).
+pub const MOST_CUT_PARTS: u64 = 999;
+
+/// Cuts the finished archive `path` into parts of `size` bytes each (the last one smaller), as
+/// [`cut_into_parts`] does. One that fits in one part stays as it is: its path is all that's
+/// returned. More than [`MOST_CUT_PARTS`] parts: refused, and `path` is left whole.
+pub fn cut_by_size(path: &str, size: u64) -> Result<Vec<String>, String> {
+    let len = std::fs::metadata(path).map_err(|e| write_error(Path::new(path), &e))?.len();
+    if len <= size {
+        return Ok(vec![path.to_string()]);
+    }
+    if len.div_ceil(size.max(1)) > MOST_CUT_PARTS {
+        return Err(format!("that would make over {MOST_CUT_PARTS} files. Pick a bigger size."));
+    }
+    cut(path, size.max(1))
+}
+
+/// Cuts `path` into parts of `size` bytes (see [`cut_into_parts`]).
+fn cut(path: &str, size: u64) -> Result<Vec<String>, String> {
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path).map_err(|e| write_error(Path::new(path), &e))?;
+    let len = file.metadata().map_err(|e| write_error(Path::new(path), &e))?.len();
+    let n = len.div_ceil(size).max(1);
+    let names = part_names(path, n as u32);
+    // The last parts first: each is copied out, and the file shortened to what's before it.
+    let mut made: Vec<(PathBuf, u64)> = Vec::new();
+    let mut result = Ok(());
+    for i in (1..n).rev() {
+        let start = i * size;
+        let to = PathBuf::from(&names[i as usize]);
+        let copied = (|| -> io::Result<()> {
+            file.seek(io::SeekFrom::Start(start))?;
+            let mut out = File::create_new(&to)?;
+            io::copy(&mut (&mut file).take(len.min(start + size) - start), &mut out)?;
+            out.sync_all()?;
+            file.set_len(start)
+        })();
+        if let Err(e) = copied {
+            let _ = std::fs::remove_file(&to);
+            result = Err(write_error(&to, &e));
+            break;
+        }
+        made.push((to, start));
+    }
+    if let Err(why) = result {
+        // Put back what was cut off, in order.
+        for (part, start) in made.iter().rev() {
+            if let Ok(mut from) = File::open(part) {
+                if file.seek(io::SeekFrom::Start(*start)).is_ok() && io::copy(&mut from, &mut file).is_ok() {
+                    let _ = std::fs::remove_file(part);
+                }
+            }
+        }
+        return Err(why);
+    }
+    drop(file);
+    std::fs::rename(path, &names[0]).map_err(|e| write_error(Path::new(&names[0]), &e))?;
+    Ok(names.into_iter().take(n as usize).collect())
+}
+
+fn pack_zip(plan: &Packing, file: File, out: &Path, password: Option<&str>, meter: &Meter) -> Result<(), String> {
     use zip::write::SimpleFileOptions;
     let zip_error = |e: zip::result::ZipError| match e {
         zip::result::ZipError::Io(e) => write_error(out, &e),
@@ -1208,7 +2091,12 @@ fn pack_zip(plan: &Packing, file: File, out: &Path, meter: &Meter) -> Result<(),
             zip.add_directory(p.name.as_str(), opts).map_err(zip_error)?;
             continue;
         }
-        zip.start_file(p.name.as_str(), opts.large_file(p.size >= ZIP64_FROM)).map_err(zip_error)?;
+        let opts = opts.large_file(p.size >= ZIP64_FROM);
+        let opts = match password {
+            Some(pw) => opts.with_aes_encryption(zip::AesMode::Aes256, pw),
+            None => opts,
+        };
+        zip.start_file(p.name.as_str(), opts).map_err(zip_error)?;
         let mut feed = Feed::new(&p.path, meter);
         loop {
             let n = match feed.read(&mut buf) {
@@ -1223,7 +2111,7 @@ fn pack_zip(plan: &Packing, file: File, out: &Path, meter: &Meter) -> Result<(),
     w.flush().map_err(|e| write_error(out, &e))
 }
 
-fn pack_7z(plan: &Packing, file: File, out: &Path, meter: &Meter) -> Result<(), String> {
+fn pack_7z(plan: &Packing, file: File, out: &Path, password: Option<&str>, meter: &Meter) -> Result<(), String> {
     use sevenz_rust2::ArchiveWriter;
     let seven_error = |e: sevenz_rust2::Error| meter.problem.take().unwrap_or_else(|| format!("Failed to write \u{201c}{}\u{201d} ({e}).", out.display()));
     let mut w = ArchiveWriter::new(BufWriter::new(file)).map_err(seven_error)?;
@@ -1242,11 +2130,17 @@ fn pack_7z(plan: &Packing, file: File, out: &Path, meter: &Meter) -> Result<(), 
         block.0.push(p);
         block.1 += p.size;
         if block.1 >= SOLID_BLOCK {
-            push_block(&mut w, block, store, meter).map_err(seven_error)?;
+            push_block(&mut w, block, store, password, meter).map_err(seven_error)?;
         }
     }
-    push_block(&mut w, &mut packed, false, meter).map_err(seven_error)?;
-    push_block(&mut w, &mut stored, true, meter).map_err(seven_error)?;
+    push_block(&mut w, &mut packed, false, password, meter).map_err(seven_error)?;
+    push_block(&mut w, &mut stored, true, password, meter).map_err(seven_error)?;
+    // (The list of names is locked when the last methods set have AES in them: set them here too,
+    // for a 7z of only folders and empty files, which has no blocks.)
+    if let Some(pw) = password {
+        use sevenz_rust2::{encoder_options::AesEncoderOptions, EncoderConfiguration, EncoderMethod};
+        w.set_content_methods(vec![AesEncoderOptions::new(sevenz_rust2::Password::new(pw)).into(), EncoderConfiguration::new(EncoderMethod::COPY)]);
+    }
     let mut f = w.finish().map_err(|e| meter.problem.take().unwrap_or_else(|| write_error(out, &e)))?;
     f.flush().map_err(|e| write_error(out, &e))
 }
@@ -1338,15 +2232,17 @@ fn barely_shrinks(path: &Path, size: u64) -> bool {
 
 /// Packs these files (`block.1` bytes in all) together as one solid block of the 7z: stored as
 /// they are, or with LZMA2 sized for them ([`lzma2_setup`]). Leaves `block` empty.
-fn push_block<W: Write + io::Seek>(w: &mut sevenz_rust2::ArchiveWriter<W>, block: &mut (Vec<&Packed>, u64), store: bool, meter: &Meter) -> Result<(), sevenz_rust2::Error> {
-    use sevenz_rust2::encoder_options::Lzma2Options;
+fn push_block<W: Write + io::Seek>(w: &mut sevenz_rust2::ArchiveWriter<W>, block: &mut (Vec<&Packed>, u64), store: bool, password: Option<&str>, meter: &Meter) -> Result<(), sevenz_rust2::Error> {
+    use sevenz_rust2::encoder_options::{AesEncoderOptions, Lzma2Options};
     use sevenz_rust2::{EncoderConfiguration, EncoderMethod};
     let (files, bytes) = (std::mem::take(&mut block.0), std::mem::take(&mut block.1));
     if files.is_empty() {
         return Ok(());
     }
+    // With a password, AES comes first: the packed data is what's locked.
+    let lock: Vec<EncoderConfiguration> = password.map(|pw| AesEncoderOptions::new(sevenz_rust2::Password::new(pw)).into()).into_iter().collect();
     if store {
-        w.set_content_methods(vec![EncoderConfiguration::new(EncoderMethod::COPY)]);
+        w.set_content_methods([lock, vec![EncoderConfiguration::new(EncoderMethod::COPY)]].concat());
     } else {
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
         let (dict, threads) = lzma2_setup(bytes, cores.min(packers_with_room()));
@@ -1357,7 +2253,7 @@ fn push_block<W: Write + io::Seek>(w: &mut sevenz_rust2::ArchiveWriter<W>, block
             Lzma2Options::from_level(PACK_LEVEL)
         };
         options.set_dictionary_size(dict);
-        w.set_content_methods(vec![EncoderConfiguration::from(options)]);
+        w.set_content_methods([lock, vec![EncoderConfiguration::from(options)]].concat());
     }
     let entries = files.iter().map(|p| sevenz_entry(p)).collect();
     let feeds = files.iter().map(|p| sevenz_rust2::SourceReader::new(Feed::new(&p.path, meter))).collect();
@@ -1613,8 +2509,7 @@ fn read_error_7z(e: &io::Error) -> String {
 fn sevenz_error(e: &sevenz_rust2::Error) -> String {
     use sevenz_rust2::Error as E;
     match e {
-        E::PasswordRequired | E::MaybeBadPassword(_) => PASSWORD.to_string(),
-        E::UnsupportedCompressionMethod(m) if m.to_ascii_lowercase().contains("aes") => PASSWORD.to_string(),
+        E::PasswordRequired | E::MaybeBadPassword(_) => "This 7z file has a password.".to_string(),
         E::UnsupportedCompressionMethod(_) | E::ExternalUnsupported | E::Unsupported(_) => "This 7z file uses a kind of packing Glint can't read yet.".to_string(),
         E::BadSignature(_) => "This isn't really a 7z file, or it's damaged.".to_string(),
         E::FileOpen(io, _) => open_error(io),
@@ -1694,7 +2589,7 @@ mod tests {
         // A folder named like an archive is just a folder.
         std::fs::create_dir_all(dir.join("folder.7z")).expect("mkdir");
         assert_eq!(split(&s(&dir.join("folder.7z").join("x"))), None);
-        assert!(is_archive_name("x.Zip") && is_archive_name("y.7Z") && !is_archive_name("zip") && !is_archive_name("a.rar"));
+        assert!(is_archive_name("x.Zip") && is_archive_name("y.7Z") && !is_archive_name("zip") && is_archive_name("a.rar") && !is_archive_name("a.tar"));
     }
 
     #[test]
@@ -1978,6 +2873,12 @@ mod tests {
         let taken = |n: &str| ["Photos", "Photos (2)"].contains(&n);
         assert_eq!(extract_folder_name("Photos.zip", taken), "Photos (3)");
         assert_eq!(extract_folder_name("my.backup.7Z", |_| false), "my.backup");
+        assert_eq!(extract_folder_name("game.part1.rar", |_| false), "game");
+        assert_eq!(extract_folder_name("Game.PART03.RAR", |_| false), "Game");
+        assert_eq!(extract_folder_name("my.party.rar", |_| false), "my.party");
+        assert_eq!(extract_folder_name("x.part2.zip", |_| false), "x.part2");
+        assert_eq!(extract_folder_name("Holiday.7z.001", |_| false), "Holiday");
+        assert_eq!(extract_folder_name("Holiday.zip.003", |_| false), "Holiday");
         assert_eq!(extract_folder_name(".zip", |_| false), ".zip");
         assert_eq!(free_name("a.tar.gz", false, |n| n == "a.tar.gz"), "a.tar (2).gz");
         assert_eq!(free_name("v1.2", true, |n| n == "v1.2"), "v1.2 (2)");
@@ -3274,5 +4175,468 @@ mod tests {
         assert_eq!(cant_change(&h), None);
         // Not read: nothing is known, so nothing is greyed out.
         assert_eq!(cant_change(&format!("{o}\\elsewhere")), None);
+    }
+
+    // ------------------------------------------------------------ passwords
+
+    /// A test archive from testdata (see NOTICE.txt there), copied to `dir`.
+    fn fixture(dir: &Path, name: &str) -> String {
+        let from = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("archive").join("testdata").join(name);
+        let to = dir.join(name);
+        std::fs::copy(&from, &to).unwrap_or_else(|e| panic!("{name}: {e}"));
+        s(&to)
+    }
+
+    /// Every file under `dir`, as (path inside it with `\`, contents).
+    fn files_under(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            for e in std::fs::read_dir(&d).expect("list") {
+                let p = e.expect("entry").path();
+                if p.is_dir() {
+                    todo.push(p);
+                } else {
+                    let rel = p.strip_prefix(dir).expect("under").to_string_lossy().replace('/', "\\");
+                    out.insert(rel, std::fs::read(&p).expect("read"));
+                }
+            }
+        }
+        out
+    }
+
+    fn numbers() -> Vec<u8> {
+        (1..=3000).map(|n| format!("{n}\n")).collect::<String>().into_bytes()
+    }
+
+    /// The zips and 7z files 7-Zip made: every way of locking reads back the same files, after the
+    /// password is asked for, and a wrong one writes nothing.
+    #[test]
+    fn locked_zip_and_7z_from_7zip() {
+        for (name, hides_names) in [("zipcrypto.zip", false), ("aes128.zip", false), ("aes192.zip", false), ("aes256.zip", false), ("locked.7z", false), ("hidden.7z", true)] {
+            let dir = scratch(&format!("pw-{name}"));
+            let a = fixture(&dir, name);
+            let _ = take_ask();
+            // Listing: needs the password only when the names are hidden too.
+            let listed = read(&a, "", &a);
+            if hides_names {
+                assert_eq!(listed.error.as_deref(), Some("\u{201c}hidden.7z\u{201d} has a password."), "{name}");
+                assert_eq!(listed.ask, Some(Ask { archive: a.clone(), name: name.to_string(), wrong: false }), "{name}");
+                set_password(&a, "nope");
+                let again = read(&a, "", &a);
+                assert_eq!(again.error.as_deref(), Some("Wrong password for \u{201c}hidden.7z\u{201d}."), "{name}");
+                assert!(again.ask.as_ref().is_some_and(|k| k.wrong), "{name}");
+                assert_eq!(password_for(&a), None, "a wrong password is forgotten");
+            } else {
+                assert!(listed.error.is_none(), "{name}: {:?}", listed.error);
+                let names: Vec<&str> = listed.entries.iter().map(|e| e.name.as_str()).collect();
+                assert!(names.contains(&"Grüße") && names.contains(&"readme.txt"), "{name}: {names:?}");
+                // Extracting without a password: asked for, nothing written.
+                let out = dir.join("out0");
+                std::fs::create_dir(&out).expect("dir");
+                let err = extract_all(&a, &s(&out), &mut Vec::new()).expect_err("needs a password");
+                assert_eq!(err, format!("\u{201c}{name}\u{201d} has a password."));
+                assert_eq!(take_ask().map(|k| k.wrong), Some(false), "{name}");
+                assert!(files_under(&out).is_empty(), "{name}");
+                // A wrong one: said so, nothing written.
+                set_password(&a, "Secret124");
+                let out = dir.join("out1");
+                std::fs::create_dir(&out).expect("dir");
+                let err = extract_all(&a, &s(&out), &mut Vec::new()).expect_err("wrong password");
+                assert_eq!(err, format!("Wrong password for \u{201c}{name}\u{201d}."), "{name}");
+                assert_eq!(take_ask().map(|k| k.wrong), Some(true), "{name}");
+                assert!(files_under(&out).is_empty(), "{name}: {:?}", files_under(&out).keys().collect::<Vec<_>>());
+            }
+            set_password(&a, "Secret123");
+            assert!(read(&a, "", &a).error.is_none(), "{name}");
+            let out = dir.join("out");
+            std::fs::create_dir(&out).expect("dir");
+            extract_all(&a, &s(&out), &mut Vec::new()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let got = files_under(&out);
+            assert_eq!(got.get("readme.txt").map(Vec::as_slice), Some(&b"hello world\n"[..]), "{name}");
+            assert_eq!(got.get("Grüße\\日本語 ✓.txt").map(Vec::as_slice), Some("Привет мир\n".as_bytes()), "{name}: {:?}", got.keys().collect::<Vec<_>>());
+            assert_eq!(got.get("numbers.txt"), Some(&numbers()), "{name}");
+            // One item, as opening it does (to the temporary folder).
+            let one = dir.join("one");
+            std::fs::create_dir(&one).expect("dir");
+            extract(&a, &["Grüße\\日本語 ✓.txt".to_string()], &s(&one)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(std::fs::read(one.join("日本語 ✓.txt")).expect("out"), "Привет мир\n".as_bytes(), "{name}");
+            // Changing a locked archive is still refused, in plain words.
+            assert!(change(&a, &Change::Remove(vec!["readme.txt".into()]), &AtomicBool::new(false)).is_err(), "{name}");
+            assert!(take_ask().is_none() || hides_names, "{name}");
+        }
+    }
+
+    /// Rar files (RAR 4, 5 and 7, names hidden or not, a mix of locked and plain files, Unicode
+    /// names, solid): listed, asked about, unpacked.
+    /// Copies the parts of a split rar test set (split\\<set>.part1.rar...) into `dir`, up to `upto`;
+    /// returns the first part.
+    fn split_fixture(dir: &Path, set: &str, upto: usize) -> String {
+        for n in 1..=upto {
+            let name = format!("{set}.part{n}.rar");
+            let from = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("archive").join("testdata").join("split").join(&name);
+            std::fs::copy(&from, dir.join(&name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        s(&dir.join(format!("{set}.part1.rar")))
+    }
+
+    #[test]
+    fn split_rar_files_are_read_from_all_their_parts() {
+        // (What WinRAR packed: big.bin runs over all four parts.)
+        let mut x = 1u32;
+        let big: Vec<u8> = (0..150_000)
+            .map(|_| {
+                x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (x >> 16) as u8
+            })
+            .collect();
+        assert_eq!(&big[..4], &[0xc6, 0x7e, 0x81, 0x6b]);
+        for (set, password, hides_names) in [("vol5", None, false), ("vol5solid", None, false), ("vol5locked", Some("Secret123"), false), ("vol5hidden", Some("Secret123"), true)] {
+            let dir = scratch(&format!("split-{set}"));
+            let first = split_fixture(&dir, set, 4);
+            let _ = take_ask();
+            if hides_names {
+                let listed = read(&first, "", &first);
+                assert_eq!(listed.error, Some(format!("\u{201c}{set}.part1.rar\u{201d} has a password.")), "{set}");
+                set_password(&first, "nope");
+                assert_eq!(read(&first, "", &first).error, Some(format!("Wrong password for \u{201c}{set}.part1.rar\u{201d}.")), "{set}");
+            } else if password.is_some() {
+                let out = dir.join("out0");
+                std::fs::create_dir(&out).expect("dir");
+                let err = extract_all(&first, &s(&out), &mut Vec::new()).expect_err("needs a password");
+                assert_eq!(err, format!("\u{201c}{set}.part1.rar\u{201d} has a password."), "{set}");
+                assert!(files_under(&out).is_empty(), "{set}");
+            }
+            if let Some(p) = password {
+                set_password(&first, p);
+            }
+            let listed = read(&first, "", &first);
+            assert!(listed.error.is_none(), "{set}: {:?}", listed.error);
+            let mut names: Vec<&str> = listed.entries.iter().map(|e| e.name.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(names, vec!["Grüße", "big.bin", "small.txt"], "{set}");
+            assert_eq!(listed.entries.iter().find(|e| e.name == "big.bin").map(|e| e.size), Some(150_000), "{set}");
+            // Everything, from the first part.
+            let out = dir.join("out");
+            std::fs::create_dir(&out).expect("dir");
+            extract_all(&first, &s(&out), &mut Vec::new()).unwrap_or_else(|e| panic!("{set}: {e}"));
+            let got = files_under(&out);
+            assert!(got.get("big.bin") == Some(&big), "{set}: big.bin");
+            assert_eq!(got.get("small.txt").map(Vec::as_slice), Some(&b"hello split\n"[..]), "{set}");
+            assert_eq!(got.get("Grüße\\日本語.txt").map(Vec::as_slice), Some(&b"unicode ok\n"[..]), "{set}: {:?}", got.keys().collect::<Vec<_>>());
+            // One file, through a later part (opened like the first: the same files).
+            let third = s(&dir.join(format!("{set}.part3.rar")));
+            if let Some(p) = password {
+                set_password(&third, p);
+            }
+            let listed = read(&third, "", &third);
+            assert!(listed.error.is_none(), "{set} part3: {:?}", listed.error);
+            assert_eq!(listed.entries.len(), 3, "{set} part3");
+            let one = dir.join("one");
+            std::fs::create_dir(&one).expect("dir");
+            extract_some(&third, &["small.txt".to_string()], &s(&one), &mut Vec::new()).unwrap_or_else(|e| panic!("{set}: {e}"));
+            assert_eq!(std::fs::read(one.join("small.txt")).ok().as_deref(), Some(&b"hello split\n"[..]), "{set}");
+            // Its fingerprint's data: the whole big.bin.
+            let mut data = Vec::new();
+            read_file(&format!("{first}\\big.bin"), &mut |d| {
+                data.extend_from_slice(d);
+                true
+            })
+            .unwrap_or_else(|e| panic!("{set}: {e}"));
+            assert!(data == big, "{set}: read_file");
+            // Rar files are never changed, split or not.
+            assert_eq!(cant_change(&first), Some(edit::RAR), "{set}");
+        }
+    }
+
+    #[test]
+    fn a_missing_part_is_named() {
+        let dir = scratch("split-missing");
+        let first = split_fixture(&dir, "vol5", 3);
+        // Not listed with files missing: said.
+        let listed = read(&first, "", &first);
+        assert_eq!(listed.error.as_deref(), Some("\u{201c}vol5.part4.rar\u{201d} is missing."));
+        let out = dir.join("out");
+        std::fs::create_dir(&out).expect("dir");
+        let err = extract_some(&first, &["big.bin".to_string()], &s(&out), &mut Vec::new()).expect_err("part 4 is missing");
+        assert_eq!(err, "\u{201c}vol5.part4.rar\u{201d} is missing.");
+        assert!(files_under(&out).is_empty());
+        assert_eq!(read_file(&format!("{first}\\big.bin"), &mut |_| true), Err("\u{201c}vol5.part4.rar\u{201d} is missing.".to_string()));
+    }
+
+    #[test]
+    fn the_first_part_of_a_split_rar_is_found_by_its_name() {
+        assert_eq!(first_part("C:\\x\\game.part3.rar").as_deref(), Some("C:\\x\\game.part1.rar"));
+        assert_eq!(first_part("C:\\x\\game.part03.rar").as_deref(), Some("C:\\x\\game.part01.rar"));
+        assert_eq!(first_part("C:\\x\\Game.PART12.RAR").as_deref(), Some("C:\\x\\Game.PART01.rar"));
+        assert_eq!(first_part("C:\\x\\game.rar"), None);
+        assert_eq!(first_part("C:\\x\\part2.rar"), None);
+        assert_eq!(first_part("C:\\x\\game.part.rar"), None);
+        assert_eq!(first_part("C:\\x\\game.zip"), None);
+    }
+
+    #[test]
+    fn a_file_inside_is_read_as_it_comes_out() {
+        // (file, password, a file in it)
+        let cases = [
+            ("zipcrypto.zip", "Secret123", "Grüße\\日本語 ✓.txt"),
+            ("aes256.zip", "Secret123", "numbers.txt"),
+            ("locked.7z", "Secret123", "numbers.txt"),
+            ("hidden.7z", "Secret123", "Grüße\\日本語 ✓.txt"),
+            ("rar5-plain.rar", "", "tiny.txt"),
+            ("rar5-solid.rar", "", "tiny.txt"),
+            ("rar5-locked.rar", "password", "hello.txt"),
+            ("rar4-locked.rar", "password", "file1.txt"),
+            ("rar4-unicode.rar", "test", "新建文本文档.txt"),
+        ];
+        for (name, password, inside) in cases {
+            let dir = scratch(&format!("readfile-{name}"));
+            let a = fixture(&dir, name);
+            let path = format!("{a}\\{inside}");
+            let read_all = || {
+                let mut got = Vec::new();
+                read_file(&path, &mut |d| {
+                    got.extend_from_slice(d);
+                    true
+                })
+                .map(|()| got)
+            };
+            if !password.is_empty() && !name.contains("hidden") {
+                // No password typed yet: asked for, nothing handed over.
+                let _ = take_ask();
+                assert_eq!(read_all(), Err(format!("\u{201c}{name}\u{201d} has a password.")), "{name}");
+                assert_eq!(take_ask().map(|k| k.wrong), Some(false), "{name}");
+                set_password(&a, "wrong one");
+                assert_eq!(read_all(), Err(format!("Wrong password for \u{201c}{name}\u{201d}.")), "{name}");
+            }
+            if !password.is_empty() {
+                set_password(&a, password);
+            }
+            // The same bytes as extracting it gives.
+            let out = dir.join("out");
+            std::fs::create_dir(&out).expect("dir");
+            extract_some(&a, &[inside.to_string()], &s(&out), &mut Vec::new()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let extracted = std::fs::read(out.join(folder::file_name(inside))).expect("extracted");
+            assert_eq!(read_all().unwrap_or_else(|e| panic!("{name}: {e}")), extracted, "{name}");
+            // Stopping: said, and nothing more is handed over.
+            let mut pieces = 0;
+            let stopped = read_file(&path, &mut |_| {
+                pieces += 1;
+                false
+            });
+            assert_eq!(stopped, Err(CANCELLED.to_string()), "{name}");
+            assert!(pieces <= 1, "{name}");
+            // Not a file in it.
+            assert!(read_file(&format!("{a}\\no such file.txt"), &mut |_| true).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn rar_files_with_and_without_passwords() {
+        // (file, password, hides names, a file in it and what it holds when known)
+        let cases: [(&str, Option<&str>, bool, &str, Option<&[u8]>); 9] = [
+            ("rar5-plain.rar", None, false, "tiny.txt", None),
+            ("rar5-solid.rar", None, false, "tiny.txt", None),
+            ("rar5-locked.rar", Some("password"), false, "hello.txt", None),
+            ("rar5-hidden.rar", Some("password"), true, "hello.txt", None),
+            ("rar7-hidden.rar", Some("Password"), true, "tmp\\rars-threshold2-8191\\random.bin", None),
+            ("rar4-locked.rar", Some("password"), false, "file1.txt", Some(b"file1\n")),
+            ("rar4-hidden.rar", Some("password"), true, "file1.txt", Some(b"file1\n")),
+            ("rar4-unicode.rar", Some("test"), false, "新建文本文档.txt", Some(b"aaaaaaaaaa")),
+            ("rar4-mixed.rar", Some("known-pass"), false, "3Sec.txt", None),
+        ];
+        for (name, password, hides_names, inside, holds) in cases {
+            let dir = scratch(&format!("pw-{name}"));
+            let a = fixture(&dir, name);
+            let _ = take_ask();
+            let listed = read(&a, "", &a);
+            if hides_names {
+                assert_eq!(listed.error.as_deref(), Some(format!("\u{201c}{name}\u{201d} has a password.").as_str()), "{name}");
+                assert!(listed.ask.as_ref().is_some_and(|k| !k.wrong), "{name}");
+                set_password(&a, "wrong one");
+                assert_eq!(read(&a, "", &a).error.as_deref(), Some(format!("Wrong password for \u{201c}{name}\u{201d}.").as_str()), "{name}");
+            } else {
+                assert!(listed.error.is_none(), "{name}: {:?}", listed.error);
+            }
+            if let (Some(_), false) = (password, hides_names) {
+                let out = dir.join("out0");
+                std::fs::create_dir(&out).expect("dir");
+                let err = extract_some(&a, &[inside.to_string()], &s(&out), &mut Vec::new()).expect_err("needs a password");
+                assert_eq!(err, format!("\u{201c}{name}\u{201d} has a password."), "{name}");
+                set_password(&a, "wrong one");
+                let err = extract_some(&a, &[inside.to_string()], &s(&out), &mut Vec::new()).expect_err("wrong");
+                assert_eq!(err, format!("Wrong password for \u{201c}{name}\u{201d}."), "{name}");
+                assert!(files_under(&out).is_empty(), "{name}: {:?}", files_under(&out).keys().collect::<Vec<_>>());
+            }
+            if let Some(p) = password {
+                set_password(&a, p);
+            }
+            let root = read(&a, "", &a);
+            assert!(root.error.is_none(), "{name}: {:?}", root.error);
+            let out = dir.join("out");
+            std::fs::create_dir(&out).expect("dir");
+            extract_all(&a, &s(&out), &mut Vec::new()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let got = files_under(&out);
+            let file = got.get(inside).unwrap_or_else(|| panic!("{name}: {:?}", got.keys().collect::<Vec<_>>()));
+            assert!(!file.is_empty(), "{name}");
+            if let Some(holds) = holds {
+                assert_eq!(file.as_slice(), holds, "{name}");
+            }
+            // Rar files are never changed.
+            assert_eq!(change(&a, &Change::Remove(vec![inside.into()]), &AtomicBool::new(false)).err().as_deref(), Some(edit::RAR), "{name}");
+            assert_eq!(cant_change(&a), Some(edit::RAR), "{name}");
+        }
+        // A plain file of a half-locked rar comes out without a password.
+        let dir = scratch("pw-rar-mixed-plain");
+        let a = fixture(&dir, "rar4-mixed.rar");
+        extract_some(&a, &["1File.txt".to_string()], &s(&dir), &mut Vec::new()).expect("plain file");
+        assert!(dir.join("1File.txt").is_file());
+    }
+
+    /// Zip and 7z files cut into parts: the parts come out the same size, and Glint reads the set
+    /// back whole from any part (list, extract, read one file), with a password too.
+    #[test]
+    fn packing_into_parts_reads_back_whole() {
+        let dir = scratch("parts-pack");
+        let top = dir.join("Holiday");
+        std::fs::create_dir_all(&top).expect("dirs");
+        let big = noise(400_000, 7);
+        std::fs::write(top.join("big.bin"), &big).expect("write");
+        std::fs::write(top.join("notes.txt"), "cut into parts").expect("write");
+        let plan = plan_pack(&[s(&top)], &AtomicBool::new(false)).expect("plan").expect("not stopped");
+        for format in [Format::Zip, Format::SevenZ] {
+            for password in [None, Some("pässwörd 1")] {
+                let tag = format!("{format:?} {password:?}");
+                let out = s(&dir.join(format!("Holiday{}", format.ext())));
+                pack_with(&plan, &out, format, password).unwrap_or_else(|e| panic!("{tag}: {e}"));
+                let whole = std::fs::read(&out).expect("packed");
+                let parts = cut_into_parts(&out, 3).unwrap_or_else(|e| panic!("{tag}: {e}"));
+                assert_eq!(parts, part_names(&out, 3), "{tag}");
+                assert!(!Path::new(&out).exists(), "{tag}: the whole one became the parts");
+                let sizes: Vec<u64> = parts.iter().map(|p| std::fs::metadata(p).expect("part").len()).collect();
+                assert_eq!(sizes[0], sizes[1], "{tag}");
+                assert!(sizes[2] <= sizes[0] && sizes[0] - sizes[2] < 3, "{tag}: {sizes:?}");
+                // Put together again they're the file as it was made.
+                let joined: Vec<u8> = parts.iter().flat_map(|p| std::fs::read(p).expect("part")).collect();
+                assert_eq!(joined, whole, "{tag}");
+                if let Some(pw) = password {
+                    set_password(&parts[0], pw);
+                }
+                // Listed from the first part (and, without a password, from a later one too).
+                let firsts: &[&String] = if password.is_some() { &[&parts[0]] } else { &[&parts[0], &parts[1]] };
+                for first in firsts {
+                    let listed = read(first, "", first);
+                    assert!(listed.error.is_none(), "{tag}: {:?}", listed.error);
+                    assert_eq!(cant_change(first), Some(edit::SPLIT), "{tag}");
+                }
+                let back = dir.join("back");
+                let _ = std::fs::remove_dir_all(&back);
+                std::fs::create_dir(&back).expect("dir");
+                extract_all(&parts[0], &s(&back), &mut Vec::new()).unwrap_or_else(|e| panic!("{tag}: {e}"));
+                let got = files_under(&back);
+                assert_eq!(got.get("Holiday\\big.bin"), Some(&big), "{tag}: {:?}", got.keys().collect::<Vec<_>>());
+                assert_eq!(got.get("Holiday\\notes.txt").map(Vec::as_slice), Some(&b"cut into parts"[..]), "{tag}");
+                // One file read straight out of the set.
+                let mut read_back = Vec::new();
+                read_file(&format!("{}\\Holiday\\big.bin", parts[0]), &mut |d| {
+                    read_back.extend_from_slice(d);
+                    true
+                })
+                .unwrap_or_else(|e| panic!("{tag}: {e}"));
+                assert_eq!(read_back, big, "{tag}");
+                for p in &parts {
+                    std::fs::remove_file(p).expect("remove");
+                }
+            }
+        }
+        // A missing last part: said, not a crash.
+        let out = s(&dir.join("Short.7z"));
+        pack_with(&plan, &out, Format::SevenZ, None).expect("pack");
+        let parts = cut_into_parts(&out, 4).expect("cut");
+        std::fs::remove_file(&parts[3]).expect("remove");
+        assert_eq!(read(&parts[0], "", &parts[0]).error.as_deref(), Some(DAMAGED_SPLIT));
+        // A missing middle or first part: named.
+        std::fs::remove_file(&parts[1]).expect("remove");
+        assert_eq!(read(&parts[0], "", &parts[0]).error.as_deref(), Some("\u{201c}Short.7z.002\u{201d} is missing."));
+        std::fs::remove_file(&parts[0]).expect("remove");
+        assert_eq!(read(&parts[2], "", &parts[2]).error.as_deref(), Some("\u{201c}Short.7z.001\u{201d} is missing."));
+    }
+
+    #[test]
+    fn split_names_are_known() {
+        assert_eq!(split_base("Holiday.7z.002"), Some("Holiday.7z"));
+        assert_eq!(split_base("C:\\x\\Holiday.zip.001"), Some("C:\\x\\Holiday.zip"));
+        assert_eq!(split_base("Holiday.7z"), None);
+        assert_eq!(split_base("notes.txt.001"), None);
+        assert_eq!(split_base("Holiday.7z.01"), None);
+        assert_eq!(kind_of("Holiday.7z.003"), Some(Kind::SevenZ));
+        assert_eq!(kind_of("Holiday.zip.010"), Some(Kind::Zip));
+        assert_eq!(part_names("a.zip", 2), vec!["a.zip.001".to_string(), "a.zip.002".to_string()]);
+        // A file smaller than the parts asked for: one byte each, no empty parts.
+        let dir = scratch("parts-tiny");
+        let f = s(&dir.join("t.zip"));
+        std::fs::write(&f, b"abc").expect("write");
+        let parts = cut_into_parts(&f, 10).expect("cut");
+        assert_eq!(parts.len(), 3);
+        assert_eq!(std::fs::read(&parts[2]).expect("part"), b"c");
+        // By size: 10 bytes in parts of 4 is 4 + 4 + 2; one that fits stays as it is.
+        let f = s(&dir.join("ten.7z"));
+        std::fs::write(&f, b"0123456789").expect("write");
+        let parts = cut_by_size(&f, 4).expect("cut");
+        assert_eq!(parts.iter().map(|p| std::fs::read(p).expect("part")).collect::<Vec<_>>(), vec![b"0123".to_vec(), b"4567".to_vec(), b"89".to_vec()]);
+        let f = s(&dir.join("small.7z"));
+        std::fs::write(&f, b"abc").expect("write");
+        assert_eq!(cut_by_size(&f, 4).expect("one part"), vec![f.clone()]);
+        // Too many parts: refused, the file left whole.
+        let f = s(&dir.join("many.zip"));
+        std::fs::write(&f, vec![1u8; 2000]).expect("write");
+        assert!(cut_by_size(&f, 1).is_err());
+        assert_eq!(std::fs::metadata(&f).expect("whole").len(), 2000);
+    }
+
+    /// Zip and 7z files Glint makes with a password: locked (a 7z's names too), and they read back.
+    #[test]
+    fn packing_with_a_password() {
+        let dir = scratch("pw-pack");
+        let top = dir.join("Trip ✓");
+        std::fs::create_dir_all(top.join("empty")).expect("dirs");
+        std::fs::write(top.join("notes.txt"), "packed with a password").expect("write");
+        std::fs::write(top.join("numbers.txt"), numbers()).expect("write");
+        std::fs::write(top.join("photo.jpg"), [7u8; 5000]).expect("write");
+        let plan = plan_pack(&[s(&top)], &AtomicBool::new(false)).expect("plan").expect("not stopped");
+        for format in [Format::Zip, Format::SevenZ] {
+            let out = s(&dir.join(format!("Trip{}", format.ext())));
+            pack_with(&plan, &out, format, Some("pässwörd 1")).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+            let listed = read(&out, "", &out);
+            match format {
+                Format::Zip => assert!(listed.error.is_none(), "zip names stay readable"),
+                Format::SevenZ => assert_eq!(listed.error.as_deref(), Some("\u{201c}Trip.7z\u{201d} has a password.")),
+            }
+            let back = dir.join(format!("back-{}", &format.ext()[1..]));
+            std::fs::create_dir(&back).expect("dir");
+            if format == Format::Zip {
+                assert!(extract_all(&out, &s(&back), &mut Vec::new()).is_err(), "locked");
+            }
+            set_password(&out, "pässwörd 1");
+            extract_all(&out, &s(&back), &mut Vec::new()).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+            let got = files_under(&back);
+            assert_eq!(got.get("Trip ✓\\notes.txt").map(Vec::as_slice), Some(&b"packed with a password"[..]), "{format:?}: {:?}", got.keys().collect::<Vec<_>>());
+            assert_eq!(got.get("Trip ✓\\numbers.txt"), Some(&numbers()), "{format:?}");
+            assert_eq!(got.get("Trip ✓\\photo.jpg").map(Vec::len), Some(5000), "{format:?}");
+            assert!(back.join("Trip ✓").join("empty").is_dir(), "{format:?}");
+        }
+        // Only folders: the 7z's names are still locked.
+        let empty = dir.join("Only folders");
+        std::fs::create_dir_all(empty.join("a").join("b")).expect("dirs");
+        let plan = plan_pack(&[s(&empty)], &AtomicBool::new(false)).expect("plan").expect("not stopped");
+        let out = s(&dir.join("Only folders.7z"));
+        pack_with(&plan, &out, Format::SevenZ, Some("x")).expect("pack");
+        assert!(read(&out, "", &out).error.is_some_and(|e| e.contains("has a password")));
+        set_password(&out, "x");
+        assert!(read(&out, "", &out).error.is_none());
+        // No password (or an empty one): as before.
+        let out = s(&dir.join("Open.7z"));
+        pack_with(&plan, &out, Format::SevenZ, Some("")).expect("pack");
+        assert!(read(&out, "", &out).error.is_none());
     }
 }

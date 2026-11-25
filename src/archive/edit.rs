@@ -25,6 +25,10 @@ use crate::folder;
 
 /// What Glint says about archives it can't change.
 pub(super) const LOCKED: &str = "Glint can't change password-protected archives.";
+/// What Glint says about changing a rar file (it only unpacks them).
+pub(super) const RAR: &str = "Glint can't change rar files.";
+/// What Glint says about changing a zip or 7z cut into parts.
+pub(super) const SPLIT: &str = "Glint can't change split files.";
 const NESTED: &str = "Glint can only change an archive that isn't inside another one. Copy it out first.";
 
 /// A change to an archive (paths inside it, `\` between parts, "" for its root).
@@ -79,6 +83,12 @@ struct Out {
 /// looking through folders to add.
 pub fn change(archive: &str, change: &Change, stop: &AtomicBool) -> Result<Option<Changed>, String> {
     let kind = super::kind_of(archive).ok_or_else(|| "This isn't a zip or 7z file.".to_string())?;
+    if kind == Kind::Rar {
+        return Err(RAR.to_string());
+    }
+    if super::split_base(archive).is_some() {
+        return Err(SPLIT.to_string());
+    }
     for dir in folders_named(change) {
         if !resolve(archive, &dir).is_ok_and(|(real, _)| real == archive) {
             return Err(NESTED.to_string());
@@ -94,9 +104,10 @@ pub fn change(archive: &str, change: &Change, stop: &AtomicBool) -> Result<Optio
     let written = File::options().write(true).open(&new).map_err(|e| write_error(&new, &e)).and_then(|file| match kind {
         Kind::Zip => match &mut opened {
             Opened::Zip(zip) => write_zip(archive, zip, &items, &outs, &disk, file, &new),
-            Opened::SevenZ(..) => Err("This isn't a zip file.".to_string()),
+            _ => Err("This isn't a zip file.".to_string()),
         },
         Kind::SevenZ => write_7z(archive, &mut opened, &items, &outs, &disk, file, &new),
+        Kind::Rar => Err(RAR.to_string()),
     });
     // The archive is closed before it's moved away.
     drop(opened);
@@ -476,7 +487,7 @@ fn in_use(archive: &Path, e: &io::Error) -> String {
 
 /// The new zip: items that stay are copied as they're packed (renamed when they moved), new ones
 /// are packed with Deflate as Compress to zip packs them.
-fn write_zip(archive: &str, zip: &mut zip::ZipArchive<BufReader<File>>, items: &[Item], outs: &[Out], disk: &Packing, file: File, out: &Path) -> Result<(), String> {
+fn write_zip(archive: &str, zip: &mut zip::ZipArchive<BufReader<super::Source>>, items: &[Item], outs: &[Out], disk: &Packing, file: File, out: &Path) -> Result<(), String> {
     use zip::write::SimpleFileOptions;
     let zip_error = |e: zip::result::ZipError| match e {
         zip::result::ZipError::Io(e) => write_error(out, &e),
@@ -503,7 +514,7 @@ fn write_zip(archive: &str, zip: &mut zip::ZipArchive<BufReader<File>>, items: &
     let mut w = zip::ZipWriter::new(BufWriter::new(file)).set_auto_large_file();
     let _ = w.set_raw_comment(comment.into_boxed_slice());
     // For entries the zip library has no index for: the file, read from each one's own header.
-    let mut direct: Option<BufReader<File>> = None;
+    let mut direct: Option<BufReader<super::Source>> = None;
     let mut buf = vec![0u8; 256 * 1024];
     for o in outs {
         let name = o.path.replace('\\', "/");
@@ -526,7 +537,7 @@ fn write_zip(archive: &str, zip: &mut zip::ZipArchive<BufReader<File>>, items: &
                     }
                     Some(at) => {
                         if direct.is_none() {
-                            direct = Some(BufReader::new(File::open(archive).map_err(|e| open_error(&e))?));
+                            direct = Some(BufReader::new(super::Source::open(archive).map_err(|e| open_error(&e))?));
                         }
                         let Some(source) = direct.as_mut() else { continue };
                         source.seek(io::SeekFrom::Start(at.header)).map_err(|e| damaged(zip::result::ZipError::Io(e)))?;
@@ -593,7 +604,7 @@ fn write_7z(archive: &str, opened: &mut Opened, items: &[Item], outs: &[Out], di
             plan.total += packed.size;
             plan.items.push(packed);
         }
-        super::pack_7z(&plan, file, out, &meter)
+        super::pack_7z(&plan, file, out, None, &meter)
     })();
     let _ = std::fs::remove_dir_all(&tmp);
     result

@@ -571,7 +571,6 @@ impl CommandBox {
             r.fill_rect(Rect::new(x + 2.0, y + 3.0, w, h), Color::rgba(0, 0, 0, 0.25));
             r.fill_rect(self.panel.inset(-1.0, -1.0), theme.line);
             r.fill_rect(self.panel, theme.toolbar);
-            r.fill_rect(Rect::new(x, y, w, 2.0), theme.accent);
         }
 
         let field = Rect::new(x + PAD, y + PAD, w - 2.0 * PAD, FIELD_H);

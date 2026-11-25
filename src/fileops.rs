@@ -77,8 +77,9 @@ pub enum Job {
     /// folder `at`: these items there (paths inside it), or none for the whole archive `at` is in,
     /// go into the real folder `dest`. Never replaces anything.
     ExtractInto { archive: String, at: String, items: Vec<String>, dest: String },
-    /// Pack these items (all of one folder) into a new .zip or .7z next to them (Compress to zip).
-    Compress { paths: Vec<String>, format: crate::archive::Format },
+    /// Pack these items (all of one folder) into a new .zip or .7z next to them (Compress to zip),
+    /// locked with a password when there is one, and cut into parts or not (Compress…).
+    Compress { paths: Vec<String>, format: crate::archive::Format, password: Option<Secret>, split: Split },
     /// Change what's inside the .zip or .7z `archive` (archive.rs), in the copy queue. `recycle`:
     /// items moved into it, sent to the Recycle Bin once they're in.
     ArchiveChange { archive: String, change: crate::archive::Change, recycle: Vec<String> },
@@ -91,6 +92,16 @@ pub enum Job {
     /// Ctrl+Z or Ctrl+Y of a change to an archive (undo.rs): it's swapped with its other version;
     /// `restore` come back from the Recycle Bin, and `recycle` go to it.
     ArchiveSwap { archive: String, other: String, restore: Vec<String>, recycle: Vec<String>, expect: u64 },
+}
+
+/// A password, kept out of anything that prints a job (the log, a crash report): it shows as dots.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\u{2022}\u{2022}\u{2022}")
+    }
 }
 
 /// What dropping items into a folder does (Explorer's rules decide which: dragdrop.rs).
@@ -149,6 +160,9 @@ pub struct Outcome {
     /// What was done, so Ctrl+Z can undo it (undo.rs). None when nothing was done, or it can't be
     /// undone (deleted for good).
     pub undo: Option<crate::undo::Step>,
+    /// It stopped because an archive needs a password (or the one typed was wrong): the window
+    /// asks for it, then runs the job again.
+    pub ask: Option<(crate::archive::Ask, Box<Job>)>,
 }
 
 impl Outcome {
@@ -231,6 +245,18 @@ impl Drop for FinishOnExit {
 }
 
 fn run(job: Job) -> Outcome {
+    // Jobs that take things out of an archive can stop for its password: kept to run again.
+    let again = matches!(job, Job::Extract { .. } | Job::ExtractInto { .. } | Job::TakeOut { .. }).then(|| job.clone());
+    let _ = crate::archive::take_ask();
+    let mut out = run_job(job);
+    let ask = crate::archive::take_ask();
+    if let (Some(ask), Some(again)) = (ask, again) {
+        out.ask = Some((ask, Box::new(again)));
+    }
+    out
+}
+
+fn run_job(job: Job) -> Outcome {
     match job {
         Job::Paste { dest } => paste(&dest),
         Job::Delete { paths, recycle } => delete(&paths, recycle),
@@ -245,7 +271,7 @@ fn run(job: Job) -> Outcome {
         Job::Restore { paths } => crate::recycle::restore_paths(&paths),
         Job::Extract { archive, own_folder } => extract(&archive, own_folder),
         Job::ExtractInto { archive, at, items, dest } => extract_into(&archive, &at, &items, &dest),
-        Job::Compress { paths, format } => compress(&paths, format),
+        Job::Compress { paths, format, password, split } => compress(&paths, format, password.as_ref().map(|p| p.0.as_str()), split),
         Job::ArchiveChange { archive, change, recycle } => archive_change(&archive, &change, &recycle),
         Job::PasteIntoArchive { archive, into } => paste_into_archive(&archive, &into),
         Job::TakeOut { archive, items, dest } => take_out(&archive, &items, &dest),
@@ -583,9 +609,17 @@ fn extract_into(archive: &str, at: &str, items: &[String], dest: &str) -> Outcom
     Outcome { ok: result.is_ok(), changed: vec![dest.to_string()], created: Some((dest.to_string(), names)), undo, note: Some(note), ..Default::default() }
 }
 
+/// How Compress… cuts the new archive: into this many parts of the same size (1: not at all), or
+/// into parts of at most this many bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Split {
+    Files(u32),
+    Size(u64),
+}
+
 /// Compress to zip / 7z (see [`Job::Compress`]), in the copy queue: one new archive next to the
 /// first item, named after it (or after its folder, for several), numbered when that's taken.
-fn compress(paths: &[String], format: crate::archive::Format) -> Outcome {
+fn compress(paths: &[String], format: crate::archive::Format, password: Option<&str>, split: Split) -> Outcome {
     let Some(dir) = paths.first().and_then(|p| parent(p)).filter(|d| !d.is_empty()) else { return Outcome::note("Select what to compress first.") };
     let what = items_text(paths);
     let cancelled_note = format!("Cancelled: {what} {} compressed.", if paths.len() == 1 { "wasn't" } else { "weren't" });
@@ -600,28 +634,61 @@ fn compress(paths: &[String], format: crate::archive::Format) -> Outcome {
     if !ticket.wait_turn() {
         return Outcome::note(cancelled_note);
     }
-    let name = unique_name(&crate::archive::pack_name(paths), format.ext(), |n| exists(&join(&dir, n)));
+    // (Cut into parts, the name must be free for each part too; by size, how many isn't known yet,
+    // so for the first few.)
+    let check = match split {
+        Split::Files(1) => 0,
+        Split::Files(n) => n,
+        Split::Size(_) => 3,
+    };
+    let name = unique_name(&crate::archive::pack_name(paths), format.ext(), |n| {
+        exists(&join(&dir, n)) || crate::archive::part_names(n, check).iter().any(|p| exists(&join(&dir, p)))
+    });
     let out = join(&dir, &name);
-    let result = crate::archive::pack(&plan, &out, format);
+    let mut result = crate::archive::pack_with(&plan, &out, format, password);
+    let mut made = vec![name.clone()];
+    if result.is_ok() && !ticket.cancel_flag().load(std::sync::atomic::Ordering::SeqCst) {
+        let cutting = match split {
+            Split::Files(1) => Ok(vec![out.clone()]),
+            Split::Files(n) => crate::archive::cut_into_parts(&out, n),
+            Split::Size(size) => crate::archive::cut_by_size(&out, size),
+        };
+        match cutting {
+            Ok(cut) => made = cut.iter().map(|p| crate::folder::file_name(p).to_string()).collect(),
+            Err(why) => {
+                let _ = std::fs::remove_file(&out);
+                result = Err(why);
+            }
+        }
+    }
     let cancelled = ticket.cancel_flag().load(std::sync::atomic::Ordering::SeqCst);
     drop(ticket);
     let changed = vec![dir.clone()];
     if cancelled {
         // (pack removed the half-made file. One finished just as CANCEL was clicked goes too.)
         if result.is_ok() {
-            let _ = std::fs::remove_file(&out);
+            for n in &made {
+                let _ = std::fs::remove_file(join(&dir, n));
+            }
         }
         return Outcome { changed, note: Some(cancelled_note), ..Default::default() };
     }
     match result {
-        Ok(()) => Outcome {
-            ok: true,
-            changed,
-            created: Some((dir, vec![name.clone()])),
-            undo: Some(crate::undo::Step::Made { paths: vec![out], what: "new archive" }),
-            note: Some(format!("Compressed {what} to \u{201c}{name}\u{201d}")),
-            ..Default::default()
-        },
+        Ok(()) => {
+            let note = match made.as_slice() {
+                [one] => format!("Compressed {what} to \u{201c}{one}\u{201d}"),
+                [first, .., last] => format!("Compressed {what} to {} parts, \u{201c}{first}\u{201d} to \u{201c}{last}\u{201d}", made.len()),
+                [] => format!("Compressed {what}"),
+            };
+            Outcome {
+                ok: true,
+                changed,
+                undo: Some(crate::undo::Step::Made { paths: made.iter().map(|n| join(&dir, n)).collect(), what: "new archive" }),
+                created: Some((dir, made)),
+                note: Some(note),
+                ..Default::default()
+            }
+        }
         Err(why) => Outcome { changed, note: Some(format!("Failed to compress {what}: {why}")), ..Default::default() },
     }
 }
@@ -2094,13 +2161,13 @@ mod tests {
         std::fs::write(join(&docs, "a.txt"), b"alpha").unwrap();
         std::fs::write(join(&join(&docs, "inner"), "b.txt"), b"beta").unwrap();
         // One folder: named after it; taken, so numbered.
-        let first = compress(&[docs.clone()], Format::Zip);
+        let first = compress(&[docs.clone()], Format::Zip, None, Split::Files(1));
         assert!(first.ok, "{:?}", first.note);
         assert_eq!(first.created, Some((dir.clone(), vec!["Docs.zip".to_string()])));
         assert_eq!(first.undo, Some(crate::undo::Step::Made { paths: vec![join(&dir, "Docs.zip")], what: "new archive" }));
-        assert_eq!(compress(&[docs.clone()], Format::Zip).created.unwrap().1, ["Docs (2).zip"]);
+        assert_eq!(compress(&[docs.clone()], Format::Zip, None, Split::Files(1)).created.unwrap().1, ["Docs (2).zip"]);
         // Several items: named after their folder.
-        let seven = compress(&[join(&docs, "a.txt"), join(&docs, "inner")], Format::SevenZ);
+        let seven = compress(&[join(&docs, "a.txt"), join(&docs, "inner")], Format::SevenZ, None, Split::Files(1));
         assert_eq!(seven.created, Some((docs.clone(), vec!["Docs.7z".to_string()])));
 
         // Extract to: "Docs" is taken (by the folder itself), so "Docs (2)".
@@ -2124,6 +2191,41 @@ mod tests {
     }
 
     #[test]
+    fn compress_into_parts_makes_numbered_parts_and_takes_them_all_back() {
+        use crate::archive::Format;
+        let dir = scratch("compress-parts");
+        let docs = join(&dir, "Docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        let noise: Vec<u8> = (0..200_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        std::fs::write(join(&docs, "a.bin"), &noise).unwrap();
+        let made = compress(&[docs.clone()], Format::SevenZ, Some("pw"), Split::Files(3));
+        assert!(made.ok, "{:?}", made.note);
+        let names = vec!["Docs.7z.001".to_string(), "Docs.7z.002".to_string(), "Docs.7z.003".to_string()];
+        assert_eq!(made.created, Some((dir.clone(), names.clone())));
+        assert_eq!(made.note.as_deref(), Some("Compressed \u{201c}Docs\u{201d} to 3 parts, \u{201c}Docs.7z.001\u{201d} to \u{201c}Docs.7z.003\u{201d}"));
+        assert_eq!(made.undo, Some(crate::undo::Step::Made { paths: names.iter().map(|n| join(&dir, n)).collect(), what: "new archive" }));
+        assert!(!exists(&join(&dir, "Docs.7z")));
+        // Again: the name is taken by the parts, so numbered.
+        assert_eq!(compress(&[docs.clone()], Format::SevenZ, None, Split::Files(2)).created.unwrap().1, ["Docs (2).7z.001", "Docs (2).7z.002"]);
+        // Extract to from the first part: the folder is named without ".7z.001".
+        crate::archive::set_password(&join(&dir, "Docs.7z.001"), "pw");
+        let to = extract(&join(&dir, "Docs.7z.001"), true);
+        assert!(to.ok, "{:?}", to.note);
+        assert_eq!(to.created, Some((dir.clone(), vec!["Docs (2)".to_string()])));
+        assert_eq!(std::fs::read(join(&join(&join(&dir, "Docs (2)"), "Docs"), "a.bin")).unwrap(), noise);
+        // By size: parts of at most 1 KB, the last one smaller.
+        let by = compress(&[docs.clone()], Format::Zip, None, Split::Size(1024));
+        assert!(by.ok, "{:?}", by.note);
+        let parts = by.created.unwrap().1;
+        assert!(parts.len() >= 2 && parts[0] == "Docs.zip.001", "{parts:?}");
+        for p in &parts[..parts.len() - 1] {
+            assert_eq!(std::fs::metadata(join(&dir, p)).unwrap().len(), 1024, "{p}");
+        }
+        // Small enough for one: just the one file.
+        assert_eq!(compress(&[docs.clone()], Format::Zip, None, Split::Size(1 << 30)).created.unwrap().1, ["Docs (2).zip"]);
+    }
+
+    #[test]
     fn extract_selected_and_all_put_things_in_the_folder_picked() {
         use crate::archive::Format;
         let dir = scratch("extract-into");
@@ -2131,7 +2233,7 @@ mod tests {
         std::fs::create_dir_all(join(&docs, "inner")).unwrap();
         std::fs::write(join(&docs, "a.txt"), b"alpha").unwrap();
         std::fs::write(join(&join(&docs, "inner"), "b.txt"), b"beta").unwrap();
-        assert!(compress(&[docs.clone()], Format::Zip).ok);
+        assert!(compress(&[docs.clone()], Format::Zip, None, Split::Files(1)).ok);
         let zip = join(&dir, "Docs.zip");
         let dest = join(&dir, "Out #1");
         std::fs::create_dir(&dest).unwrap();
@@ -2171,7 +2273,7 @@ mod tests {
         std::fs::create_dir_all(&docs).unwrap();
         // (A name no other test extracts: the copy queue is shared, so the cancel finds only this job.)
         std::fs::write(join(&docs, "wait here.txt"), b"alpha").unwrap();
-        assert!(compress(&[docs.clone()], Format::SevenZ).ok);
+        assert!(compress(&[docs.clone()], Format::SevenZ, None, Split::Files(1)).ok);
         let dest = join(&dir, "dest");
         std::fs::create_dir(&dest).unwrap();
         let running = crate::copyqueue::Ticket::join("extract-into-cancel: the job before".into());
@@ -2198,7 +2300,7 @@ mod tests {
         std::fs::write(join(&docs, "a.txt"), b"alpha").unwrap();
         std::fs::write(join(&join(&docs, "inner"), "b.txt"), b"beta").unwrap();
         for format in [Format::Zip, Format::SevenZ] {
-            let made = compress(&[docs.clone()], format);
+            let made = compress(&[docs.clone()], format, None, Split::Files(1));
             let archive = join(&dir, &made.created.unwrap().1[0]);
             let before = std::fs::read(&archive).unwrap();
             let out = run(Job::ArchiveChange { archive: archive.clone(), change: Change::Rename { from: "Docs\\inner".into(), name: "Inside".into() }, recycle: Vec::new() });

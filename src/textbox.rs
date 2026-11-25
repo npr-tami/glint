@@ -524,6 +524,17 @@ impl TextBox {
         SETTING.with(|s| s.set(false));
     }
 
+    /// Shows dots instead of what's typed (a password), or the text again. Copying and cutting out
+    /// of it then do nothing, as in any Windows password box.
+    pub fn set_secret(&self, secret: bool) {
+        const EM_SETPASSWORDCHAR: u32 = 0x00CC;
+        // SAFETY: plain messages to our own child.
+        unsafe {
+            SendMessageW(self.hwnd, EM_SETPASSWORDCHAR, Some(WPARAM(if secret { 0x25CF } else { 0 })), Some(LPARAM(0)));
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(self.hwnd), None, true);
+        }
+    }
+
     pub fn select_all(&self) {
         // SAFETY: plain message to our own child.
         unsafe {
@@ -600,6 +611,12 @@ fn is_paste(msg: u32, wparam: WPARAM) -> bool {
 /// that wants it (`post` tells Enter). False for text that needs no tidying, or no text: the box's
 /// own paste does it then.
 fn pasted(hwnd: HWND, data: usize, post: impl Fn(TextEventKind)) -> bool {
+    // A password goes in as it was copied, spaces and all (the box's own paste).
+    const EM_GETPASSWORDCHAR: u32 = 0x00D2;
+    // SAFETY: plain message to our own child.
+    if unsafe { SendMessageW(hwnd, EM_GETPASSWORDCHAR, None, None) }.0 != 0 {
+        return false;
+    }
     let tidy = crate::codebox::clipboard_text(hwnd).as_deref().and_then(tidy_paste);
     let Some((line, whole)) = tidy else { return false };
     if line.is_empty() {

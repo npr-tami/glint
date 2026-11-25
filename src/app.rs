@@ -470,7 +470,8 @@ enum Loaded {
     /// A folder open in a tab's tree view was read (app/tree.rs).
     Branch { tab_id: u64, key: String, generation: u64, folder: Folder },
     /// Items taken out of a .zip or .7z, to open or to copy (app/files.rs `extract_then`).
-    Extracted { result: Result<Vec<String>, String>, then: Then },
+    /// `ask`: it stopped for an archive's password (which one, and what to take out again).
+    Extracted { result: Result<Vec<String>, String>, then: Then, ask: Option<(crate::archive::Ask, String, Vec<String>)> },
     /// The total size of a folder in a tab's listing (foldersize.rs).
     FolderSize { tab_id: u64, dir: String, bytes: u64 },
     /// The files of a tab's duplicates list that are gone after a file job (app/files.rs).
@@ -1160,6 +1161,7 @@ impl AppState {
             Command::Extract { own_folder } => self.extract_archive(own_folder),
             Command::ExtractInside { all } => self.extract_inside(all),
             Command::Compress(format) => self.compress(format),
+            Command::CompressAsk => self.ask_pack(),
             Command::TagSelected(tag) => self.tag_selected(Some(tag)),
             Command::UntagSelected => self.tag_selected(None),
             _ => return false,
@@ -1626,8 +1628,8 @@ impl AppState {
                         changed = true;
                     }
                 }
-                Loaded::Extracted { result, then } => {
-                    self.extracted(result, then);
+                Loaded::Extracted { result, then, ask } => {
+                    self.extracted(result, then, ask);
                     changed = true;
                 }
                 Loaded::BinChanged => {
@@ -1638,6 +1640,7 @@ impl AppState {
                     changed |= self.branch_read(tab_id, &key, generation, folder);
                 }
                 Loaded::Folder { tab_id, generation, folder, finished } => {
+                    let on_screen = self.tabs.get(self.active).is_some_and(|a| a.id == tab_id);
                     let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab_id) else { continue };
                     let Some(p) = t.loading.take_if(|p| p.generation == generation) else { continue };
                     let opens_file = t.opens_file.take();
@@ -1669,6 +1672,9 @@ impl AppState {
                         continue;
                     }
                     let applying = Instant::now();
+                    // Looking into an archive that needs its password first: asked for, and read
+                    // again with it (on the tab on screen only; another tab says so in its list).
+                    let ask = folder.ask.clone().filter(|_| on_screen);
                     apply_listing(t, folder);
                     // "Opened in": reading on the background thread + sorting here. Time the result
                     // spent waiting for the UI thread (only at start-up, while the window is being
@@ -1685,6 +1691,9 @@ impl AppState {
                     if t.folder.error.is_some() {
                         self.watcher.let_go(t.id); // it may be being deleted (see watch.rs)
                         self.split_watch.let_go(t.id);
+                    }
+                    if let Some(ask) = ask {
+                        self.ask_password(ask, forms::Retry::Reload(tab_id));
                     }
                     changed = true;
                 }
@@ -2709,6 +2718,27 @@ mod tests {
 
     fn listing(names: &[&str]) -> Folder {
         Folder { path: "C:\\x".into(), entries: names.iter().map(|n| file(n)).collect(), ..Default::default() }
+    }
+
+    #[test]
+    fn cancel_after_a_wrong_password_takes_back_what_was_said() {
+        let mut app = AppState::for_tests(Settings::default());
+        let wrong = "Wrong password for \u{201c}a.7z\u{201d}.";
+        app.tabs[0].folder.error = Some(wrong.to_string());
+        app.say(wrong);
+        let ask = crate::archive::Ask { archive: "C:\\a.7z".into(), name: "a.7z".into(), wrong: true };
+        app.ask_password(ask, forms::Retry::Reload(app.tabs[0].id));
+        assert!(app.form.is_some());
+        assert!(app.form_answer(None));
+        assert!(app.form.is_none());
+        assert_eq!(app.note(), None);
+        assert_eq!(app.tabs[0].folder.error.as_deref(), Some("\u{201c}a.7z\u{201d} has a password."));
+        // Another note stays.
+        app.say("Copied 3 items.");
+        let ask = crate::archive::Ask { archive: "C:\\a.7z".into(), name: "a.7z".into(), wrong: true };
+        app.ask_password(ask, forms::Retry::Reload(app.tabs[0].id));
+        app.form_answer(None);
+        assert_eq!(app.note(), Some("Copied 3 items."));
     }
 
     #[test]

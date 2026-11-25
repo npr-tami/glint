@@ -25,7 +25,7 @@ use crate::ui::MenuAbout;
 /// The status-bar note for file commands in This PC.
 pub const THIS_PC_NOTE: &str = "This PC only holds drives. Open a drive or folder first.";
 /// The status-bar note for what can't be done inside a .zip or .7z.
-pub const ARCHIVE_NOTE: &str = "That can't be done inside a zip or 7z file.";
+pub const ARCHIVE_NOTE: &str = "That can't be done inside a zip, 7z or rar file.";
 
 /// How long a name box waits for its item to turn up in the list (a new folder being read).
 const RENAME_WAIT: Duration = Duration::from_secs(3);
@@ -191,8 +191,10 @@ impl AppState {
         let (tx, hwnd) = (self.tx.clone(), self.hwnd.clone());
         let started = crate::shell::background("take out of archive", move || {
             let _com = crate::shell::ComGuard::init();
+            let _ = crate::archive::take_ask();
             let result = crate::archive::temp_dir_for(&archive).and_then(|dir| crate::archive::extract(&archive, &items, &dir));
-            if tx.send(Loaded::Extracted { result, then }).is_ok() {
+            let ask = crate::archive::take_ask().map(|ask| (ask, archive, items));
+            if tx.send(Loaded::Extracted { result, then, ask }).is_ok() {
                 wake(&hwnd);
             }
         });
@@ -203,7 +205,19 @@ impl AppState {
     }
 
     /// Items taken out of an archive arrived (see `extract_then`).
-    pub(super) fn extracted(&mut self, result: Result<Vec<String>, String>, then: super::Then) {
+    pub(super) fn extracted(&mut self, result: Result<Vec<String>, String>, then: super::Then, ask: Option<(crate::archive::Ask, String, Vec<String>)>) {
+        if let Some((ask, archive, items)) = ask {
+            if let super::Then::Copy(turn) = then {
+                if turn != self.clip_turn {
+                    return;
+                }
+                self.taking_out = false;
+            }
+            if let Err(why) = &result {
+                self.say(why.clone());
+            }
+            return self.ask_password(ask, super::forms::Retry::TakeOut { archive, items, then });
+        }
         if let super::Then::Copy(turn) = then {
             // (Copied or cut again meanwhile: that's what's on the clipboard now.)
             if turn != self.clip_turn {
@@ -248,7 +262,7 @@ impl AppState {
             [i] => Some(&t.folder.entries[*i]).filter(|e| e.kind == EntryKind::File && crate::archive::is_archive_name(&e.name)).map(|e| e.path_in(&t.folder.path)),
             _ => None,
         };
-        let Some(archive) = archive else { return self.say("Select one zip or 7z file first.") };
+        let Some(archive) = archive else { return self.say("Select one zip, 7z or rar file first.") };
         let after = AfterJob::new(self.tab().id);
         self.start_job(Job::Extract { archive, own_folder }, after);
     }
@@ -290,7 +304,7 @@ impl AppState {
             return self.say("Select what to compress first.");
         }
         let after = AfterJob::new(self.tab().id);
-        self.start_job(Job::Compress { paths, format }, after);
+        self.start_job(Job::Compress { paths, format, password: None, split: crate::fileops::Split::Files(1) }, after);
     }
 
     /// Ctrl+C / Ctrl+X: the selected items go on the clipboard as files, to be pasted here, in
@@ -642,6 +656,10 @@ impl AppState {
     pub(super) fn after_file_op(&mut self, after: AfterJob, mut outcome: Outcome) {
         if outcome.moved_cut {
             self.cut = None;
+        }
+        // An archive wants its password: asked for, then the job runs again.
+        if let Some((ask, job)) = outcome.ask.take() {
+            self.ask_password(ask, super::forms::Retry::Job(job, after.clone()));
         }
         // A folder Glint renamed or moved (cut and paste): tabs inside it (and Back / Forward)
         // follow it, as they do when it's renamed elsewhere (watch.rs). Done before this job's own step

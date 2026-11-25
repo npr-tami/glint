@@ -27,7 +27,46 @@ pub struct Form {
     pub fields: Vec<Field>,
     /// The yes button's label ("SAVE").
     pub yes: &'static str,
+    /// A two-way switch above the boxes (ZIP / 7Z), when the form has one.
+    pub choice: Option<Choice>,
+    /// A slider under the boxes (Split into), when the form has one.
+    pub slider: Option<Slider>,
+    /// A second switch under the boxes (Split by: FILES / SIZE): side 1 swaps the slider for the
+    /// sizes. Its side comes after the slider's number in the values.
+    pub by: Option<Choice>,
+    /// Sizes to pick from (Each file: 25 MB...) and a box to type your own. The one picked comes
+    /// next in the values (the own box is the number after the last chip), then the own box's text.
+    pub sizes: Option<Sizes>,
     kind: Kind,
+}
+
+/// A form's sizes to pick from (see `Form::sizes`).
+pub struct Sizes {
+    pub label: &'static str,
+    pub chips: &'static [&'static str],
+    pub start: usize,
+    /// The own box's unit, shown in it ("MB"), and its faint text when empty.
+    pub unit: &'static str,
+    pub own_hint: &'static str,
+}
+
+/// A form's slider: its label, the lowest and highest number, and the one it starts on. The number
+/// picked comes last in the form's values ("3").
+pub struct Slider {
+    pub label: &'static str,
+    pub min: u32,
+    pub max: u32,
+    pub start: u32,
+    /// What the number counts, one and more ("file", "files"), shown after it.
+    pub units: [&'static str; 2],
+}
+
+/// A form's two-way switch: its label, its two sides, and which is on at first. What's picked comes
+/// after the boxes' text in the form's values ("0" or "1").
+pub struct Choice {
+    pub label: &'static str,
+    pub sides: [&'static str; 2],
+    pub start: usize,
 }
 
 /// One text box of a form.
@@ -39,6 +78,8 @@ pub struct Field {
     pub start: String,
     /// A faint line under the box saying how to fill it in ("" for none).
     pub note: &'static str,
+    /// Shows dots instead of what's typed (a password).
+    pub secret: bool,
 }
 
 /// What a form's typing would do, for its preview.
@@ -51,6 +92,8 @@ pub struct Preview {
     pub list: Vec<(String, String)>,
     /// Why it can't be done as typed (shown in the accent colour; yes does nothing).
     pub problem: Option<String>,
+    /// Something to know that doesn't stop yes ("Wrong password. Try again."), in the accent colour.
+    pub alert: Option<String>,
     /// Something would happen (otherwise yes does nothing, without a problem to say).
     pub ready: bool,
 }
@@ -60,18 +103,72 @@ enum Kind {
     /// The items to rename: their full paths, in the order they're shown (the numbers follow it),
     /// and whether each is a folder (folders have no extension to keep).
     RenameMany { paths: Vec<String>, folders: Vec<bool> },
+    /// The password for an archive, then what wanted it is done again.
+    Password { ask: crate::archive::Ask, retry: Retry },
+    /// Compress…: these items into a new zip or 7z, with a password or not, in parts or not.
+    Pack { paths: Vec<String> },
+}
+
+/// What to do again once an archive's password is typed.
+pub(super) enum Retry {
+    /// Read the tab with this id again (it was looking into the archive).
+    Reload(u64),
+    /// Take these items out of the archive again, and then this (open, copy...).
+    TakeOut { archive: String, items: Vec<String>, then: super::Then },
+    /// Run this job again (Extract here...).
+    Job(Box<Job>, AfterJob),
+    /// Nothing to do again by itself (a drag): say how to go on.
+    Say(&'static str),
 }
 
 impl AppState {
     fn open_form(&mut self, title: String, fields: Vec<Field>, yes: &'static str, kind: Kind) {
         self.next_question += 1;
-        self.form = Some(Form { id: self.next_question, title, fields, yes, kind });
+        self.form = Some(Form { id: self.next_question, title, fields, yes, choice: None, slider: None, by: None, sizes: None, kind });
+    }
+
+    /// Asks for the password `ask` wants (the archive's name in the title; "Wrong password" under
+    /// the box when the one typed was wrong), then does `retry`. Another form already open stays:
+    /// then the error already on the status bar has to do.
+    pub(super) fn ask_password(&mut self, ask: crate::archive::Ask, retry: Retry) {
+        if self.form.is_some() || self.question.is_some() {
+            return;
+        }
+        let title = format!("\u{201c}{}\u{201d} has a password", ask.name);
+        let fields = vec![Field { label: "Password", hint: "", start: String::new(), note: "", secret: true }];
+        self.open_form(title, fields, "OPEN", Kind::Password { ask, retry });
+    }
+
+    /// A drag out of a locked archive stopped for its password: asked for, then it's dragged again
+    /// by hand.
+    pub fn ask_password_to_drag(&mut self, ask: crate::archive::Ask) {
+        self.ask_password(ask, Retry::Say("Now drag it out again."));
+    }
+
+    /// Right-click > Compress…: zip or 7z, a password (none when it's left empty; its SHOW button
+    /// lets you read what you typed), and how many parts of the same size (1: one file).
+    pub(super) fn ask_pack(&mut self) {
+        if !self.files_here() {
+            return;
+        }
+        let paths = self.chosen();
+        if paths.is_empty() {
+            return self.say("Select what to compress first.");
+        }
+        let fields = vec![Field { label: "Password", hint: "", start: String::new(), note: "Leave empty for no password.", secret: true }];
+        self.open_form("Compress".into(), fields, "COMPRESS", Kind::Pack { paths });
+        if let Some(f) = self.form.as_mut() {
+            f.choice = Some(Choice { label: "Type", sides: ["ZIP", "7Z"], start: 0 });
+            f.slider = Some(Slider { label: "Split into", min: 1, max: MOST_PARTS, start: 1, units: ["file", "files"] });
+            f.by = Some(Choice { label: "Split by", sides: ["FILES", "SIZE"], start: 0 });
+            f.sizes = Some(Sizes { label: "Each file", chips: &SIZE_NAMES, start: 3, unit: "MB", own_hint: "Own" });
+        }
     }
 
     /// "Save tabs as a set…": asks for a name.
     pub(super) fn ask_tab_set_name(&mut self) {
         let start = self.tab_set_suggestion();
-        self.open_form("Save these tabs as a set".into(), vec![Field { label: "Name", hint: "Work", start, note: "" }], "SAVE", Kind::SaveTabs);
+        self.open_form("Save these tabs as a set".into(), vec![Field { label: "Name", hint: "Work", start, note: "", secret: false }], "SAVE", Kind::SaveTabs);
     }
 
     /// The name offered for a new set: "Set 1", "Set 2"…
@@ -93,9 +190,9 @@ impl AppState {
         let folders = chosen.iter().map(|&i| t.folder.entries[i].is_container()).collect();
         let title = format!("Rename {} items", paths.len());
         let fields = vec![
-            Field { label: "New name", hint: "Holiday #", start: String::new(), note: "Use # for sequential numbers, for example Photo # \u{2192} Photo 1, Photo 2." },
-            Field { label: "Find", hint: "", start: String::new(), note: "" },
-            Field { label: "Replace with", hint: "", start: String::new(), note: THEN_FIND },
+            Field { label: "New name", hint: "Holiday #", start: String::new(), note: "Use # for sequential numbers, for example Photo # \u{2192} Photo 1, Photo 2.", secret: false },
+            Field { label: "Find", hint: "", start: String::new(), note: "", secret: false },
+            Field { label: "Replace with", hint: "", start: String::new(), note: THEN_FIND, secret: false },
         ];
         self.open_form(title, fields, "RENAME", Kind::RenameMany { paths, folders });
     }
@@ -112,7 +209,7 @@ impl AppState {
                 if self.settings.tab_sets.iter().any(|s| s.name.eq_ignore_ascii_case(name)) {
                     lines.push(format!("Replaces the set called \u{201c}{name}\u{201d}"));
                 }
-                Preview { lines, list: Vec::new(), problem: None, ready: !name.is_empty() }
+                Preview { lines, ready: !name.is_empty(), ..Default::default() }
             }
             Kind::RenameMany { paths, folders } => {
                 let names: Vec<&str> = paths.iter().map(|p| file_name(p)).collect();
@@ -122,7 +219,7 @@ impl AppState {
                     lines.push(NUMBER_ADDED.into());
                 }
                 match new_names(&names, folders, value(0), value(1), value(2)) {
-                    Err(problem) => Preview { lines, list: Vec::new(), problem: Some(problem), ready: false },
+                    Err(problem) => Preview { lines, problem: Some(problem), ..Default::default() },
                     Ok(new) => {
                         let list: Vec<(String, String)> = names.iter().zip(&new).filter(|(a, b)| **a != b.as_str()).map(|(a, b)| (a.to_string(), b.clone())).collect();
                         let problem = self.taken_name(paths, &new);
@@ -130,9 +227,20 @@ impl AppState {
                             lines.push("Nothing changes yet".into());
                         }
                         let ready = !list.is_empty();
-                        Preview { lines, list, problem, ready }
+                        Preview { lines, list, problem, ready, alert: None }
                     }
                 }
+            }
+            Kind::Password { ask, .. } => Preview { ready: !value(0).is_empty(), alert: ask.wrong.then(|| "Wrong password. Try again.".to_string()), ..Default::default() },
+            Kind::Pack { paths } => {
+                let name = format!("{}{}", crate::archive::pack_name(paths), pack_format(value(1)).ext());
+                let line = match pack_split(value(2), value(3), value(4), value(5)) {
+                    Ok(crate::fileops::Split::Files(1)) => name,
+                    Ok(crate::fileops::Split::Files(n)) => format!("{name}.001 to {name}.{n:03}"),
+                    Ok(crate::fileops::Split::Size(_)) => format!("{name}.001, .002\u{2026} each up to {}", size_name(value(4), value(5))),
+                    Err(problem) => return Preview { lines: vec![name], problem, ..Default::default() },
+                };
+                Preview { lines: vec![line], ready: true, ..Default::default() }
             }
         }
     }
@@ -151,6 +259,20 @@ impl AppState {
     /// The form's yes (`values`) or no (None). True when the form is done and closes.
     pub fn form_answer(&mut self, values: Option<Vec<String>>) -> bool {
         let Some(values) = values else {
+            // CANCEL after a wrong password: what was said about it goes, so it doesn't stay up
+            // as if Glint were still trying (the list says the archive has a password instead).
+            if let Some(Form { kind: Kind::Password { ask, .. }, .. }) = self.form.take() {
+                let wrong = format!("Wrong password for \u{201c}{}\u{201d}.", ask.name);
+                if self.note() == Some(wrong.as_str()) {
+                    self.note = None;
+                }
+                let locked = format!("\u{201c}{}\u{201d} has a password.", ask.name);
+                for t in &mut self.tabs {
+                    if t.folder.error.as_deref() == Some(wrong.as_str()) {
+                        t.folder.error = Some(locked.clone());
+                    }
+                }
+            }
             self.form = None;
             return true;
         };
@@ -160,6 +282,32 @@ impl AppState {
         let Some(form) = self.form.take() else { return true };
         let value = |i: usize| values.get(i).map(String::as_str).unwrap_or("");
         match form.kind {
+            Kind::Password { ask, retry } => {
+                crate::archive::set_password(&ask.archive, value(0));
+                match retry {
+                    Retry::Reload(tab_id) => {
+                        if let Some(i) = self.tabs.iter().position(|t| t.id == tab_id) {
+                            self.start_load(i);
+                        }
+                    }
+                    Retry::TakeOut { archive, items, then } => {
+                        let started = self.extract_then(archive, items, then);
+                        if let super::Then::Copy(_) = then {
+                            self.taking_out = started;
+                        }
+                    }
+                    Retry::Job(job, after) => {
+                        self.start_job(*job, after);
+                    }
+                    Retry::Say(what) => self.say(what),
+                }
+            }
+            Kind::Pack { paths } => {
+                let after = AfterJob::new(self.tab().id);
+                let password = (!value(0).is_empty()).then(|| crate::fileops::Secret(value(0).to_string()));
+                let split = pack_split(value(2), value(3), value(4), value(5)).unwrap_or(crate::fileops::Split::Files(1));
+                self.start_job(Job::Compress { paths, format: pack_format(value(1)), password, split }, after);
+            }
             Kind::SaveTabs => self.save_tab_set(value(0).trim()),
             Kind::RenameMany { paths, folders } => {
                 let names: Vec<&str> = paths.iter().map(|p| file_name(p)).collect();
@@ -216,6 +364,57 @@ impl AppState {
             let set = self.settings.tab_sets.remove(i);
             self.say(format!("Removed the set \u{201c}{}\u{201d}.", set.name));
         }
+    }
+}
+
+/// The most parts Compress… cuts an archive into.
+const MOST_PARTS: u32 = 10;
+
+/// Compress…'s sizes to pick from, and what each is in MB (1 MB = 1024 × 1024 bytes). "4 GB" is
+/// a little under 4 GB, so a part fits a FAT32 USB stick.
+const SIZE_NAMES: [&str; 4] = ["25 MB", "100 MB", "700 MB", "4 GB"];
+const SIZE_MB: [u64; 4] = [25, 100, 700, 4092];
+const MB: u64 = 1024 * 1024;
+
+/// How Compress… cuts the archive, from its values: `by` "0" (FILES) takes the slider's `count`;
+/// "1" (SIZE) takes the size chip `chip`, or the own box's `own` MB when that's picked. Err: why
+/// it can't be done yet (None: nothing to say, the own box is just empty).
+fn pack_split(count: &str, by: &str, chip: &str, own: &str) -> Result<crate::fileops::Split, Option<String>> {
+    use crate::fileops::Split;
+    if by != "1" {
+        return Ok(Split::Files(pack_parts(count)));
+    }
+    let chip: usize = chip.parse().unwrap_or(0);
+    if let Some(mb) = SIZE_MB.get(chip) {
+        return Ok(Split::Size(mb * MB));
+    }
+    let own = own.trim();
+    if own.is_empty() {
+        return Err(None);
+    }
+    match own.parse::<u64>() {
+        Ok(mb) if mb > 0 && mb <= 1024 * 1024 => Ok(Split::Size(mb * MB)),
+        _ => Err(Some("Type the size in MB, like 50.".into())),
+    }
+}
+
+/// The size picked, in words ("4 GB", "50 MB").
+fn size_name(chip: &str, own: &str) -> String {
+    let chip: usize = chip.parse().unwrap_or(0);
+    SIZE_NAMES.get(chip).map_or_else(|| format!("{} MB", own.trim()), |n| n.to_string())
+}
+
+/// How many parts Compress…'s slider picks (1 to `MOST_PARTS`).
+fn pack_parts(value: &str) -> u32 {
+    value.parse::<u32>().unwrap_or(1).clamp(1, MOST_PARTS)
+}
+
+/// The kind of archive the switch of Compress… picks ("0" zip, "1" 7z).
+fn pack_format(side: &str) -> crate::archive::Format {
+    if side == "1" {
+        crate::archive::Format::SevenZ
+    } else {
+        crate::archive::Format::Zip
     }
 }
 
@@ -659,5 +858,41 @@ mod tests {
                 Err(_) => panic!("the file job never finished"),
             }
         }
+    }
+
+    #[test]
+    fn compress_asks_type_password_and_parts_in_one_box() {
+        let mut a = app_with(&["a.txt"], &["a.txt"]);
+        a.ask_pack();
+        let form = a.form.as_ref().expect("the form opened");
+        assert_eq!(form.title, "Compress");
+        assert_eq!(form.slider.as_ref().map(|s| s.label), Some("Split into"));
+        assert_eq!(form.fields.len(), 1, "one password box");
+        assert!(form.fields[0].secret, "dots at first");
+        let s = form.slider.as_ref().expect("a Parts slider");
+        assert_eq!((s.min, s.max, s.start), (1, 10, 1));
+        // Values: password, type ("0" zip, "1" 7z), parts. Empty password is fine (none).
+        let v = |pw: &str, side: &str, parts: &str| vec![pw.to_string(), side.to_string(), parts.to_string()];
+        for (pw, side) in [("", "0"), ("", "1"), ("cat123", "0"), ("cat123", "1")] {
+            let p = a.form_preview(&v(pw, side, "1"));
+            assert!(p.ready && p.problem.is_none(), "{pw} {side}");
+        }
+        // By size: a chip, or your own MB.
+        let z = |chip: &str, own: &str| vec!["".to_string(), "0".to_string(), "1".to_string(), "1".to_string(), chip.to_string(), own.to_string()];
+        assert_eq!(a.form_preview(&z("3", "")).lines[0], "a.zip.001, .002\u{2026} each up to 4 GB");
+        assert!(a.form_preview(&z("3", "")).ready);
+        let empty = a.form_preview(&z("4", ""));
+        assert!(!empty.ready && empty.problem.is_none(), "an empty own box says nothing yet");
+        assert_eq!(a.form_preview(&z("4", "50")).lines[0], "a.zip.001, .002\u{2026} each up to 50 MB");
+        assert!(a.form_preview(&z("4", "abc")).problem.is_some());
+        assert!(a.form_preview(&z("4", "0")).problem.is_some());
+        assert_eq!(pack_split("5", "1", "0", ""), Ok(crate::fileops::Split::Size(25 * MB)));
+        assert_eq!(pack_split("5", "0", "0", ""), Ok(crate::fileops::Split::Files(5)));
+        assert_eq!(a.form_preview(&v("", "1", "1")).lines[0], "a.7z");
+        assert_eq!(a.form_preview(&v("", "0", "1")).lines[0], "a.zip");
+        assert_eq!(a.form_preview(&v("", "1", "3")).lines[0], "a.7z.001 to a.7z.003");
+        assert_eq!(pack_parts("0"), 1);
+        assert_eq!(pack_parts("99"), 10);
+        assert_eq!(pack_parts(""), 1);
     }
 }

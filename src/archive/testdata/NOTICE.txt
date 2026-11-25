@@ -1,0 +1,5 @@
+The .rar files here are test files from the rars project (https://github.com/bitplane/rars),
+Apache-2.0. Passwords: rar5-locked, rar5-hidden, rar4-locked, rar4-hidden "password";
+rar7-hidden "Password"; rar4-mixed "known-pass"; rar4-unicode "test".
+The .zip and .7z files were made with 7-Zip, password "Secret123".
+split\*: made with WinRAR for Glint's tests

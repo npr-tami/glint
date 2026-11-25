@@ -154,10 +154,9 @@ impl AskBox {
                 r.fill_rect(Rect::new(x + radius, y + 1.0, (w - 2.0 * radius).max(0.0), 1.0), theme.highlight);
             }
         } else {
-            // A hairline frame, the panel, and the accent's line along its top like the toolbar's.
+            // A hairline frame and the panel.
             r.fill_rect(self.panel.inset(-1.0, -1.0), theme.line);
             r.fill_rect(self.panel, theme.toolbar);
-            r.fill_rect(Rect::new(x, y, w, 2.0), theme.accent);
         }
 
         let mut line_y = y + 20.0;

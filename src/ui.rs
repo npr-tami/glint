@@ -405,6 +405,8 @@ pub enum Command {
     /// Pack the selected items into a new archive next to them (right-click > Compress to zip /
     /// Compress to 7z). In the copy queue (app/files.rs).
     Compress(crate::archive::Format),
+    /// Right-click > Compress…: asks zip or 7z, a password and how many parts first.
+    CompressAsk,
     /// Put this colour tag on the selected items, or take it off when they all have it already
     /// (right-click > Tag; tags.rs, app/files.rs).
     TagSelected(crate::tags::Tag),

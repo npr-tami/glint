@@ -96,6 +96,8 @@ const PICK_7Z: u32 = 91;
 // Inside a zip or 7z: Extract selected… and Extract all… (into a folder picked first).
 const PICK_EXTRACT_SELECTED: u32 = 120;
 const PICK_EXTRACT_ALL: u32 = 121;
+// Compress… (zip or 7z, a password, parts: picked in its box).
+const PICK_PACK_ASK: u32 = 122;
 // Colour tags (tags.rs): Tag › (from PICK_TAG, in `Tag::ALL`'s order), and Remove tag.
 const PICK_TAG: u32 = 92;
 const PICK_UNTAG: u32 = 98;
@@ -195,6 +197,7 @@ pub fn for_items(app: &AppState, at: Point, how: How) -> Effect {
         }
         items.push(MenuItem::new(PICK_ZIP, "Compress to zip"));
         items.push(MenuItem::new(PICK_7Z, "Compress to 7z"));
+        items.push(MenuItem::new(PICK_PACK_ASK, "Compress\u{2026}"));
     }
     if files && inside {
         items.push(MenuItem::separator());
@@ -479,6 +482,7 @@ pub fn pick(id: u32, app: &mut AppState) -> Effect {
         PICK_EXTRACT_ALL => Command::ExtractInside { all: true },
         PICK_ZIP => Command::Compress(crate::archive::Format::Zip),
         PICK_7Z => Command::Compress(crate::archive::Format::SevenZ),
+        PICK_PACK_ASK => Command::CompressAsk,
         PICK_REDO => Command::Redo,
         PICK_NEW_FOLDER => Command::NewFolder,
         PICK_NEW_TEXT => Command::NewTextFile,

@@ -460,7 +460,9 @@ impl Window {
             // (The archive is read once for both.)
             let copy = self.app.keys(crate::keymap::Action::Copy);
             let too_much = crate::keymap::say_with(&copy, "That's a lot to drag out of an archive. Copy it ({keys}) and paste it instead.", "That's a lot to drag out of an archive. Copy it and paste it instead.");
+            let _ = crate::archive::take_ask();
             let taken = crate::archive::extract_at_most(&archive, &items, MOST, &too_much);
+            let ask = crate::archive::take_ask();
             match taken {
                 Ok((dir, paths)) => {
                     d.names = paths.iter().map(|p| crate::folder::file_name(p).to_string()).collect();
@@ -469,6 +471,10 @@ impl Window {
                 }
                 Err(why) => {
                     self.app.say(why);
+                    // A locked archive: its password is asked for, then it can be dragged again.
+                    if let Some(ask) = ask {
+                        self.app.ask_password_to_drag(ask);
+                    }
                     self.invalidate();
                     return;
                 }

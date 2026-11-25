@@ -11,7 +11,8 @@
 //!   (CNG), on a thread of its own, in percent for a big file. Then Copy copies the code, and Check
 //!   compares it with a code copied from a website (for an MD5 or SHA-1 code, the file's own of that
 //!   kind is worked out to compare). Selecting something else stops it and forgets it. Not in the
-//!   Recycle Bin or Home, nor inside a .zip or .7z.
+//!   Recycle Bin or Home. Inside a zip, 7z or rar it's worked out from the file's unpacked data
+//!   (never written to disk), which is what the file is once extracted.
 //! - Several: a little stack of cards with the count, how many files and folders, and the files' size.
 //!
 //! The panel never waits: each frame shows what is there, and the thumbnail service, peek.rs and
@@ -719,6 +720,10 @@ impl Hasher {
     }
 }
 
+// SAFETY: a CNG hash may be used from any thread, as long as only one at a time does (it's only
+// ever used by the thread working out its code).
+unsafe impl Send for Hasher {}
+
 impl Drop for Hasher {
     fn drop(&mut self) {
         // SAFETY: both handles were made in `new`, and are let go of here, once.
@@ -731,9 +736,24 @@ impl Drop for Hasher {
 
 /// The `kind` code of the file at `path`, read a chunk at a time (`read` is told how much each
 /// time). None if it can't be read, or once `stop` is set.
-fn file_code(path: &str, kind: Kind, stop: &AtomicBool, read: &mut dyn FnMut(u64)) -> Option<String> {
-    let mut file = std::fs::File::open(path).ok()?;
+fn file_code(path: &str, kind: Kind, stop: &AtomicBool, read: &mut (dyn FnMut(u64) + Send)) -> Option<String> {
     let mut hasher = Hasher::new(kind)?;
+    // A file inside an archive: its unpacked data, the same bytes it has once extracted (so the
+    // same code), never written anywhere. The archive's own check of the data has to pass.
+    if folder::parent(path).is_some_and(|p| crate::archive::split(&p).is_some()) {
+        let mut ok = true;
+        let result = crate::archive::read_file(path, &mut |data| {
+            if stop.load(Ordering::Relaxed) || !hasher.add(data) {
+                ok = false;
+                return false;
+            }
+            read(data.len() as u64);
+            true
+        });
+        // (When it's for want of the password, `take_ask` on this thread says so.)
+        return (result.is_ok() && ok).then(|| hasher.finish()).flatten();
+    }
+    let mut file = std::fs::File::open(path).ok()?;
     let mut chunk = vec![0u8; CHUNK];
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -764,13 +784,15 @@ struct Job {
     stop: AtomicBool,
     /// Once it's done, the code (None: the file couldn't be read).
     end: OnceLock<Option<String>>,
+    /// It couldn't be read because the archive it's in wants its password first.
+    locked: AtomicBool,
 }
 
 impl Job {
     /// Starts working out the `kind` code of the file at `path` (`size` bytes). `hwnd` is repainted
     /// as it goes along (for a big file) and when it's done.
     fn start(path: &str, size: u64, kind: Kind, hwnd: HWND) -> Running {
-        let job = Arc::new(Job { kind, total: size, done: AtomicU64::new(0), stop: AtomicBool::new(false), end: OnceLock::new() });
+        let job = Arc::new(Job { kind, total: size, done: AtomicU64::new(0), stop: AtomicBool::new(false), locked: AtomicBool::new(false), end: OnceLock::new() });
         let (mine, path, window) = (job.clone(), path.to_string(), AtomicIsize::new(hwnd.0 as isize));
         let started = shell::background("fingerprint", move || {
             let mut shown = Instant::now();
@@ -781,6 +803,9 @@ impl Job {
                     thumbs::repaint(&window);
                 }
             });
+            if code.is_none() && crate::archive::take_ask().is_some() {
+                mine.locked.store(true, Ordering::Relaxed);
+            }
             let _ = mine.end.set(code);
             thumbs::repaint(&window);
         });
@@ -819,6 +844,8 @@ enum Step {
     Done(String),
     /// The file couldn't be read.
     Failed,
+    /// It's in an archive whose password hasn't been typed yet.
+    Locked,
 }
 
 /// What Check found out.
@@ -883,7 +910,8 @@ impl Print {
     fn poll(&mut self) {
         if let Step::Working(job) = &self.sha256 {
             if let Some(end) = job.0.end.get() {
-                self.sha256 = end.clone().map_or(Step::Failed, Step::Done);
+                let failed = if job.0.locked.load(Ordering::Relaxed) { Step::Locked } else { Step::Failed };
+                self.sha256 = end.clone().map_or(failed, Step::Done);
             }
         }
         if let Some(Check::Working { copied, job }) = &self.check {
@@ -1178,10 +1206,10 @@ impl DetailsPanel {
         (self.hover == h, self.pressed == h && self.hover == h)
     }
 
-    /// Whether the item has a Fingerprint row: a file, but not one in the Recycle Bin or Home, nor
-    /// inside a .zip or .7z.
+    /// Whether the item has a Fingerprint row: a file, but not one in the Recycle Bin or Home. (A
+    /// file inside an archive has one too: its code is worked out from its unpacked data.)
     fn can_print(&mut self, one: &One, app: &AppState) -> bool {
-        one.is_file() && !one.deleted && !folder::is_place(&app.tab().folder.path) && !self.in_archive(&one.path)
+        one.is_file() && !one.deleted && !folder::is_place(&app.tab().folder.path)
     }
 
     /// Whether the item at `path` is inside a .zip or .7z (found out once for each item: it may ask
@@ -1219,6 +1247,7 @@ impl DetailsPanel {
                 }
                 Some(Step::Working(job)) => r.text(&job.0.progress("Working it out"), value, &muted),
                 Some(Step::Failed) => r.text("Failed to read this file", value, &muted),
+                Some(Step::Locked) => r.text("Extract to fingerprint", value, &muted),
                 Some(Step::Done(code)) => {
                     let style = TextStyle::new(theme.text).align(Align::Right);
                     let shown = fit_code(code, value.w, &mut |t| r.measure(t, &style));
@@ -1519,7 +1548,7 @@ mod tests {
 
     /// A job that's done already, with this code (None: the file couldn't be read).
     fn finished(kind: Kind, code: Option<&str>) -> Running {
-        let job = Job { kind, total: 3, done: AtomicU64::new(3), stop: AtomicBool::new(false), end: OnceLock::new() };
+        let job = Job { kind, total: 3, done: AtomicU64::new(3), stop: AtomicBool::new(false), locked: AtomicBool::new(false), end: OnceLock::new() };
         let _ = job.end.set(code.map(str::to_string));
         Running(Arc::new(job))
     }
@@ -1630,6 +1659,30 @@ mod tests {
         let job = running.0.clone();
         drop(running);
         assert!(job.stop.load(Ordering::Relaxed));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_inside_an_archive_has_the_code_it_has_outside() {
+        let dir = fresh_dir("fingerprint-inside");
+        let file = dir.join("big.bin");
+        let data: Vec<u8> = (0..2 * CHUNK + 777).map(|i| (i * 13 % 241) as u8).collect();
+        std::fs::write(&file, &data).unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let stop = AtomicBool::new(false);
+        for format in [crate::archive::Format::Zip, crate::archive::Format::SevenZ] {
+            let out = dir.join(format!("packed.{}", format.ext().trim_start_matches('.')));
+            let out = out.to_string_lossy().into_owned();
+            let plan = crate::archive::plan_pack(std::slice::from_ref(&path), &stop).unwrap().unwrap();
+            crate::archive::pack(&plan, &out, format).unwrap();
+            let inside = format!("{out}\\big.bin");
+            let mut read = 0u64;
+            assert_eq!(file_code(&inside, Kind::Sha256, &stop, &mut |n| read += n), Some(code_of(&data, Kind::Sha256)), "{format:?}");
+            assert_eq!(read, data.len() as u64, "{format:?}");
+            assert_eq!(file_code(&inside, Kind::Md5, &stop, &mut |_| {}), file_code(&path, Kind::Md5, &stop, &mut |_| {}), "{format:?}");
+            assert_eq!(file_code(&inside, Kind::Sha256, &AtomicBool::new(true), &mut |_| {}), None, "stopped");
+            assert_eq!(file_code(&format!("{out}\\gone.bin"), Kind::Sha256, &stop, &mut |_| {}), None);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1744,7 +1797,7 @@ mod tests {
 
     #[test]
     fn big_files_say_how_far_along_they_are() {
-        let job = Job { kind: Kind::Sha256, total: 4 * BIG, done: AtomicU64::new(BIG + BIG / 2), stop: AtomicBool::new(false), end: OnceLock::new() };
+        let job = Job { kind: Kind::Sha256, total: 4 * BIG, done: AtomicU64::new(BIG + BIG / 2), stop: AtomicBool::new(false), locked: AtomicBool::new(false), end: OnceLock::new() };
         assert_eq!(job.progress("Working it out"), "Working it out\u{2026} 37%");
         job.done.store(5 * BIG, Ordering::Relaxed); // (it grew meanwhile)
         assert_eq!(job.percent(), Some(99));

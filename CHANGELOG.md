@@ -1,5 +1,15 @@
 # Changelog
 
+## 26.11.7 · 26/11/2026 00:57
+
+- Added opening and extracting rar files
+- Added passwords for zip, 7z and rar files
+- Added Compress… with a password and splitting into parts
+- Added opening split zip, 7z and rar files
+- Added Fingerprint for files inside archives
+- Updated the readme
+- Removed the coloured line on top of pop-up boxes
+
 ## 26.11.6 · 21/11/2026 18:46
 
 - Added a pop-out Skins window

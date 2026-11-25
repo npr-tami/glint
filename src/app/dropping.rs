@@ -24,7 +24,7 @@ impl AppState {
                 let job = match within {
                     Some((_, items, _)) => Job::ArchiveChange { archive, change: crate::archive::Change::Move { items: items.clone(), into }, recycle: Vec::new() },
                     None if how == DropHow::Link => {
-                        self.say("Shortcuts can't be made inside a zip or 7z file.");
+                        self.say("Shortcuts can't be made inside a zip, 7z or rar file.");
                         return false;
                     }
                     None => {

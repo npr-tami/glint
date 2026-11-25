@@ -130,6 +130,8 @@ pub struct Folder {
     pub bin: Option<Arc<recycle::Listing>>,
     /// Home only: where its parts start (recent.rs).
     pub home: Option<Box<crate::recent::Parts>>,
+    /// Inside an archive that needs a password first (archive.rs): which one, to ask for it.
+    pub ask: Option<crate::archive::Ask>,
 }
 
 /// A drive for This PC and the sidebar.

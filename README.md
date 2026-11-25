@@ -45,7 +45,7 @@ No installer, and it starts instantly.
 - **Undo and redo** for file operations
 - **Copy queue** with pause and cancel
 - **Search bar** for this folder, its subfolders, every drive (from This PC) or text inside files
-- **Zip and 7z** files open like folders, and can be edited, extracted or created
+- **Zip, 7z and rar** files open like folders, with a password too. Zip and 7z can also be created, edited and split
 - **Rename all**: rename many files at once (F2 with several selected)
 - **Find duplicates**, then select the extra copies
 

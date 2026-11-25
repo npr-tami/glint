@@ -54,10 +54,22 @@ const BUTTON_H: f32 = 30.0;
 const LEAN: f32 = 8.0;
 const BUTTON_GAP: f32 = 6.0;
 
+/// The SHOW / HIDE button at the right end of a password box: its width, and the gap between it and
+/// the typing.
+const EYE_W: f32 = 52.0;
+const EYE_GAP: f32 = 4.0;
+/// The slider (Split into): its thumb's width, its line's thickness, and the room right of it for the
+/// number picked.
+const THUMB_W: f32 = 12.0;
+const TRACK_H: f32 = 4.0;
+const SLIDER_NUMBER_W: f32 = 64.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Button {
     Yes,
     No,
+    /// The SHOW / HIDE button of box `n` (a password box).
+    Eye(usize),
 }
 
 #[derive(Default)]
@@ -84,12 +96,55 @@ pub struct FormBox {
     grab: Option<f32>,
     /// The mouse is over that thumb.
     over_thumb: bool,
+    /// The form's two-way switch (ZIP / 7Z), when it has one: which side is on, and where each is.
+    choice: Option<usize>,
+    sides: [Rect; 2],
+    /// Each password box's SHOW / HIDE button, where it was drawn (None: not a password box).
+    eyes: [Option<Rect>; MAX_FIELDS],
+    /// Each password box shows what's typed (its SHOW was pressed) instead of dots.
+    shown: [bool; MAX_FIELDS],
+    /// The form's slider (Split into), when it has one: the number picked, the lowest and highest, and
+    /// where its line was drawn.
+    slider: Option<(u32, u32, u32)>,
+    slider_track: Rect,
+    /// The slider's thumb is held (it follows the mouse until the button comes up).
+    sliding: bool,
+    /// The slider was drawn (a form that splits by size hides it while SIZE is picked).
+    slider_shown: bool,
+    /// The form's second switch (Split by: FILES / SIZE), when it has one: which side is on, and
+    /// where each is.
+    by: Option<usize>,
+    by_sides: [Rect; 2],
+    /// The form's size choices (Each file: 25 MB ... and a box for your own), when it has them and
+    /// they show: which is picked (the last number is the own box), and where each was drawn.
+    chip: Option<usize>,
+    chips: Vec<Rect>,
+    chips_shown: bool,
+    /// The own size box, and where it was drawn.
+    own: Option<TextBox>,
+    own_rect: Rect,
 }
 
+/// The own size box's id (after the form's boxes).
+const OWN_ID: u16 = FIRST_ID + MAX_FIELDS as u16;
+/// The own size box's width, and the room for its unit ("MB") inside it on the right.
+const OWN_W: f32 = 96.0;
+const UNIT_W: f32 = 28.0;
+const CHIP_GAP: f32 = 6.0;
+
 impl FormBox {
-    /// What is typed in the form's boxes now.
+    /// What is typed in the form's boxes now, and after them, for a form with a switch, which side
+    /// of it is on ("0" or "1").
     pub fn values(&self) -> Vec<String> {
-        self.boxes.iter().take(self.used).map(TextBox::text).collect()
+        let mut values: Vec<String> = self.boxes.iter().take(self.used).map(TextBox::text).collect();
+        values.extend(self.choice.map(|c| c.to_string()));
+        values.extend(self.slider.map(|(n, ..)| n.to_string()));
+        values.extend(self.by.map(|b| b.to_string()));
+        if let Some(c) = self.chip {
+            values.push(c.to_string());
+            values.push(self.own.as_ref().map(TextBox::text).unwrap_or_default());
+        }
+        values
     }
 
     /// Whether form `id` has been drawn (input before that isn't meant for it; see ask.rs).
@@ -101,8 +156,19 @@ impl FormBox {
     pub fn close(&mut self, window: HWND) {
         for b in &mut self.boxes {
             b.hide();
+            // (A password typed in it doesn't stay behind.)
+            b.set_text("");
+            b.set_secret(false);
         }
         self.used = 0;
+        self.choice = None;
+        (self.slider, self.sliding) = (None, false);
+        (self.by, self.chip, self.chips_shown, self.slider_shown) = (None, None, false, false);
+        if let Some(own) = &mut self.own {
+            own.hide();
+            own.set_text("");
+        }
+        (self.eyes, self.shown) = Default::default();
         self.seen = 0;
         (self.grab, self.over_thumb) = (None, false);
         // SAFETY: handing the keyboard to our own window.
@@ -126,9 +192,24 @@ impl FormBox {
                 self.boxes.push(TextBox::new(window, id));
             }
             self.used = form.fields.len().min(MAX_FIELDS);
+            // (A password starts as dots, every time.)
+            (self.eyes, self.shown) = Default::default();
             for (b, f) in self.boxes.iter().zip(&form.fields) {
+                b.set_secret(f.secret);
                 b.set_text(&f.start);
                 b.set_hint(f.hint);
+            }
+            self.choice = form.choice.as_ref().map(|c| c.start);
+            self.slider = form.slider.as_ref().map(|s| (s.start.clamp(s.min, s.max), s.min, s.max));
+            self.sliding = false;
+            self.by = form.by.as_ref().map(|c| c.start);
+            self.chip = form.sizes.as_ref().map(|z| z.start);
+            if form.sizes.is_some() && self.own.is_none() {
+                self.own = Some(TextBox::new(window, OWN_ID));
+            }
+            if let Some(own) = &mut self.own {
+                own.set_text("");
+                own.hide();
             }
             for b in self.boxes.iter_mut().skip(self.used) {
                 b.hide();
@@ -140,10 +221,21 @@ impl FormBox {
 
         let w = WIDTH.min(area.w - 32.0).max(260.0);
         let inner = w - 2.0 * PAD;
-        let lines = preview.lines.len() + preview.list.len().min(LIST_ROWS) + preview.problem.is_some() as usize;
+        let lines = preview.lines.len() + preview.list.len().min(LIST_ROWS) + preview.problem.is_some() as usize + preview.alert.is_some() as usize;
+        let switch_h = if form.choice.is_some() { FIELD_H + FIELD_GAP } else { 0.0 };
         let notes = form.fields.iter().take(self.used).filter(|f| !f.note.is_empty()).count();
-        let fields_h = self.used as f32 * (FIELD_H + FIELD_GAP) + notes as f32 * NOTE_LINE;
-        let h = 20.0 + TITLE_LINE + 12.0 + fields_h + 6.0 + lines as f32 * LINE + 22.0 + BUTTON_H + 20.0;
+        // (A form that splits by count or size shows the slider or the sizes, after its switch.)
+        let by_size = self.by == Some(1);
+        let by_h = if form.by.is_some() { FIELD_H + FIELD_GAP } else { 0.0 };
+        let slider_h = if form.slider.is_some() && !by_size { FIELD_H + FIELD_GAP } else { 0.0 };
+        let chip_style = TextStyle::new(theme.text).semibold().align(Align::Center);
+        let (chip_x, chip_right) = (LABEL_W, WIDTH.min(area.w - 32.0).max(260.0) - 2.0 * PAD);
+        let sizes_h = match (&form.sizes, by_size) {
+            (Some(z), true) => lay_chips(r, &chip_style, z.chips, chip_x, chip_right, 0.0).2 + FIELD_GAP,
+            _ => 0.0,
+        };
+        let fields_h = self.used as f32 * (FIELD_H + FIELD_GAP) + notes as f32 * NOTE_LINE + by_h + slider_h + sizes_h;
+        let h = 20.0 + TITLE_LINE + 12.0 + switch_h + fields_h + 6.0 + lines as f32 * LINE + 22.0 + BUTTON_H + 20.0;
         let x = area.x + ((area.w - w) / 2.0).max(0.0);
         let y = area.y + ((area.h - h) / 2.0 - 24.0).max(12.0);
         self.panel = Rect::new(x, y, w, h);
@@ -157,20 +249,36 @@ impl FormBox {
         } else {
             r.fill_rect(self.panel.inset(-1.0, -1.0), theme.line);
             r.fill_rect(self.panel, theme.toolbar);
-            r.fill_rect(Rect::new(x, y, w, 2.0), theme.accent);
         }
 
         let title_style = TextStyle::new(theme.text_strong).size(TITLE_SIZE).semibold();
         r.text(&form.title, Rect::new(x + PAD, y + 20.0, inner, TITLE_LINE), &title_style);
         let label_style = TextStyle::new(theme.text);
         let mut line_y = y + 20.0 + TITLE_LINE + 12.0;
+        // The switch (ZIP / 7Z): two halves side by side, the one that's on in the accent colour.
+        if let (Some(c), Some(on)) = (&form.choice, self.choice) {
+            self.sides = switch(r, theme, c.label, c.sides, on, x + PAD, line_y);
+            line_y += FIELD_H + FIELD_GAP;
+        }
         for (i, f) in form.fields.iter().take(self.used).enumerate() {
             r.text(f.label, Rect::new(x + PAD, line_y + (FIELD_H - 20.0) / 2.0, LABEL_W - 8.0, 20.0), &label_style);
             let field = Rect::new(x + PAD + LABEL_W, line_y, inner - LABEL_W, FIELD_H);
             r.fill_rect(field, theme.input);
             r.stroke_rect(field.inset(0.5, 0.5), 1.0, theme.input_border);
+            // A password box: SHOW (or HIDE) at its right end, and the typing left of it.
+            let mut typing = field.inset(6.0, 4.0);
+            self.eyes[i] = None;
+            if f.secret {
+                let eye = Rect::new(field.right() - EYE_W - 3.0, field.y + 3.0, EYE_W, field.h - 6.0);
+                let lit = self.hover == Some(Button::Eye(i));
+                r.fill_rect(eye, if lit { theme.chip_hover } else { theme.chip });
+                let word = if self.shown[i] { "HIDE" } else { "SHOW" };
+                r.text(word, eye, &TextStyle::new(theme.text).semibold().align(Align::Center));
+                typing.w = (eye.x - EYE_GAP - typing.x).max(10.0);
+                self.eyes[i] = Some(eye);
+            }
             let b = &mut self.boxes[i];
-            b.place(field.inset(6.0, 4.0), 0.0, scale);
+            b.place(typing, 0.0, scale);
             b.show();
             line_y += FIELD_H + FIELD_GAP;
             // How to fill it in, faint, under the box.
@@ -181,6 +289,62 @@ impl FormBox {
                 r.text(f.note, Rect::new(from, line_y - FIELD_GAP + 2.0, field.right() - from, NOTE_LINE), &note_style);
                 line_y += NOTE_LINE;
             }
+        }
+        if let (Some(c), Some(on)) = (&form.by, self.by) {
+            self.by_sides = switch(r, theme, c.label, c.sides, on, x + PAD, line_y);
+            line_y += FIELD_H + FIELD_GAP;
+        }
+        // The sizes (Each file): a chip each, the picked one in the accent colour, and a box to type
+        // your own (picked while it's typed in).
+        self.chips_shown = false;
+        if let (Some(z), Some(picked), true) = (&form.sizes, self.chip, by_size) {
+            r.text(z.label, Rect::new(x + PAD, line_y + (FIELD_H - 20.0) / 2.0, LABEL_W - 8.0, 20.0), &label_style);
+            let (rects, own, rows_h) = lay_chips(r, &chip_style, z.chips, x + PAD + LABEL_W, x + PAD + inner, line_y);
+            for (i, (rect, name)) in rects.iter().zip(z.chips).enumerate() {
+                if i == picked {
+                    r.fill_rect(*rect, theme.accent);
+                    r.text(name, *rect, &chip_style.color(theme.on_accent));
+                } else {
+                    r.fill_rect(*rect, theme.chip);
+                    r.stroke_rect(rect.inset(0.5, 0.5), 1.0, theme.input_border);
+                    r.text(name, *rect, &chip_style);
+                }
+            }
+            r.fill_rect(own, theme.input);
+            let own_on = picked == z.chips.len();
+            r.stroke_rect(own.inset(0.5, 0.5), if own_on { 2.0 } else { 1.0 }, if own_on { theme.accent } else { theme.input_border });
+            r.text(z.unit, Rect::new(own.right() - UNIT_W, own.y, UNIT_W - 6.0, own.h), &TextStyle::new(theme.muted).align(Align::Right));
+            if let Some(b) = &mut self.own {
+                b.set_hint(z.own_hint);
+                b.place(Rect::new(own.x + 6.0, own.y + 4.0, own.w - UNIT_W - 8.0, own.h - 8.0), 0.0, scale);
+                b.show();
+            }
+            (self.chips, self.own_rect, self.chips_shown) = (rects, own, true);
+            line_y += rows_h + FIELD_GAP;
+        } else if let Some(b) = &mut self.own {
+            b.hide();
+        }
+        // The slider (Split into): a line with a mark for each number, the thumb on the one picked, and
+        // the number right of it.
+        self.slider_shown = false;
+        if let (Some(sl), Some((n, lo, hi)), false) = (&form.slider, self.slider, by_size) {
+            self.slider_shown = true;
+            r.text(sl.label, Rect::new(x + PAD, line_y + (FIELD_H - 20.0) / 2.0, LABEL_W - 8.0, 20.0), &label_style);
+            let left = x + PAD + LABEL_W + THUMB_W / 2.0;
+            let right = x + PAD + inner - SLIDER_NUMBER_W - THUMB_W / 2.0;
+            self.slider_track = Rect::new(left, line_y, (right - left).max(10.0), FIELD_H);
+            let mid = line_y + FIELD_H / 2.0;
+            let at = |v: u32| left + self.slider_track.w * (v - lo) as f32 / (hi - lo).max(1) as f32;
+            r.fill_rect(Rect::new(left, mid - TRACK_H / 2.0, self.slider_track.w, TRACK_H), theme.chip);
+            r.fill_rect(Rect::new(left, mid - TRACK_H / 2.0, at(n) - left, TRACK_H), theme.accent);
+            for v in lo..=hi {
+                r.fill_rect(Rect::new(at(v) - 0.5, mid + TRACK_H / 2.0 + 2.0, 1.0, 4.0), theme.muted);
+            }
+            let thumb = Rect::new(at(n) - THUMB_W / 2.0, line_y + 4.0, THUMB_W, FIELD_H - 8.0);
+            r.fill_rect(thumb, theme.accent);
+            let count = format!("{n} {}", sl.units[usize::from(n != 1)]);
+            r.text(&count, Rect::new(x + PAD + inner - SLIDER_NUMBER_W + 8.0, line_y, SLIDER_NUMBER_W - 8.0, FIELD_H), &TextStyle::new(theme.text_strong).semibold());
+            line_y += FIELD_H + FIELD_GAP;
         }
         if fresh {
             if let Some(first) = self.boxes.first() {
@@ -220,6 +384,10 @@ impl FormBox {
         }
         if let Some(p) = &preview.problem {
             r.text(p, Rect::new(x + PAD, line_y, inner, LINE), &TextStyle::new(theme.accent).semibold());
+            line_y += LINE;
+        }
+        if let Some(a) = &preview.alert {
+            r.text(a, Rect::new(x + PAD, line_y, inner, LINE), &TextStyle::new(theme.accent).semibold());
         }
 
         // CANCEL at the right, the yes button left of it (as in the question box).
@@ -254,8 +422,18 @@ impl FormBox {
         } else if box_contains_beside(self.no, self.lean, Beside::LEFT, p) {
             Some(Button::No)
         } else {
-            None
+            self.eyes.iter().take(self.used).position(|e| e.is_some_and(|e| e.contains(p))).map(Button::Eye)
         }
+    }
+
+    /// SHOW / HIDE pressed on password box `i`: it shows what's typed, or dots again. The cursor
+    /// goes back into the box, so typing carries on.
+    fn flip_eye(&mut self, i: usize) -> Answer {
+        let Some(b) = self.boxes.get(i) else { return Answer::Nothing };
+        self.shown[i] = !self.shown[i];
+        b.set_secret(!self.shown[i]);
+        b.focus();
+        Answer::Redraw
     }
 
     fn yes(&self) -> Answer {
@@ -270,15 +448,42 @@ impl FormBox {
     /// Whether the list's scroll bar thumb is being dragged (the window then keeps the mouse, so
     /// the drag goes on outside it and ends wherever the button comes up).
     pub fn dragging(&self) -> bool {
-        self.grab.is_some()
+        self.grab.is_some() || self.sliding
     }
 
     /// The drag ended without a mouse-up here (something else took the mouse).
     pub fn let_go(&mut self) {
         self.grab = None;
+        self.sliding = false;
+    }
+
+    /// Puts the slider on the number nearest `x` (as far as it goes). Redraw when that's another.
+    fn slide_to(&mut self, x: f32) -> Answer {
+        let Some((n, lo, hi)) = self.slider else { return Answer::Nothing };
+        let t = self.slider_track;
+        let share = ((x - t.x) / t.w.max(1.0)).clamp(0.0, 1.0);
+        let v = lo + (share * (hi - lo) as f32).round() as u32;
+        self.slider = Some((v, lo, hi));
+        if v == n { Answer::Nothing } else { Answer::Redraw }
+    }
+
+    /// The slider a number up or down (Right / Left arrow).
+    fn slide_by(&mut self, up: bool) -> Answer {
+        let Some((n, lo, hi)) = self.slider.filter(|_| self.slider_shown) else { return Answer::Nothing };
+        let v = if up { (n + 1).min(hi) } else { n.saturating_sub(1).max(lo) };
+        self.slider = Some((v, lo, hi));
+        if v == n { Answer::Nothing } else { Answer::Redraw }
+    }
+
+    /// Whether `p` is on the slider (its line, a thumb's width either side, the row's height).
+    fn on_slider(&self, p: Point) -> bool {
+        self.slider_shown && self.slider.is_some() && self.slider_track.inset(-THUMB_W, 0.0).contains(p)
     }
 
     pub fn mouse_move(&mut self, p: Point) -> Answer {
+        if self.sliding {
+            return self.slide_to(p.x);
+        }
         if let Some(grab) = self.grab {
             // The thumb follows the mouse (as far as the list goes).
             let track = self.bar.track(self.list);
@@ -313,6 +518,36 @@ impl FormBox {
                 return Answer::Redraw;
             }
         }
+        if self.on_slider(p) {
+            self.sliding = true;
+            self.slide_to(p.x);
+            return Answer::Redraw;
+        }
+        if let Some(on) = self.choice {
+            if let Some(i) = self.sides.iter().position(|s| s.contains(p)) {
+                self.choice = Some(i);
+                return if i == on { Answer::Nothing } else { Answer::Redraw };
+            }
+        }
+        if let Some(on) = self.by {
+            if let Some(i) = self.by_sides.iter().position(|s| s.contains(p)) {
+                self.by = Some(i);
+                return if i == on { Answer::Nothing } else { Answer::Redraw };
+            }
+        }
+        if self.chips_shown {
+            if let Some(i) = self.chips.iter().position(|c| c.contains(p)) {
+                self.chip = Some(i);
+                return Answer::Redraw;
+            }
+            if self.own_rect.contains(p) {
+                self.chip = Some(self.chips.len());
+                if let Some(b) = &self.own {
+                    b.focus();
+                }
+                return Answer::Redraw;
+            }
+        }
         match self.button_at(p) {
             Some(b) => {
                 self.pressed = Some(b);
@@ -324,6 +559,9 @@ impl FormBox {
     }
 
     pub fn mouse_up(&mut self, p: Point) -> Answer {
+        if std::mem::take(&mut self.sliding) {
+            return self.slide_to(p.x);
+        }
         if self.grab.take().is_some() {
             // (Let go anywhere, a button or outside the panel too: only the drag ends.)
             self.over_thumb = self.thumb().is_some_and(|t| t.inset(-3.0, 0.0).contains(p));
@@ -332,6 +570,7 @@ impl FormBox {
         match (self.pressed.take(), self.button_at(p)) {
             (Some(Button::Yes), Some(Button::Yes)) => self.yes(),
             (Some(Button::No), Some(Button::No)) => Answer::No,
+            (Some(Button::Eye(i)), Some(Button::Eye(j))) if i == j => self.flip_eye(i),
             (Some(_), _) => Answer::Redraw,
             _ => Answer::Nothing,
         }
@@ -349,9 +588,11 @@ impl FormBox {
 
     /// A key that reached the window itself while the form is open (after a click on the panel).
     pub fn key(&mut self, vk: u16) -> Answer {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
+        use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT};
         match vk {
             v if v == VK_RETURN.0 => self.yes(),
+            v if v == VK_LEFT.0 => self.slide_by(false),
+            v if v == VK_RIGHT.0 => self.slide_by(true),
             v if v == VK_ESCAPE.0 => Answer::No,
             _ => Answer::Nothing,
         }
@@ -359,6 +600,25 @@ impl FormBox {
 
     /// News from one of the form's boxes. None: not one of them.
     pub fn text_event(&mut self, ev: &TextEvent) -> Option<Answer> {
+        if ev.id == OWN_ID && self.own.is_some() {
+            return Some(match ev.kind {
+                // (Typing your own size picks it.)
+                TextEventKind::Changed => {
+                    self.chip = Some(self.chips.len());
+                    Answer::Redraw
+                }
+                TextEventKind::Enter => self.yes(),
+                TextEventKind::Escape => Answer::No,
+                TextEventKind::Tab => {
+                    if let Some(b) = self.boxes.first().filter(|_| self.used > 0) {
+                        b.focus();
+                        b.select_all();
+                    }
+                    Answer::Nothing
+                }
+                TextEventKind::LostFocus | TextEventKind::Down => Answer::Nothing,
+            });
+        }
         let i = ev.id.checked_sub(FIRST_ID).map(usize::from).filter(|&i| i < self.used)?;
         Some(match ev.kind {
             TextEventKind::Changed => Answer::Redraw,
@@ -375,6 +635,48 @@ impl FormBox {
             TextEventKind::LostFocus | TextEventKind::Down => Answer::Nothing,
         })
     }
+}
+
+/// A two-way switch (ZIP / 7Z, FILES / SIZE) with its label left of it, at `x`, `y`: two halves side
+/// by side, the one that's on in the accent colour. Returns where each half is.
+fn switch(r: &mut Renderer, theme: &Theme, label: &str, sides: [&str; 2], on: usize, x: f32, y: f32) -> [Rect; 2] {
+    r.text(label, Rect::new(x, y + (FIELD_H - 20.0) / 2.0, LABEL_W - 8.0, 20.0), &TextStyle::new(theme.text));
+    let side_style = TextStyle::new(theme.text).semibold().align(Align::Center);
+    let mut rects = [Rect::default(); 2];
+    let mut sx = x + LABEL_W;
+    for (i, name) in sides.iter().enumerate() {
+        let side_w = (r.measure(name, &side_style) + 32.0).max(64.0);
+        let side = Rect::new(sx, y, side_w, FIELD_H);
+        rects[i] = side;
+        if i == on {
+            r.fill_rect(side, theme.accent);
+            r.text(name, side, &side_style.color(theme.on_accent));
+        } else {
+            r.fill_rect(side, theme.chip);
+            r.stroke_rect(side.inset(0.5, 0.5), 1.0, theme.input_border);
+            r.text(name, side, &side_style);
+        }
+        sx += side_w;
+    }
+    rects
+}
+
+/// Where the size chips and the own size box go, from `left` to `right`, starting at `y`: a chip
+/// each, then the box, on as many rows as they need. Returns the chips, the box, and the rows'
+/// height.
+fn lay_chips(r: &mut Renderer, style: &TextStyle, chips: &[&str], left: f32, right: f32, y: f32) -> (Vec<Rect>, Rect, f32) {
+    let (mut cx, mut cy) = (left, y);
+    let mut place = |w: f32| {
+        if cx > left && cx + w > right {
+            (cx, cy) = (left, cy + FIELD_H + CHIP_GAP);
+        }
+        let rect = Rect::new(cx, cy, w, FIELD_H);
+        cx += w + CHIP_GAP;
+        rect
+    };
+    let rects: Vec<Rect> = chips.iter().map(|c| r.measure(c, style) + 20.0).collect::<Vec<_>>().into_iter().map(&mut place).collect();
+    let own = place(OWN_W);
+    (rects, own, own.bottom() - y)
 }
 
 /// One line of the list, "old  →  new", no wider than `width` (`measure`: how wide a text is).
@@ -552,6 +854,51 @@ mod tests {
         assert!(f.thumb().is_none());
         assert_eq!(f.mouse_down(Point::new(f.list.right() - 4.0, f.list.y + 4.0)), Answer::Nothing);
         assert!(!f.dragging());
+    }
+
+    #[test]
+    fn a_password_boxs_show_button_is_found_under_the_mouse() {
+        let mut f = laid_out(0);
+        f.used = 2;
+        f.eyes[1] = Some(Rect::new(400.0, 100.0, EYE_W, 22.0));
+        assert_eq!(f.button_at(Point::new(410.0, 110.0)), Some(Button::Eye(1)));
+        assert_eq!(f.button_at(Point::new(300.0, 110.0)), None);
+        // Over it it lights up; pressed and let go there it flips (no real box in a test: nothing).
+        assert_eq!(f.mouse_move(Point::new(410.0, 110.0)), Answer::Redraw);
+        assert_eq!(f.mouse_down(Point::new(410.0, 110.0)), Answer::Redraw);
+        assert_eq!(f.mouse_up(Point::new(410.0, 110.0)), Answer::Nothing);
+        assert!(!f.shown[1]);
+        // Let go somewhere else: no flip.
+        f.mouse_down(Point::new(410.0, 110.0));
+        assert_eq!(f.mouse_up(Point::new(300.0, 110.0)), Answer::Redraw);
+    }
+
+    #[test]
+    fn the_slider_picks_the_number_nearest_the_mouse() {
+        let mut f = laid_out(0);
+        f.slider = Some((1, 1, 10));
+        f.slider_shown = true;
+        f.slider_track = Rect::new(150.0, 100.0, 270.0, FIELD_H);
+        // Pressed at the middle: 5.5 rounds to 6 (each number is 30 apart).
+        assert_eq!(f.mouse_down(Point::new(285.0, 110.0)), Answer::Redraw);
+        assert!(f.dragging());
+        assert_eq!(f.values(), vec!["6".to_string()]);
+        // Dragged past either end it stops at 10 and 1.
+        f.mouse_move(Point::new(900.0, 110.0));
+        assert_eq!(f.slider.unwrap().0, 10);
+        f.mouse_move(Point::new(-50.0, 300.0));
+        assert_eq!(f.slider.unwrap().0, 1);
+        f.mouse_up(Point::new(180.0, 300.0));
+        assert_eq!(f.slider.unwrap().0, 2);
+        assert!(!f.dragging());
+        // The arrows: one up, one down, never past the ends.
+        assert_eq!(f.key(windows::Win32::UI::Input::KeyboardAndMouse::VK_RIGHT.0), Answer::Redraw);
+        assert_eq!(f.slider.unwrap().0, 3);
+        for _ in 0..5 {
+            f.key(windows::Win32::UI::Input::KeyboardAndMouse::VK_LEFT.0);
+        }
+        assert_eq!(f.slider.unwrap().0, 1);
+        assert_eq!(f.key(windows::Win32::UI::Input::KeyboardAndMouse::VK_LEFT.0), Answer::Nothing);
     }
 
     #[test]
