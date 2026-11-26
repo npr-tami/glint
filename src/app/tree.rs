@@ -247,6 +247,24 @@ impl Tab {
         self.ruled_view(folder).or_else(|| self.folder_views.lock().ok()?.get(&key(folder)).copied()).unwrap_or(self.own_view)
     }
 
+    /// The icon size between the steps for a folder shown in `view` in this tab: the one picked
+    /// there (not in folders the view rules give a view), when `view` is an icon view.
+    pub fn icon_px_for(&self, folder: &str, view: ViewMode) -> Option<f32> {
+        view.icon_px()?;
+        if self.ruled_view(folder).is_some() {
+            return None;
+        }
+        let px = *self.folder_sizes.lock().ok()?.get(&key(folder))? as f32;
+        let px = crate::settings::icon_size(px);
+        // (Only when it's still for this view: VIEW may have picked another since.)
+        (ViewMode::for_icon_px(px) == view && Some(px) != view.icon_px()).then_some(px)
+    }
+
+    /// The picture size the icon views show now, in DIPs.
+    pub fn icon_size(&self) -> Option<f32> {
+        self.icon_px.or_else(|| self.view_mode.icon_px())
+    }
+
     /// Whether the view rules give the folder on screen a view of its own.
     pub fn view_ruled(&self) -> bool {
         self.ruled_view(&self.folder.path).is_some()
@@ -305,13 +323,16 @@ impl AppState {
     /// keeps it, as in Explorer: it shows that way whenever it's opened, after a restart too.
     pub fn set_view(&mut self, mode: ViewMode) {
         let t = self.tab_mut();
-        if t.view_mode == mode {
+        if t.view_mode == mode && t.icon_px.is_none() {
             return;
         }
         change_view(t, mode);
         let ruled = t.view_ruled();
         if !ruled {
             let folder = key(&t.folder.path);
+            if let Ok(mut sizes) = t.folder_sizes.lock() {
+                sizes.remove(&folder);
+            }
             if let Ok(mut views) = t.folder_views.lock() {
                 // (The tab's own view needs no remembering.)
                 if mode == t.own_view {
@@ -327,6 +348,48 @@ impl AppState {
         } else {
             self.say(format!("{} (Ctrl+Shift+{n}) for this folder.", mode.name()));
         }
+    }
+
+    /// Ctrl+wheel in the icon views, VIEW's Size: the tab on screen shows its icons `px` DIPs big
+    /// (held between Medium's and Extra large's, on a step), counted as the nearest icon view. The
+    /// folder keeps the size as it keeps a view (just for now where the view rules give one).
+    pub fn set_icon_size(&mut self, px: f32) {
+        let px = crate::settings::icon_size(px);
+        let mode = ViewMode::for_icon_px(px);
+        let own = (mode.icon_px() != Some(px)).then_some(px);
+        let t = self.tab_mut();
+        if t.view_mode == mode && t.icon_px == own {
+            return;
+        }
+        if t.view_mode != mode {
+            // (Among the icon views the scroll stays: a step bigger or smaller keeps you where
+            // you were.)
+            let (scroll, icons) = (t.scroll, t.view_mode.icon_px().is_some());
+            change_view(t, mode);
+            if icons {
+                t.scroll = scroll;
+            }
+        }
+        t.icon_px = own;
+        t.lines = None;
+        t.reveal_focus = true;
+        if !t.view_ruled() {
+            let folder = key(&t.folder.path);
+            if let Ok(mut sizes) = t.folder_sizes.lock() {
+                match own {
+                    Some(px) => sizes.insert(folder.clone(), px as u16),
+                    None => sizes.remove(&folder),
+                };
+            }
+            if let Ok(mut views) = t.folder_views.lock() {
+                if mode == t.own_view {
+                    views.remove(&folder);
+                } else {
+                    views.insert(folder, mode);
+                }
+            }
+        }
+        self.say(format!("Icon size {}.", px as u32));
     }
 
     /// The Settings window's "View": every open tab shows its items this way (and new windows and
@@ -532,10 +595,12 @@ impl AppState {
 /// whether that changed it.
 pub(super) fn follow_view_rules(t: &mut Tab) -> bool {
     let want = t.view_for(&t.folder.path);
-    if t.view_mode == want {
+    let px = t.icon_px_for(&t.folder.path, want);
+    if t.view_mode == want && t.icon_px == px {
         return false;
     }
     change_view(t, want);
+    t.icon_px = px;
     true
 }
 
@@ -546,6 +611,7 @@ fn change_view(t: &mut Tab, mode: ViewMode) {
         close_all(t);
     }
     t.view_mode = mode;
+    t.icon_px = None;
     t.scroll = 0.0;
     t.lines = None;
     t.reveal_focus = true;

@@ -31,7 +31,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
 use windows::Win32::Foundation::HWND;
-use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS};
+use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer, SystemParametersInfoW, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS};
 
 use crate::app::{can_pin, AppState};
 use crate::folder::Drive;
@@ -88,6 +88,9 @@ const FRAME_HEAD_START: f64 = 0.008;
 /// The window timer that repeats a held scroll bar arrow or track (an older Windows); window.rs
 /// hands it to [`Sidebar::repeat_due`].
 pub const BAR_REPEAT_TIMER: usize = 12;
+/// The window timer that shows a cut name's whole name once the mouse has rested on it; window.rs
+/// hands it to [`Sidebar::tip_due`].
+pub const TIP_TIMER: usize = 14;
 
 /// The pinned folders' name box (text boxes 500-599 belong to the sidebar).
 const PIN_NAME_BOX: u16 = 500;
@@ -153,6 +156,21 @@ struct MenuFor {
     path: Option<String>,
 }
 
+/// A pinned folder pressed with the left button: a click opens it when the button comes up; moved
+/// up or down past a few DIPs, it's dragged to a new place in "Pinned" instead.
+#[derive(Clone, Debug)]
+struct PinPress {
+    path: String,
+    /// Where the button went down (window DIPs).
+    at: Point,
+    /// Being dragged; `to`: the place it would go (0 = first).
+    moving: bool,
+    to: usize,
+}
+
+/// How far a pressed pinned folder moves (DIPs) before it's dragged rather than clicked.
+const PIN_DRAG_DISTANCE: f32 = 5.0;
+
 /// A pinned folder whose name is being edited.
 struct Renaming {
     path: String,
@@ -217,6 +235,12 @@ pub struct Sidebar {
     bars_while_used: bool,
     /// The skin's `scrollbar-show: never`.
     bars_hidden: bool,
+    /// A whole name over a cut one (as in the list): whether it shows for the line under the mouse,
+    /// and, from the last frame, that line's whole name and where its cut name is.
+    tip_shown: bool,
+    tip_here: Option<(usize, String, Rect)>,
+    /// A pinned folder pressed, or being dragged to a new place.
+    pin_press: Option<PinPress>,
 }
 
 impl Default for Sidebar {
@@ -273,6 +297,9 @@ impl Sidebar {
             text: 0.0,
             bars_while_used: false,
             bars_hidden: false,
+            tip_shown: false,
+            tip_here: None,
+            pin_press: None,
         }
     }
 
@@ -584,11 +611,72 @@ impl Sidebar {
         let hover = hover.filter(|&i| Self::clickable(self.items[i].item));
         let over_track = self.mouse.is_some_and(|p| self.on_track(p));
         if hover != self.hover || over_track != self.over_track {
+            if hover != self.hover {
+                self.wait_for_tip(hover.is_some());
+            }
             self.hover = hover;
             self.over_track = over_track;
             return Effect::Redraw;
         }
         Effect::None
+    }
+
+    /// The mouse is on another line (`on`: a line at all): a shown whole name goes, and resting on
+    /// the new line starts the wait for its own (TIP_TIMER).
+    fn wait_for_tip(&mut self, on: bool) {
+        self.tip_shown = false;
+        if self.hwnd.is_invalid() {
+            return;
+        }
+        // SAFETY: a one-off timer on our own window.
+        unsafe {
+            if on && self.renaming.is_none() {
+                SetTimer(Some(self.hwnd), TIP_TIMER, crate::list::TIP_WAIT_MS, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), TIP_TIMER);
+            }
+        }
+    }
+
+    /// TIP_TIMER ran out (window.rs): the line under the mouse shows its whole name, if it was cut.
+    pub fn tip_due(&mut self) -> Effect {
+        if self.hover.is_none() || self.tip_shown || self.drag.is_some() {
+            return Effect::None;
+        }
+        self.tip_shown = true;
+        if self.tip_here.as_ref().is_some_and(|(i, _, _)| Some(*i) == self.hover) {
+            Effect::Redraw
+        } else {
+            Effect::None
+        }
+    }
+
+    /// Draws the whole name over a cut one; called by the window after every part is drawn, so the
+    /// box can reach past the sidebar over the list (`inside`: the window's body).
+    pub fn paint_tip(&self, r: &mut Renderer, theme: &Theme, inside: Rect) {
+        let Some((i, text, name)) = self.tip_here.as_ref() else { return };
+        if !self.tip_shown || self.hover != Some(*i) || self.drag.is_some() || self.renaming.is_some() {
+            return;
+        }
+        crate::list::paint_tip(r, theme, text, *name, inside, size::FONT + self.text);
+    }
+
+    /// Where a pinned folder dragged to height `y` (window DIPs) would go: before the first pinned
+    /// folder whose middle is below it (0 = first), or last.
+    fn pin_slot(&self, y: f32) -> usize {
+        let y = y - self.rect.y + self.scroll;
+        let pins: Vec<&Placed> = self.items.iter().filter(|p| matches!(p.item, Item::Pin(_))).collect();
+        pins.iter().position(|p| y < p.top + p.h / 2.0).unwrap_or(pins.len())
+    }
+
+    /// Where the line showing a dragged pinned folder's new place goes (window DIPs, its middle).
+    fn pin_slot_y(&self, to: usize) -> Option<f32> {
+        let pins: Vec<&Placed> = self.items.iter().filter(|p| matches!(p.item, Item::Pin(_))).collect();
+        let y = match pins.get(to) {
+            Some(p) => p.top,
+            None => pins.last().map(|p| p.top + p.h)?,
+        };
+        Some(self.rect.y + y - self.scroll)
     }
 
     /// The row of a line on screen (None when there's no such line).
@@ -605,7 +693,9 @@ impl Sidebar {
         (text_x, (right - text_x).max(0.0))
     }
 
-    fn paint_place(&self, r: &mut Renderer, theme: &Theme, app: &AppState, item: Item, row: Rect, state: RowState) {
+    /// Draws a place's line; returns its whole name and where it is when the name was cut short
+    /// (for `paint_tip`).
+    fn paint_place(&self, r: &mut Renderer, theme: &Theme, app: &AppState, item: Item, row: Rect, state: RowState) -> Option<(String, Rect)> {
         // In a panel, rows have round ends (in a rounded skin).
         let radius = if self.panels { theme.corner(row.h) } else { 0.0 };
         let seven = theme.era == crate::theme::Era::Win7;
@@ -658,6 +748,13 @@ impl Sidebar {
                 r.fill_rect(Rect::new(line.x, r.snap(line.y + line.h / 2.0 + 6.0), w, 1.0), color);
             }
         };
+        // A name too long for its line: cut in the middle, so its end still shows.
+        let put = |r: &mut Renderer, name: &str, line: Rect| -> Option<(String, Rect)> {
+            let shown = r.middle_of(name, line.w, &style);
+            mark(r, &shown, line);
+            r.text(&shown, line, &style);
+            (shown != name).then(|| (name.to_string(), line))
+        };
         let path = self.path_of(item, app).unwrap_or("");
         // A skin with older Windows' icons draws its own in place of Windows'.
         if theme.icons != IconSet::Windows {
@@ -671,6 +768,7 @@ impl Sidebar {
             eraicons::draw(r, theme.icons, role, icon);
         }
         let era_icons = theme.icons != IconSet::Windows;
+        let mut cut = None;
         match item {
             Item::Known(i) => {
                 // (Home opening its page: the page's icon, or the folder's until that's in.)
@@ -680,8 +778,7 @@ impl Sidebar {
                     None => r.icon(&app.icons, app.icons.folder(), icon),
                 }
                 let name = self.known.get(i).map_or("", |k| k.name);
-                mark(r, name, Rect::new(text_x, row.y, text_w, row.h));
-                r.text(name, Rect::new(text_x, row.y, text_w, row.h), &style);
+                cut = put(r, name, Rect::new(text_x, row.y, text_w, row.h));
             }
             Item::Bin => {
                 match self.icons.get(path) {
@@ -689,8 +786,7 @@ impl Sidebar {
                     Some(id) => r.icon(&app.icons, id, icon),
                     None => draw_bin_glyph(r, icon, theme.muted),
                 }
-                mark(r, recycle::NAME, Rect::new(text_x, row.y, text_w, row.h));
-                r.text(recycle::NAME, Rect::new(text_x, row.y, text_w, row.h), &style);
+                cut = put(r, recycle::NAME, Rect::new(text_x, row.y, text_w, row.h));
             }
             Item::Pin(_) => {
                 // A pinned drive gets its drive's icon (once the drive list brought it), a folder
@@ -702,12 +798,11 @@ impl Sidebar {
                     None => r.icon(&app.icons, app.icons.folder(), icon),
                 }
                 if self.renaming.as_ref().is_none_or(|rn| !same_path(&rn.path, path)) {
-                    mark(r, &app.pin_name(path), Rect::new(text_x, row.y, text_w, row.h));
-                    r.text(&app.pin_name(path), Rect::new(text_x, row.y, text_w, row.h), &style);
+                    cut = put(r, &app.pin_name(path), Rect::new(text_x, row.y, text_w, row.h));
                 }
             }
             Item::Drive(i) => {
-                let Some(drive) = app.drives.get(i) else { return };
+                let Some(drive) = app.drives.get(i) else { return None };
                 // Its own icon once the background lookup brought it, Windows' standard drive icon
                 // until then, and a drawn one if Windows has neither.
                 match self.icons.get(path).or_else(|| app.icons.stock_drive(drive.kind_name)) {
@@ -723,14 +818,12 @@ impl Sidebar {
                 };
                 match usage(drive).filter(|&used| shown(used)) {
                     Some(used) if theme.era.classic() && !self.panels => {
-                        mark(r, &drive.name, Rect::new(text_x, row.y, text_w, top_h));
-                        r.text(&drive.name, Rect::new(text_x, row.y, text_w, top_h), &style);
+                        cut = put(r, &drive.name, Rect::new(text_x, row.y, text_w, top_h));
                         let bar = Rect::new(text_x, row.bottom() - bar_bottom - CLASSIC_BAR_H, text_w, CLASSIC_BAR_H);
                         classic_usage(r, theme, bar, used);
                     }
                     Some(used) => {
-                        mark(r, &drive.name, Rect::new(text_x, row.y, text_w, top_h));
-                        r.text(&drive.name, Rect::new(text_x, row.y, text_w, top_h), &style);
+                        cut = put(r, &drive.name, Rect::new(text_x, row.y, text_w, top_h));
                         let bar = Rect::new(text_x, row.bottom() - bar_bottom - bar_h, text_w, bar_h);
                         // Round ends in a rounded skin, and the edge of the path box if it has one.
                         let radius = theme.corner(bar_h);
@@ -745,13 +838,13 @@ impl Sidebar {
                         }
                     }
                     None => {
-                        mark(r, &drive.name, Rect::new(text_x, row.y, text_w, row.h));
-                        r.text(&drive.name, Rect::new(text_x, row.y, text_w, row.h), &style);
+                        cut = put(r, &drive.name, Rect::new(text_x, row.y, text_w, row.h));
                     }
                 }
             }
             Item::QuickHeading | Item::QuickHint | Item::PinnedHeading | Item::PinHint | Item::PcHeading => {}
         }
+        cut
     }
 
     /// With panels: the three panels (in the skin's `sidebar-panel` paint, round-cornered in a
@@ -1012,10 +1105,12 @@ impl Component for Sidebar {
         if self.panels {
             self.paint_panels(r, theme);
         }
-        let hover = if self.drag.is_some() { None } else { self.mouse.and_then(|p| self.item_at(p)) };
+        let dragging = self.drag.is_some() || self.pin_press.as_ref().is_some_and(|p| p.moving);
+        let hover = if dragging { None } else { self.mouse.and_then(|p| self.item_at(p)) };
         let current = self.current_place(app);
         let lane = if self.track().is_some() { self.bar_w + 2.0 * self.bar_margin } else { 0.0 };
         let heading_w = (self.rect.w - lane - PAD_LEFT - PAD_RIGHT).max(0.0);
+        let mut tip_here = None;
         for (index, placed) in self.items.iter().enumerate() {
             let y = self.rect.y + placed.top - self.scroll;
             if y + placed.h <= self.rect.y || y >= self.rect.bottom() {
@@ -1083,7 +1178,9 @@ impl Component for Sidebar {
                     } else {
                         RowState::Normal
                     };
-                    self.paint_place(r, theme, app, item, row, state);
+                    if let Some((text, name)) = self.paint_place(r, theme, app, item, row, state).filter(|_| hovered) {
+                        tip_here = Some((index, text, name));
+                    }
                     if dropping && self.panels {
                         let radius = theme.corner(row.h);
                         r.stroke_round_rect(row.inset(0.5, 0.5), (radius - 0.5).max(0.0), 1.0, theme.accent);
@@ -1092,6 +1189,12 @@ impl Component for Sidebar {
                     }
                 }
             }
+        }
+        self.tip_here = tip_here;
+        // A pinned folder being dragged: a line where it would go.
+        if let Some(y) = self.pin_press.as_ref().filter(|p| p.moving).and_then(|p| self.pin_slot_y(p.to)) {
+            let (x, w) = if self.panels { self.panel_across() } else { (self.rect.x, self.rect.w - lane) };
+            r.fill_rect(Rect::new(x + 6.0, r.snap(y - 1.0), (w - 12.0).max(0.0), 2.0), theme.accent);
         }
         // The name box is a Windows text box on top; this is the frame around it.
         if let Some(at) = self.name_box_at.filter(|_| self.renaming.is_some()) {
@@ -1119,6 +1222,31 @@ impl Component for Sidebar {
         // (The mouse coming in shows a scroll bar that only shows while it's in use.)
         let entered = self.mouse.is_none() && self.bars_while_used;
         self.mouse = Some(e.pos);
+        // A pressed pinned folder moved far enough: it's dragged, and the line shows where it goes.
+        if let Some(mut p) = self.pin_press.take() {
+            p.moving = p.moving || (e.pos.y - p.at.y).abs() > PIN_DRAG_DISTANCE;
+            if p.moving {
+                self.rebuild(app);
+                // Near the sidebar's top or bottom edge (or past it), it scrolls along, so a pinned
+                // folder can go to a place out of sight (the wheel scrolls too).
+                let edge = self.row_h;
+                let step = if e.pos.y < self.rect.y + edge {
+                    -(self.rect.y + edge - e.pos.y).min(edge)
+                } else if e.pos.y > self.rect.bottom() - edge {
+                    (e.pos.y - (self.rect.bottom() - edge)).min(edge)
+                } else {
+                    0.0
+                };
+                if step != 0.0 {
+                    self.anim.stop();
+                    self.scroll = (self.scroll + step * 0.5).clamp(0.0, self.max_scroll());
+                }
+                p.to = self.pin_slot(e.pos.y.clamp(self.rect.y, self.rect.bottom()));
+                self.tip_shown = false;
+            }
+            self.pin_press = Some(p);
+            return Effect::Redraw;
+        }
         if let Some(grab) = self.drag {
             self.rebuild(app);
             if let (Some(track), Some(thumb)) = (self.track(), self.thumb()) {
@@ -1148,6 +1276,7 @@ impl Component for Sidebar {
     }
 
     fn mouse_down(&mut self, ctx: &Ctx, e: &MouseEvent, app: &mut AppState) -> Effect {
+        self.tip_shown = false;
         self.rebuild(app);
         // An older Windows' scroll bar arrow buttons: a line up or down.
         if self.track().is_some() && e.button == MouseButton::Left {
@@ -1188,6 +1317,11 @@ impl Component for Sidebar {
             }
         }
         match (e.button, path) {
+            // A pinned folder opens when the button comes up, unless it's dragged to a new place.
+            (MouseButton::Left, Some(path)) if matches!(item, Item::Pin(_)) && app.settings.pinned.len() > 1 => {
+                self.pin_press = Some(PinPress { path, at: e.pos, moving: false, to: 0 });
+                Effect::None
+            }
             (MouseButton::Left, Some(path)) => Effect::Command(Command::Navigate(path)),
             (MouseButton::Middle, Some(path)) => Effect::Command(Command::NewTabAt(path)),
             (MouseButton::Right, path) => {
@@ -1202,7 +1336,15 @@ impl Component for Sidebar {
         }
     }
 
-    fn mouse_up(&mut self, _ctx: &Ctx, _e: &MouseEvent, _app: &mut AppState) -> Effect {
+    fn mouse_up(&mut self, _ctx: &Ctx, _e: &MouseEvent, app: &mut AppState) -> Effect {
+        if let Some(p) = self.pin_press.take() {
+            if !p.moving {
+                return Effect::Command(Command::Navigate(p.path));
+            }
+            app.place_pin(&p.path, p.to);
+            self.rebuild(app);
+            return Effect::Redraw;
+        }
         if self.repeat.release() {
             crate::retroctl::repeat_timer(self.hwnd, BAR_REPEAT_TIMER, None);
             return Effect::Redraw;
@@ -1216,6 +1358,7 @@ impl Component for Sidebar {
     }
 
     fn wheel(&mut self, ctx: &Ctx, e: &MouseEvent, app: &mut AppState) -> Effect {
+        self.tip_shown = false;
         // Scrolling while renaming keeps what was typed, like clicking elsewhere.
         if self.renaming.is_some() {
             self.end_rename(true, true, Some(app));

@@ -65,7 +65,7 @@ use crate::app::{AppState, WM_APP_LOADED};
 use crate::ask::{Answer, AskBox};
 use crate::frame;
 use crate::keymap::{Action, Chord, KeyMap};
-use crate::list::{ListView, BAR_REPEAT_TIMER, SLOW_CLICK_TIMER};
+use crate::list::{ListView, BAR_REPEAT_TIMER, SLOW_CLICK_TIMER, TIP_TIMER};
 use crate::log;
 use crate::render::{FrameResult, Renderer, TextStyle};
 use crate::settings::{self, Backspace, Settings, ThemeMode, ViewMode};
@@ -1716,9 +1716,12 @@ impl Window {
                 SHELL_MENU_TIMER,
                 SLOW_CLICK_TIMER,
                 BAR_REPEAT_TIMER,
+                TIP_TIMER,
                 crate::sidebar::BAR_REPEAT_TIMER,
+                crate::sidebar::TIP_TIMER,
                 drag::DRAG_SCROLL_TIMER,
                 drag::TAB_SWITCH_TIMER,
+                drag::FOLDER_OPEN_TIMER,
             ] {
                 let _ = KillTimer(Some(self.hwnd), timer);
             }
@@ -2215,6 +2218,11 @@ impl Window {
             app.theme.set_place(Place::Other);
             renderer.set_fade(1.0);
             let b = frame::classic_border(&app.theme, *maximized);
+            // A cut name's whole name in the sidebar: over everything, so it can reach over the list.
+            if app.settings.show_sidebar && app.question.is_none() && app.form.is_none() {
+                let top = b + app.theme.title_h() + app.theme.toolbar_h();
+                sidebar.paint_tip(renderer, &app.theme, Rect::new(b, top, (client.0 - 2.0 * b).max(0.0), (client.1 - top - b).max(0.0)));
+            }
             if let Some(q) = &app.question {
                 // Over everything below the toolbar (see ask.rs for why not the toolbar too).
                 let top = b + app.theme.title_h() + app.theme.toolbar_h();
@@ -3010,6 +3018,32 @@ impl Window {
                 self.apply(Part::Sidebar, e);
                 Some(LRESULT(0))
             }
+            WM_TIMER if wparam.0 == TIP_TIMER => {
+                // The mouse rested on a cut name: its whole name shows (list.rs). Either half of
+                // split view may be the one waiting.
+                // SAFETY: stops our own one-off timer.
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), wparam.0);
+                }
+                let e = self.list.tip_due(&self.app);
+                self.apply(Part::List, e);
+                if let Some(o) = self.app.split_index() {
+                    let keep = std::mem::replace(&mut self.app.active, o);
+                    let e = self.list2.tip_due(&self.app);
+                    self.app.active = keep;
+                    self.apply(Part::List2, e);
+                }
+                Some(LRESULT(0))
+            }
+            WM_TIMER if wparam.0 == crate::sidebar::TIP_TIMER => {
+                // SAFETY: stops our own one-off timer.
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), wparam.0);
+                }
+                let e = self.sidebar.tip_due();
+                self.apply(Part::Sidebar, e);
+                Some(LRESULT(0))
+            }
             WM_TIMER if wparam.0 == SLOW_CLICK_TIMER => {
                 // A slow second click on a selected name: renaming starts (list.rs).
                 // SAFETY: stops our own one-off timer.
@@ -3046,6 +3080,14 @@ impl Window {
             }
             // The skins folder changed, was listed, or a skin file was written (skin.rs): the look
             // follows a skin whose text changed, and the windows that list skins show the news.
+            // VIEW's Size slider moved (droplist.rs, while its menu is open).
+            crate::ui::WM_APP_MENU_SLIDER => {
+                if wparam.0 as u32 == toolbar::VIEW_SIZE {
+                    self.run_command(Command::SetIconSize(lparam.0.clamp(0, u16::MAX as isize) as u16));
+                    self.invalidate();
+                }
+                Some(LRESULT(0))
+            }
             WM_APP_SKINS => {
                 self.app.skins_event(wparam.0);
                 self.sync_theme();
@@ -3131,7 +3173,7 @@ impl Window {
                 dragdrop::finish_async(wparam.0 as u64, lparam.0 != 0);
                 Some(LRESULT(0))
             }
-            WM_TIMER if matches!(wparam.0, drag::DRAG_SCROLL_TIMER | drag::TAB_SWITCH_TIMER) => {
+            WM_TIMER if matches!(wparam.0, drag::DRAG_SCROLL_TIMER | drag::TAB_SWITCH_TIMER | drag::FOLDER_OPEN_TIMER) => {
                 self.drag_timer(wparam.0);
                 Some(LRESULT(0))
             }

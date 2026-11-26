@@ -254,7 +254,7 @@ dependencies = [
 
 [[package]]
 name = "glint"
-version = "26.11.8"
+version = "26.11.9"
 dependencies = [
  "flate2",
  "rars",

@@ -235,6 +235,9 @@ pub struct Renderer {
     old_layouts: HashMap<LayoutKey, IDWriteTextLayout>,
     /// Measured widths, by (text, size, weight, title font).
     widths: HashMap<(String, u32, u16, bool), f32>,
+    /// Names cut in the middle (`text_middle`), by (text, box width in quarter DIPs, size, weight,
+    /// title font): what is shown.
+    middles: HashMap<(String, i32, u32, u16, bool), String>,
     dpi: f32,
     /// Reused buffer for converting text to UTF-16, so drawing text doesn't allocate.
     wide: Vec<u16>,
@@ -327,6 +330,7 @@ impl Renderer {
             layouts: HashMap::new(),
             old_layouts: HashMap::new(),
             widths: HashMap::new(),
+            middles: HashMap::new(),
             dpi: dpi as f32,
             wide: Vec::with_capacity(256),
             clip_depth: 0,
@@ -365,6 +369,7 @@ impl Renderer {
             self.layouts.clear();
             self.old_layouts.clear();
             self.widths.clear();
+            self.middles.clear();
             self.font_generation = self.font_generation.wrapping_add(1);
         }
     }
@@ -828,6 +833,25 @@ impl Renderer {
             // SAFETY: the layout and brush live across the call.
             unsafe { t.rt.DrawTextLayout(vec2(Point::new(r.x, r.y)), &layout, &t.brush, D2D1_DRAW_TEXT_OPTIONS_CLIP) };
         }
+    }
+
+    /// What of `text` shows in a box `w` DIPs wide when a name too long for it is cut in the middle
+    /// ("Holiday pict…day 1.jpg"), so its end (a number, the file type) still shows. Draw it with
+    /// `text`.
+    pub fn middle_of(&mut self, text: &str, w: f32, style: &TextStyle) -> String {
+        if text.is_empty() || w <= 0.0 {
+            return text.to_string();
+        }
+        let key = (text.to_string(), (w * 4.0).round() as i32, (style.size * 100.0) as u32, style.weight, style.title);
+        if let Some(s) = self.middles.get(&key) {
+            return s.clone();
+        }
+        let shown = middle_cut(text, w, |t| self.measure(t, style));
+        if self.middles.len() >= MAX_CACHED_TEXTS {
+            self.middles.clear();
+        }
+        self.middles.insert(key, shown.clone());
+        shown
     }
 
     /// Text broken into as many lines as fit in `r` (at spaces, or inside a long word), from the
@@ -1947,8 +1971,88 @@ fn family_in(collection: &IDWriteFontCollection, name: &str) -> bool {
     ok.is_ok() && exists.as_bool()
 }
 
+/// `text` cut in the middle to fit `w` (as `measure` measures): the start, "…", and the end - the
+/// file type with up to 6 letters before it ("…day 1.jpg"), or the last 8 letters when there's no
+/// file type. As much of the start as fits. Unchanged when it fits; when not even "…" and the end
+/// fit, the end is cut shorter (and at worst it's just "…").
+pub fn middle_cut(text: &str, w: f32, mut measure: impl FnMut(&str) -> f32) -> String {
+    if measure(text) <= w {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    // Where the file type starts (a dot that isn't the first letter, with 1 to 8 letters after it).
+    let ext = chars.iter().rposition(|&c| c == '.').filter(|&d| d > 0 && n - d >= 2 && n - d <= 9);
+    let want_tail = ext.map_or(8, |d| n - d + 6).min(n.saturating_sub(1));
+    let joined = |head: usize, tail: usize| -> String {
+        let mut s: String = chars[..head].iter().collect();
+        s.push('…');
+        s.extend(chars[n - tail..].iter());
+        s
+    };
+    // The end: as wanted, shorter when it alone (after "…") would take more than half the box.
+    let mut tail = want_tail;
+    while tail > 0 && measure(&joined(0, tail)) > w * 0.55 {
+        tail -= 1;
+    }
+    // (Not starting with a space after "…".)
+    while tail > 0 && chars[n - tail] == ' ' {
+        tail -= 1;
+    }
+    // The start: the most letters that still fit (found by halving).
+    let (mut lo, mut hi) = (0usize, n - tail);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if measure(&joined(mid, tail)) <= w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    // A start that ended in spaces reads badly before "…".
+    let mut head = lo;
+    while head > 0 && chars[head - 1] == ' ' {
+        head -= 1;
+    }
+    joined(head, tail)
+}
+
 #[cfg(test)]
 mod tests {
+    /// Each letter 1 DIP wide.
+    fn letters(t: &str) -> f32 {
+        t.chars().count() as f32
+    }
+
+    #[test]
+    fn a_name_that_fits_is_left_alone() {
+        assert_eq!(super::middle_cut("notes.txt", 20.0, letters), "notes.txt");
+        assert_eq!(super::middle_cut("notes.txt", 9.0, letters), "notes.txt");
+    }
+
+    #[test]
+    fn a_long_name_keeps_its_end_and_file_type() {
+        let name = "Holiday pictures Rome 2024 day 1.jpg";
+        let shown = super::middle_cut(name, 22.0, letters);
+        assert_eq!(shown, "Holiday pict…day 1.jpg");
+        assert!(letters(&shown) <= 22.0);
+        // Two files that differ only near the end stay apart.
+        assert_ne!(shown, super::middle_cut("Holiday pictures Rome 2024 day 2.jpg", 22.0, letters));
+    }
+
+    #[test]
+    fn a_long_name_without_a_file_type_keeps_its_last_letters() {
+        assert_eq!(super::middle_cut("A folder with a very long name 2026", 20.0, letters), "A folder wi…ame 2026");
+    }
+
+    #[test]
+    fn a_tiny_box_still_gets_something_that_fits() {
+        for w in 0..12 {
+            let shown = super::middle_cut("Holiday pictures Rome 2024 day 1.jpg", w as f32, letters);
+            assert!(letters(&shown) <= (w as f32).max(1.0), "{w}: {shown}");
+        }
+    }
+
     use super::*;
 
 

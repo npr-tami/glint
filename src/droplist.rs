@@ -14,7 +14,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromRect, ValidateRect, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SPACE, VK_TAB, VK_UP};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW, LoadCursorW, PostQuitMessage, RegisterClassExW, ShowWindow, TranslateMessage, IDC_ARROW,
     MSG, SW_SHOWNOACTIVATE, WM_CHAR, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN,
@@ -26,7 +26,7 @@ use crate::parts::{MenuPick, P};
 use crate::render::{Renderer, TextStyle};
 use crate::theme::{Color, Theme};
 use crate::thumbs::Picture;
-use crate::ui::{MenuItem, Point, Rect};
+use crate::ui::{MenuItem, MenuSlider, Point, Rect, WM_APP_MENU_SLIDER};
 
 /// One choice's row, in DIPs.
 #[cfg(test)]
@@ -38,6 +38,11 @@ const SPACE_H: f32 = 10.0;
 const PICK_LINE_W: f32 = 3.0;
 /// Room left of a choice's words (and right of them, in the width).
 const PAD: f32 = 8.0;
+/// A slider row (`MenuItem::slider`): room for its words on the left, for its value on the right,
+/// and its knob's size.
+const SLIDER_WORDS_W: f32 = 40.0;
+const SLIDER_VALUE_W: f32 = 52.0;
+const KNOB_R: f32 = 6.0;
 /// At most this many rows show; the rest scroll (the wheel, or the arrows).
 const MOST: usize = 12;
 const WHEEL_ROWS: f32 = 3.0;
@@ -192,6 +197,9 @@ struct Open {
     top: f32,
     hot: Option<usize>,
     pictures: Vec<Option<(Arc<Picture>, f32, f32)>>,
+    /// The sliders' values as they are now (`MenuItem::slider`), and the one being dragged.
+    sliders: Vec<Option<MenuSlider>>,
+    dragging: Option<usize>,
 }
 
 impl Open {
@@ -225,6 +233,28 @@ impl Open {
         self.rows.iter().position(|(top, h)| y >= *top && y < top + h)
     }
 
+    /// Where a slider row's track runs across, in client DIPs.
+    fn track(&self, menu: bool) -> (f32, f32) {
+        let x0 = 1.0 + if menu { TICK_W } else { PAD } + SLIDER_WORDS_W + KNOB_R;
+        let x1 = (self.size.0 - PAD - SLIDER_VALUE_W - KNOB_R).max(x0 + 1.0);
+        (x0, x1)
+    }
+
+    /// Slider `i` set to the value under `x`, or a step either way; whether it changed.
+    fn slide(&mut self, i: usize, x: Option<f32>, steps: f32, menu: bool) -> bool {
+        let (x0, x1) = self.track(menu);
+        let Some(s) = self.sliders.get_mut(i).and_then(Option::as_mut) else { return false };
+        let v = match x {
+            Some(x) => s.at((x - x0) / (x1 - x0)),
+            None => (s.value + steps * s.step).clamp(s.min, s.max),
+        };
+        if v == s.value {
+            return false;
+        }
+        s.value = v;
+        true
+    }
+
     fn inside(&self, p: Point) -> bool {
         p.x >= 0.0 && p.y >= 0.0 && p.x < self.size.0 && p.y < self.size.1
     }
@@ -233,6 +263,7 @@ impl Open {
         if !self.renderer.begin() {
             return;
         }
+        let (x0, x1) = self.track(menu);
         let r = &mut self.renderer;
         let (w, h) = self.size;
         r.clear(look.back);
@@ -250,6 +281,23 @@ impl Open {
                 if look.gap_line {
                     r.fill_rect(Rect::new(PAD, (y + rh / 2.0).floor(), w - 2.0 * PAD, 1.0), look.line.with_alpha(0.5));
                 }
+                continue;
+            }
+            if let Some(Some(s)) = self.sliders.get(i) {
+                let x = 1.0 + if menu { TICK_W } else { PAD };
+                let mid = (y + rh / 2.0).round();
+                r.text(&it.label, Rect::new(x, y, SLIDER_WORDS_W, rh), &TextStyle::new(look.text));
+                r.fill_round_rect(Rect::new(x0, mid - 1.5, x1 - x0, 3.0), 1.5, look.muted.with_alpha(0.45));
+                let at = x0 + s.spot(s.value) * (x1 - x0);
+                r.fill_round_rect(Rect::new(x0, mid - 1.5, at - x0, 3.0), 1.5, look.pick);
+                for m in &s.marks {
+                    let mx = (x0 + s.spot(*m) * (x1 - x0)).round();
+                    r.fill_rect(Rect::new(mx - 0.5, mid + 4.0, 1.0, 4.0), look.muted);
+                }
+                let big = if self.hot == Some(i) || self.dragging == Some(i) { 1.0 } else { 0.0 };
+                r.fill_ellipse(Point::new(at, mid), KNOB_R + big, KNOB_R + big, look.pick);
+                let value = format!("{} px", s.value.round() as i32);
+                r.text(&value, Rect::new(x1 + KNOB_R, y, (w - PAD - x1 - KNOB_R).max(0.0), rh), &TextStyle::new(look.muted).align(crate::render::Align::Right));
                 continue;
             }
             let row = Rect::new(1.0, y, w - 2.0, rh);
@@ -351,12 +399,15 @@ pub fn show(owner: HWND, list: &DropList) -> u32 {
             })
             .fold(0.0_f32, f32::max);
         let words = if list.menu { words + TICK_W - PAD + 8.0 } else { words };
+        // (A slider wants a track of some length.)
+        let words = if items.iter().any(|it| it.slider.is_some()) { words.max(SLIDER_WORDS_W + SLIDER_VALUE_W + 160.0) } else { words };
         let picture_w = pictures.iter().flatten().map(|(_, pw, _)| *pw).fold(0.0_f32, f32::max);
         let picture_w = if picture_w > 0.0 { picture_w + PICTURE_GAP } else { 0.0 };
         let box_w = (list.under.right - list.under.left) as f32 / scale;
         let rows = rows(items, list.look.row_h, list.look.line_h);
         let extent = rows.last().map_or(0.0, |(y, h)| y + h);
-        let most = MOST as f32 * list.look.row_h;
+        // (A button's menu shows whole; long lists scroll.)
+        let most = if list.menu { extent.max(MOST as f32 * list.look.row_h) } else { MOST as f32 * list.look.row_h };
         let w = box_w.max((words + picture_w + 2.0 * PAD + 2.0 + if extent > most { 12.0 } else { 0.0 }).ceil());
         let h = extent.min(most) + 2.0;
         let (pw, ph) = ((w * scale).round() as i32, (h * scale).round() as i32);
@@ -378,7 +429,8 @@ pub fn show(owner: HWND, list: &DropList) -> u32 {
         }
         renderer.resize(pw as u32, ph as u32);
         let current = if list.menu { None } else { items.iter().position(|it| it.checked && pickable(it)) };
-        let mut open = Open { hwnd, renderer, size: (w, h), rows, top: 0.0, hot: current, pictures };
+        let sliders = items.iter().map(|it| it.slider.clone()).collect();
+        let mut open = Open { hwnd, renderer, size: (w, h), rows, top: 0.0, hot: current, pictures, sliders, dragging: None };
         if let Some(c) = current {
             open.scroll_to_show(c);
         }
@@ -398,6 +450,14 @@ pub fn show(owner: HWND, list: &DropList) -> u32 {
         // A press inside the list picks on release (as Windows' lists do); a press outside closes it.
         let mut picked = 0u32;
         let mut msg = MSG::default();
+        // A slider's new value goes to the window at once, so it shows while the menu stays open.
+        let tell = |open: &Open, i: usize| {
+            if let Some(Some(s)) = open.sliders.get(i) {
+                use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+                let _ = PostMessageW(Some(owner), WM_APP_MENU_SLIDER, WPARAM(items[i].id as usize), LPARAM(s.value.round() as isize));
+            }
+        };
+        let is_slider = |open: &Open, i: usize| open.sliders.get(i).is_some_and(Option::is_some);
         loop {
             if GetCapture() != hwnd || (GetForegroundWindow() != owner && GetForegroundWindow() != owner_of(owner)) {
                 break;
@@ -413,6 +473,13 @@ pub fn show(owner: HWND, list: &DropList) -> u32 {
                     let _ = ValidateRect(Some(hwnd), None);
                     continue;
                 }
+                WM_MOUSEMOVE if msg.hwnd == hwnd && open.dragging.is_some() => {
+                    let i = open.dragging.unwrap_or(0);
+                    if open.slide(i, Some(point(msg.lParam).x), 0.0, list.menu) {
+                        tell(&open, i);
+                        repaint = true;
+                    }
+                }
                 WM_MOUSEMOVE if msg.hwnd == hwnd => {
                     let p = point(msg.lParam);
                     let at = open.row_at(p).filter(|i| pickable(&items[*i]));
@@ -422,12 +489,26 @@ pub fn show(owner: HWND, list: &DropList) -> u32 {
                     }
                 }
                 WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_MBUTTONDOWN if msg.hwnd == hwnd => {
-                    if !open.inside(point(msg.lParam)) {
+                    let p = point(msg.lParam);
+                    if !open.inside(p) {
                         break;
                     }
+                    if let Some(i) = open.row_at(p).filter(|i| msg.message == WM_LBUTTONDOWN && is_slider(&open, *i)) {
+                        open.dragging = Some(i);
+                        open.hot = Some(i);
+                        if open.slide(i, Some(p.x), 0.0, list.menu) {
+                            tell(&open, i);
+                        }
+                        repaint = true;
+                    }
+                }
+                // Letting go of a slider: the menu stays open for more.
+                WM_LBUTTONUP if msg.hwnd == hwnd && open.dragging.is_some() => {
+                    open.dragging = None;
+                    repaint = true;
                 }
                 WM_LBUTTONUP if msg.hwnd == hwnd => {
-                    if let Some(i) = open.row_at(point(msg.lParam)).filter(|i| pickable(&items[*i])) {
+                    if let Some(i) = open.row_at(point(msg.lParam)).filter(|i| pickable(&items[*i]) && !is_slider(&open, *i)) {
                         picked = items[i].id;
                         break;
                     }
@@ -435,7 +516,15 @@ pub fn show(owner: HWND, list: &DropList) -> u32 {
                 WM_NCLBUTTONDOWN | WM_NCRBUTTONDOWN => break,
                 WM_MOUSEWHEEL => {
                     let notches = ((msg.wParam.0 >> 16) & 0xffff) as i16 as f32 / 120.0;
-                    open.scroll_by(-notches * WHEEL_ROWS * list.look.row_h);
+                    // Over a slider: a step per notch.
+                    match open.hot.filter(|i| is_slider(&open, *i)) {
+                        Some(i) => {
+                            if open.slide(i, None, notches.signum(), list.menu) {
+                                tell(&open, i);
+                            }
+                        }
+                        None => open.scroll_by(-notches * WHEEL_ROWS * list.look.row_h),
+                    }
                     repaint = true;
                 }
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
@@ -449,10 +538,17 @@ pub fn show(owner: HWND, list: &DropList) -> u32 {
                     match vk {
                         k if k == VK_ESCAPE.0 || k == VK_TAB.0 => break,
                         k if k == VK_RETURN.0 || k == VK_SPACE.0 => {
-                            if let Some(i) = open.hot {
+                            if let Some(i) = open.hot.filter(|i| !is_slider(&open, *i)) {
                                 picked = items[i].id;
                             }
                             break;
+                        }
+                        // Left and Right move a slider a step.
+                        k if (k == VK_LEFT.0 || k == VK_RIGHT.0) && open.hot.is_some_and(|i| is_slider(&open, i)) => {
+                            let i = open.hot.unwrap_or(0);
+                            if open.slide(i, None, if k == VK_RIGHT.0 { 1.0 } else { -1.0 }, list.menu) {
+                                tell(&open, i);
+                            }
                         }
                         k if k == VK_DOWN.0 => { let to = next_pick(items, open.hot, 1); move_to(&mut open, to) },
                         k if k == VK_UP.0 => { let to = next_pick(items, open.hot, -1); move_to(&mut open, to) },

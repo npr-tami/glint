@@ -1,5 +1,13 @@
 # Changelog
 
+## 26.11.9 · 26/11/2026 23:34
+
+- Added icon sizes in small steps with Ctrl+wheel
+- Added a Size slider to the VIEW menu
+- Added dragging pinned folders into order
+- Added opening a folder by holding a dragged file over it
+- Added the whole name when hovering a cut name
+- Changed long names to cut in the middle
 ## 26.11.8 · 26/11/2026 02:25
 
 - Added Never to when scroll bars show

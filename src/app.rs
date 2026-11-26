@@ -164,6 +164,11 @@ pub struct Tab {
     pub own_view: ViewMode,
     /// The views picked with VIEW in folders, shared by every tab (`AppState::folder_views`).
     pub folder_views: FolderViews,
+    /// The icon sizes picked between the steps in folders, shared the same way.
+    pub folder_sizes: FolderSizes,
+    /// The icon size shown now when it's between the views' own (Ctrl+wheel, VIEW's Size), in
+    /// DIPs; None: the view's own size.
+    pub icon_px: Option<f32>,
     /// The folders open in the tree view, whose items follow the folder's own in `folder.entries`
     /// (app/tree.rs).
     pub tree: Tree,
@@ -231,6 +236,8 @@ impl Tab {
             view_mode: ViewMode::Details,
             own_view: ViewMode::Details,
             folder_views: FolderViews::default(),
+            folder_sizes: FolderSizes::default(),
+            icon_px: None,
             tree: Tree::default(),
             lines: None,
             sizes_asked: false,
@@ -497,6 +504,8 @@ enum Then {
 /// the steps back and forward (the rules then, and where the cursor was).
 /// The view picked with VIEW in each folder, by its path in lower case (app/tree.rs).
 pub type FolderViews = Arc<Mutex<std::collections::BTreeMap<String, ViewMode>>>;
+/// The icon size picked in each folder (between the views' own), by its path in lower case.
+pub type FolderSizes = Arc<Mutex<std::collections::BTreeMap<String, u16>>>;
 
 pub type SortHistory = (String, Vec<(String, usize)>, Vec<(String, usize)>);
 
@@ -587,6 +596,8 @@ pub struct AppState {
     pub sort_history: Option<SortHistory>,
     /// The view picked in each folder (settings.json "FolderViews"), shared with every tab.
     pub folder_views: FolderViews,
+    /// The icon size picked in each folder (settings.json "FolderIconSizes"), shared the same way.
+    pub folder_sizes: FolderSizes,
     /// What Ctrl+Z and Ctrl+Y undo and redo (undo.rs). Not remembered after Glint closes.
     pub history: crate::undo::History,
     /// A form waiting to be filled in (form.rs shows it, app/forms.rs says what it does).
@@ -625,6 +636,7 @@ impl AppState {
             sort_caret: None,
             sort_history: None,
             folder_views: Arc::new(Mutex::new(std::mem::take(&mut loaded.folder_views))),
+            folder_sizes: Arc::new(Mutex::new(std::mem::take(&mut loaded.folder_icon_sizes))),
             history: Default::default(),
             form: None,
             sizer: Default::default(),
@@ -706,6 +718,7 @@ impl AppState {
             sort_caret: None,
             sort_history: None,
             folder_views: FolderViews::default(),
+            folder_sizes: FolderSizes::default(),
             history: Default::default(),
             form: None,
             sizer: Default::default(),
@@ -757,6 +770,7 @@ impl AppState {
         tab.custom = self.custom_order();
         tab.views = Some(self.view_rules());
         tab.folder_views = self.folder_views.clone();
+        tab.folder_sizes = self.folder_sizes.clone();
         tab.set_own_view(self.settings.view);
         tab
     }
@@ -786,6 +800,7 @@ impl AppState {
         s.active_tab = self.active;
         s.split_folder = self.split_index().map(|i| self.tabs[i].path.clone());
         s.folder_views = self.folder_views.lock().map(|m| m.clone()).unwrap_or_default();
+        s.folder_icon_sizes = self.folder_sizes.lock().map(|m| m.clone()).unwrap_or_default();
         s.sort_column = settings::sort_number(self.tab().sort);
         s.sort_descending = self.tab().descending;
         s
@@ -1153,6 +1168,7 @@ impl AppState {
             Command::TogglePin(path) => self.toggle_pin(&path),
             Command::ToggleFavorites => self.toggle_favorites(),
             Command::SetView(mode) => self.set_view(mode),
+            Command::SetIconSize(px) => self.set_icon_size(px as f32),
             Command::ToggleSplit => self.toggle_split(),
             Command::OtherPane => self.focus_other_pane(),
             Command::OpenInOtherSide => self.open_in_other_side(),
@@ -2543,8 +2559,10 @@ pub(crate) fn apply_listing(t: &mut Tab, folder: Folder) {
         t.column_now = false; // a column picked for now was for the folder it left
         // Another folder: the view the rules give it, or the tab's own.
         let view = t.view_for(&folder.path);
-        if t.view_mode != view {
+        let px = t.icon_px_for(&folder.path, view);
+        if t.view_mode != view || t.icon_px != px {
             t.view_mode = view;
+            t.icon_px = px;
             t.lines = None; // (a step means something else in another view)
         }
     }
@@ -3277,6 +3295,7 @@ mod tests {
         let views = a.view_rules();
         a.tabs[0].views = Some(views);
         a.tabs[0].folder_views = a.folder_views.clone();
+        a.tabs[0].folder_sizes = a.folder_sizes.clone();
         a
     }
 
@@ -3715,5 +3734,46 @@ mod tests {
         assert_eq!(a.tab().view_mode, ViewMode::Large);
         a.run(Command::SetCustomViews(true));
         assert_eq!(a.tab().view_mode, ViewMode::Large);
+    }
+
+    #[test]
+    fn icon_sizes_between_the_steps_count_as_the_nearest_view_and_the_folder_keeps_them() {
+        let mut a = with_views("", false);
+        open(&mut a, "C:\\pics");
+        a.run(Command::SetIconSize(64));
+        assert_eq!((a.tab().view_mode, a.tab().icon_px), (ViewMode::Medium, Some(64.0)));
+        a.run(Command::SetIconSize(131)); // on a step: 128
+        assert_eq!((a.tab().view_mode, a.tab().icon_px), (ViewMode::Large, Some(128.0)));
+        a.run(Command::SetIconSize(96)); // a view's own size: no size of its own
+        assert_eq!((a.tab().view_mode, a.tab().icon_px), (ViewMode::Large, None));
+        a.run(Command::SetIconSize(200));
+        assert_eq!((a.tab().view_mode, a.tab().icon_px), (ViewMode::ExtraLarge, Some(200.0)));
+        // Gone and back, and after a restart: the folder shows that size; others don't.
+        open(&mut a, "C:\\other");
+        assert_eq!((a.tab().view_mode, a.tab().icon_px), (ViewMode::Details, None));
+        open(&mut a, "C:\\pics");
+        assert_eq!(a.tab().icon_px, Some(200.0));
+        let saved = a.snapshot();
+        let mut b = with_views("", false);
+        *b.folder_views.lock().unwrap() = saved.folder_views;
+        *b.folder_sizes.lock().unwrap() = saved.folder_icon_sizes;
+        open(&mut b, "C:\\PICS");
+        assert_eq!((b.tab().view_mode, b.tab().icon_px), (ViewMode::ExtraLarge, Some(200.0)));
+        // A view picked with VIEW: that view's own size again, and the size is forgotten.
+        b.run(Command::SetView(ViewMode::ExtraLarge));
+        assert_eq!((b.tab().view_mode, b.tab().icon_px), (ViewMode::ExtraLarge, None));
+        assert!(b.snapshot().folder_icon_sizes.is_empty());
+    }
+
+    #[test]
+    fn an_icon_size_in_a_folder_with_a_view_rule_is_for_now() {
+        let mut a = with_views("in C:\\pics (\n-large_icons\n)\n", false);
+        open(&mut a, "C:\\pics");
+        a.run(Command::SetIconSize(120));
+        assert_eq!(a.tab().icon_px, Some(120.0));
+        assert!(a.snapshot().folder_icon_sizes.is_empty(), "under a rule nothing is remembered");
+        open(&mut a, "C:\\other");
+        open(&mut a, "C:\\pics");
+        assert_eq!((a.tab().view_mode, a.tab().icon_px), (ViewMode::Large, None));
     }
 }

@@ -361,6 +361,8 @@ pub enum Command {
     ShowStatusBar(bool),
     /// Show the tab on screen this way (the VIEW button, Ctrl+Shift+1 to 6, right-click > View).
     SetView(ViewMode),
+    /// The icon views' picture size between the steps, in DIPs (Ctrl+wheel, VIEW's Size).
+    SetIconSize(u16),
     /// Split view on or off: two folders side by side (Ctrl+\; app/split.rs).
     ToggleSplit,
     /// Split view: work in the other half (F6).
@@ -444,7 +446,42 @@ pub struct MenuItem {
     pub picture: Option<MenuPicture>,
     /// In bold (the menu's default item): the skin in use in Settings' skin list.
     pub bold: bool,
+    /// A slider instead of a choice (VIEW's Size), in menus Glint draws itself (droplist.rs).
+    pub slider: Option<MenuSlider>,
 }
+
+/// A slider row in a menu: dragging it (or the wheel, or Left and Right over it) changes the value
+/// while the menu stays open, each change sent to the owner window as `WM_APP_MENU_SLIDER`
+/// (wparam: the item's id, lparam: the value).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MenuSlider {
+    pub min: f32,
+    pub max: f32,
+    pub step: f32,
+    pub value: f32,
+    /// Little marks on the track (the views' own sizes).
+    pub marks: Vec<f32>,
+}
+
+impl MenuSlider {
+    /// The value at `t` (0 to 1) along the track, on a step.
+    pub fn at(&self, t: f32) -> f32 {
+        let v = self.min + t.clamp(0.0, 1.0) * (self.max - self.min);
+        let step = self.step.max(1.0);
+        (((v - self.min) / step).round() * step + self.min).clamp(self.min, self.max)
+    }
+
+    /// Where `v` sits along the track (0 to 1).
+    pub fn spot(&self, v: f32) -> f32 {
+        if self.max <= self.min {
+            return 0.0;
+        }
+        ((v - self.min) / (self.max - self.min)).clamp(0.0, 1.0)
+    }
+}
+
+/// A menu's slider moved (see `MenuSlider`).
+pub const WM_APP_MENU_SLIDER: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 90;
 
 /// A little picture beside a menu item's words; popup.rs makes it at the menu's DPI.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -485,6 +522,10 @@ impl MenuItem {
     }
     pub fn separator() -> MenuItem {
         MenuItem::default()
+    }
+    /// A slider row (VIEW's Size), with `label` on its left.
+    pub fn slider(id: u32, label: &str, slider: MenuSlider) -> MenuItem {
+        MenuItem { id, label: label.to_string(), slider: Some(slider), ..Default::default() }
     }
 }
 
@@ -612,5 +653,18 @@ impl Anim {
     }
     pub fn stop(&mut self) {
         self.running = false;
+    }
+}
+
+#[cfg(test)]
+mod slider_tests {
+    #[test]
+    fn a_menu_slider_lands_on_steps_inside_its_ends() {
+        let s = super::MenuSlider { min: 48.0, max: 256.0, step: 8.0, value: 48.0, marks: vec![] };
+        assert_eq!(s.at(0.0), 48.0);
+        assert_eq!(s.at(1.0), 256.0);
+        assert_eq!(s.at(2.0), 256.0);
+        assert_eq!(s.at(0.5), 152.0);
+        assert_eq!(s.spot(96.0), 48.0 / 208.0);
     }
 }

@@ -116,6 +116,11 @@ pub const SLOW_CLICK_TIMER: usize = 10;
 /// The window timer that repeats a held scroll bar arrow or track (an older Windows); window.rs
 /// hands it to [`ListView::repeat_due`].
 pub const BAR_REPEAT_TIMER: usize = 11;
+/// The window timer that shows a cut name's whole name once the mouse has rested on it; window.rs
+/// hands it to [`ListView::tip_due`].
+pub const TIP_TIMER: usize = 13;
+/// How long the mouse rests on a cut name before its whole name shows (ms).
+pub const TIP_WAIT_MS: u32 = 500;
 
 /// The column titles' right-click menu (its tag; the files menus are menu.rs's 1 and 2).
 const MENU_HEADER: u32 = 10;
@@ -397,6 +402,11 @@ pub struct ListView {
     /// What the mouse lit up in the last frame painted: a move that changes none of it needs no
     /// new frame.
     painted_hover: HoverKey,
+    /// A whole name over a cut one: the row the mouse rests on (TIP_TIMER runs), the row whose
+    /// name shows, and, from the last frame, the hovered row's whole name and where its cut name is.
+    tip_wait: Option<usize>,
+    tip_shown: Option<usize>,
+    tip_here: Option<(usize, String, Rect)>,
     drag: Drag,
     /// The scroll bar's held arrow or track, repeating (an older Windows).
     repeat: crate::retroctl::Repeat,
@@ -535,6 +545,9 @@ impl ListView {
             bars_hidden: false,
             mouse: None,
             painted_hover: HoverKey::default(),
+            tip_wait: None,
+            tip_shown: None,
+            tip_here: None,
             drag: Drag::None,
             repeat: crate::retroctl::Repeat::default(),
             anim: Anim::default(),
@@ -611,7 +624,11 @@ impl ListView {
         self.home_on = Self::is_home(app.tab());
         let mode = if self.home_on { ViewMode::Details } else { app.tab().view_mode };
         self.flow = Flow::of(mode);
-        self.tile = Tile::of(mode);
+        // (A size between the steps, from Ctrl+wheel or VIEW's Size, when there is one.)
+        self.tile = match app.tab().icon_px.filter(|_| !self.home_on && self.flow == Flow::Grid) {
+            Some(px) => Tile::sized(px),
+            None => Tile::of(mode),
+        };
         if mode != self.mode {
             // Another view: a glide or rectangle under way meant the old one; the name box moves.
             self.mode = mode;
@@ -1650,6 +1667,7 @@ impl ListView {
     /// Draws the items as the tab's view says, then what goes over them: the name box's frame, a
     /// message instead of items, the rectangle being dragged and the scrollbar.
     fn paint_rows(&mut self, r: &mut Renderer, theme: &Theme, app: &AppState, tab: &Tab) {
+        self.tip_here = None;
         let area = self.rows_area();
         let geo = self.geo(tab);
         let scroll = tab.scroll.clamp(0.0, geo.max_scroll());
@@ -1702,6 +1720,7 @@ impl ListView {
             let room = crate::retroctl::Room::of(tab.scroll, self.max_scroll(tab));
             paint_scrollbar(r, theme, self.lane(), thumb, state, room);
         }
+        self.paint_tip(r, theme);
     }
 
     /// What the list says instead of items: a folder on its way (`waiting`: a slow one, whose
@@ -1776,6 +1795,65 @@ impl ListView {
             return None;
         }
         self.mouse.and_then(|p| self.row_at(tab, p))
+    }
+
+    /// The mouse moved: resting on another item starts the wait for its whole name (TIP_TIMER),
+    /// and a shown one goes.
+    fn watch_tip(&mut self, tab: &Tab) {
+        let on = if self.press.is_some() || self.rename.is_some() { None } else { self.hovered(tab) };
+        if on == self.tip_wait {
+            return;
+        }
+        self.tip_wait = on;
+        self.tip_shown = None;
+        if self.hwnd.is_invalid() {
+            return;
+        }
+        // SAFETY: a one-off timer on our own window.
+        unsafe {
+            if on.is_some() {
+                SetTimer(Some(self.hwnd), TIP_TIMER, TIP_WAIT_MS, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), TIP_TIMER);
+            }
+        }
+    }
+
+    /// TIP_TIMER ran out (window.rs): the mouse still on the same item shows its whole name, if it
+    /// was cut.
+    pub fn tip_due(&mut self, app: &AppState) -> Effect {
+        let Some(row) = self.tip_wait.filter(|&r| self.hovered(app.tab()) == Some(r)) else { return Effect::None };
+        if self.tip_shown == Some(row) {
+            return Effect::None;
+        }
+        self.tip_shown = Some(row);
+        if self.tip_here.as_ref().is_some_and(|(r, _, _)| *r == row) {
+            Effect::Redraw
+        } else {
+            Effect::None
+        }
+    }
+
+    /// Takes a shown whole name away (a click, a key, the wheel, the mouse leaving). It shows again
+    /// only once the mouse rests on another item.
+    fn drop_tip(&mut self) {
+        self.tip_shown = None;
+        if !self.hwnd.is_invalid() {
+            // SAFETY: stops our own one-off timer (harmless when it doesn't run).
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), TIP_TIMER);
+            }
+        }
+    }
+
+    /// The whole name of the cut name the mouse rests on, in a box just under it (above it at the
+    /// bottom), kept inside the list.
+    fn paint_tip(&mut self, r: &mut Renderer, theme: &Theme) {
+        let Some((row, text, name)) = self.tip_here.clone() else { return };
+        if self.tip_shown != Some(row) || self.drag != Drag::None || self.press.is_some() || self.rename.is_some() {
+            return;
+        }
+        paint_tip(r, theme, &text, name, self.rect, self.font);
     }
 
     /// Whether an item is cut to the clipboard (drawn faded until it's pasted, as in Explorer).
@@ -1938,18 +2016,25 @@ impl ListView {
             let name_right = self.name_right();
             let name_style = Self::name_weight(TextStyle::new(name_color).size(self.font), theme, e, selected);
             let tag = tags.of(e);
+            let name_box = Rect::new(name_x, y, name_right - name_x - 8.0 - crate::tags::room(tag), row_h);
+            // A name too long for its box: cut in the middle, so its end still shows; its whole name
+            // shows over it when the mouse rests on it (`paint_tip`).
+            let full = shown_name(e, hide_ext);
+            let shown = r.middle_of(full, name_box.w, &name_style);
+            if hover == Some(row) && shown != full {
+                self.tip_here = Some((row, full.to_string(), name_box));
+            }
             if label_only && selected {
                 // The selection behind the name only, and the keyboard's dotted box round it.
-                let w = r.measure(shown_name(e, hide_ext), &name_style).min((name_right - name_x - 8.0 - crate::tags::room(tag)).max(0.0)).ceil();
+                let w = r.measure(&shown, &name_style).min(name_box.w.max(0.0)).ceil();
                 let label = Rect::new(r.snap(name_x - 2.0), r.snap(y + 1.0), w + 4.0, (row_h - 2.0).round());
                 r.fill_paint(label, 0.0, &label_paint);
                 if tab.focus == Some(index) && lit {
                     crate::retroctl::dotted(r, label, theme.selection_text);
                 }
             }
-            let name_box = Rect::new(name_x, y, name_right - name_x - 8.0 - crate::tags::room(tag), row_h);
-            r.text(shown_name(e, hide_ext), name_box, &name_style);
-            crate::tags::after_name(r, theme, tag, shown_name(e, hide_ext), &name_style, name_box, selected);
+            r.text(&shown, name_box, &name_style);
+            crate::tags::after_name(r, theme, tag, &shown, &name_style, name_box, selected);
             let detail = TextStyle::new(if selected && !label_only { theme.selection_details } else { theme.muted }).size(self.font);
             let facts = media.iter().find(|(at, _)| *at == row).map(|(_, f)| f);
             for p in cols.iter().skip(1) {
@@ -1987,11 +2072,17 @@ impl ListView {
             let label_only = theme.era.classic();
             let (lit, label_paint) = self.classic_label(theme);
             let style = Self::name_weight(TextStyle::new(Self::name_color(theme, e, selected && (lit || !label_only), is_cut)).size(self.font), theme, e, selected);
-            let name = shown_name(e, hide_ext);
+            let full = shown_name(e, hide_ext);
             let name_x = cell.x + ROW_PAD + self.icon + 8.0;
             // (A colour tag's dot goes after the name, in the item: tags.rs.)
             let tag = tags.of(e);
             let room = (cell.right() - name_x - 10.0 - crate::tags::room(tag)).max(0.0);
+            // Too long: cut in the middle, the whole name over it on a rest of the mouse (as Details).
+            let name = r.middle_of(full, room, &style);
+            if hover == Some(row) && name != full {
+                self.tip_here = Some((row, full.to_string(), Rect::new(name_x, cell.y, room, cell.h)));
+            }
+            let name = name.as_str();
             let w = r.measure(name, &style).min(room);
             let item = Rect::new(cell.x + 4.0, cell.y + 1.0, name_x + w + 6.0 + crate::tags::room(tag) - (cell.x + 4.0), cell.h - 2.0);
             self.list_hit.push((row, item.right() - cell.x));
@@ -2262,6 +2353,22 @@ pub(crate) fn picture(r: &mut Renderer, theme: &Theme, app: &AppState, dir: &str
     at
 }
 
+/// A whole name over a cut one (`name`: where the cut name is drawn): a box with the name, under the
+/// name (or above it when there's no room below), inside `inside`. Used by the list and the sidebar.
+pub fn paint_tip(r: &mut Renderer, theme: &Theme, text: &str, name: Rect, inside: Rect, font: f32) {
+    let style = TextStyle::new(theme.text).size(font);
+    let h = (font + 12.0).round();
+    let w = (r.measure(text, &style) + 14.0).ceil().min(inside.w - 4.0).max(0.0);
+    let x = (name.x - 7.0).min(inside.right() - w - 2.0).max(inside.x + 2.0);
+    let below = name.bottom() + 2.0;
+    let y = if below + h <= inside.bottom() { below } else { (name.y - h - 2.0).max(inside.y) };
+    let tip = Rect::new(r.snap(x), r.snap(y), w, h);
+    r.fill_rect(tip, theme.panel);
+    r.fill_rect(tip, theme.hover);
+    r.stroke_rect(tip.inset(0.5, 0.5), 1.0, theme.line);
+    r.text(text, tip.inset(7.0, 0.0), &style);
+}
+
 /// Draws a scrollbar (the file list's, the sidebar's): the skin's track along `lane` if it paints
 /// one (with a line on the side facing the items), and the thumb in `thumb`: a bar with round ends
 /// in the skin's `scrollbar` paint (a gradient shades it across, like a rod), its edge and three
@@ -2508,20 +2615,35 @@ impl ListView {
     /// Ctrl + wheel ("Ctrl + scroll wheel changes view"), as in File Explorer: up for bigger,
     /// down for smaller, through Details, List, Medium, Large and Extra large icons. The folder
     /// keeps the view, as a VIEW pick does.
+    ///
+    /// In the icon views each notch makes the icons a small step (ICON_STEP) bigger or smaller, as
+    /// Explorer does, from Medium's size to Extra large's; below Medium comes List, then Details.
     fn zoom(&mut self, notches: f32, app: &mut AppState) -> Effect {
-        const STEPS: [ViewMode; 5] = [ViewMode::Details, ViewMode::List, ViewMode::Medium, ViewMode::Large, ViewMode::ExtraLarge];
+        use crate::settings::{ICON_MAX, ICON_MIN, ICON_STEP};
         self.zoom_wheel += notches;
         if self.zoom_wheel.abs() < 1.0 {
             return Effect::None;
         }
         let up = self.zoom_wheel > 0.0;
         self.zoom_wheel = 0.0;
-        let now = STEPS.iter().position(|v| *v == app.tab().view_mode).unwrap_or(0);
-        let next = if up { (now + 1).min(STEPS.len() - 1) } else { now.saturating_sub(1) };
-        if next == now {
-            return Effect::None;
-        }
-        Effect::Command(Command::SetView(STEPS[next]))
+        zoom_step(app.tab().view_mode, app.tab().icon_size(), up, ICON_MIN, ICON_MAX, ICON_STEP)
+    }
+}
+
+/// What one notch of Ctrl+wheel does from `mode` with icons `px` big: Details, List, then icon sizes
+/// from `min` to `max` in `step`s (`zoom`).
+fn zoom_step(mode: ViewMode, px: Option<f32>, up: bool, min: f32, max: f32, step: f32) -> Effect {
+    let to = |v: ViewMode| Effect::Command(Command::SetView(v));
+    let size = |px: f32| Effect::Command(Command::SetIconSize(px.round() as u16));
+    match (mode, px) {
+        (_, Some(px)) if up && px >= max => Effect::None,
+        (_, Some(px)) if up => size((px + step).min(max)),
+        (_, Some(px)) if px <= min => to(ViewMode::List),
+        (_, Some(px)) => size((px - step).max(min)),
+        (ViewMode::List, _) if up => size(min),
+        (ViewMode::List, _) => to(ViewMode::Details),
+        (_, _) if up => to(ViewMode::List),
+        _ => Effect::None,
     }
 }
 
@@ -2653,6 +2775,7 @@ impl Component for ListView {
             }
         }
         let geo = self.geo(app.tab());
+        self.watch_tip(app.tab());
         let tab = app.tab_mut();
         match self.drag {
             Drag::Thumb { grab } => {
@@ -2687,6 +2810,8 @@ impl Component for ListView {
     }
 
     fn mouse_leave(&mut self, _ctx: &Ctx, app: &mut AppState) -> Effect {
+        self.drop_tip();
+        self.tip_wait = None;
         if crate::diskspace::is_disk(&app.tab().path) {
             return self.disk.mouse_leave();
         }
@@ -2695,6 +2820,7 @@ impl Component for ListView {
     }
 
     fn mouse_down(&mut self, ctx: &Ctx, e: &MouseEvent, app: &mut AppState) -> Effect {
+        self.drop_tip();
         if crate::diskspace::is_disk(&app.tab().path) {
             return self.disk.mouse_down(e, app);
         }
@@ -2961,6 +3087,7 @@ impl Component for ListView {
     }
 
     fn wheel(&mut self, ctx: &Ctx, e: &MouseEvent, app: &mut AppState) -> Effect {
+        self.drop_tip();
         if crate::diskspace::is_disk(&app.tab().path) {
             return self.disk.wheel(e);
         }
@@ -2987,6 +3114,7 @@ impl Component for ListView {
     }
 
     fn key_down(&mut self, ctx: &Ctx, vk: u16, mods: crate::ui::Mods, app: &mut AppState) -> Effect {
+        self.drop_tip();
         if crate::diskspace::is_disk(&app.tab().path) {
             return if self.disk.key(vk) { Effect::Redraw } else { Effect::None };
         }
@@ -3285,6 +3413,28 @@ pub(crate) fn wallpaper_layout(area: Rect, pic: (f32, f32), theme: &Theme, dip_p
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ctrl_wheel_goes_through_details_list_then_icon_sizes_in_small_steps() {
+        use super::zoom_step;
+        use crate::settings::ViewMode as V;
+        use crate::ui::{Command as C, Effect as E};
+        let z = |m, px, up| match zoom_step(m, px, up, 48.0, 256.0, 8.0) {
+            E::Command(C::SetView(v)) => format!("{v:?}"),
+            E::Command(C::SetIconSize(px)) => px.to_string(),
+            _ => "-".into(),
+        };
+        assert_eq!(z(V::Details, None, true), "List");
+        assert_eq!(z(V::Tree, None, true), "List");
+        assert_eq!(z(V::Details, None, false), "-");
+        assert_eq!(z(V::List, None, true), "48");
+        assert_eq!(z(V::List, None, false), "Details");
+        assert_eq!(z(V::Medium, Some(48.0), true), "56");
+        assert_eq!(z(V::Medium, Some(48.0), false), "List");
+        assert_eq!(z(V::Large, Some(96.0), false), "88");
+        assert_eq!(z(V::ExtraLarge, Some(252.0), true), "256");
+        assert_eq!(z(V::ExtraLarge, Some(256.0), true), "-");
+    }
+
     use super::*;
     use std::sync::Arc;
 

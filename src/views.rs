@@ -72,6 +72,17 @@ impl Tile {
         }
     }
 
+    /// A tile for a picture `px` DIPs big (Ctrl+wheel's sizes between the views' own): as wide
+    /// as the views' own tiles are around that size.
+    pub fn sized(px: f32) -> Tile {
+        let steps = [(48.0, 104.0), (96.0, 136.0), (256.0, 280.0)];
+        let px = px.clamp(48.0, 256.0);
+        let i = if px <= 96.0 { 0 } else { 1 };
+        let ((p0, w0), (p1, w1)) = (steps[i], steps[i + 1]);
+        let min_w = w0 + (w1 - w0) * (px - p0) / (p1 - p0);
+        Tile { picture: px, min_w: min_w.round(), lines: 2 }
+    }
+
     /// The whole tile's height: room, picture, room, the name's lines, room.
     pub fn h(&self) -> f32 {
         TILE_PAD + self.picture + TILE_TEXT_GAP + self.lines as f32 * NAME_LINE_H + TILE_PAD
@@ -337,6 +348,17 @@ impl Geometry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_tile_between_the_steps_is_as_wide_as_the_views_own_around_it() {
+        use super::Tile;
+        use crate::settings::ViewMode;
+        for v in [ViewMode::Medium, ViewMode::Large, ViewMode::ExtraLarge] {
+            assert_eq!(Tile::sized(v.icon_px().unwrap()), Tile::of(v));
+        }
+        let t = Tile::sized(72.0);
+        assert!(t.min_w > 104.0 && t.min_w < 136.0 && t.picture == 72.0);
+    }
+
     use super::*;
     use crate::ui::Point;
 

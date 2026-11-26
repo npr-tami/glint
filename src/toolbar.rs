@@ -81,6 +81,8 @@ const VIEW_STATUS_BAR: u32 = 21;
 const VIEW_SPLIT: u32 = 23;
 const VIEW_RULES: u32 = 22;
 const VIEW_CUSTOM: u32 = 24;
+/// VIEW's Size slider: the icons' size between the steps (its moves come as WM_APP_MENU_SLIDER).
+pub const VIEW_SIZE: u32 = 25;
 
 /// The SETTINGS button's right-click menu: what the Settings window doesn't have, the Skins window
 /// and Folder rules a click away, and a shortcut to its About page.
@@ -670,6 +672,11 @@ impl Toolbar {
             .enumerate()
             .map(|(i, (v, name))| MenuItem::new(VIEW_FIRST + i as u32, &format!("{name}\tCtrl+Shift+{}", i + 1)).checked(app.tab().view_mode == *v))
             .collect();
+        // Any size between Medium's and Extra large's, with marks at the views' own.
+        use crate::settings::{ICON_MAX, ICON_MIN, ICON_STEP};
+        let marks = [ViewMode::Medium, ViewMode::Large, ViewMode::ExtraLarge].iter().filter_map(|v| v.icon_px()).collect();
+        let value = app.tab().icon_size().unwrap_or(ICON_MIN);
+        items.push(MenuItem::slider(VIEW_SIZE, "Size", crate::ui::MenuSlider { min: ICON_MIN, max: ICON_MAX, step: ICON_STEP, value, marks }));
         items.push(MenuItem::separator());
         items.push(MenuItem::new(VIEW_SIDEBAR, "Sidebar\tCtrl+B").checked(app.settings.show_sidebar));
         items.push(MenuItem::new(VIEW_STATUS_BAR, "Status bar").checked(app.settings.show_status_bar));

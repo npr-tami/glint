@@ -926,6 +926,42 @@ impl ViewMode {
     pub fn from_key(key: &str) -> Option<ViewMode> {
         ViewMode::ALL.iter().map(|(v, _)| *v).find(|v| v.key().eq_ignore_ascii_case(key.trim()))
     }
+
+    /// An icon view's own picture size in DIPs (48, 96, 256); None for the others.
+    pub fn icon_px(self) -> Option<f32> {
+        match self {
+            ViewMode::Medium => Some(48.0),
+            ViewMode::Large => Some(96.0),
+            ViewMode::ExtraLarge => Some(256.0),
+            _ => None,
+        }
+    }
+
+    /// The icon view a size between the steps counts as (for VIEW's tick and the folder rules):
+    /// the nearest of Medium, Large and Extra large.
+    pub fn for_icon_px(px: f32) -> ViewMode {
+        if px < 72.0 {
+            ViewMode::Medium
+        } else if px < 176.0 {
+            ViewMode::Large
+        } else {
+            ViewMode::ExtraLarge
+        }
+    }
+}
+
+/// Icon sizes between the steps (Ctrl+wheel, VIEW's Size): from Medium's to Extra large's, in
+/// steps of this many DIPs.
+pub const ICON_MIN: f32 = 48.0;
+pub const ICON_MAX: f32 = 256.0;
+pub const ICON_STEP: f32 = 8.0;
+
+/// `px` held between ICON_MIN and ICON_MAX, on a step.
+pub fn icon_size(px: f32) -> f32 {
+    if !px.is_finite() {
+        return ICON_MIN;
+    }
+    ((px.clamp(ICON_MIN, ICON_MAX) - ICON_MIN) / ICON_STEP).round() * ICON_STEP + ICON_MIN
 }
 
 /// The extra columns next to Name, by their names in settings.json ("Columns"), in the list's order:
@@ -1260,6 +1296,9 @@ pub struct Settings {
     /// The view picked with VIEW in each folder, by its path in lower case, so the folder shows
     /// that way again (as in Explorer). Folders the view rules give a view aren't in it.
     pub folder_views: BTreeMap<String, ViewMode>,
+    /// The icon size picked between the steps (Ctrl+wheel, VIEW's Size) in each folder, in DIPs,
+    /// by its path in lower case. Folders at one of the views' own sizes aren't in it.
+    pub folder_icon_sizes: BTreeMap<String, u16>,
     /// How new tabs are sorted when Glint starts without its old tabs: 0 Name, 1 Date modified,
     /// 2 Type, 3 Size. Each saved tab has its own.
     pub sort_column: u32,
@@ -1387,6 +1426,7 @@ impl Default for Settings {
             maximized: false,
             column_width_map: BTreeMap::new(),
             folder_views: BTreeMap::new(),
+            folder_icon_sizes: BTreeMap::new(),
             sort_column: 0,
             sort_descending: false,
             sidebar_width: 0,
@@ -1462,6 +1502,7 @@ const CHOICES: &[&str] = &[
     "DoubleClickUp",
     "View",
     "FolderViews",
+    "FolderIconSizes",
     // The sidebar's (sidebar.rs, app/places.rs).
     "Pinned",
     "PinNames",
@@ -1958,7 +1999,7 @@ fn merge(ours: &Settings, synced: Option<&Map<String, Value>>, disk: Option<Map<
 
 /// Choices that are lists or maps both windows add to and take from (pins, tab sets...): merged item
 /// by item, not taken whole.
-const LIST_CHOICES: &[&str] = &["Pinned", "PinNames", "HiddenPlaces", "Favorites", "TabSets", "FolderViews"];
+const LIST_CHOICES: &[&str] = &["Pinned", "PinNames", "HiddenPlaces", "Favorites", "TabSets", "FolderViews", "FolderIconSizes"];
 
 /// `ours` with the changes the file got since `base` made to it too (what the other window added or
 /// removed); an item both changed keeps ours.

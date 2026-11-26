@@ -32,6 +32,10 @@ pub(super) const DRAG_SCROLL_TIMER: usize = 60;
 pub(super) const TAB_SWITCH_TIMER: usize = 61;
 /// How long a drag rests on a tab before Glint switches to it.
 const TAB_SWITCH_MS: u32 = 600;
+/// The timer that opens the folder a drag rests on (in the list or the sidebar).
+pub(super) const FOLDER_OPEN_TIMER: usize = 62;
+/// How long a drag rests on a folder before it opens, so you can keep going down into it.
+const FOLDER_OPEN_MS: u32 = 1000;
 /// How often the list moves while a drag is at its edge (about 60 times a second).
 const SCROLL_TICK_MS: u32 = 16;
 
@@ -54,6 +58,8 @@ pub(super) struct DragState {
     shown_dest: Option<Dest>,
     /// The tab the drag rests on (TAB_SWITCH_TIMER runs).
     waiting_tab: Option<usize>,
+    /// The folder the drag rests on, and in which part (FOLDER_OPEN_TIMER runs).
+    waiting_folder: Option<(Part, String)>,
     /// The list scrolls (DRAG_SCROLL_TIMER runs); when it last moved.
     scrolling: Option<Instant>,
     /// Whether any dropped item is a folder (asked once per drag, for "Pinned").
@@ -156,6 +162,7 @@ impl Window {
         self.drag.shown_dest = show.as_ref().and_then(|(_, t)| self.dest_of(t));
         self.show_drop(show);
         self.wait_on_tab();
+        self.wait_on_folder();
         self.scroll_near_edge();
         answer
     }
@@ -267,6 +274,34 @@ impl Window {
         }
     }
 
+    /// Resting on a folder (a folder's row, a place in the sidebar) starts the timer that opens it,
+    /// so the drag can go on down into it. Not the folder already on screen there.
+    fn wait_on_folder(&mut self) {
+        let on = match &self.drag.shown {
+            Some((part @ (Part::List | Part::List2 | Part::Sidebar), DropTarget::Folder(path))) => {
+                let here = match part {
+                    Part::List2 => self.app.split_index().map(|o| self.app.tabs[o].path.as_str()),
+                    _ => Some(self.app.tab().path.as_str()),
+                };
+                let open = here.is_some_and(|h| crate::fileops::same_path(h, path));
+                (!open && !path.is_empty()).then(|| (*part, path.clone()))
+            }
+            _ => None,
+        };
+        if on == self.drag.waiting_folder {
+            return;
+        }
+        self.drag.waiting_folder = on;
+        // SAFETY: timers on our own window.
+        unsafe {
+            if self.drag.waiting_folder.is_some() {
+                SetTimer(Some(self.hwnd), FOLDER_OPEN_TIMER, FOLDER_OPEN_MS, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), FOLDER_OPEN_TIMER);
+            }
+        }
+    }
+
     /// How fast the list under the drag should scroll, and whether that is split view's other
     /// half (`list2`, asked with its own tab as the active one, as in `drop_spot`).
     fn edge_scroll_speed(&mut self) -> (f32, bool) {
@@ -302,7 +337,7 @@ impl Window {
         }
     }
 
-    /// DRAG_SCROLL_TIMER and TAB_SWITCH_TIMER.
+    /// DRAG_SCROLL_TIMER, TAB_SWITCH_TIMER and FOLDER_OPEN_TIMER.
     pub(super) fn drag_timer(&mut self, id: usize) {
         match id {
             TAB_SWITCH_TIMER => {
@@ -316,6 +351,23 @@ impl Window {
                     self.apply(Part::Title, Effect::Command(Command::SwitchTab(i)));
                     let _ = self.drag_update();
                 }
+            }
+            FOLDER_OPEN_TIMER => {
+                // SAFETY: stops our own one-off timer.
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), FOLDER_OPEN_TIMER);
+                }
+                let Some((part, path)) = self.drag.waiting_folder.take() else { return };
+                let still_there = matches!(&self.drag.shown, Some((p, DropTarget::Folder(f))) if *p == part && *f == path);
+                if self.drag.files.is_none() || !still_there {
+                    return;
+                }
+                // In split view's other half: that half becomes the one Glint works in first.
+                if part == Part::List2 {
+                    self.apply(Part::List2, Effect::Command(Command::OtherPane));
+                }
+                self.apply(part, Effect::Command(Command::Navigate(path)));
+                let _ = self.drag_update();
             }
             DRAG_SCROLL_TIMER => {
                 let (speed, other) = self.edge_scroll_speed();
@@ -417,9 +469,11 @@ impl Window {
         self.drag.effects.forget();
         self.drag.has_folder = None;
         self.drag.waiting_tab = None;
+        self.drag.waiting_folder = None;
         self.drag.scrolling = None;
         // SAFETY: stops our own timers (harmless when they don't run).
         unsafe {
+            let _ = KillTimer(Some(self.hwnd), FOLDER_OPEN_TIMER);
             let _ = KillTimer(Some(self.hwnd), TAB_SWITCH_TIMER);
             let _ = KillTimer(Some(self.hwnd), DRAG_SCROLL_TIMER);
         }

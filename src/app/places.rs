@@ -63,6 +63,16 @@ impl AppState {
         }
     }
 
+    /// Moves a pinned folder to place `to` in "Pinned" (0 = first; counted as the list is before the
+    /// move, as where it was dragged to), for dragging it in the sidebar.
+    pub fn place_pin(&mut self, path: &str, to: usize) {
+        let pins = &mut self.settings.pinned;
+        let Some(i) = pins.iter().position(|p| same_path(p, path)) else { return };
+        let pin = pins.remove(i);
+        let to = if to > i { to - 1 } else { to };
+        pins.insert(to.min(pins.len()), pin);
+    }
+
     /// The name a pinned folder shows (right-click > Rename). Only the sidebar shows it - the folder
     /// keeps its own name. An empty name, or the folder's own, means no name of its own any more.
     pub fn rename_pin(&mut self, path: &str, name: &str) {
@@ -160,6 +170,25 @@ mod tests {
         // Kept in settings.json under "Favorites".
         let text = serde_json::to_string(&a.settings).unwrap();
         assert!(text.contains("\"Favorites\":[\"C:\\\\a.txt\"]"), "{text}");
+    }
+
+    #[test]
+    fn a_dragged_pin_lands_where_the_line_showed() {
+        let mut a = app();
+        for p in ["C:\\A", "C:\\B", "C:\\C", "C:\\D"] {
+            a.toggle_pin(p);
+        }
+        a.place_pin("C:\\D", 0); // dragged to the top
+        assert_eq!(a.settings.pinned, vec!["C:\\D", "C:\\A", "C:\\B", "C:\\C"]);
+        a.place_pin("c:\\d", 4); // to the bottom (below the last one)
+        assert_eq!(a.settings.pinned, vec!["C:\\A", "C:\\B", "C:\\C", "C:\\D"]);
+        a.place_pin("C:\\A", 2); // between B and C
+        assert_eq!(a.settings.pinned, vec!["C:\\B", "C:\\A", "C:\\C", "C:\\D"]);
+        a.place_pin("C:\\C", 2); // onto its own place: stays
+        a.place_pin("C:\\C", 3);
+        assert_eq!(a.settings.pinned, vec!["C:\\B", "C:\\A", "C:\\C", "C:\\D"]);
+        a.place_pin("C:\\Gone", 0);
+        assert_eq!(a.settings.pinned.len(), 4, "not pinned: nothing moves");
     }
 
     #[test]
