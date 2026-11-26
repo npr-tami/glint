@@ -215,6 +215,8 @@ pub struct Sidebar {
     text: f32,
     /// The skin's `scrollbar-show: using` (see `list::bar_in_use`).
     bars_while_used: bool,
+    /// The skin's `scrollbar-show: never`.
+    bars_hidden: bool,
 }
 
 impl Default for Sidebar {
@@ -270,6 +272,7 @@ impl Sidebar {
             drive_bars: DriveBars::Always,
             text: 0.0,
             bars_while_used: false,
+            bars_hidden: false,
         }
     }
 
@@ -297,6 +300,7 @@ impl Sidebar {
         self.drive_bars = parts.drive_bars();
         self.text = parts.num(P::SidebarText);
         self.bars_while_used = parts.scrollbars_while_used();
+        self.bars_hidden = parts.scrollbars_hidden();
         // Above the first heading, after a heading, between the groups, and after the last line.
         let (top, heading_h, first, between, end) = if self.panels {
             (PANEL_MARGIN, PANEL_HEADER_H, PANEL_PAD, PANEL_PAD + PANEL_MARGIN, PANEL_PAD + PANEL_MARGIN)
@@ -385,7 +389,9 @@ impl Sidebar {
     /// panels, inside its panel (a heading as wide as the panel, a row a little in from its sides).
     fn line_rect(&self, item: Item, y: f32, h: f32) -> Rect {
         if !self.panels {
-            return Rect::new(self.rect.x, y, self.rect.w, h);
+            // Clear of the scrollbar's lane, so a row's box never shows under or beside the bar.
+            let lane = if self.track().is_some() { self.bar_w + 2.0 * self.bar_margin } else { 0.0 };
+            return Rect::new(self.rect.x, y, (self.rect.w - lane).max(0.0), h);
         }
         let (x, w) = self.panel_across();
         let inset = if Self::is_heading(item) { 0.0 } else { PANEL_PAD };
@@ -451,7 +457,7 @@ impl Sidebar {
     fn track(&self) -> Option<Rect> {
         // Clear of an older Windows' arrow buttons at the two ends.
         let along = self.bar_margin + self.arrows;
-        (self.max_scroll() > 0.0).then(|| {
+        (self.max_scroll() > 0.0 && !self.bars_hidden).then(|| {
             Rect::new(self.rect.right() - self.bar_w - self.bar_margin, self.rect.y + along, self.bar_w, (self.rect.h - 2.0 * along).max(0.0))
         })
     }
@@ -594,12 +600,8 @@ impl Sidebar {
     /// Where a line's name starts, and how wide it may be.
     fn name_span(&self, row: Rect) -> (f32, f32) {
         let text_x = row.x + self.pad_left() + self.icon + ICON_GAP;
-        // (A panel's rows already keep clear of the scrollbar.)
-        let right = if self.panels {
-            row.right() - PANEL_ROW_PAD
-        } else {
-            row.right() - PAD_RIGHT - if self.track().is_some() { self.bar_w } else { 0.0 }
-        };
+        // (Rows already keep clear of the scrollbar.)
+        let right = if self.panels { row.right() - PANEL_ROW_PAD } else { row.right() - PAD_RIGHT };
         (text_x, (right - text_x).max(0.0))
     }
 
@@ -1012,7 +1014,8 @@ impl Component for Sidebar {
         }
         let hover = if self.drag.is_some() { None } else { self.mouse.and_then(|p| self.item_at(p)) };
         let current = self.current_place(app);
-        let heading_w = self.rect.w - PAD_LEFT - PAD_RIGHT;
+        let lane = if self.track().is_some() { self.bar_w + 2.0 * self.bar_margin } else { 0.0 };
+        let heading_w = (self.rect.w - lane - PAD_LEFT - PAD_RIGHT).max(0.0);
         for (index, placed) in self.items.iter().enumerate() {
             let y = self.rect.y + placed.top - self.scroll;
             if y + placed.h <= self.rect.y || y >= self.rect.bottom() {

@@ -1,5 +1,10 @@
 # Changelog
 
+## 26.11.8 · 26/11/2026 02:25
+
+- Added Never to when scroll bars show
+- Fixed rows poking out next to the scroll bar
+
 ## 26.11.7 · 26/11/2026 00:57
 
 - Added opening and extracting rar files

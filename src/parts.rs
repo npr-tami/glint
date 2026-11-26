@@ -220,7 +220,7 @@ pub const SPECS: [Spec; COUNT] = [
     num("list-icon-size", "File list", "Icon size", "the file list's icons at the small size, 12 to 32", 12.0, 32.0, 16.0, ICON_OFFER),
     flag("folders-bold", "File list", "Folder names in bold", "folders' names in bold: true or false", false),
     words("scrollbar-ends", "Scroll bars", "Ends", "the scroll bars' ends: round or square", &[("round", "Round"), ("square", "Square")]),
-    words("scrollbar-show", "Scroll bars", "Show", "when the scroll bars show: always, or using (while the mouse is over them or you scroll)", &[("always", "Always"), ("using", "While you use them")]),
+    words("scrollbar-show", "Scroll bars", "Show", "when the scroll bars show: always, using (while the mouse is over them or you scroll) or never", &[("always", "Always"), ("using", "While you use them"), ("never", "Never")]),
     auto("scrollbar-gap", "Scroll bars", "Space from the edge", "the space beside the scroll bars, 0 to 8 (3 if not set)", 0.0, 8.0, &[0.0, 1.0, 2.0, 3.0, 4.0, 6.0]),
     num("menu-row-height", "Menus", "Row height", "how tall a row of Glint's menus is, 18 to 40", 18.0, 40.0, 22.0, &[20.0, 22.0, 24.0, 26.0, 28.0, 32.0]),
     words("menu-pick", "Menus", "Picked row", "how a menu's picked row looks: accent, tint, or tint-line (a tint and a line)", &[("accent", "Accent colour"), ("tint", "Light tint"), ("tint-line", "Tint and line")]),
@@ -473,6 +473,10 @@ impl Parts {
     /// The scroll bars show only while they're used.
     pub fn scrollbars_while_used(&self) -> bool {
         self.word(P::ScrollShow) == 1
+    }
+    /// The scroll bars never show (the mouse wheel still scrolls).
+    pub fn scrollbars_hidden(&self) -> bool {
+        self.word(P::ScrollShow) == 2
     }
     pub fn menu_pick(&self) -> MenuPick {
         [MenuPick::Accent, MenuPick::Tint, MenuPick::TintLine][self.word(P::MenuPick).min(2)]

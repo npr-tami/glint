@@ -391,6 +391,8 @@ pub struct ListView {
     header_h: f32,
     /// The skin's `scrollbar-show: using`: the scroll bar shows only while the mouse is over the list.
     bars_while_used: bool,
+    /// The skin's `scrollbar-show: never`: no scroll bar, and no room kept for one.
+    bars_hidden: bool,
     mouse: Option<Point>,
     /// What the mouse lit up in the last frame painted: a move that changes none of it needs no
     /// new frame.
@@ -530,6 +532,7 @@ impl ListView {
             edge_in: 0.0,
             header_h: size::HEADER_H,
             bars_while_used: false,
+            bars_hidden: false,
             mouse: None,
             painted_hover: HoverKey::default(),
             drag: Drag::None,
@@ -599,6 +602,7 @@ impl ListView {
         self.font = if large { size::FONT_LARGE } else { size::FONT } + parts.num(P::ListText);
         self.header_h = app.theme.header_h();
         self.bars_while_used = app.theme.parts.scrollbars_while_used();
+        self.bars_hidden = app.theme.parts.scrollbars_hidden();
         self.skin_text = app.theme.font_size / size::FONT;
         self.bar_w = app.theme.scrollbar_w;
         self.bar_margin = app.theme.scrollbar_margin();
@@ -735,10 +739,10 @@ impl ListView {
             // back would move the edge away from under the mouse.
             all.iter().map(|&(c, _)| c).filter(|c| self.cols.iter().any(|p| p.col == *c)).collect()
         } else {
-            columns_that_fit(&all, self.rect.w - SCROLL_GUTTER - READABLE_NAME * grow)
+            columns_that_fit(&all, self.rect.w - self.gutter() - READABLE_NAME * grow)
         };
         let mut widths: Vec<f32> = all.iter().filter(|(c, _)| others.contains(c)).map(|&(_, w)| w).collect();
-        let avail = self.rect.w - SCROLL_GUTTER - MIN_NAME;
+        let avail = self.rect.w - self.gutter() - MIN_NAME;
         let total: f32 = widths.iter().sum();
         if total > avail && avail > 0.0 {
             let k = avail / total;
@@ -746,7 +750,7 @@ impl ListView {
                 *w = (*w * k).max(MIN_COL.min(*w));
             }
         }
-        let end = self.rect.right() - SCROLL_GUTTER;
+        let end = self.rect.right() - self.gutter();
         let mut x = end;
         let mut placed: Vec<Placed> = Vec::with_capacity(wanted_cols.len());
         for (c, w) in others.iter().zip(&widths).rev() {
@@ -775,7 +779,16 @@ impl ListView {
 
     /// The right edge of the Name column.
     fn name_right(&self) -> f32 {
-        self.cols.first().map_or(self.rect.right() - SCROLL_GUTTER, |p| p.x + p.w)
+        self.cols.first().map_or(self.rect.right() - self.gutter(), |p| p.x + p.w)
+    }
+
+    /// Room kept free on the right for the scrollbar: `SCROLL_GUTTER`, or more when the skin's bar
+    /// (and the space round it, and 98 / 2000's sunken edge) is wider, so columns never go under it.
+    fn gutter(&self) -> f32 {
+        if self.bars_hidden {
+            return self.edge_in + 4.0;
+        }
+        SCROLL_GUTTER.max(self.bar_w + 2.0 * self.bar_margin + self.edge_in)
     }
 
     /// The column titles (Details and Tree only: the other views have none).
@@ -859,6 +872,9 @@ impl ListView {
 
     /// Whether `p` is on (or right next to) the scrollbar's track.
     fn near_track(&self, p: Point) -> bool {
+        if self.bars_hidden {
+            return false;
+        }
         let t = self.track();
         if self.flow == Flow::Columns {
             p.y >= t.y - 2.0 && self.rect.contains(p)
@@ -874,6 +890,9 @@ impl ListView {
 
     /// Where the thumb is once the list is scrolled to `scroll`.
     fn thumb_at(&self, tab: &Tab, scroll: f32) -> Option<Rect> {
+        if self.bars_hidden {
+            return None;
+        }
         if self.home_on {
             let (max, track) = (self.max_scroll(tab), self.track());
             if max <= 0.0 {
@@ -909,7 +928,7 @@ impl ListView {
         if self.flow != Flow::Rows || !self.header().contains(p) {
             return None;
         }
-        let end = self.rect.right() - SCROLL_GUTTER;
+        let end = self.rect.right() - self.gutter();
         self.cols.iter().find(|c| p.x >= c.x && p.x < (c.x + c.w).min(end)).map(|c| c.col)
     }
 
@@ -1545,7 +1564,7 @@ impl ListView {
         // Home and Duplicates keep an order of their own until a column is clicked: till then no
         // column is the sorted one.
         let own_order = !tab.column_now && (crate::recent::is_recent(&tab.folder.path) || tab.search.as_ref().is_some_and(|s| s.is_dupes()));
-        let end = self.rect.right() - SCROLL_GUTTER;
+        let end = self.rect.right() - self.gutter();
         if theme.era.old() {
             // An older Windows' column titles (retrolist.rs).
             crate::retrolist::header_band(r, theme, header);
@@ -1636,7 +1655,13 @@ impl ListView {
         let scroll = tab.scroll.clamp(0.0, geo.max_scroll());
         // A slow folder on its way: no items of the one we came from (see app::LOADING_DELAY).
         let waiting = tab.waiting_long();
-        r.push_clip(area);
+        // Details and Tree: nothing goes under the scrollbar (a column made wider than the list
+        // is cut off at it).
+        let clip = match self.thumb(tab) {
+            Some(_) if self.flow == Flow::Rows => Rect::new(area.x, area.y, (self.lane().x - area.x).max(0.0), area.h),
+            _ => area,
+        };
+        r.push_clip(clip);
         if !waiting {
             match self.flow {
                 Flow::Rows => self.paint_lines(r, theme, app, tab, &geo, scroll),
@@ -1814,7 +1839,7 @@ impl ListView {
         let cut = app.cut_names(&tab.folder.path);
         let large = app.settings.size == ListSize::Large;
         let hide_ext = app.settings.hide_known_extensions;
-        let end = self.rect.right() - SCROLL_GUTTER;
+        let end = self.rect.right() - self.gutter();
         let cols = self.cols.clone();
         // The Recycle Bin: where each item came from (its "Original location"), one per entry.
         let bin = tab.folder.bin.as_ref().filter(|b| b.items.len() == tab.folder.entries.len());
@@ -1829,10 +1854,13 @@ impl ListView {
         let mut tags = app.tags.lookup(&tab.folder.path);
         let rows_look = theme.parts.list_rows();
         let column_lines = theme.parts.on(P::ColumnLines);
+        // A row stops at the scrollbar's lane, so its box never shows under or beside the bar.
+        let bar_x = self.thumb(tab).map(|_| self.lane().x);
         for row in geo.visible(scroll) {
             let Some(index) = tab.index_at(row) else { continue };
             let e = &tab.folder.entries[index];
             let line = geo.cell(row, scroll);
+            let line = bar_x.map_or(line, |x| Rect::new(line.x, line.y, (x - line.x).max(0.0), line.h));
             let y = line.y;
             if dupes && row > 0 && tab.index_at(row - 1).is_some_and(|p| tab.folder.entries[p].free != e.free) {
                 r.fill_rect(Rect::new(line.x, y, line.w, 1.0), theme.line);
@@ -2643,7 +2671,7 @@ impl Component for ListView {
                 let w = (start_w + (start_x - e.pos.x)).max(MIN_COL);
                 let others: f32 = self.cols.iter().skip(1).filter(|p| p.col != col).map(|p| p.w).sum();
                 let name = if self.cols.iter().any(|p| DROP_ORDER.contains(&p.col)) { READABLE_NAME * self.text_growth() } else { MIN_NAME };
-                let max_w = (self.rect.w - SCROLL_GUTTER - name - others).max(MIN_COL);
+                let max_w = (self.rect.w - self.gutter() - name - others).max(MIN_COL);
                 // Kept at the normal text size (see `text_growth`).
                 self.wanted.insert(col.key(), w.min(max_w) / self.text_growth());
                 self.place_columns(app);
