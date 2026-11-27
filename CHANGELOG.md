@@ -1,5 +1,8 @@
 # Changelog
 
+## 26.11.10 · 27/11/2026 14:35
+
+- Added opening zip files packed with LZMA, BZip2, XZ, Zstandard or PPMd
 ## 26.11.9 · 26/11/2026 23:34
 
 - Added icon sizes in small steps with Ctrl+wheel

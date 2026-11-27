@@ -1,6 +1,6 @@
 [package]
 name = "glint"
-version = "26.11.9"
+version = "26.11.10"
 edition = "2021"
 description = "A fast, lightweight file explorer for Windows that draws everything itself"
 license = "MIT"
@@ -22,12 +22,13 @@ serde_json = "1.0.145"
 # Needed by name for `#[implement]` (fileops.rs: the copy engine's progress reports). Already part of
 # the `windows` crate, so nothing new is downloaded or built.
 windows-core = "=0.62.2"
-# .zip files (archive.rs): browsing and unpacking (Deflate and Deflate64), and making them
+# .zip files (archive.rs): browsing and unpacking every packing method the crate knows (Deflate,
+# Deflate64, BZip2, LZMA, XZ, Zstandard, PPMd, and the old Shrink, Reduce and Implode), and making them
 # (Compress to zip, with Deflate). "aes-crypto": zips with a password (ZipCrypto and AES-128/192/256
 # to unpack, AES-256 to make). "unreserved": files copied from one zip into another keep
 # every extra field they came with - without it, a change inside a zip made on Linux or a Mac
 # is refused (their files carry who owned them there, a field the crate won't write otherwise).
-zip = { version = "=9.0.3", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64", "unreserved", "aes-crypto"] }
+zip = { version = "=9.0.3", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64", "bzip2", "lzma", "xz", "zstd", "ppmd", "legacy-zip", "unreserved", "aes-crypto"] }
 # The Deflate packer and unpacker the zip code uses: zlib-rs, a pure-Rust zlib (about twice as fast
 # as miniz_oxide both ways), using the fastest code this PC's processor can run.
 flate2 = { version = "=1.1.10", default-features = false, features = ["zlib-rs", "runtime_detection"] }
